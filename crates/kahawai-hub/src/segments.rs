@@ -21,17 +21,18 @@
 //!   where the music starts, a black-frame one where the picture goes dark,
 //!   and a chapter one wherever the person who made the file put it.
 //!
-//! ## `media_segment_scans` schema
+//! ## Segment scan/failure schemas
 //!
-//! One row per episode the detector has *finished* with, found something or
-//! not, with the `detector` generation that finished it. It is what stops the
-//! sweep from re-analyzing a season whose episodes simply share no opening —
-//! which is most films, most documentaries, and any show whose season was
-//! ripped without one. Bump [`kahawai_core::segments::DETECTOR_GENERATION`] to
-//! ask every season again.
-//!
-//! (Migration 0062's inline comment predates the `chapter` source and its
-//! checksum is frozen with the applied file; this doc is the authority.)
+//! `media_segment_scans` is one successful detector answer per episode; its
+//! generation and source mtime keep found-nothing answers settled while that
+//! rendition remains current. `media_segment_failures` is different by design:
+//! one row per exact `(item,module,collection,root,path,size,mtime,detector)` revision.
+//! Scheduling skips only failed physical sources, can fall through to another
+//! rendition of the same episode, and stops retrying when every current
+//! rendition has failed. A move/replacement or detector bump asks again; a
+//! successful rendition clears only its own exact failure. Migration 72 removes
+//! the short-lived false failures whose error was comparison insufficiency,
+//! because that state says nothing about the readable source's bytes.
 //!
 //! Boundaries are MEASURED ON — and chapters read from — the playback-ranked
 //! rendition, and stored per item. A client that negotiates an alternative
@@ -235,6 +236,117 @@ impl Default for Detector {
     fn default() -> Self {
         Self::new()
     }
+}
+
+async fn pending_episode_ids(
+    db: &sqlx::SqlitePool,
+    series_id: &str,
+    season: i64,
+) -> Result<Vec<String>> {
+    Ok(sqlx::query_scalar(
+        "SELECT i.id FROM items i
+          WHERE i.parent_id = ? AND i.season = ? AND i.kind = 'episode'
+            AND NOT EXISTS (
+                SELECT 1 FROM media_segment_scans s
+                 WHERE s.item_id = i.id AND s.detector = ?
+                   AND (s.mtime_unix IS NULL OR s.mtime_unix IN (
+                       SELECT f.mtime_unix
+                         FROM playable_sources ps
+                         JOIN playable_source_parts psp
+                              ON psp.playable_source_id = ps.id
+                         JOIN files f ON f.id = psp.file_id
+                        WHERE ps.item_id = i.id AND ps.expected_parts = 1)))
+            AND EXISTS (
+                SELECT 1
+                  FROM playable_sources ps
+                  JOIN playable_source_parts psp ON psp.playable_source_id = ps.id
+                  JOIN files f ON f.id = psp.file_id
+                  LEFT JOIN collection_roots r ON r.id = f.root_id
+                 WHERE ps.item_id = i.id AND ps.expected_parts = 1
+                   AND (SELECT COUNT(*) FROM playable_source_parts all_parts
+                         WHERE all_parts.playable_source_id = ps.id) = 1
+                   AND NOT EXISTS (
+                       SELECT 1 FROM media_segment_failures failure
+                        WHERE failure.item_id = i.id AND failure.detector = ?
+                          AND failure.module_id = f.module_id
+                          AND failure.collection_id = f.collection_id
+                          AND failure.root_token = COALESCE(r.root_token,'')
+                          AND failure.path_rel = f.path_rel
+                          AND failure.size = f.size
+                          AND failure.mtime_unix = f.mtime_unix))",
+    )
+    .bind(series_id)
+    .bind(season)
+    .bind(DETECTOR)
+    .bind(DETECTOR)
+    .fetch_all(db)
+    .await?)
+}
+async fn segment_source_failed(
+    db: &sqlx::SqlitePool,
+    item_id: &str,
+    revision: &SourceRevision,
+) -> Result<bool> {
+    Ok(sqlx::query_scalar(
+        "SELECT EXISTS (
+           SELECT 1 FROM media_segment_failures
+            WHERE item_id=? AND detector=? AND module_id=? AND collection_id=?
+              AND root_token=? AND path_rel=? AND size=? AND mtime_unix=?)",
+    )
+    .bind(item_id)
+    .bind(DETECTOR)
+    .bind(&revision.module_id)
+    .bind(&revision.collection_id)
+    .bind(&revision.root_token)
+    .bind(&revision.path_rel)
+    .bind(revision.size as i64)
+    .bind(revision.mtime_unix)
+    .fetch_one(db)
+    .await?)
+}
+
+struct SegmentCandidate {
+    part: crate::sessions::PartSource,
+    info: kahawai_core::media::MediaInfo,
+}
+
+struct SegmentEpisodeOptions {
+    item_id: String,
+    pending: bool,
+    candidates: Vec<SegmentCandidate>,
+}
+
+fn choose_segment_home(options: &[SegmentEpisodeOptions]) -> Option<(String, String)> {
+    let mut scores: std::collections::BTreeMap<(String, String), (usize, usize, usize)> =
+        Default::default();
+    for episode in options {
+        let mut seen = std::collections::HashSet::new();
+        for (rank, candidate) in episode.candidates.iter().enumerate() {
+            let home = (
+                candidate.part.module_id.clone(),
+                candidate.part.collection_id.clone(),
+            );
+            if !seen.insert(home.clone()) {
+                continue;
+            }
+            let score = scores.entry(home).or_default();
+            score.0 += usize::from(episode.pending);
+            score.1 += 1;
+            score.2 += rank;
+        }
+    }
+    scores
+        .into_iter()
+        .filter(|(_, (pending, total, _))| *pending > 0 && *total >= 2)
+        .min_by_key(|(home, (pending, total, rank))| {
+            (
+                std::cmp::Reverse(*pending),
+                std::cmp::Reverse(*total),
+                *rank,
+                home.clone(),
+            )
+        })
+        .map(|(home, _)| home)
 }
 
 impl Detector {
@@ -641,35 +753,7 @@ impl Detector {
         // Re-check under the lock: the sweep picks its season before blocking
         // here, and the admin route answers before its detached run begins.
         // Another runner may have completed it in that interval.
-        let pending_ids: Vec<String> = sqlx::query_scalar(
-            "SELECT i.id FROM items i
-              WHERE i.parent_id = ? AND i.season = ? AND i.kind = 'episode'
-                AND EXISTS (SELECT 1 FROM playable_sources ps WHERE ps.item_id = i.id)
-                AND NOT EXISTS (
-                    SELECT 1 FROM media_segment_scans s
-                     WHERE s.item_id = i.id AND s.detector = ?
-                       AND (s.mtime_unix IS NULL OR s.mtime_unix IN (
-                             -- The scan row holds the mtime of the file the
-                             -- detector READ; it stays settled while that
-                             -- file still exists among the item's single-part
-                             -- renditions. Membership, not \"the ranked one\":
-                             -- rank in SQL cannot see connectivity, and the
-                             -- resolver reads the best CONNECTED rendition —
-                             -- comparing against the best-ranked one re-read
-                             -- the whole season in a loop for the length of
-                             -- a partial outage.
-                             SELECT f.mtime_unix
-                               FROM playable_sources ps
-                               JOIN playable_source_parts psp
-                                    ON psp.playable_source_id = ps.id
-                               JOIN files f ON f.id = psp.file_id
-                              WHERE ps.item_id = i.id AND ps.expected_parts = 1)))",
-        )
-        .bind(series_id)
-        .bind(season)
-        .bind(DETECTOR)
-        .fetch_all(registry.db())
-        .await?;
+        let pending_ids = pending_episode_ids(registry.db(), series_id, season).await?;
         if pending_ids.is_empty() {
             return Ok(Analysis {
                 scanned: 0,
@@ -704,78 +788,106 @@ impl Detector {
             .map(|t| t == "anime")
             .unwrap_or(false);
 
-        let mut revisions: std::collections::HashMap<String, SourceRevision> = Default::default();
         tracing::info!(
             series = %series_id, season, episodes = rows.len(), anime,
             "intro detection: opening a season"
         );
-        let mut episode_ids = Vec::with_capacity(rows.len());
+        let mut options = Vec::with_capacity(rows.len());
+        let mut awaiting = 0usize;
+        for row in &rows {
+            let item_id: String = row.get("id");
+            let title: String = row.get("title");
+            let candidates = match sessions.candidate_sources(registry, &item_id).await {
+                Ok(candidates) => candidates,
+                Err(error) => {
+                    tracing::debug!(episode = %title, error = format!("{error:#}"),
+                        "intro detection: no playable rendition, skipped");
+                    continue;
+                }
+            };
+            if candidates.is_empty() {
+                if sessions.has_any_source(registry, &item_id).await {
+                    awaiting += 1;
+                }
+                continue;
+            }
+            let mut eligible = Vec::new();
+            for (parts, info) in candidates {
+                if parts.len() != 1 {
+                    continue;
+                }
+                let part = parts.into_iter().next().expect("one part checked");
+                if part.duration_ms == 0 {
+                    continue;
+                }
+                let revision = SourceRevision::from(&part);
+                if !segment_source_failed(registry.db(), &item_id, &revision).await? {
+                    eligible.push(SegmentCandidate { part, info });
+                }
+            }
+            let pending = pending_ids.contains(&item_id);
+            if eligible.is_empty() {
+                // The scheduler saw an unfailed current source, but none of
+                // the connected candidates is eligible. It is on an offline
+                // host (or changed under this snapshot), so remember the
+                // season as awaiting rather than selecting it every pass.
+                if pending {
+                    awaiting += 1;
+                }
+                continue;
+            }
+            options.push(SegmentEpisodeOptions {
+                item_id,
+                pending,
+                candidates: eligible,
+            });
+        }
+        let Some(job_home) = choose_segment_home(&options) else {
+            // A segment job runs on one mediahost. Split libraries can only
+            // proceed once at least two episodes share a reachable home.
+            awaiting += options.iter().filter(|episode| episode.pending).count();
+            return Ok(Analysis {
+                scanned: 0,
+                awaiting,
+                attempted: 0,
+            });
+        };
+
+        let mut episode_ids = Vec::with_capacity(options.len());
         // What each episode's bytes were when this pass read them, recorded
         // with the scan so a replaced file asks again.
         let mut identity: std::collections::HashMap<String, Option<i64>> = Default::default();
         let mut named: std::collections::HashMap<String, Vec<kahawai_core::segments::Named>> =
             Default::default();
-        let mut descriptors = Vec::with_capacity(rows.len());
-        let mut job_home: Option<(String, String)> = None;
-        let mut awaiting = 0usize;
-        for row in &rows {
-            let item_id: String = row.get("id");
-            let title: String = row.get("title");
-            let (parts, info) = match sessions.source_parts(registry, &item_id).await {
-                Ok(v) => v,
-                Err(e) => {
-                    if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
-                        awaiting += 1;
-                    } else {
-                        tracing::debug!(episode = %title, error = format!("{e:#}"),
-                            "intro detection: no playable rendition, skipped");
-                    }
-                    continue;
+        let mut revisions: std::collections::HashMap<String, SourceRevision> = Default::default();
+        let mut descriptors = Vec::with_capacity(options.len());
+        for episode in options {
+            let Some(candidate) = episode.candidates.into_iter().find(|candidate| {
+                candidate.part.module_id == job_home.0 && candidate.part.collection_id == job_home.1
+            }) else {
+                if episode.pending {
+                    awaiting += 1;
                 }
+                continue;
             };
-            if parts.len() != 1 {
-                tracing::debug!(episode = %title, parts = parts.len(),
-                    "intro detection: multi-part only, skipped");
-                continue;
-            }
-            let part = &parts[0];
-            if part.duration_ms == 0 {
-                tracing::debug!(episode = %title, "intro detection: no running time, skipped");
-                continue;
-            }
-            if let Some((module_id, collection_id)) = &job_home {
-                anyhow::ensure!(
-                    module_id == &part.module_id && collection_id == &part.collection_id,
-                    "one season resolved across multiple mediahosts or collections"
-                );
-            } else {
-                job_home = Some((part.module_id.clone(), part.collection_id.clone()));
-            }
-            identity.insert(item_id.clone(), Some(part.mtime_unix));
+            let part = candidate.part;
+            identity.insert(episode.item_id.clone(), Some(part.mtime_unix));
             named.insert(
-                item_id.clone(),
-                info.chapters
+                episode.item_id.clone(),
+                candidate
+                    .info
+                    .chapters
                     .as_deref()
                     .map(|chapters| kahawai_core::segments::named(chapters, part.duration_ms))
                     .unwrap_or_default(),
             );
-            episode_ids.push(item_id.clone());
-            revisions.insert(
-                item_id.clone(),
-                SourceRevision {
-                    module_id: part.module_id.clone(),
-                    collection_id: part.collection_id.clone(),
-                    root_token: part.root_token.clone(),
-                    path_rel: part.path_rel.clone(),
-                    size: part.size,
-                    mtime_unix: part.mtime_unix,
-                },
-            );
+            episode_ids.push(episode.item_id.clone());
+            revisions.insert(episode.item_id.clone(), SourceRevision::from(&part));
             descriptors.push(kahawai_proto::v1::SegmentEpisode {
-                item_id,
+                item_id: episode.item_id,
                 source: Some(kahawai_proto::v1::SourcePath {
-                    root_token: part.root_token.clone(),
-                    path_rel: part.path_rel.clone(),
+                    root_token: part.root_token,
+                    path_rel: part.path_rel,
                 }),
                 expected_size: part.size,
                 expected_mtime_unix: part.mtime_unix,
@@ -805,17 +917,20 @@ impl Detector {
                 series = %series_id, season, episodes = episode_ids.len(),
                 "intro detection: the files name their own boundaries"
             );
-            let boundaries = episode_ids
+            let outcomes = episode_ids
                 .iter()
-                .map(|item_id| Answered {
-                    item_id: item_id.clone(),
-                    found: from_chapters(named.get(item_id)),
-                    scanned: true,
-                    wholesale: pending_ids.contains(item_id),
+                .map(|item_id| {
+                    Answered {
+                        item_id: item_id.clone(),
+                        found: from_chapters(named.get(item_id)),
+                        scanned: true,
+                        wholesale: pending_ids.contains(item_id),
+                    }
+                    .into()
                 })
                 .collect::<Vec<_>>();
             let stored = self
-                .store_guarded(registry, boundaries, &identity, &revisions)
+                .store_guarded(registry, outcomes, &identity, &revisions)
                 .await?;
             let scanned = progress(&stored);
             self.analyzed.fetch_add(scanned, Ordering::Relaxed);
@@ -825,7 +940,7 @@ impl Detector {
                 attempted: 0,
             });
         }
-        let (module_id, collection_id) = job_home.context("season has no source home")?;
+        let (module_id, collection_id) = job_home;
         let Some(link) = registry.host_link(&module_id) else {
             return Ok(Analysis {
                 scanned: 0,
@@ -847,6 +962,7 @@ impl Detector {
             });
         }
         let generation = link.generation();
+        let host_protocol_minor = link.protocol_minor();
         let request_id = ulid::Ulid::generate().to_string();
         let mut reply_rx =
             self.wait_for_segment_result(&module_id, generation, link.current_token(), &request_id);
@@ -927,28 +1043,46 @@ impl Detector {
             .map(|episode| (episode.item_id.as_str(), episode))
             .collect::<std::collections::HashMap<_, _>>();
         let mut gone_mid_read = Vec::new();
-        let mut boundaries = Vec::with_capacity(result.episodes.len());
+        let mut outcomes = Vec::with_capacity(result.episodes.len());
         for episode in result.episodes {
             let descriptor = expected.get(episode.item_id.as_str()).with_context(|| {
                 format!("segment result names unknown item {}", episode.item_id)
             })?;
             validate_episode_segments(&episode, descriptor)?;
             let revision_matches = result_matches_request(&episode, descriptor)?;
-            if !revision_matches {
-                // The mediahost observed a replacement after doing useful work
-                // on the siblings. Keep this episode pending without rejecting
-                // or discarding the rest of the season.
-                boundaries.push(Answered {
-                    item_id: episode.item_id,
-                    found: Vec::new(),
-                    scanned: false,
-                    wholesale: false,
-                });
+            if !revision_matches && !episode.unreadable {
+                outcomes.push(
+                    Answered {
+                        item_id: episode.item_id,
+                        found: Vec::new(),
+                        scanned: false,
+                        wholesale: false,
+                    }
+                    .into(),
+                );
                 continue;
             }
-            if episode.unreadable && !registry.is_connected(&module_id) {
-                gone_mid_read.push(episode.item_id.clone());
-            }
+            let failure = if episode.unreadable {
+                anyhow::ensure!(
+                    !episode.error.is_empty(),
+                    "unreadable segment result has no error for {}",
+                    episode.item_id
+                );
+                if !registry.is_connected(&module_id) {
+                    gone_mid_read.push(episode.item_id.clone());
+                    None
+                } else if retryable_segment_result(host_protocol_minor, &episode) {
+                    // The source was readable, but too few siblings survived
+                    // preflight for a comparison. Minors before 6 expressed
+                    // this with the stable error text alone; neither form is a
+                    // terminal statement about this exact source revision.
+                    None
+                } else {
+                    Some(episode.error.clone())
+                }
+            } else {
+                None
+            };
             let mut found = from_chapters(named.get(&episode.item_id));
             for segment in episode.segments {
                 let kind = match segment.kind.as_str() {
@@ -966,20 +1100,26 @@ impl Detector {
                     found.push((kind, segment.start_ms, segment.end_ms, analyzer));
                 }
             }
-            boundaries.push(Answered {
-                item_id: episode.item_id,
-                found,
-                scanned: !episode.unreadable,
-                wholesale: !episode.unreadable,
+            outcomes.push(EpisodeOutcome {
+                answer: Answered {
+                    item_id: episode.item_id,
+                    found,
+                    scanned: !episode.unreadable,
+                    wholesale: !episode.unreadable,
+                },
+                failure,
             });
         }
         let awaiting_mid_read = gone_mid_read.len();
         let awaiting = awaiting + awaiting_mid_read;
-        if boundaries.iter().all(|episode| !episode.scanned) && awaiting == 0 {
+        if outcomes.iter().all(|outcome| !outcome.answer.scanned)
+            && awaiting == 0
+            && outcomes.iter().all(|outcome| outcome.failure.is_none())
+        {
             anyhow::bail!("no episode's bytes could be read, and the mediahost is up");
         }
         let stored = self
-            .store_guarded(registry, boundaries, &identity, &revisions)
+            .store_guarded(registry, outcomes, &identity, &revisions)
             .await?;
         let scanned = progress(&stored);
         self.analyzed.fetch_add(scanned, Ordering::Relaxed);
@@ -1001,8 +1141,13 @@ impl Detector {
         boundaries: Vec<Answered>,
         identity: &std::collections::HashMap<String, Option<i64>>,
     ) -> Result<Vec<String>> {
-        self.store_guarded(registry, boundaries, identity, &Default::default())
-            .await
+        self.store_guarded(
+            registry,
+            boundaries.into_iter().map(Into::into).collect(),
+            identity,
+            &Default::default(),
+        )
+        .await
     }
 
     /// Write one season's boundaries and mark its episodes scanned, found
@@ -1011,7 +1156,7 @@ impl Detector {
     async fn store_guarded(
         &self,
         registry: &Arc<Registry>,
-        boundaries: Vec<Answered>,
+        outcomes: Vec<EpisodeOutcome>,
         identity: &std::collections::HashMap<String, Option<i64>>,
         revisions: &std::collections::HashMap<String, SourceRevision>,
     ) -> Result<Vec<String>> {
@@ -1024,7 +1169,8 @@ impl Detector {
         // six hours over sub-millisecond weather.
         let mut tx = registry.db().begin_with("BEGIN IMMEDIATE").await?;
         let mut scanned = Vec::new();
-        for answer in &boundaries {
+        for outcome in &outcomes {
+            let answer = &outcome.answer;
             let item_id = &answer.item_id;
             if let Some(revision) = revisions.get(item_id) {
                 let current: bool = sqlx::query_scalar(
@@ -1072,6 +1218,37 @@ impl Detector {
             if !exists {
                 tracing::debug!(item = %item_id, "intro detection: item vanished mid-pass, answer dropped");
                 continue;
+            }
+            anyhow::ensure!(
+                !(answer.scanned && outcome.failure.is_some()),
+                "segment answer cannot be both successful and failed"
+            );
+            if let Some(error) = &outcome.failure {
+                let revision = revisions
+                    .get(item_id)
+                    .context("failed segment answer has no source revision")?;
+                sqlx::query(
+                    "INSERT INTO media_segment_failures
+                       (item_id,module_id,collection_id,root_token,path_rel,size,
+                        mtime_unix,detector,error,failed_at)
+                     VALUES(?,?,?,?,?,?,?,?,?,unixepoch())
+                     ON CONFLICT(item_id,module_id,collection_id,root_token,path_rel,
+                                 size,mtime_unix,detector)
+                     DO UPDATE SET error=excluded.error,failed_at=excluded.failed_at",
+                )
+                .bind(item_id)
+                .bind(&revision.module_id)
+                .bind(&revision.collection_id)
+                .bind(&revision.root_token)
+                .bind(&revision.path_rel)
+                .bind(revision.size as i64)
+                .bind(revision.mtime_unix)
+                .bind(DETECTOR)
+                .bind(error)
+                .execute(&mut *tx)
+                .await?;
+                tracing::warn!(item = %item_id, path = %revision.path_rel, %error,
+                    "segment failure recorded for source revision");
             }
             if answer.scanned && answer.wholesale {
                 // A finished full-search episode is rewritten wholesale.
@@ -1131,20 +1308,47 @@ impl Detector {
                 .execute(&mut *tx)
                 .await?;
             }
-            // The scan row is the statement "this episode has been analysed",
-            // and a half-read episode has not: the question stays open.
+            // A successful rendition clears only its own exact failure.
+            // Other physical sources remain known-bad if this one disappears.
             if answer.scanned {
+                if let Some(revision) = revisions.get(item_id) {
+                    sqlx::query(
+                        "DELETE FROM media_segment_failures
+                          WHERE item_id=? AND detector=? AND module_id=? AND collection_id=?
+                            AND root_token=? AND path_rel=? AND size=? AND mtime_unix=?",
+                    )
+                    .bind(item_id)
+                    .bind(DETECTOR)
+                    .bind(&revision.module_id)
+                    .bind(&revision.collection_id)
+                    .bind(&revision.root_token)
+                    .bind(&revision.path_rel)
+                    .bind(revision.size as i64)
+                    .bind(revision.mtime_unix)
+                    .execute(&mut *tx)
+                    .await?;
+                }
                 scanned.push(item_id.clone());
+                let revision = revisions.get(item_id);
                 sqlx::query(
-                    "INSERT INTO media_segment_scans (item_id, scanned_at, detector, mtime_unix)
-                     VALUES (?, unixepoch(), ?, ?)
-                     ON CONFLICT(item_id) DO UPDATE SET scanned_at = excluded.scanned_at,
-                                                        detector = excluded.detector,
-                                                        mtime_unix = excluded.mtime_unix",
+                    "INSERT INTO media_segment_scans
+                       (item_id,scanned_at,detector,mtime_unix,module_id,
+                        collection_id,root_token,path_rel,size,error)
+                     VALUES(?,unixepoch(),?,?,?,?,?,?,?,'')
+                     ON CONFLICT(item_id) DO UPDATE SET
+                       scanned_at=excluded.scanned_at,detector=excluded.detector,
+                       mtime_unix=excluded.mtime_unix,module_id=excluded.module_id,
+                       collection_id=excluded.collection_id,root_token=excluded.root_token,
+                       path_rel=excluded.path_rel,size=excluded.size,error=''",
                 )
                 .bind(item_id)
                 .bind(DETECTOR)
                 .bind(identity.get(item_id).copied().flatten())
+                .bind(revision.map(|revision| revision.module_id.as_str()))
+                .bind(revision.map(|revision| revision.collection_id.as_str()))
+                .bind(revision.map(|revision| revision.root_token.as_str()))
+                .bind(revision.map(|revision| revision.path_rel.as_str()))
+                .bind(revision.map(|revision| revision.size as i64))
                 .execute(&mut *tx)
                 .await?;
             }
@@ -1165,6 +1369,19 @@ struct SourceRevision {
     mtime_unix: i64,
 }
 
+impl From<&crate::sessions::PartSource> for SourceRevision {
+    fn from(part: &crate::sessions::PartSource) -> Self {
+        Self {
+            module_id: part.module_id.clone(),
+            collection_id: part.collection_id.clone(),
+            root_token: part.root_token.clone(),
+            path_rel: part.path_rel.clone(),
+            size: part.size,
+            mtime_unix: part.mtime_unix,
+        }
+    }
+}
+
 fn result_matches_request(
     result: &kahawai_proto::v1::SegmentEpisodeResult,
     request: &kahawai_proto::v1::SegmentEpisode,
@@ -1183,6 +1400,15 @@ fn result_matches_request(
         "readable segment result changed source revision"
     );
     Ok(matches)
+}
+
+fn retryable_segment_result(
+    host_protocol_minor: u32,
+    result: &kahawai_proto::v1::SegmentEpisodeResult,
+) -> bool {
+    result.retryable
+        || (host_protocol_minor < kahawai_proto::SEGMENT_RETRYABLE_MINOR
+            && result.error == kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT)
 }
 
 fn validate_result_set(
@@ -1220,6 +1446,11 @@ fn validate_episode_segments(
     result: &kahawai_proto::v1::SegmentEpisodeResult,
     request: &kahawai_proto::v1::SegmentEpisode,
 ) -> Result<()> {
+    anyhow::ensure!(
+        !result.retryable || result.unreadable,
+        "readable segment result marked retryable for {}",
+        result.item_id
+    );
     let mut kinds = std::collections::HashSet::new();
     for segment in &result.segments {
         anyhow::ensure!(
@@ -1268,6 +1499,24 @@ struct Answered {
     /// answers only the kinds the names cover, and deleting the rest threw
     /// away a previously inferred recap the chapters never mentioned.
     wholesale: bool,
+}
+
+/// Everything one episode contributes to a commit. A terminal source failure
+/// and useful partial boundaries are orthogonal: the failure stops this exact
+/// revision being retried, while `answer.found` still improves what viewers
+/// know. A successful scan is the only state that clears the exact failure.
+struct EpisodeOutcome {
+    answer: Answered,
+    failure: Option<String>,
+}
+
+impl From<Answered> for EpisodeOutcome {
+    fn from(answer: Answered) -> Self {
+        Self {
+            answer,
+            failure: None,
+        }
+    }
 }
 
 /// How a season pass ended: how much was settled, and how much is waiting
@@ -1336,7 +1585,50 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
                 COALESCE(p.title, '') AS title,
                 i.season AS season,
                 COUNT(*) AS episodes,
-                SUM(CASE WHEN s.item_id IS NULL THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN s.item_id IS NULL AND EXISTS (
+                    SELECT 1
+                      FROM playable_sources pending_source
+                      JOIN playable_source_parts pending_part
+                           ON pending_part.playable_source_id = pending_source.id
+                      JOIN files pending_file ON pending_file.id = pending_part.file_id
+                      LEFT JOIN collection_roots pending_root
+                             ON pending_root.id = pending_file.root_id
+                     WHERE pending_source.item_id = i.id
+                       AND pending_source.expected_parts = 1
+                       AND (SELECT COUNT(*) FROM playable_source_parts all_pending_parts
+                             WHERE all_pending_parts.playable_source_id = pending_source.id) = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM media_segment_failures failure
+                            WHERE failure.item_id = i.id AND failure.detector = ?
+                              AND failure.module_id = pending_file.module_id
+                              AND failure.collection_id = pending_file.collection_id
+                              AND failure.root_token = COALESCE(pending_root.root_token,'')
+                              AND failure.path_rel = pending_file.path_rel
+                              AND failure.size = pending_file.size
+                              AND failure.mtime_unix = pending_file.mtime_unix)
+                ) THEN 1 ELSE 0 END) AS pending,
+                SUM(CASE WHEN EXISTS (
+                    SELECT 1
+                      FROM playable_sources eligible_source
+                      JOIN playable_source_parts eligible_part
+                           ON eligible_part.playable_source_id = eligible_source.id
+                      JOIN files eligible_file ON eligible_file.id = eligible_part.file_id
+                      LEFT JOIN collection_roots eligible_root
+                             ON eligible_root.id = eligible_file.root_id
+                     WHERE eligible_source.item_id = i.id
+                       AND eligible_source.expected_parts = 1
+                       AND (SELECT COUNT(*) FROM playable_source_parts all_eligible_parts
+                             WHERE all_eligible_parts.playable_source_id = eligible_source.id) = 1
+                       AND NOT EXISTS (
+                           SELECT 1 FROM media_segment_failures failure
+                            WHERE failure.item_id = i.id AND failure.detector = ?
+                              AND failure.module_id = eligible_file.module_id
+                              AND failure.collection_id = eligible_file.collection_id
+                              AND failure.root_token = COALESCE(eligible_root.root_token,'')
+                              AND failure.path_rel = eligible_file.path_rel
+                              AND failure.size = eligible_file.size
+                              AND failure.mtime_unix = eligible_file.mtime_unix)
+                ) THEN 1 ELSE 0 END) AS eligible,
                 MIN(CASE WHEN EXISTS (
                     SELECT 1
                       FROM playable_sources chapter_source
@@ -1372,8 +1664,6 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
            LEFT JOIN media_segment_scans s
                   ON s.item_id = i.id AND s.detector = ?
                  AND (s.mtime_unix IS NULL OR s.mtime_unix IN (
-                       -- Same membership test as the re-check in
-                       -- `analyze_season`: the read file still exists.
                        SELECT f.mtime_unix
                          FROM playable_sources ps
                          JOIN playable_source_parts psp
@@ -1383,9 +1673,11 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
           WHERE i.kind = 'episode' AND i.season IS NOT NULL
             AND EXISTS (SELECT 1 FROM playable_sources ps WHERE ps.item_id = i.id)
           GROUP BY i.module_id, i.parent_id, i.season
-         HAVING episodes >= 2 AND pending > 0
+         HAVING episodes >= 2 AND eligible >= 2 AND pending > 0
           ORDER BY watched_at DESC, pending ASC, title",
     )
+    .bind(DETECTOR)
+    .bind(DETECTOR)
     .bind(DETECTOR)
     .bind(kahawai_core::segments::NAMED_COMPLETE as i64)
     .bind(kahawai_core::segments::NAMED_COMPLETE as i64)
@@ -1930,12 +2222,15 @@ mod tests {
             },
         )]);
         let answer = || {
-            vec![Answered {
-                item_id: "e1".into(),
-                found: vec![("intro", 1_000, 2_000, "chromaprint")],
-                scanned: true,
-                wholesale: true,
-            }]
+            vec![
+                Answered {
+                    item_id: "e1".into(),
+                    found: vec![("intro", 1_000, 2_000, "chromaprint")],
+                    scanned: true,
+                    wholesale: true,
+                }
+                .into(),
+            ]
         };
 
         let stored = detector
@@ -1988,6 +2283,318 @@ mod tests {
         );
     }
     #[test]
+    fn season_source_selection_uses_one_common_home() {
+        let candidate = |module: &str, path: &str| SegmentCandidate {
+            part: crate::sessions::PartSource {
+                file_id: 0,
+                module_id: module.into(),
+                collection_id: "shows".into(),
+                root_token: "root".into(),
+                path_rel: path.into(),
+                size: 1,
+                mtime_unix: 1,
+                base_ms: 0,
+                duration_ms: 1,
+            },
+            info: Default::default(),
+        };
+        let options = vec![
+            SegmentEpisodeOptions {
+                item_id: "e1".into(),
+                pending: true,
+                // Host A's revision failed, so this episode fell through to B.
+                candidates: vec![candidate("b", "e1-b.mkv")],
+            },
+            SegmentEpisodeOptions {
+                item_id: "e2".into(),
+                pending: true,
+                // Playback ranking still prefers A for its sibling.
+                candidates: vec![candidate("a", "e2-a.mkv"), candidate("b", "e2-b.mkv")],
+            },
+        ];
+        assert_eq!(
+            choose_segment_home(&options),
+            Some(("b".into(), "shows".into())),
+            "the fallback must pull its sibling onto the same mediahost"
+        );
+
+        let split = vec![
+            SegmentEpisodeOptions {
+                item_id: "e1".into(),
+                pending: true,
+                candidates: vec![candidate("a", "e1-a.mkv")],
+            },
+            SegmentEpisodeOptions {
+                item_id: "e2".into(),
+                pending: true,
+                candidates: vec![candidate("b", "e2-b.mkv")],
+            },
+        ];
+        assert_eq!(
+            choose_segment_home(&split),
+            None,
+            "one unreadable episode per host cannot form a detector job"
+        );
+    }
+
+    #[tokio::test]
+    async fn unreadable_episode_is_terminal_only_for_its_exact_revision() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        sqlx::raw_sql(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+               VALUES('m','c','series');
+             INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
+               VALUES('m','c','r','/series');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+               VALUES('show','show','Show','show','show','m','c');
+             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+                               parent_id,season,episode)
+               VALUES('e1','episode','One','one','one','m','c','show',1,1),
+                     ('e2','episode','Two','two','two','m','c','show',1,2);
+             INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               SELECT 'm','c',id,'e1.mkv',10,1,0,0,0,'{}' FROM collection_roots
+               UNION ALL
+               SELECT 'm','c',id,'e2.mkv',10,1,0,0,0,'{}' FROM collection_roots;
+             INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
+                                          family_key,expected_parts)
+               SELECT 'm','c',id,NULL,'file:' || id,1 FROM items WHERE kind='episode';
+             INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
+                                               ordinal,file_id)
+               SELECT ps.id,'m','c',1,f.id FROM playable_sources ps
+               JOIN files f ON f.path_rel = ps.item_id || '.mkv';",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        let registry = Arc::new(Registry::new(db, Default::default()));
+        let detector = Detector::new();
+        sqlx::query(
+            "INSERT INTO media_segments(item_id,kind,start_ms,end_ms,source)
+             VALUES('e1','credits',50_000,60_000,'blackframe')",
+        )
+        .execute(registry.db())
+        .await
+        .unwrap();
+        let identity = std::collections::HashMap::from([
+            ("e1".to_string(), Some(1)),
+            ("e2".to_string(), Some(1)),
+        ]);
+        let revision = |path_rel: &str| SourceRevision {
+            module_id: "m".into(),
+            collection_id: "c".into(),
+            root_token: "r".into(),
+            path_rel: path_rel.into(),
+            size: 10,
+            mtime_unix: 1,
+        };
+        let revisions = std::collections::HashMap::from([
+            ("e1".to_string(), revision("e1.mkv")),
+            ("e2".to_string(), revision("e2.mkv")),
+        ]);
+        let outcomes = vec![
+            EpisodeOutcome {
+                answer: Answered {
+                    item_id: "e1".into(),
+                    found: vec![("intro", 1_000, 2_000, "chromaprint")],
+                    scanned: false,
+                    wholesale: false,
+                },
+                failure: Some("decoder failed".into()),
+            },
+            Answered {
+                item_id: "e2".into(),
+                found: Vec::new(),
+                scanned: true,
+                wholesale: true,
+            }
+            .into(),
+        ];
+        detector
+            .store_guarded(&registry, outcomes, &identity, &revisions)
+            .await
+            .unwrap();
+
+        assert!(
+            pending_seasons(registry.db()).await.unwrap().is_empty(),
+            "current terminal failure was queued again"
+        );
+        let error: String =
+            sqlx::query_scalar("SELECT error FROM media_segment_failures WHERE item_id='e1'")
+                .fetch_one(registry.db())
+                .await
+                .unwrap();
+        assert_eq!(error, "decoder failed");
+        let kinds: Vec<String> =
+            sqlx::query_scalar("SELECT kind FROM media_segments WHERE item_id='e1' ORDER BY kind")
+                .fetch_all(registry.db())
+                .await
+                .unwrap();
+        assert_eq!(
+            kinds,
+            ["credits", "intro"],
+            "terminal failure discarded its useful partial boundary"
+        );
+        let scans: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM media_segment_scans WHERE item_id='e1'")
+                .fetch_one(registry.db())
+                .await
+                .unwrap();
+        assert_eq!(scans, 0, "partial failure was marked successfully scanned");
+        assert!(
+            pending_episode_ids(registry.db(), "show", 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "hourly season re-check queued the terminal failure"
+        );
+        sqlx::raw_sql(
+            "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
+                               head_xxh3,tail_xxh3,oshash,streams_json)
+               SELECT 'm','c',id,'e1-alt.mkv',11,1,0,0,0,'{}' FROM collection_roots;
+             INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
+                                          family_key,expected_parts)
+               VALUES('m','c','e1',NULL,'file:e1-alt',1);
+             INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
+                                               ordinal,file_id)
+               SELECT ps.id,'m','c',1,f.id FROM playable_sources ps
+               JOIN files f ON f.path_rel='e1-alt.mkv'
+              WHERE ps.family_key='file:e1-alt';",
+        )
+        .execute(registry.db())
+        .await
+        .unwrap();
+        assert_eq!(
+            pending_episode_ids(registry.db(), "show", 1).await.unwrap(),
+            ["e1"],
+            "an unfailed alternative rendition was hidden by another file's failure"
+        );
+        let alt_revisions = std::collections::HashMap::from([(
+            "e1".to_string(),
+            SourceRevision {
+                module_id: "m".into(),
+                collection_id: "c".into(),
+                root_token: "r".into(),
+                path_rel: "e1-alt.mkv".into(),
+                size: 11,
+                mtime_unix: 1,
+            },
+        )]);
+        detector
+            .store_guarded(
+                &registry,
+                vec![
+                    Answered {
+                        item_id: "e1".into(),
+                        found: Vec::new(),
+                        scanned: true,
+                        wholesale: true,
+                    }
+                    .into(),
+                ],
+                &identity,
+                &alt_revisions,
+            )
+            .await
+            .unwrap();
+        let original_failures: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM media_segment_failures
+              WHERE item_id='e1' AND path_rel='e1.mkv'",
+        )
+        .fetch_one(registry.db())
+        .await
+        .unwrap();
+        assert_eq!(
+            original_failures, 1,
+            "success on the alternative erased the known-bad source"
+        );
+        sqlx::query("DELETE FROM playable_sources WHERE family_key='file:e1-alt'")
+            .execute(registry.db())
+            .await
+            .unwrap();
+        assert!(
+            pending_episode_ids(registry.db(), "show", 1)
+                .await
+                .unwrap()
+                .is_empty(),
+            "removing the successful source retried the known-bad rendition"
+        );
+
+        let part = |path_rel: &str, size: u64| crate::sessions::PartSource {
+            file_id: 0,
+            module_id: "m".into(),
+            collection_id: "c".into(),
+            root_token: "r".into(),
+            path_rel: path_rel.into(),
+            size,
+            mtime_unix: 1,
+            base_ms: 0,
+            duration_ms: 1,
+        };
+        assert!(
+            segment_source_failed(
+                registry.db(),
+                "e1",
+                &SourceRevision::from(&part("e1.mkv", 10)),
+            )
+            .await
+            .unwrap()
+        );
+        assert!(
+            !segment_source_failed(
+                registry.db(),
+                "e1",
+                &SourceRevision::from(&part("e1-alt.mkv", 11)),
+            )
+            .await
+            .unwrap()
+        );
+
+        sqlx::query("UPDATE files SET mtime_unix=2 WHERE path_rel='e1.mkv'")
+            .execute(registry.db())
+            .await
+            .unwrap();
+        let pending = pending_seasons(registry.db()).await.unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].pending, 1, "changed revision stayed terminal");
+        assert_eq!(
+            pending_episode_ids(registry.db(), "show", 1).await.unwrap(),
+            ["e1"]
+        );
+        sqlx::query("DELETE FROM media_segment_scans WHERE item_id='e2'")
+            .execute(registry.db())
+            .await
+            .unwrap();
+        detector
+            .store_guarded(
+                &registry,
+                vec![EpisodeOutcome {
+                    answer: Answered {
+                        item_id: "e2".into(),
+                        found: Vec::new(),
+                        scanned: false,
+                        wholesale: false,
+                    },
+                    failure: Some("decoder failed".into()),
+                }],
+                &identity,
+                &revisions,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            pending_episode_ids(registry.db(), "show", 1).await.unwrap(),
+            ["e1"],
+            "the changed source itself must remain pending"
+        );
+        assert!(
+            pending_seasons(registry.db()).await.unwrap().is_empty(),
+            "a season with only one comparison source was selected forever"
+        );
+    }
+
+    #[test]
     fn an_unreadable_changed_revision_does_not_reject_its_siblings() {
         let request = kahawai_proto::v1::SegmentEpisode {
             source: Some(kahawai_proto::v1::SourcePath::new("root", "episode.mkv")),
@@ -2010,6 +2617,25 @@ mod tests {
         result.unreadable = true;
         result.source.as_mut().unwrap().path_rel = "other.mkv".into();
         assert!(result_matches_request(&result, &request).is_err());
+    }
+
+    #[test]
+    fn legacy_comparison_insufficiency_remains_retryable() {
+        let legacy = kahawai_proto::v1::SegmentEpisodeResult {
+            unreadable: true,
+            error: kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT.into(),
+            ..Default::default()
+        };
+        assert!(retryable_segment_result(5, &legacy));
+        assert!(
+            !retryable_segment_result(6, &legacy),
+            "a current host omitted the structured retryable state"
+        );
+        let current = kahawai_proto::v1::SegmentEpisodeResult {
+            retryable: true,
+            ..legacy
+        };
+        assert!(retryable_segment_result(6, &current));
     }
 
     #[test]

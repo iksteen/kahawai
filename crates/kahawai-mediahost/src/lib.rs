@@ -362,6 +362,7 @@ impl Engine {
             tx,
             activity,
             std::sync::Arc::new(tokio::sync::Mutex::new(())),
+            PROTOCOL_MINOR,
         )
     }
 
@@ -372,6 +373,7 @@ impl Engine {
         tx: tokio::sync::mpsc::Sender<HostToHub>,
         activity: Activity,
         segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
+        hub_protocol_minor: u32,
     ) -> Engine {
         // Manifest responses are routed to the scan task of their collection.
         let manifest_waiters: std::sync::Arc<
@@ -399,6 +401,7 @@ impl Engine {
             collections.to_vec(),
             activity.clone(),
             segment_serial,
+            hub_protocol_minor,
         )));
         let (loudness_tx, loudness_rx) = tokio::sync::mpsc::unbounded_channel();
         guards.push(tokio::spawn(loudness::run(
@@ -852,7 +855,7 @@ async fn link_once(
         .context("opening link")?
         .into_inner();
 
-    match inbound.message().await.context("awaiting HelloAck")? {
+    let hub_protocol_minor = match inbound.message().await.context("awaiting HelloAck")? {
         Some(m) => match m.msg {
             Some(hub_to_host::Msg::HelloAck(ack)) => {
                 anyhow::ensure!(
@@ -867,11 +870,12 @@ async fn link_once(
                     hub_protocol = format!("{}.{}", ack.protocol_major, ack.protocol_minor),
                     "link established"
                 );
+                ack.protocol_minor
             }
             _ => bail!("hub did not open with HelloAck"),
         },
         None => bail!("hub closed the link before HelloAck"),
-    }
+    };
 
     let engine = Engine::start_with_runtime(
         collections,
@@ -880,6 +884,7 @@ async fn link_once(
         tx.clone(),
         jobs.activity,
         jobs.segment_serial,
+        hub_protocol_minor,
     );
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);

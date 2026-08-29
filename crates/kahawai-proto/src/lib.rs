@@ -9,7 +9,11 @@ pub mod v1 {
 /// Inter-module protocol version (AR-7). Protocol 3 deliberately rejects all
 /// protocol 2 satellites: exact-root identity has one authoritative wire shape.
 pub const PROTOCOL_MAJOR: u32 = 3;
-pub const PROTOCOL_MINOR: u32 = 5;
+pub const PROTOCOL_MINOR: u32 = 6;
+/// First mediahost minor that marks comparison-insufficient segment answers
+/// explicitly instead of encoding the state only in the legacy error string.
+pub const SEGMENT_RETRYABLE_MINOR: u32 = 6;
+pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
 impl v1::SourcePath {
     pub fn new(root_token: impl Into<String>, path_rel: impl Into<String>) -> Self {

@@ -38,6 +38,7 @@ pub async fn run(
     collections: Vec<CollectionConfig>,
     activity: Activity,
     segment_serial: Arc<tokio::sync::Mutex<()>>,
+    hub_protocol_minor: u32,
 ) {
     while let Some(job) = rx.recv().await {
         if job.detector != kahawai_core::segments::DETECTOR_GENERATION {
@@ -120,7 +121,13 @@ pub async fn run(
             let _serial_guard = serial_guard;
             let _background_guard = background_guard;
             let _priority_guard = priority_guard;
-            analyze(job, &collections2, &activity2, &cancelled)
+            analyze(
+                job,
+                &collections2,
+                &activity2,
+                &cancelled,
+                hub_protocol_minor,
+            )
         })
         .await;
 
@@ -175,6 +182,7 @@ fn analyze(
     collections: &[CollectionConfig],
     activity: &Activity,
     cancelled: &AtomicBool,
+    hub_protocol_minor: u32,
 ) -> Result<SegmentDetectionResult> {
     anyhow::ensure!(
         job.episodes.len() >= 2,
@@ -230,13 +238,30 @@ fn analyze(
         });
     }
     if prepared.len() < 2 {
+        if hub_protocol_minor < kahawai_proto::SEGMENT_RETRYABLE_MINOR {
+            // Pre-minor-6 hubs ignore the structured retryable flag. A
+            // job-level transient failure makes them persist nothing, which
+            // preserves the old pending behavior under inverted version skew.
+            return Ok(SegmentDetectionResult {
+                request_id: job.request_id,
+                detector: job.detector,
+                elapsed_ms: 0,
+                episodes: Vec::new(),
+                error: kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT.into(),
+            });
+        }
         preflight_failures.extend(prepared.into_iter().map(|prepared| {
-            preflight_failure(
+            let mut result = preflight_failure(
                 &prepared.request,
                 prepared.request.expected_size,
                 prepared.request.expected_mtime_unix,
-                "fewer than two readable episodes remain".into(),
-            )
+                kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT.into(),
+            );
+            // Comparison insufficiency says nothing bad about these bytes.
+            // The hub must keep the source pending, not quarantine its exact
+            // revision beside the sibling that actually failed preflight.
+            result.retryable = true;
+            result
         }));
         return Ok(SegmentDetectionResult {
             request_id: job.request_id,
@@ -325,14 +350,23 @@ fn analyze(
                 segments.push(segment("credits", range, analyzer));
             }
         }
+        let unreadable = answer.unreadable || stale;
+        let error = if let Some(error) = stale_error {
+            error
+        } else if answer.unreadable {
+            "segment analyzer could not read source".to_string()
+        } else {
+            String::new()
+        };
         results.push(SegmentEpisodeResult {
             item_id: prepared.request.item_id,
             source,
             observed_size,
             observed_mtime_unix,
-            unreadable: answer.unreadable || stale,
-            error: stale_error.unwrap_or_default(),
+            unreadable,
+            error,
             segments,
+            retryable: false,
         });
     }
     results.extend(preflight_failures);
@@ -360,6 +394,7 @@ fn preflight_failure(
         unreadable: true,
         error,
         segments: Vec::new(),
+        retryable: false,
     }
 }
 
@@ -476,6 +511,77 @@ mod tests {
         assert!(Milliseconds::from_seconds(-1.0).is_err());
     }
 
+    #[test]
+    fn comparison_insufficiency_does_not_condemn_the_readable_source() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("healthy.mkv"), b"healthy").unwrap();
+        std::fs::write(dir.path().join("changed.mkv"), b"changed").unwrap();
+        let collection = CollectionConfig {
+            name: "series".into(),
+            media_type: "series".into(),
+            roots: vec![dir.path().to_path_buf()],
+        };
+        let root_token = collection.resolved_roots().next().unwrap().token;
+        let episode = |id: &str, path: &str, stale: bool| {
+            let metadata = std::fs::metadata(dir.path().join(path)).unwrap();
+            SegmentEpisode {
+                item_id: id.into(),
+                source: Some(kahawai_proto::v1::SourcePath {
+                    root_token: root_token.clone(),
+                    path_rel: path.into(),
+                }),
+                expected_size: metadata.len() + u64::from(stale),
+                expected_mtime_unix: mtime_unix(&metadata),
+                duration_ms: 60_000,
+            }
+        };
+        let job = || DetectSegments {
+            request_id: "job".into(),
+            detector: kahawai_core::segments::DETECTOR_GENERATION,
+            collection_id: "series".into(),
+            anime: false,
+            episodes: vec![
+                episode("healthy", "healthy.mkv", false),
+                episode("changed", "changed.mkv", true),
+            ],
+        };
+        let result = analyze(
+            job(),
+            std::slice::from_ref(&collection),
+            &Activity::default(),
+            &AtomicBool::new(false),
+            kahawai_proto::PROTOCOL_MINOR,
+        )
+        .unwrap();
+
+        let healthy = result
+            .episodes
+            .iter()
+            .find(|episode| episode.item_id == "healthy")
+            .unwrap();
+        assert!(healthy.unreadable && healthy.retryable);
+        let changed = result
+            .episodes
+            .iter()
+            .find(|episode| episode.item_id == "changed")
+            .unwrap();
+        assert!(changed.unreadable && !changed.retryable);
+
+        let legacy = analyze(
+            job(),
+            std::slice::from_ref(&collection),
+            &Activity::default(),
+            &AtomicBool::new(false),
+            kahawai_proto::SEGMENT_RETRYABLE_MINOR - 1,
+        )
+        .unwrap();
+        assert_eq!(legacy.error, kahawai_proto::SEGMENT_COMPARISON_INSUFFICIENT);
+        assert!(
+            legacy.episodes.is_empty(),
+            "an old hub could persist a per-source terminal answer"
+        );
+    }
+
     #[tokio::test]
     async fn a_job_is_acknowledged_before_a_source_error_is_reported() {
         let dir = tempfile::tempdir().unwrap();
@@ -510,6 +616,7 @@ mod tests {
             vec![collection],
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
+            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx.send(job).unwrap();
 
@@ -548,6 +655,7 @@ mod tests {
             Vec::new(),
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
+            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx
             .send(DetectSegments {
@@ -583,6 +691,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         render(&dir.path().join("one.mkv"));
         render(&dir.path().join("two.mkv"));
+        std::fs::write(dir.path().join("broken.mkv"), b"not a media file").unwrap();
         let collection = CollectionConfig {
             name: "series".into(),
             media_type: "series".into(),
@@ -620,6 +729,7 @@ mod tests {
             episodes: vec![
                 episode("one", "one.mkv"),
                 episode("two", "two.mkv"),
+                episode("broken", "broken.mkv"),
                 missing,
             ],
         };
@@ -631,6 +741,7 @@ mod tests {
             vec![collection],
             Activity::default(),
             Arc::new(tokio::sync::Mutex::new(())),
+            kahawai_proto::PROTOCOL_MINOR,
         ));
         job_tx.send(job).unwrap();
         assert!(matches!(
@@ -647,18 +758,27 @@ mod tests {
             panic!("wrong result message");
         };
         assert!(result.error.is_empty(), "{}", result.error);
-        assert_eq!(result.episodes.len(), 3);
+        assert_eq!(result.episodes.len(), 4);
         let failed = result
             .episodes
             .iter()
             .find(|episode| episode.item_id == "missing")
             .unwrap();
         assert!(failed.unreadable && failed.error.contains("path not found"));
+        let broken = result
+            .episodes
+            .iter()
+            .find(|episode| episode.item_id == "broken")
+            .unwrap();
+        assert!(
+            broken.unreadable && !broken.error.is_empty(),
+            "an analyzer read failure had no terminal reason: {broken:?}"
+        );
         assert!(
             result
                 .episodes
                 .iter()
-                .filter(|episode| episode.item_id != "missing")
+                .filter(|episode| !matches!(episode.item_id.as_str(), "missing" | "broken"))
                 .all(|episode| !episode.unreadable
                     && episode
                         .segments

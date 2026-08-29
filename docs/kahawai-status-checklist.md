@@ -542,10 +542,14 @@ How something works and why it was built that way belong in
       chooses seasons in watched-first order and remains the sole persistence
       authority; the owning mediahost performs the decode work locally, yielding
       to scans and viewer leases, so analysis sends no media bytes over a lease.
-      The admin API reports what is left and can run the next season now. A scan
-      record is keyed to the analysed file's mtime, so a replaced episode is
-      analysed again. Chapter-name analysis stays hub-side over stored source
-      facts: a season that names its own opening and credits is answered without
+      The admin API reports what is left and can run the next season now.
+      Successful scan rows retain the historical rendition-mtime membership
+      rule. Unreadable exact module/collection/root/path/size/mtime revisions
+      land in a separate failure table, so another rendition may be tried and
+      hourly retries stop only when every current source has failed. Source or
+      analyzer changes retry and later success clears remembered failures.
+      Chapter-name analysis stays hub-side over stored source facts: a season
+      that names its own opening and credits is answered without
       dispatching work. Per-file chapter-kind masks are normalized on ingest and
       generation-backfilled from stored JSON, so old mediahosts skip generic
       chapter lists without hiding genuinely complete named seasons. Design in

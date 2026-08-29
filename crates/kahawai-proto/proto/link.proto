@@ -459,6 +459,9 @@ message SegmentEpisodeResult {
   bool unreadable = 5;
   string error = 6;
   repeated DetectedSegment segments = 7;
+  // The source itself was readable, but too few siblings remained for a
+  // season comparison. Keep it pending without recording a source failure.
+  bool retryable = 8;
 }
 
 message DetectedSegment {
