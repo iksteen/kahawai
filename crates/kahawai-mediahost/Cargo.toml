@@ -11,6 +11,7 @@ kahawai-core = { workspace = true }
 kahawai-intro = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }
+kahawai-sqlite = { workspace = true }
 kahawai-transport = { workspace = true }
 anyhow = { workspace = true }
 serde = { workspace = true }

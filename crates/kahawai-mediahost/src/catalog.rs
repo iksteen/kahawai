@@ -37,9 +37,10 @@ use kahawai_proto::v1::{
     CatalogCollection, CatalogRecord, CollectionRoot, DiscoveryStatus, FileError, FileRecord,
     HostToHub, SourcePath, host_to_hub,
 };
+use kahawai_sqlite::Database;
 use prost::Message as _;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 #[derive(Debug)]
 struct StaleFact(&'static str);
@@ -60,7 +61,7 @@ use crate::scan::CollectionConfig;
 
 #[derive(Clone)]
 pub struct Catalog {
-    db: SqlitePool,
+    db: Database,
 }
 
 #[derive(Debug, Clone)]
@@ -104,21 +105,32 @@ impl Catalog {
         std::fs::create_dir_all(state_dir)
             .with_context(|| format!("creating {}", state_dir.display()))?;
         let path = state_dir.join("catalog.db");
-        let options = SqliteConnectOptions::new()
+        let writer_options = SqliteConnectOptions::new()
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal)
             .foreign_keys(true)
             .busy_timeout(Duration::from_secs(30));
-        let db = SqlitePoolOptions::new()
-            .max_connections(4)
-            .connect_with(options)
+        let reader_options = SqliteConnectOptions::new()
+            .filename(&path)
+            .read_only(true)
+            .foreign_keys(true)
+            .pragma("query_only", "on")
+            .busy_timeout(Duration::from_secs(30));
+        // The former four-connection budget becomes three concurrent WAL
+        // readers plus the one actor-owned writer connection.
+        let db = Database::connect_with(writer_options, reader_options, 3)
             .await
             .with_context(|| format!("opening {}", path.display()))?;
-        sqlx::migrate!("./migrations")
-            .run(&db)
-            .await
-            .context("migrating mediahost catalogue")?;
+        db.write("mediahost catalog migrations", |connection| {
+            Box::pin(async move {
+                sqlx::migrate!("./migrations")
+                    .run_direct(None, connection, false)
+                    .await
+                    .context("migrating mediahost catalogue")
+            })
+        })
+        .await?;
         sqlx::query("UPDATE catalog_jobs SET state='pending' WHERE state='running'")
             .execute(&db)
             .await?;
@@ -186,7 +198,7 @@ impl Catalog {
     }
 
     async fn ensure_discovery_generation(
-        db: &SqlitePool,
+        db: &Database,
         kind: &str,
         generation: &str,
     ) -> Result<()> {
@@ -237,20 +249,20 @@ impl Catalog {
     }
 
     async fn insert_collection(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         collection: &CollectionConfig,
     ) -> Result<()> {
         sqlx::query("INSERT INTO catalog_collections(id,media_type,epoch) VALUES(?,?,?)")
             .bind(&collection.name)
             .bind(&collection.media_type)
             .bind(ulid::Ulid::generate().to_string())
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         Ok(())
     }
 
-    pub fn pool(&self) -> &SqlitePool {
-        &self.db
+    pub fn read_pool(&self) -> &sqlx::SqlitePool {
+        self.db.read_pool()
     }
 
     pub async fn offers(&self, collections: &[CollectionConfig]) -> Result<Vec<CatalogCollection>> {
@@ -788,22 +800,19 @@ impl Catalog {
         Ok(current as u64)
     }
 
-    async fn next_version(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
-        collection: &str,
-    ) -> Result<u64> {
+    async fn next_version(tx: &mut sqlx::SqliteConnection, collection: &str) -> Result<u64> {
         let version: i64 = sqlx::query_scalar(
             "UPDATE catalog_collections SET current_version=current_version+1
               WHERE id=? RETURNING current_version",
         )
         .bind(collection)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         Ok(version as u64)
     }
 
     async fn put_record(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         collection: &str,
         kind: &str,
         key: &[u8],
@@ -823,13 +832,13 @@ impl Catalog {
         .bind(version as i64)
         .bind(payload)
         .bind(deleted)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
 
     async fn tombstone_derived_records(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         collection: &str,
         key: &[u8],
     ) -> Result<()> {
@@ -839,7 +848,7 @@ impl Catalog {
         )
         .bind(collection)
         .bind(key)
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut *tx)
         .await?;
         for kind in kinds {
             let version = Self::next_version(tx, collection).await?;
@@ -849,7 +858,7 @@ impl Catalog {
     }
 
     async fn reversion_derived_records(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         collection: &str,
         key: &[u8],
     ) -> Result<()> {
@@ -859,7 +868,7 @@ impl Catalog {
         )
         .bind(collection)
         .bind(key)
-        .fetch_all(&mut **tx)
+        .fetch_all(&mut *tx)
         .await?;
         for record in records {
             let kind: String = record.get("kind");
