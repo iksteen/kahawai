@@ -420,7 +420,7 @@ pub fn extract_embedded(
     source: Box<dyn crate::remux::RemuxSource>,
     index: usize,
 ) -> Result<Extracted> {
-    let all = extract_embedded_core(source, usize::MAX, |_| {})?;
+    let all = extract_embedded_core(source, usize::MAX, |_| {}, || Ok(()))?;
     let ex = all
         .into_iter()
         .find(|(i, _)| *i == index)
@@ -438,7 +438,7 @@ pub fn extract_embedded_stream(
     stream_index: usize,
     sink: impl FnMut(SubStreamEvent),
 ) -> Result<Vec<(usize, Extracted)>> {
-    extract_embedded_core(source, stream_index, sink)
+    extract_embedded_core(source, stream_index, sink, || Ok(()))
 }
 
 fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
@@ -456,7 +456,17 @@ fn raw_from_sample(sample: &gst::Sample) -> Option<(u64, u64, String)> {
 pub fn extract_embedded_all(
     source: Box<dyn crate::remux::RemuxSource>,
 ) -> Result<Vec<(usize, Extracted)>> {
-    extract_embedded_core(source, usize::MAX, |_| {})
+    extract_embedded_core(source, usize::MAX, |_| {}, || Ok(()))
+}
+
+/// Interruptible form for source-local background extraction. The checkpoint
+/// runs at least once per bus wait, so a scheduler preemption stops demux work
+/// without rebuilding the pipeline when it resumes.
+pub fn extract_embedded_all_interruptible(
+    source: Box<dyn crate::remux::RemuxSource>,
+    checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Vec<(usize, Extracted)>> {
+    extract_embedded_core(source, usize::MAX, |_| {}, checkpoint)
 }
 
 /// The one demux pass behind every embedded extraction: taps every text
@@ -466,6 +476,7 @@ fn extract_embedded_core(
     source: Box<dyn crate::remux::RemuxSource>,
     stream_index: usize,
     mut out: impl FnMut(SubStreamEvent),
+    mut checkpoint: impl FnMut() -> Result<()>,
 ) -> Result<Vec<(usize, Extracted)>> {
     crate::init()?;
 
@@ -576,6 +587,10 @@ fn extract_embedded_core(
         }
     };
     'outer: loop {
+        if let Err(error) = checkpoint() {
+            result = Err(error);
+            break 'outer;
+        }
         drain(&mut taps.lock().unwrap());
         let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(100)) else {
             continue;

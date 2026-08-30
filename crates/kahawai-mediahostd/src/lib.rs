@@ -22,6 +22,7 @@ pub async fn run_mediahost(cfg: config::MediahostConfig) -> Result<()> {
         &cfg.name,
         cfg.collections,
         cfg.rescan_minutes,
+        cfg.scheduler,
         hubs,
         cfg.detect_segments,
     )

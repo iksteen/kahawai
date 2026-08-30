@@ -94,7 +94,7 @@ How something works and why it was built that way belong in
       SQLite catalogue before any hub observes them
 - [x] MH-3 GStreamer discovery for technical metadata, including exact PAR,
       normalized display orientation and resulting display dimensions. Legacy
-      rows use a bounded local exact-source idle worklist rather than
+      rows use a bounded local exact-source scheduler tier rather than
       scans/reconciliation; results and terminal failures are source-owned and
       catalogue-revision-guarded, scan
       generations remain unchanged, and changed source JSON retries only that
@@ -102,7 +102,7 @@ How something works and why it was built that way belong in
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
       at scan via a sparse EBML walk; missing records are retried by one local
-      idle worklist shared across hubs (cheapest tier, SeekHead-guided early stop).
+      fixed-priority worklist shared across hubs (SeekHead-guided early stop).
       VobSub sidecar pairs (.idx/.sub) are discovered at scan, one entry
       per track inside the .idx, and served through the image pipeline
       (extraction/OCR; no tap, so no overlay/burn).
@@ -117,16 +117,19 @@ How something works and why it was built that way belong in
 - [x] MH-7 Scan batching + incremental rescans keep large scans cheap
       *(no explicit rate-limit knob; stat batching + in-sync skip in practice)*
 - [x] MH-8 Unreadable files reported with diagnostics (FileError)
-- [x] MH-9 ED2K hashing: locally selected idle-priority background job,
+- [x] MH-9 ED2K hashing: locally selected fixed-priority background job,
       eMule/AniDB variant, filename-CRC32 verify in the same pass; exact-source
       results persist locally and replicate to every subscribed hub
 - [x] MH-10 Protocol 4 local catalogue: per-collection epoch/version, current
       rows plus tombstones, hub-supplied durable cursors, incremental replay or
       full live snapshot. Hub ACKs are independent and reconnect never walks
       the filesystem. Protocol 4 intentionally rejects protocol-3 satellites
-- [x] MH-11 Source-owned job scheduling: urgent hub-requested subtitle and
-      attachment extraction remains foreground; hashes, loudness and segment
-      discovery are local, shared across hubs, and idle-gated
+- [x] MH-11 One source-owned scheduler admits scans, watcher installation,
+      exact-source probes/hashes/extraction, segment/loudness analysis and
+      standalone or all-in-one reads as atomic CPU + storage-domain bundles.
+      Fixed semantic priority never ages; conflicting higher work interrupts
+      at checkpoints, independent I/O-only work overlaps, and protocol-4.1
+      playback/up-next hints temporarily make matching segment work demand
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
       the requirement. Built and reverted the same night: probing one
       host read 30 s for `movies` and 23 ms for `anime` on the same
@@ -137,8 +140,8 @@ How something works and why it was built that way belong in
 
 - [x] MH-13 Source-local season analysis: the mediahost groups and selects
       exact sources from its local catalogue, size/mtime-guards them, stores
-      boundaries locally and projects them to each hub. A hub can wake but not
-      schedule it. Audio stops video before decode, video stops audio, and
+      boundaries locally and projects them to each hub. A hub can wake or hint
+      exact demand but not schedule it. Audio stops video before decode, video stops audio, and
       keyframe inspection decodes neither
 
 ## Hub — registry, resolution, enrichment
@@ -638,7 +641,7 @@ How something works and why it was built that way belong in
       chapter lists without hiding genuinely complete named seasons. Design in
       implementation §4.9; detector parity remains measured against
       intro-skipper in `docs/intro-detection-results.md`.
-- [x] HUB-38 Measured audio loudness normalization: the mediahost idle-decodes
+- [x] HUB-38 Measured audio loudness normalization: the mediahost background-decodes
       every non-music audio stream once and meters the untouched decoded layout
       plus every smaller canonical output matrix playback may choose. The hub
       stores revision-guarded EBU R128 integrated-loudness/true-peak pairs keyed
@@ -653,20 +656,17 @@ How something works and why it was built that way belong in
       measured and locally preflighted. Music remains owned by ReplayGain.
       Full-file work stays source-local, revision retry remains possible after
       later scans, and session facts state the exact applied dB gain.
-      Full-file rebuild work is source-local, serialized with other background
-      jobs, and yields to scans and viewer leases. Watched-first segment
-      detection preempts loudness at the next audio buffer; the same pipeline
-      resumes afterward without re-decoding, and start/yield/resume/completion
-      logs expose long-running files.
-      Foreground pauses log scan/lease/urgent counts and their resume; foreground
-      byte leases log collection/path at open and close, so a silent gate cannot
-      look like a decoder hang.
+      Full-file rebuild work is source-local and admitted by the universal
+      scheduler. Any higher fixed-priority job needing the same CPU or storage
+      domain preempts loudness at the next audio buffer; the same pipeline
+      resumes afterward without re-decoding.
       A 60-second no-buffer watchdog advances past decoders that produce neither
       audio, EOS nor an error; active callbacks are exempt so intentional
       foreground/segment pauses remain unbounded.
       One cross-collection queue chooses movie files before series/anime and
       newer source mtimes first within each category, re-evaluated after every
-      file and after permit waits; the in-flight file is never interrupted.
+      file and after scheduler waits; an in-flight file pauses at decoder
+      checkpoints and resumes in place.
       Long-running segment and loudness jobs trim glibc's freed decoder-thread
       arenas every 30 seconds and again at completion, so sequential full-file
       work returns resident memory instead of retaining its high-water mark;

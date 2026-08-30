@@ -11,6 +11,7 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::scan::CollectionConfig;
+use crate::scheduler::{Priority, Scheduler};
 
 const CHUNK: usize = 256 * 1024;
 
@@ -65,18 +66,116 @@ pub fn resolve_rel(
     bail!("path not found or outside exact collection root: {path_rel}")
 }
 
-/// Open the byte channel and serve read requests for one lease.
+/// Compatibility helper for tests and protocol-3 fixtures that do not carry a
+/// runtime scheduler. It still uses the scheduler, conservatively grouping the
+/// lease into the fallback storage domain as foreground demand.
 pub async fn serve_lease(
     channel: tonic::transport::Channel,
     lease_token: String,
     path: Result<PathBuf>,
 ) -> Result<()> {
+    let scheduler = Scheduler::new(&[], &Default::default())?;
+    serve_lease_scheduled(
+        channel,
+        lease_token,
+        path,
+        scheduler,
+        String::new(),
+        false,
+        None,
+    )
+    .await
+}
+
+/// Resolve and serve a production request under the same resource admission.
+/// Canonicalization can itself block on a network mount, so it must not happen
+/// in the control-link task before the scheduler sees the operation.
+pub async fn serve_request_scheduled(
+    channel: tonic::transport::Channel,
+    request: OpenRead,
+    collections: Vec<CollectionConfig>,
+    scheduler: Scheduler,
+    owner: Option<String>,
+) -> Result<()> {
+    let source = request
+        .source
+        .as_ref()
+        .context("OpenRead missing exact source")?;
+    let root_token = source.root_token.clone();
+    let background = request.background;
+    let resources = scheduler.resources([root_token.as_str()], false);
+    let _interactive = (!background).then(|| {
+        scheduler.enter_interactive(
+            resources.clone(),
+            format!("viewer path resolution {root_token}"),
+        )
+    });
+    let _resolution_permit = if background {
+        Some(
+            scheduler
+                .acquire(
+                    Priority::LocalMetadata,
+                    resources,
+                    owner.clone(),
+                    format!("background path resolution {root_token}"),
+                )
+                .await?,
+        )
+    } else {
+        None
+    };
+    let lease_token = request.lease_token.clone();
+    let path = tokio::task::spawn_blocking(move || resolve_path(&collections, &request))
+        .await
+        .context("path resolution task failed")?;
+    drop(_resolution_permit);
+    drop(_interactive);
+    serve_lease_scheduled(
+        channel,
+        lease_token,
+        path,
+        scheduler,
+        root_token,
+        background,
+        owner,
+    )
+    .await
+}
+
+/// Open the byte channel and serve read requests for one scheduled lease.
+pub async fn serve_lease_scheduled(
+    channel: tonic::transport::Channel,
+    lease_token: String,
+    path: Result<PathBuf>,
+    scheduler: Scheduler,
+    root_token: String,
+    background: bool,
+    owner: Option<String>,
+) -> Result<()> {
     let mut client = MediahostLinkClient::new(channel);
     let (tx, rx) = tokio::sync::mpsc::channel::<ByteChunk>(8);
+    let resources = scheduler.resources([root_token.as_str()], false);
+    let _interactive = (!background).then(|| {
+        scheduler.enter_interactive(resources.clone(), format!("viewer read {root_token}"))
+    });
 
     // First chunk binds the token; carry a resolution error if there is one.
     let (bind_error, file) = match path {
         Ok(p) => {
+            let _open_permit = if background {
+                Some(
+                    scheduler
+                        .acquire(
+                            Priority::LocalMetadata,
+                            resources.clone(),
+                            owner.clone(),
+                            format!("background open {root_token}"),
+                        )
+                        .await?,
+                )
+            } else {
+                None
+            };
             let f = tokio::fs::File::open(&p)
                 .await
                 .with_context(|| format!("opening {}", p.display()))?;
@@ -105,11 +204,28 @@ pub async fn serve_lease(
     let size = file.metadata().await?.len();
 
     while let Some(req) = requests.message().await? {
+        let permit = if background {
+            Some(
+                scheduler
+                    .acquire(
+                        Priority::LocalMetadata,
+                        resources.clone(),
+                        owner.clone(),
+                        format!("background read {root_token}"),
+                    )
+                    .await?,
+            )
+        } else {
+            None
+        };
         let end = req.offset.saturating_add(req.len).min(size);
         let mut cur = req.offset.min(size);
         file.seek(std::io::SeekFrom::Start(cur)).await?;
         let mut buf = vec![0u8; CHUNK];
         while cur < end {
+            if let Some(permit) = &permit {
+                permit.checkpoint().await?;
+            }
             let want = ((end - cur) as usize).min(CHUNK);
             let n = file.read(&mut buf[..want]).await?;
             if n == 0 {

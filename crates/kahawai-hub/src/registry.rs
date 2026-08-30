@@ -1743,6 +1743,42 @@ impl Registry {
         accepted
     }
 
+    /// Best-effort, short-lived demand signal. It is deliberately lossy: the
+    /// durable catalogue remains authoritative and the mediahost will still
+    /// complete ordinary backfill if this hint misses a reconnect window.
+    pub fn hint_discovery(
+        &self,
+        module_id: &str,
+        kind: &str,
+        collection_id: &str,
+        source: kahawai_proto::v1::SourcePath,
+        reason: &str,
+        ttl_seconds: u32,
+    ) -> bool {
+        let link = self.links.lock().unwrap();
+        let Some(link) = link.get(module_id) else {
+            return false;
+        };
+        if !kahawai_proto::ProtocolFeatures::new(link.protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::DiscoveryPriorityHints)
+        {
+            return false;
+        }
+        link.tx
+            .try_send(Ok(kahawai_proto::v1::HubToHost {
+                msg: Some(kahawai_proto::v1::hub_to_host::Msg::DiscoveryPriorityHint(
+                    kahawai_proto::v1::DiscoveryPriorityHint {
+                        kind: kind.to_string(),
+                        collection_id: collection_id.to_string(),
+                        source: Some(source),
+                        reason: reason.to_string(),
+                        ttl_seconds,
+                    },
+                )),
+            }))
+            .is_ok()
+    }
+
     pub(crate) fn host_link(&self, module_id: &str) -> Option<HostLink> {
         self.links.lock().unwrap().get(module_id).cloned()
     }

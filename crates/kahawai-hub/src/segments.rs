@@ -700,8 +700,9 @@ impl Detector {
         }
     }
 
-    /// Walk the library a season at a time, forever. The mediahost owns the
-    /// foreground gate because only it can see scans and viewer leases.
+    /// Walk the library a season at a time, forever. The mediahost scheduler
+    /// arbitrates the resulting work because only it can see scans, analysis
+    /// and viewer reads competing for the same resources.
     pub fn spawn_sweep(self: &Arc<Self>, registry: Arc<Registry>, sessions: Arc<Sessions>) {
         let detector = self.clone();
         tokio::spawn(async move {

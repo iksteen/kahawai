@@ -5565,6 +5565,40 @@ async fn up_next(
         .fetch_one(db)
         .await
         .map_err(internal)?;
+    if !rows.is_empty() {
+        let mut hints = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
+            "SELECT ps.item_id,ps.module_id,ps.collection_id,r.root_token,f.path_rel \
+             FROM playable_sources ps \
+             JOIN playable_source_parts p ON p.playable_source_id=ps.id AND p.ordinal=1 \
+             JOIN files f ON f.id=p.file_id \
+             JOIN collection_roots r ON r.id=f.root_id WHERE 0",
+        );
+        hints.push(" OR ps.item_id IN (");
+        let mut separated = hints.separated(",");
+        for row in &rows {
+            separated.push_bind(row.get::<String, _>("id"));
+        }
+        separated.push_unseparated(") ORDER BY ps.item_id,ps.id");
+        let hint_rows = hints.build().fetch_all(db).await.map_err(internal)?;
+        let mut hinted = std::collections::HashSet::new();
+        for row in hint_rows {
+            let item_id: String = row.get("item_id");
+            if !hinted.insert(item_id) {
+                continue;
+            }
+            state.registry.hint_discovery(
+                row.get("module_id"),
+                "segments",
+                row.get("collection_id"),
+                kahawai_proto::v1::SourcePath::new(
+                    row.get::<String, _>("root_token"),
+                    row.get::<String, _>("path_rel"),
+                ),
+                "up-next",
+                30 * 60,
+            );
+        }
+    }
     let items = rows
         .iter()
         .map(|row| item_row(row, row.get::<i64, _>("sources")))

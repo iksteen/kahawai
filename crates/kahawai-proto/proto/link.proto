@@ -281,6 +281,9 @@ message HubToHost {
     CatalogAck catalog_ack = 16;
     // Administrative wake-up only: the mediahost still chooses the work.
     DiscoveryWake discovery_wake = 17;
+    // Short-lived viewer/up-next interest. This changes admission priority,
+    // never ownership or result routing; the mediahost still chooses work.
+    DiscoveryPriorityHint discovery_priority_hint = 18;
   }
 }
 
@@ -357,6 +360,14 @@ message DiscoveryWake {
   // "segments" is currently the only administrative wake kind.
   string kind = 1;
   string collection_id = 2;
+}
+
+message DiscoveryPriorityHint {
+  string kind = 1;
+  string collection_id = 2;
+  SourcePath source = 3;
+  string reason = 4;
+  uint32 ttl_seconds = 5;
 }
 
 message KeyframeWorklist {

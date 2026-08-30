@@ -15,6 +15,13 @@ use rand_core::{OsRng, RngCore};
 use tokio::sync::{mpsc, oneshot};
 use tokio_stream::wrappers::ReceiverStream;
 
+pub type LocalAdmission = Arc<
+    dyn Fn() -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Box<dyn Send + Sync>>> + Send>,
+        > + Send
+        + Sync,
+>;
+
 /// Read granularity: big enough to amortize round trips, small enough that
 /// an abandoned HTTP request wastes at most one block.
 const BLOCK: u64 = 4 * 1024 * 1024;
@@ -120,18 +127,37 @@ impl Lease {
     /// serving task speaks the same ReadRequest/ByteChunk protocol so
     /// every consumer of Lease works unchanged.
     pub fn local(path: std::path::PathBuf) -> Lease {
-        Self::local_guarded(path, None)
+        Self::local_guarded(path, None, None)
     }
 
     pub fn local_guarded(
         path: std::path::PathBuf,
         activity_guard: Option<Box<dyn Send + Sync>>,
+        background_admission: Option<LocalAdmission>,
     ) -> Lease {
         let (req_tx, mut req_rx) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(4);
         let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
         tokio::spawn(async move {
             const CHUNK: usize = 256 * 1024;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
+            let _open_permit = match &background_admission {
+                Some(admit) => match admit().await {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        let _ = chunk_tx
+                            .send(ByteChunk {
+                                lease_token: String::new(),
+                                offset: 0,
+                                data: Vec::new(),
+                                eof: false,
+                                error: format!("local read admission failed: {error:#}"),
+                            })
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
             let mut file = match tokio::fs::File::open(&path).await {
                 Ok(f) => f,
                 Err(e) => {
@@ -148,6 +174,7 @@ impl Lease {
                 }
             };
             let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
+            drop(_open_permit);
             while let Some(Ok(req)) = req_rx.recv().await {
                 let end = req.offset.saturating_add(req.len).min(size);
                 let mut cur = req.offset.min(size);
@@ -156,6 +183,24 @@ impl Lease {
                 }
                 let mut buf = vec![0u8; CHUNK];
                 while cur < end {
+                    let _read_permit = match &background_admission {
+                        Some(admit) => match admit().await {
+                            Ok(permit) => Some(permit),
+                            Err(error) => {
+                                let _ = chunk_tx
+                                    .send(ByteChunk {
+                                        lease_token: String::new(),
+                                        offset: cur,
+                                        data: Vec::new(),
+                                        eof: false,
+                                        error: format!("local read admission failed: {error:#}"),
+                                    })
+                                    .await;
+                                return;
+                            }
+                        },
+                        None => None,
+                    };
                     let want = ((end - cur) as usize).min(CHUNK);
                     let n = match file.read(&mut buf[..want]).await {
                         Ok(0) => break,

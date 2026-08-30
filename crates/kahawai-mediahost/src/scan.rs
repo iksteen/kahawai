@@ -31,20 +31,19 @@ pub(crate) enum ScanOutcome {
     RootAdoptionAcknowledged,
 }
 
-async fn scan_blocking<T, F>(
-    guard: &crate::BlockingActivityGuard,
-    work: F,
-) -> std::result::Result<T, tokio::task::JoinError>
+async fn scan_blocking<T, F>(permit: &crate::scheduler::JobPermit, work: F) -> Result<T>
 where
     T: Send + 'static,
     F: FnOnce() -> T + Send + 'static,
 {
-    let guard = guard.clone();
+    permit.checkpoint().await?;
+    let permit = permit.clone();
     tokio::task::spawn_blocking(move || {
-        let _guard = guard;
+        let _permit = permit;
         work()
     })
     .await
+    .context("scan blocking task failed")
 }
 
 /// Protocol-4 scan: reconcile the filesystem into the mediahost's own durable
@@ -54,7 +53,7 @@ pub(crate) async fn scan_local_collection(
     cfg: CollectionConfig,
     catalog: crate::catalog::Catalog,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
-    blocking_guard: crate::BlockingActivityGuard,
+    permit: crate::scheduler::JobPermit,
 ) -> Result<u64> {
     let generation = catalog.begin_scan(&cfg.name).await?;
     let known = std::sync::Arc::new(catalog.known_files(&cfg.name).await?);
@@ -68,9 +67,7 @@ pub(crate) async fn scan_local_collection(
         let root = configured_root.path;
         let root_for_walk = root.clone();
         let paths =
-            match scan_blocking(&blocking_guard, move || walk(&root_for_walk, include_audio))
-                .await?
-            {
+            match scan_blocking(&permit, move || walk(&root_for_walk, include_audio)).await? {
                 Ok(paths) => paths,
                 Err(error) => {
                     failed += 1;
@@ -85,7 +82,7 @@ pub(crate) async fn scan_local_collection(
             let known = known.clone();
             let force_dirs = force_dirs.clone();
             let batch_root_token = root_token.clone();
-            let verdicts = scan_blocking(&blocking_guard, move || {
+            let verdicts = scan_blocking(&permit, move || {
                 batch
                     .into_iter()
                     .map(|(root_local, path)| {
@@ -127,7 +124,7 @@ pub(crate) async fn scan_local_collection(
                     continue;
                 }
                 let (root2, path2) = (root_local.clone(), path.clone());
-                match scan_blocking(&blocking_guard, move || inspect(&root2, &path2)).await? {
+                match scan_blocking(&permit, move || inspect(&root2, &path2)).await? {
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                         scanned += 1;
                         catalog
@@ -219,7 +216,7 @@ pub(crate) async fn scan_collection(
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     sync_version: u64,
-    blocking_guard: crate::BlockingActivityGuard,
+    permit: crate::scheduler::JobPermit,
 ) -> Result<ScanOutcome> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     // Live progress (HUB-35/HUB-26): a start beacon (after the in-sync
@@ -290,8 +287,7 @@ pub(crate) async fn scan_collection(
     for configured_root in cfg.resolved_roots() {
         let root_token = configured_root.token;
         let root = configured_root.path;
-        let paths = match scan_blocking(&blocking_guard, move || walk(&root, include_audio)).await?
-        {
+        let paths = match scan_blocking(&permit, move || walk(&root, include_audio)).await? {
             Ok(paths) => paths,
             Err(error) => {
                 // One unavailable mount must not make another root stand in
@@ -335,7 +331,7 @@ pub(crate) async fn scan_collection(
             let force2 = force.clone();
             let compare2 = compare_sidecars;
             let verdicts: Vec<((std::path::PathBuf, std::path::PathBuf), String, bool)> =
-                scan_blocking(&blocking_guard, move || {
+                scan_blocking(&permit, move || {
                     stat_batch
                         .into_iter()
                         .map(|(root_local, path)| {
@@ -388,7 +384,7 @@ pub(crate) async fn scan_collection(
                     continue;
                 }
                 let (r, p) = (root_local.clone(), path.clone());
-                let record = scan_blocking(&blocking_guard, move || inspect(&r, &p)).await?;
+                let record = scan_blocking(&permit, move || inspect(&r, &p)).await?;
                 match record {
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                         scanned += 1;
@@ -784,6 +780,25 @@ fn sum_u64_le(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
+    async fn scan_permit(cfg: &CollectionConfig) -> crate::scheduler::JobPermit {
+        let scheduler =
+            crate::scheduler::Scheduler::new(std::slice::from_ref(cfg), &Default::default())
+                .unwrap();
+        let roots = cfg
+            .resolved_roots()
+            .map(|root| root.token)
+            .collect::<Vec<_>>();
+        scheduler
+            .acquire(
+                crate::scheduler::Priority::CatalogFreshness,
+                scheduler.resources(roots.iter().map(String::as_str), true),
+                None,
+                "test scan",
+            )
+            .await
+            .unwrap()
+    }
+
     /// The two sides compare this as a STRING, so they must spell it the
     /// same way. A silent divergence here would rescan the whole library
     /// on every pass, or nothing ever again.
@@ -951,17 +966,11 @@ id: nl, index: 1
             .unwrap();
         drop(manifest_tx);
 
+        let permit = scan_permit(&cfg).await;
         assert_eq!(
-            scan_collection(
-                cfg,
-                tx,
-                manifest_rx,
-                Default::default(),
-                1,
-                std::sync::Arc::new(crate::Activity::default().scan()),
-            )
-            .await
-            .unwrap(),
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 1, permit,)
+                .await
+                .unwrap(),
             ScanOutcome::Completed
         );
         let mut sources = Vec::new();
@@ -1017,17 +1026,11 @@ id: nl, index: 1
             .unwrap();
         drop(manifest_tx);
 
+        let permit = scan_permit(&cfg).await;
         assert_eq!(
-            scan_collection(
-                cfg,
-                tx,
-                manifest_rx,
-                Default::default(),
-                9,
-                std::sync::Arc::new(crate::Activity::default().scan()),
-            )
-            .await
-            .unwrap(),
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 9, permit,)
+                .await
+                .unwrap(),
             ScanOutcome::Completed
         );
         let mut unavailable = false;
@@ -1062,11 +1065,19 @@ id: nl, index: 1
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn an_aborted_scan_keeps_its_permit_until_blocking_work_exits() {
-        let activity = crate::Activity::default();
-        let guard: crate::BlockingActivityGuard = std::sync::Arc::new(activity.scan());
+        let scheduler = crate::scheduler::Scheduler::new(&[], &Default::default()).unwrap();
+        let permit = scheduler
+            .acquire(
+                crate::scheduler::Priority::CatalogFreshness,
+                scheduler.resources(["missing"], false),
+                None,
+                "blocking scan",
+            )
+            .await
+            .unwrap();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let task_guard = guard.clone();
+        let task_guard = permit.clone();
         let task = tokio::spawn(async move {
             scan_blocking(&task_guard, move || {
                 let _ = started_tx.send(());
@@ -1074,22 +1085,32 @@ id: nl, index: 1
             })
             .await
         });
-        drop(guard);
+        drop(permit);
         started_rx.await.unwrap();
         task.abort();
+        let scheduler2 = scheduler.clone();
+        let waiter = tokio::spawn(async move {
+            scheduler2
+                .acquire(
+                    crate::scheduler::Priority::CatalogFreshness,
+                    scheduler2.resources(["missing"], false),
+                    None,
+                    "following scan",
+                )
+                .await
+        });
+        tokio::task::yield_now().await;
         assert!(
-            activity.busy(),
-            "aborting the scan released its permit while blocking work was live"
+            !waiter.is_finished(),
+            "abort released a live blocking permit"
         );
 
         release_tx.send(()).unwrap();
-        for _ in 0..100 {
-            if !activity.busy() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("blocking scan work did not release its permit");
+        tokio::time::timeout(std::time::Duration::from_secs(1), waiter)
+            .await
+            .expect("blocking scan work did not release its permit")
+            .unwrap()
+            .unwrap();
     }
 
     #[test]

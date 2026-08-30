@@ -10,7 +10,7 @@ pub mod v1 {
 /// durable local catalogue authoritative and deliberately rejects protocol 3
 /// peers, whose hub-owned manifest/worklist contract has the reverse meaning.
 pub const PROTOCOL_MAJOR: u32 = 4;
-pub const PROTOCOL_MINOR: u32 = 0;
+pub const PROTOCOL_MINOR: u32 = 1;
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
 /// Protocol features that may acquire minor-version gates after the 4.0
@@ -23,11 +23,15 @@ pub enum ProtocolFeature {
     ExactAudioLoudnessGains,
     AudioLoudnessAnalysis,
     RetryableSegmentResults,
+    DiscoveryPriorityHints,
 }
 
 impl ProtocolFeature {
     pub const fn minimum_minor(self) -> u32 {
-        0
+        match self {
+            Self::DiscoveryPriorityHints => 1,
+            _ => 0,
+        }
     }
 }
 
@@ -75,8 +79,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_four_starts_at_zero_with_every_inherited_gate_open() {
-        assert_eq!(PROTOCOL_MINOR, 0);
+    fn protocol_four_one_keeps_inherited_gates_open_and_adds_hints() {
+        assert_eq!(PROTOCOL_MINOR, 1);
         for feature in [
             ProtocolFeature::SegmentDetection,
             ProtocolFeature::AudioLoudnessScalars,
@@ -87,6 +91,8 @@ mod tests {
             assert_eq!(feature.minimum_minor(), 0);
             assert!(ProtocolFeatures::new(0).supports(feature));
         }
+        assert!(!ProtocolFeatures::new(0).supports(ProtocolFeature::DiscoveryPriorityHints));
+        assert!(ProtocolFeatures::new(1).supports(ProtocolFeature::DiscoveryPriorityHints));
     }
 
     #[test]

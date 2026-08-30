@@ -12,7 +12,7 @@ use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::{HubToHost, OpenRead, hub_to_host};
 use sqlx::Row;
 
-use crate::leases::{Lease, Leases, new_lease_token};
+use crate::leases::{Lease, Leases, LocalAdmission, new_lease_token};
 use crate::registry::{LoudnessPreference, Registry};
 
 /// Who a read lease is for. It travels to the mediahost, which serves both
@@ -1379,7 +1379,8 @@ fn playlist_span_secs(playlist: &str) -> f64 {
 
 type LocalResolver =
     std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
-type LocalActivity = std::sync::Arc<dyn Fn() -> Box<dyn Send + Sync> + Send + Sync>;
+type LocalActivity = std::sync::Arc<dyn Fn(&str) -> Box<dyn Send + Sync> + Send + Sync>;
+type LocalBackground = std::sync::Arc<dyn Fn(&str) -> LocalAdmission + Send + Sync>;
 
 /// How long a burn-in session waits for the mediahost to walk its
 /// index. Milliseconds on local disk; this is the sanity bound, well
@@ -1422,8 +1423,10 @@ pub struct Sessions {
     /// AR-5: the in-process mediahost, if any — (module_id, path
     /// resolver). Its leases are direct file reads, no OpenRead.
     local_source: Mutex<Option<(String, LocalResolver)>>,
-    /// Enters the in-process mediahost's foreground gate for a local lease.
+    /// Registers an in-process viewer lease as interactive scheduler work.
     local_activity: Mutex<Option<LocalActivity>>,
+    /// Scheduler admission for non-interactive all-in-one reads.
+    local_background: Mutex<Option<LocalBackground>>,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
     scratch_root: PathBuf,
     max_per_user: usize,
@@ -1741,6 +1744,7 @@ impl Sessions {
             leases: Leases::default(),
             local_source: Mutex::new(None),
             local_activity: Mutex::new(None),
+            local_background: Mutex::new(None),
             scratch_root,
             max_per_user,
             idle_timeout,
@@ -2022,9 +2026,16 @@ impl Sessions {
 
     pub fn set_local_activity(
         &self,
-        enter: impl Fn() -> Box<dyn Send + Sync> + Send + Sync + 'static,
+        enter: impl Fn(&str) -> Box<dyn Send + Sync> + Send + Sync + 'static,
     ) {
         *self.local_activity.lock().unwrap() = Some(std::sync::Arc::new(enter));
+    }
+
+    pub fn set_local_background(
+        &self,
+        admit: impl Fn(&str) -> LocalAdmission + Send + Sync + 'static,
+    ) {
+        *self.local_background.lock().unwrap() = Some(std::sync::Arc::new(admit));
     }
 
     pub(crate) async fn open_lease(
@@ -2040,18 +2051,47 @@ impl Sessions {
         // function call — resolve the path and read the disk directly.
         let local = {
             let guard = self.local_source.lock().unwrap();
-            guard.as_ref().and_then(|(id, resolve)| {
-                (id == module_id).then(|| resolve(collection_id, root_token, path_rel))
-            })
-        };
-        if let Some(path) = local {
-            let activity_guard = self
-                .local_activity
-                .lock()
-                .unwrap()
+            guard
                 .as_ref()
-                .map(|enter| enter());
-            return Ok(Lease::local_guarded(path?, activity_guard));
+                .and_then(|(id, resolve)| (id == module_id).then(|| resolve.clone()))
+        };
+        if let Some(resolve) = local {
+            let activity_guard = (reader == Reader::Viewer)
+                .then(|| {
+                    self.local_activity
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|enter| enter(root_token))
+                })
+                .flatten();
+            let background_admission = (reader == Reader::Sweep)
+                .then(|| {
+                    self.local_background
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|admit| admit(root_token))
+                })
+                .flatten();
+            let resolution_permit = match &background_admission {
+                Some(admit) => Some(admit().await?),
+                None => None,
+            };
+            let collection_id = collection_id.to_string();
+            let root_token_owned = root_token.to_string();
+            let path_rel = path_rel.to_string();
+            let path = tokio::task::spawn_blocking(move || {
+                resolve(&collection_id, &root_token_owned, &path_rel)
+            })
+            .await
+            .context("local media path resolution task failed")?;
+            drop(resolution_permit);
+            return Ok(Lease::local_guarded(
+                path?,
+                activity_guard,
+                background_admission,
+            ));
         }
         let token = new_lease_token();
         let msg = HubToHost {
@@ -2190,6 +2230,16 @@ impl Sessions {
         )
         .await?;
         let (parts, info, sp, mode) = neg.best_source(item_id, mode).await?;
+        for part in &parts {
+            registry.hint_discovery(
+                &part.module_id,
+                "segments",
+                &part.collection_id,
+                kahawai_proto::v1::SourcePath::new(&part.root_token, &part.path_rel),
+                "playback",
+                15 * 60,
+            );
+        }
         // HUB-32b: a burn is only real once the display sets exist. Ask
         // the mediahost, and if they do not arrive, negotiate again
         // with the tier withdrawn — better an honest "unavailable"
@@ -4274,7 +4324,7 @@ mod lease_purpose_tests {
         sessions.set_local_source("local", move |_, _, _| Ok(source.clone()));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let entered = active.clone();
-        sessions.set_local_activity(move || {
+        sessions.set_local_activity(move |_| {
             entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Box::new(Guard(entered.clone()))
         });
@@ -4286,6 +4336,46 @@ mod lease_purpose_tests {
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
         drop(lease);
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+    }
+
+    #[tokio::test]
+    async fn a_local_sweep_is_admitted_before_path_resolution() {
+        struct Guard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
+        impl Drop for Guard {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("episode.mkv");
+        std::fs::write(&source, b"bytes").unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        let sessions = Sessions::new(dir.path().join("sessions"));
+        let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolving = active.clone();
+        sessions.set_local_source("local", move |_, _, _| {
+            assert_eq!(resolving.load(std::sync::atomic::Ordering::Relaxed), 1);
+            Ok(source.clone())
+        });
+        let admitted = active.clone();
+        sessions.set_local_background(move |_| {
+            let admitted = admitted.clone();
+            std::sync::Arc::new(move || {
+                let admitted = admitted.clone();
+                Box::pin(async move {
+                    admitted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    Ok(Box::new(Guard(admitted)) as Box<dyn Send + Sync>)
+                })
+            })
+        });
+
+        let lease = sessions
+            .open_lease(&registry, "local", "c", "r", "episode.mkv", Reader::Sweep)
+            .await
+            .unwrap();
+        drop(lease);
     }
 }
 

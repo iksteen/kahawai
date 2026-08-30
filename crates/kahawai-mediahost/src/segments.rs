@@ -16,8 +16,8 @@ use kahawai_proto::v1::{
     host_to_hub,
 };
 
-use crate::Activity;
 use crate::scan::CollectionConfig;
+use crate::scheduler::{JobPermit, Scheduler};
 
 struct Prepared {
     request: SegmentEpisode,
@@ -36,8 +36,8 @@ pub async fn run(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<DetectSegments>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     collections: Vec<CollectionConfig>,
-    activity: Activity,
-    segment_serial: Arc<tokio::sync::Mutex<()>>,
+    scheduler: Scheduler,
+    owner: Option<String>,
 ) {
     while let Some(job) = rx.recv().await {
         if job.detector != kahawai_core::segments::DETECTOR_GENERATION {
@@ -80,26 +80,31 @@ pub async fn run(
         {
             return;
         }
-        // Announcing this before waiting on the shared permit makes queued
-        // watched-first work preempt an in-flight loudness decode at its next
-        // buffer checkpoint. The guard follows the blocking analyzer so a
-        // dropped link cannot resume loudness while the old job still runs.
-        let priority_guard = activity.segment_priority();
         tracing::info!(
             request = %job.request_id,
             collection = %job.collection_id,
             episodes = job.episodes.len(),
             "segment job queued"
         );
-        let serial_guard = segment_serial.clone().lock_owned().await;
-        let background_guard = loop {
-            while activity.busy() {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-            if let Some(guard) = activity.try_background() {
-                break guard;
-            }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+        let roots = job
+            .episodes
+            .iter()
+            .filter_map(|episode| episode.source.as_ref())
+            .map(|source| source.root_token.as_str());
+        let resources = scheduler
+            .resources(roots, true)
+            .exclusive("segment-analysis");
+        let permit = match scheduler
+            .acquire_segments(
+                resources,
+                owner.clone(),
+                format!("segments {}/{}", job.collection_id, job.request_id),
+                &job,
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => return,
         };
         tracing::info!(
             request = %job.request_id,
@@ -113,18 +118,11 @@ pub async fn run(
         let retry_sources = job.episodes.clone();
         let tx2 = tx.clone();
         let collections2 = collections.clone();
-        let activity2 = activity.clone();
         let cancelled = Arc::new(AtomicBool::new(false));
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
-        let result = tokio::task::spawn_blocking(move || {
-            // Owned by the blocking task, not its async waiter: aborting an old
-            // link cannot admit replacement work until this analysis exits.
-            let _serial_guard = serial_guard;
-            let _background_guard = background_guard;
-            let _priority_guard = priority_guard;
-            analyze(job, &collections2, &activity2, &cancelled)
-        })
-        .await;
+        let result =
+            tokio::task::spawn_blocking(move || analyze(job, &collections2, &permit, &cancelled))
+                .await;
 
         let result = match result {
             Ok(Ok(result)) => result,
@@ -202,7 +200,7 @@ fn failed(
 fn analyze(
     job: DetectSegments,
     collections: &[CollectionConfig],
-    activity: &Activity,
+    permit: &JobPermit,
     cancelled: &AtomicBool,
 ) -> Result<SegmentDetectionResult> {
     anyhow::ensure!(
@@ -306,12 +304,8 @@ fn analyze(
     let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(30));
     let between = || -> Result<()> {
         trimmer.checkpoint("segment checkpoint");
-        while activity.busy() {
-            anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "segment job cancelled");
-            std::thread::sleep(Duration::from_secs(2));
-        }
         anyhow::ensure!(!cancelled.load(Ordering::Relaxed), "segment job cancelled");
-        Ok(())
+        permit.checkpoint_blocking()
     };
     let report = kahawai_intro::season::analyze(&episodes, &config, &between)?;
 
@@ -523,8 +517,8 @@ mod tests {
         assert!(Milliseconds::from_seconds(-1.0).is_err());
     }
 
-    #[test]
-    fn comparison_insufficiency_does_not_condemn_the_readable_source() {
+    #[tokio::test]
+    async fn comparison_insufficiency_does_not_condemn_the_readable_source() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("healthy.mkv"), b"healthy").unwrap();
         std::fs::write(dir.path().join("changed.mkv"), b"changed").unwrap();
@@ -557,10 +551,21 @@ mod tests {
                 episode("changed", "changed.mkv", true),
             ],
         };
+        let scheduler =
+            Scheduler::new(std::slice::from_ref(&collection), &Default::default()).unwrap();
+        let permit = scheduler
+            .acquire(
+                crate::scheduler::Priority::Segments,
+                scheduler.resources([root_token.as_str()], true),
+                None,
+                "test segment analysis",
+            )
+            .await
+            .unwrap();
         let result = analyze(
             job(),
             std::slice::from_ref(&collection),
-            &Activity::default(),
+            &permit,
             &AtomicBool::new(false),
         )
         .unwrap();
@@ -607,13 +612,9 @@ mod tests {
         };
         let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(4);
-        let worker = tokio::spawn(run(
-            job_rx,
-            result_tx,
-            vec![collection],
-            Activity::default(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        ));
+        let scheduler =
+            Scheduler::new(std::slice::from_ref(&collection), &Default::default()).unwrap();
+        let worker = tokio::spawn(run(job_rx, result_tx, vec![collection], scheduler, None));
         job_tx.send(job).unwrap();
 
         let accepted = result_rx.recv().await.unwrap().msg.unwrap();
@@ -645,13 +646,8 @@ mod tests {
     async fn an_unsupported_detector_generation_is_rejected_without_running() {
         let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(2);
-        let worker = tokio::spawn(run(
-            job_rx,
-            result_tx,
-            Vec::new(),
-            Activity::default(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        ));
+        let scheduler = Scheduler::new(&[], &Default::default()).unwrap();
+        let worker = tokio::spawn(run(job_rx, result_tx, Vec::new(), scheduler, None));
         job_tx
             .send(DetectSegments {
                 request_id: "future".into(),
@@ -730,13 +726,9 @@ mod tests {
         };
         let (job_tx, job_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(4);
-        let worker = tokio::spawn(run(
-            job_rx,
-            result_tx,
-            vec![collection],
-            Activity::default(),
-            Arc::new(tokio::sync::Mutex::new(())),
-        ));
+        let scheduler =
+            Scheduler::new(std::slice::from_ref(&collection), &Default::default()).unwrap();
+        let worker = tokio::spawn(run(job_rx, result_tx, vec![collection], scheduler, None));
         job_tx.send(job).unwrap();
         assert!(matches!(
             result_rx.recv().await.unwrap().msg,

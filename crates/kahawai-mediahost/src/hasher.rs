@@ -1,8 +1,8 @@
-//! The background job worker: ED2K hashing (MH-9) and subtitle
-//! extraction (efficiency ladder step 2), one file at a time, in three
-//! tiers — urgent subtitle jobs (a viewer waits: run immediately),
-//! ED2K (idle-gated), background subtitle pre-warm (idle-gated,
-//! drained only when the ED2K queue is empty).
+//! Exact-source hashing, sparse declarations and subtitle extraction.
+//!
+//! Per-kind queues preserve useful ordering and deduplication; the universal
+//! scheduler, not this worker, decides admission and interruption. Urgent
+//! extraction registers immediate demand because a viewer is waiting.
 
 use std::collections::{HashSet, VecDeque};
 use std::io::Read;
@@ -14,15 +14,14 @@ use kahawai_proto::v1::{
     FileSubtitles, FileVideoGeometry, Hashlist, HostToHub, SubTrack, SubsWorklist, host_to_hub,
 };
 
-use crate::Activity;
 type BlockingGuard = Arc<dyn Send + Sync>;
 use crate::ed2k::{self, CHUNK, Ed2k};
 use crate::scan::CollectionConfig;
+use crate::scheduler::{JobPermit, Priority, Scheduler};
 
 /// Pause between chunks even when idle: bounds the read rate (~95 MB/s)
 /// so the hasher never monopolizes the disk it shares with everything else.
 const CHUNK_PACE: Duration = Duration::from_millis(100);
-const BUSY_POLL: Duration = Duration::from_secs(2);
 
 /// Work arriving from the hub via the link dispatch loop.
 pub enum JobMsg {
@@ -133,25 +132,28 @@ fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
 
 /// Which background tier a drained job came from — three of them now,
 /// and a bool cannot say.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
 enum Bg {
+    Ed2k,
     Atts,
     Keyframe,
     Geometry,
     Subs,
 }
 
-async fn wait_for_intake(
-    rx: &mut tokio::sync::mpsc::Receiver<JobMsg>,
-    queues: &mut Queues,
-) -> bool {
-    match tokio::time::timeout(Duration::from_millis(100), rx.recv()).await {
-        Ok(Some(message)) => {
-            intake(message, queues);
-            true
+impl Bg {
+    fn priority(self) -> Priority {
+        match self {
+            Self::Atts => Priority::Attachments,
+            Self::Keyframe => Priority::Keyframes,
+            Self::Geometry => Priority::Geometry,
+            Self::Ed2k => Priority::Ed2k,
+            Self::Subs => Priority::SubtitlePrewarm,
         }
-        Ok(None) => false,
-        Err(_) => true,
+    }
+
+    fn cpu_heavy(self) -> bool {
+        matches!(self, Self::Geometry | Self::Ed2k | Self::Subs)
     }
 }
 
@@ -159,240 +161,240 @@ pub async fn run(
     mut rx: tokio::sync::mpsc::Receiver<JobMsg>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     collections: Vec<CollectionConfig>,
-    activity: Activity,
+    scheduler: Scheduler,
+    owner: Option<String>,
     retry_tx: Option<tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
     let mut queues = Queues::default();
-
+    let mut active = HashSet::new();
+    let mut jobs = tokio::task::JoinSet::new();
+    let mut intake_open = true;
     loop {
-        // Drain new work; block only when every queue is empty.
-        //
-        // EVERY queue, and the background ones are listed once so they
-        // cannot drift apart: a tier missing from this check is work
-        // that sits in its queue while the loop blocks on `recv()`
-        // waiting for a message that never comes — which is exactly
-        // what a fourth tier did on the day it was added.
-        loop {
-            let background = [&queues.atts, &queues.keys, &queues.geometry, &queues.subs];
-            let empty = queues.urgent.is_empty()
-                && queues.urgent_image.is_empty()
-                && queues.ed2k.q.is_empty()
-                && background.iter().all(|t| t.q.is_empty());
-            let msg = if empty {
-                match rx.recv().await {
-                    Some(m) => m,
-                    None => return,
-                }
-            } else {
-                match rx.try_recv() {
-                    Ok(m) => m,
-                    Err(_) => break,
-                }
-            };
-            intake(msg, &mut queues);
+        while let Ok(message) = rx.try_recv() {
+            intake(message, &mut queues);
         }
 
-        // Tier order: urgent (never idle-gated — the active lease IS the
-        // requesting viewer) → ED2K → background subs.
-        if let Some((collection_id, root_token, path_rel)) = queues.urgent.pop_front() {
-            let urgent: BlockingGuard = Arc::new(activity.urgent());
-            extract_and_send(
-                &collections,
-                &collection_id,
-                &root_token,
-                &path_rel,
-                Some(urgent),
-                &tx,
-            )
-            .await;
-            continue;
-        }
-        if let Some(e) = queues.urgent_image.pop_front() {
-            let urgent: BlockingGuard = Arc::new(activity.urgent());
-            if let Some(source) = e.source {
-                extract_image_and_send(
+        while let Some((collection_id, root_token, path_rel)) = queues.urgent.pop_front() {
+            let scheduler = scheduler.clone();
+            let collections = collections.clone();
+            let tx = tx.clone();
+            jobs.spawn(async move {
+                let resources = scheduler.resources([root_token.as_str()], true);
+                let urgent: BlockingGuard = Arc::new(scheduler.enter_interactive(
+                    resources,
+                    format!("urgent subtitles {collection_id}/{path_rel}"),
+                ));
+                extract_and_send(
                     &collections,
-                    &e.collection_id,
-                    &source.root_token,
-                    &source.path_rel,
-                    e.sub_index,
-                    urgent,
+                    &collection_id,
+                    &root_token,
+                    &path_rel,
+                    Some(urgent),
+                    None,
                     &tx,
                 )
                 .await;
-            }
-            continue;
+                None
+            });
         }
-        if let Some((collection_id, root_token, path_rel)) = queues.ed2k.q.pop_front() {
-            let Some(background) = activity.try_background() else {
-                queues
-                    .ed2k
-                    .q
-                    .push_front((collection_id, root_token, path_rel));
-                if !wait_for_intake(&mut rx, &mut queues).await {
-                    return;
-                }
-                continue;
-            };
-            let background: BlockingGuard = Arc::new(background);
-            match hash_one(
-                &collections,
-                &collection_id,
-                &root_token,
-                &path_rel,
-                &activity,
-                background,
-            )
-            .await
-            {
-                Ok(mut fh) => {
-                    fh.source = source(&root_token, &path_rel);
-                    tracing::info!(collection = %collection_id, path = %path_rel,
-                        ed2k = %fh.ed2k_hex, crc_ok = fh.crc_ok || !fh.crc_checked, "ed2k computed");
-                    let msg = HostToHub {
-                        msg: Some(host_to_hub::Msg::FileHashes(FileHashes {
-                            collection_id: collection_id.clone(),
-                            hashes: vec![fh],
-                        })),
-                    };
-                    if crate::send_link_message(&tx, msg).await.is_err() {
-                        return; // link gone; the next session gets a fresh list
-                    }
-                }
-                Err(e) => {
-                    let error = format!("{e:#}");
-                    tracing::warn!(collection = %collection_id, path = %path_rel,
-                        %error, "ed2k failed for exact source revision");
-                    let msg = HostToHub {
-                        msg: Some(host_to_hub::Msg::FileHashes(FileHashes {
-                            collection_id: collection_id.clone(),
-                            hashes: vec![FileHash {
-                                source: source(&root_token, &path_rel),
-                                error,
-                                ..Default::default()
-                            }],
-                        })),
-                    };
-                    if crate::send_link_message(&tx, msg).await.is_err() {
-                        return;
-                    }
-                }
+        while let Some(e) = queues.urgent_image.pop_front() {
+            if let Some(source) = e.source {
+                let scheduler = scheduler.clone();
+                let collections = collections.clone();
+                let tx = tx.clone();
+                jobs.spawn(async move {
+                    let resources = scheduler.resources([source.root_token.as_str()], true);
+                    let urgent: BlockingGuard = Arc::new(scheduler.enter_interactive(
+                        resources,
+                        format!(
+                            "urgent image subtitles {}/{}",
+                            e.collection_id, source.path_rel
+                        ),
+                    ));
+                    extract_image_and_send(
+                        &collections,
+                        &e.collection_id,
+                        &source.root_token,
+                        &source.path_rel,
+                        e.sub_index,
+                        urgent,
+                        &tx,
+                    )
+                    .await;
+                    None
+                });
             }
-            queues
-                .ed2k
-                .seen
-                .remove(&(collection_id, root_token, path_rel));
-            continue;
         }
-        // Background tiers share the idle gate. Attachment declaration
-        // drains FIRST: it is ~10x cheaper per file (header reads only)
-        // and unblocks font serving, while the subs pre-warm is a
-        // long-tail warmup that can wait behind it.
-        // Attachments first (cheapest, unblocks font serving), then
-        // keyframe intervals — the same index-read cost, and every file
-        // still missing one forces a conservative TARGETDURATION until
-        // it lands. The subs pre-warm is the long tail and waits.
-        let (which, job) = match queues.atts.q.pop_front() {
-            Some(j) => (Bg::Atts, Some(j)),
-            None => match queues.keys.q.pop_front() {
-                Some(j) => (Bg::Keyframe, Some(j)),
-                None => match queues.geometry.q.pop_front() {
-                    Some(j) => (Bg::Geometry, Some(j)),
-                    None => (Bg::Subs, queues.subs.q.pop_front()),
-                },
-            },
-        };
-        if let Some((collection_id, root_token, path_rel)) = job {
-            let Some(background) = activity.try_background() else {
-                match which {
-                    Bg::Subs => &mut queues.subs,
-                    Bg::Atts => &mut queues.atts,
-                    Bg::Keyframe => &mut queues.keys,
-                    Bg::Geometry => &mut queues.geometry,
-                }
-                .q
-                .push_front((collection_id, root_token, path_rel));
-                if !wait_for_intake(&mut rx, &mut queues).await {
-                    return;
-                }
+
+        for which in [Bg::Atts, Bg::Keyframe, Bg::Geometry, Bg::Ed2k, Bg::Subs] {
+            if active.contains(&which) {
                 continue;
-            };
-            let background: BlockingGuard = Arc::new(background);
-            // Idle gate before starting; the work itself is a bounded
-            // local read (ponytail: can't pause a gst pipeline mid-walk).
-            let mut preempted = false;
-            while activity.busy() {
-                match tokio::time::timeout(BUSY_POLL, rx.recv()).await {
-                    Ok(Some(m)) => {
-                        if intake(m, &mut queues) {
-                            preempted = true;
-                            break;
-                        }
-                    }
-                    Ok(None) => return,
-                    Err(_) => {} // still busy; keep waiting
-                }
             }
             let tier = match which {
+                Bg::Ed2k => &mut queues.ed2k,
                 Bg::Subs => &mut queues.subs,
                 Bg::Atts => &mut queues.atts,
                 Bg::Keyframe => &mut queues.keys,
                 Bg::Geometry => &mut queues.geometry,
             };
-            if preempted || !queues.urgent.is_empty() {
-                // Preempted: put the background job back and loop.
-                tier.q.push_front((collection_id, root_token, path_rel));
+            let Some(key) = tier.q.pop_front() else {
                 continue;
-            }
-            match which {
-                Bg::Subs => {
-                    extract_and_send(
-                        &collections,
-                        &collection_id,
-                        &root_token,
-                        &path_rel,
-                        Some(background),
-                        &tx,
+            };
+            let (collection_id, root_token, path_rel) = key.clone();
+            active.insert(which);
+            let scheduler = scheduler.clone();
+            let collections = collections.clone();
+            let tx = tx.clone();
+            let retry_tx = retry_tx.clone();
+            let owner = owner.clone();
+            jobs.spawn(async move {
+                let resources = scheduler.resources([root_token.as_str()], which.cpu_heavy());
+                let permit = scheduler
+                    .acquire(
+                        which.priority(),
+                        resources,
+                        owner,
+                        format!("{which:?} {collection_id}/{path_rel}"),
                     )
-                    .await
-                }
-                Bg::Atts => {
-                    declare_and_send(
+                    .await;
+                if let Ok(permit) = permit {
+                    run_background_job(
+                        which,
                         &collections,
                         &collection_id,
                         &root_token,
                         &path_rel,
-                        background,
-                        &tx,
-                        retry_tx.as_ref(),
-                    )
-                    .await
-                }
-                Bg::Keyframe => {
-                    measure_keyframes_and_send(
-                        &collections,
-                        &collection_id,
-                        &root_token,
-                        &path_rel,
-                        background,
+                        permit,
                         &tx,
                         retry_tx.as_ref(),
                     )
-                    .await
+                    .await;
                 }
-                Bg::Geometry => {
-                    probe_geometry_and_send(
-                        &collections,
-                        &collection_id,
-                        &root_token,
-                        &path_rel,
-                        background,
-                        &tx,
-                    )
-                    .await
+                Some((which, key))
+            });
+        }
+
+        if !intake_open && jobs.is_empty() {
+            return;
+        }
+        tokio::select! {
+            message = rx.recv(), if intake_open => match message {
+                Some(message) => { intake(message, &mut queues); }
+                None => intake_open = false,
+            },
+            completed = jobs.join_next(), if !jobs.is_empty() => {
+                match completed {
+                    Some(Ok(Some((which, key)))) => {
+                        active.remove(&which);
+                        let tier = match which {
+                            Bg::Ed2k => &mut queues.ed2k,
+                            Bg::Subs => &mut queues.subs,
+                            Bg::Atts => &mut queues.atts,
+                            Bg::Keyframe => &mut queues.keys,
+                            Bg::Geometry => &mut queues.geometry,
+                        };
+                        tier.seen.remove(&key);
+                    }
+                    Some(Ok(None)) => {}
+                    Some(Err(error)) => tracing::warn!(%error, "mediahost work task failed"),
+                    None => {}
                 }
             }
-            tier.seen.remove(&(collection_id, root_token, path_rel));
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_background_job(
+    which: Bg,
+    collections: &[CollectionConfig],
+    collection_id: &str,
+    root_token: &str,
+    path_rel: &str,
+    permit: JobPermit,
+    tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
+) {
+    let background: BlockingGuard = Arc::new(permit.clone());
+    match which {
+        Bg::Ed2k => {
+            let result = hash_one(collections, collection_id, root_token, path_rel, permit).await;
+            let hash = match result {
+                Ok(mut hash) => {
+                    hash.source = source(root_token, path_rel);
+                    tracing::info!(collection = %collection_id, path = %path_rel,
+                        ed2k = %hash.ed2k_hex, crc_ok = hash.crc_ok || !hash.crc_checked,
+                        "ed2k computed");
+                    hash
+                }
+                Err(error) => {
+                    let error = format!("{error:#}");
+                    tracing::warn!(collection = %collection_id, path = %path_rel,
+                        %error, "ed2k failed for exact source revision");
+                    FileHash {
+                        source: source(root_token, path_rel),
+                        error,
+                        ..Default::default()
+                    }
+                }
+            };
+            let _ = crate::send_link_message(
+                tx,
+                HostToHub {
+                    msg: Some(host_to_hub::Msg::FileHashes(FileHashes {
+                        collection_id: collection_id.to_string(),
+                        hashes: vec![hash],
+                    })),
+                },
+            )
+            .await;
+        }
+        Bg::Subs => {
+            extract_and_send(
+                collections,
+                collection_id,
+                root_token,
+                path_rel,
+                Some(background),
+                Some(permit),
+                tx,
+            )
+            .await;
+        }
+        Bg::Atts => {
+            declare_and_send(
+                collections,
+                collection_id,
+                root_token,
+                path_rel,
+                background,
+                tx,
+                retry_tx,
+            )
+            .await;
+        }
+        Bg::Keyframe => {
+            measure_keyframes_and_send(
+                collections,
+                collection_id,
+                root_token,
+                path_rel,
+                background,
+                tx,
+                retry_tx,
+            )
+            .await;
+        }
+        Bg::Geometry => {
+            probe_geometry_and_send(
+                collections,
+                collection_id,
+                root_token,
+                path_rel,
+                background,
+                tx,
+            )
+            .await;
         }
     }
 }
@@ -733,6 +735,7 @@ async fn extract_and_send(
     root_token: &str,
     path_rel: &str,
     background: Option<BlockingGuard>,
+    permit: Option<JobPermit>,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
@@ -740,6 +743,7 @@ async fn extract_and_send(
         let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
         let size = std::fs::metadata(&path)?.len();
         let blocking = background.clone();
+        let checkpoint = permit.clone();
         let tracks = tokio::task::spawn_blocking(move || {
             let _background = blocking;
             // Sparse first (index-driven reads, no demux); trust it
@@ -753,7 +757,15 @@ async fn extract_and_send(
                 _ => {
                     tracing::debug!(path = %path.display(), "sequential extraction");
                     let source = kahawai_media::remux::FileSource::open(&path)?;
-                    kahawai_media::subtitles::extract_embedded_all(Box::new(source))
+                    match checkpoint {
+                        Some(permit) => {
+                            kahawai_media::subtitles::extract_embedded_all_interruptible(
+                                Box::new(source),
+                                move || permit.checkpoint_blocking(),
+                            )
+                        }
+                        None => kahawai_media::subtitles::extract_embedded_all(Box::new(source)),
+                    }
                 }
             }
         })
@@ -808,8 +820,7 @@ async fn hash_one(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
-    activity: &Activity,
-    background: BlockingGuard,
+    permit: JobPermit,
 ) -> anyhow::Result<FileHash> {
     let path = crate::serve::resolve_rel(collections, collection_id, root_token, path_rel)?;
     let claimed_crc = path
@@ -824,12 +835,9 @@ async fn hash_one(
     let mut remaining = size;
 
     while remaining > 0 {
-        // Yield to scans and playback between chunks (MH-9: low priority).
-        while activity.busy() {
-            tokio::time::sleep(BUSY_POLL).await;
-        }
+        permit.checkpoint().await?;
         let want = remaining.min(CHUNK as u64) as usize;
-        let blocking = background.clone();
+        let blocking = permit.clone();
         let (f, buf) = tokio::task::spawn_blocking(move || {
             let _background = blocking;
             let mut buf = vec![0u8; want];

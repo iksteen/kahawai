@@ -31,91 +31,6 @@ const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 const RECONNECT_DELAY: Duration = Duration::from_millis(10);
 const LINK_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// Shared mediahost work classes. Scans, viewer leases and urgent extraction
-/// pause every background task. Segment detection additionally preempts
-/// loudness, while the one `background` permit keeps their decoders disjoint.
-#[derive(Clone, Default)]
-pub struct Activity {
-    scans: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    leases: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    urgent: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    segments: std::sync::Arc<std::sync::atomic::AtomicUsize>,
-    background: std::sync::Arc<std::sync::atomic::AtomicBool>,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub(crate) struct ActivitySnapshot {
-    pub scans: usize,
-    pub leases: usize,
-    pub urgent: usize,
-    pub segments: usize,
-}
-
-impl ActivitySnapshot {
-    pub(crate) fn foreground_busy(self) -> bool {
-        self.scans != 0 || self.leases != 0 || self.urgent != 0
-    }
-}
-
-pub struct ActivityGuard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
-impl Drop for ActivityGuard {
-    fn drop(&mut self) {
-        self.0.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
-    }
-}
-pub(crate) type BlockingActivityGuard = std::sync::Arc<ActivityGuard>;
-
-pub struct BackgroundGuard(std::sync::Arc<std::sync::atomic::AtomicBool>);
-impl Drop for BackgroundGuard {
-    fn drop(&mut self) {
-        self.0.store(false, std::sync::atomic::Ordering::Release);
-    }
-}
-
-impl Activity {
-    fn enter(counter: &std::sync::Arc<std::sync::atomic::AtomicUsize>) -> ActivityGuard {
-        counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ActivityGuard(counter.clone())
-    }
-    pub fn scan(&self) -> ActivityGuard {
-        Self::enter(&self.scans)
-    }
-    pub fn lease(&self) -> ActivityGuard {
-        Self::enter(&self.leases)
-    }
-    pub fn urgent(&self) -> ActivityGuard {
-        Self::enter(&self.urgent)
-    }
-    pub(crate) fn segment_priority(&self) -> ActivityGuard {
-        Self::enter(&self.segments)
-    }
-    pub(crate) fn snapshot(&self) -> ActivitySnapshot {
-        ActivitySnapshot {
-            scans: self.scans.load(std::sync::atomic::Ordering::Relaxed),
-            leases: self.leases.load(std::sync::atomic::Ordering::Relaxed),
-            urgent: self.urgent.load(std::sync::atomic::Ordering::Relaxed),
-            segments: self.segments.load(std::sync::atomic::Ordering::Relaxed),
-        }
-    }
-    pub(crate) fn segment_pending(&self) -> bool {
-        self.snapshot().segments != 0
-    }
-    pub fn try_background(&self) -> Option<BackgroundGuard> {
-        self.background
-            .compare_exchange(
-                false,
-                true,
-                std::sync::atomic::Ordering::Acquire,
-                std::sync::atomic::Ordering::Relaxed,
-            )
-            .ok()
-            .map(|_| BackgroundGuard(self.background.clone()))
-    }
-    pub fn busy(&self) -> bool {
-        self.snapshot().foreground_busy()
-    }
-}
-
 /// Full-file/season GStreamer jobs create short-lived decoder threads whose
 /// glibc arenas can retain hundreds of MiB after every pipeline has reached
 /// NULL and dropped. The allocation is no longer live; ask glibc to return
@@ -172,12 +87,6 @@ impl BackgroundMemoryTrimmer {
     }
 }
 
-#[derive(Clone, Default)]
-struct JobRuntime {
-    activity: Activity,
-    segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
-}
-
 /// One independently enrolled hub. `legacy_identity` preserves the original
 /// single-hub credentials directly in the mediahost state directory.
 #[derive(Debug, Clone)]
@@ -208,7 +117,7 @@ struct LocalRuntime {
     catalog: catalog::Catalog,
     collections: Vec<CollectionConfig>,
     triggers: std::collections::HashMap<String, TriggerSink>,
-    activity: Activity,
+    scheduler: scheduler::Scheduler,
     discovery_wake: std::sync::Arc<tokio::sync::Notify>,
     catalog_versions: std::sync::Arc<std::sync::RwLock<CatalogVersionState>>,
     discovery_status: std::sync::Arc<
@@ -222,23 +131,25 @@ impl LocalRuntime {
         state_dir: &Path,
         collections: Vec<CollectionConfig>,
         rescan_minutes: u64,
+        scheduler_config: kahawai_core::media::MediahostSchedulerConfig,
         detect_segments: bool,
     ) -> Result<Self> {
-        Self::start_with_activity(
+        let scheduler = scheduler::Scheduler::new(&collections, &scheduler_config)?;
+        Self::start_with_scheduler(
             state_dir,
             collections,
             rescan_minutes,
-            Activity::default(),
+            scheduler,
             detect_segments,
         )
         .await
     }
 
-    async fn start_with_activity(
+    async fn start_with_scheduler(
         state_dir: &Path,
         collections: Vec<CollectionConfig>,
         rescan_minutes: u64,
-        activity: Activity,
+        scheduler: scheduler::Scheduler,
         detect_segments: bool,
     ) -> Result<Self> {
         let catalog =
@@ -305,22 +216,46 @@ impl LocalRuntime {
             triggers.insert(collection.name.clone(), sink.clone());
             let collection = collection.clone();
             let catalog = catalog.clone();
-            let activity = activity.clone();
+            let scan_scheduler = scheduler.clone();
             let overflow = sink.overflow.clone();
             guards.push(tokio::spawn(async move {
                 while let Some(mut trigger) = rx.recv().await {
                     while let Ok(more) = rx.try_recv() {
                         trigger.force_dirs.extend(more.force_dirs);
+                        trigger.demand |= more.demand;
                     }
                     if let Some(more) = overflow.lock().unwrap().take() {
                         trigger.force_dirs.extend(more.force_dirs);
+                        trigger.demand |= more.demand;
                     }
-                    let busy: BlockingActivityGuard = std::sync::Arc::new(activity.scan());
+                    let root_tokens = collection
+                        .resolved_roots()
+                        .map(|root| root.token)
+                        .collect::<Vec<_>>();
+                    let resources =
+                        scan_scheduler.resources(root_tokens.iter().map(String::as_str), true);
+                    let priority = if trigger.demand {
+                        scheduler::Priority::Demand
+                    } else {
+                        scheduler::Priority::CatalogFreshness
+                    };
+                    let permit = match scan_scheduler
+                        .acquire(
+                            priority,
+                            resources,
+                            None,
+                            format!("catalog scan {}", collection.name),
+                        )
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
                     if let Err(error) = scan::scan_local_collection(
                         collection.clone(),
                         catalog.clone(),
                         trigger.force_dirs,
-                        busy,
+                        permit,
                     )
                     .await
                     {
@@ -377,13 +312,35 @@ impl LocalRuntime {
                             .map(|root| (collection.name.clone(), root.clone()))
                     })
                     .collect();
+                let watch_tokens = collections
+                    .iter()
+                    .flat_map(CollectionConfig::resolved_roots)
+                    .map(|root| root.token)
+                    .collect::<Vec<_>>();
+                let watch_scheduler = scheduler.clone();
                 let watch_roots = routes.clone();
                 let watch_triggers = triggers.clone();
                 guards.push(tokio::spawn(async move {
                     // Installing recursive watches walks the mount. Keep that
                     // network-filesystem latency away from catalogue startup
                     // and every independently supervised hub link.
+                    let permit = match watch_scheduler
+                        .acquire(
+                            scheduler::Priority::CatalogFreshness,
+                            watch_scheduler.resources(
+                                watch_tokens.iter().map(String::as_str),
+                                false,
+                            ),
+                            None,
+                            "filesystem watch installation",
+                        )
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
                     let watcher = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         use notify::Watcher as _;
                         let mut watcher = watcher;
                         for (_, root) in &watch_roots {
@@ -436,6 +393,7 @@ impl LocalRuntime {
                                         trigger.send(ScanTrigger {
                                             force_dirs,
                                             initial: false,
+                                            demand: false,
                                         });
                                     }
                                 }
@@ -456,7 +414,8 @@ impl LocalRuntime {
             local_hash_rx,
             fact_tx.clone(),
             collections.clone(),
-            activity.clone(),
+            scheduler.clone(),
+            None,
             Some(retry_tx),
         )));
         let (local_loudness_tx, local_loudness_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -464,7 +423,8 @@ impl LocalRuntime {
             local_loudness_rx,
             fact_tx,
             collections.clone(),
-            activity.clone(),
+            scheduler.clone(),
+            None,
         )));
         let segment_inflight = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let fact_catalog = catalog.clone();
@@ -547,8 +507,8 @@ impl LocalRuntime {
                 segment_rx,
                 result_tx,
                 collections.clone(),
-                activity.clone(),
-                std::sync::Arc::new(tokio::sync::Mutex::new(())),
+                scheduler.clone(),
+                None,
             )));
             Some(segment_tx)
         } else {
@@ -750,7 +710,7 @@ impl LocalRuntime {
             catalog,
             collections,
             triggers,
-            activity,
+            scheduler,
             discovery_wake,
             catalog_versions,
             discovery_status,
@@ -769,7 +729,10 @@ impl LocalRuntime {
     fn rescan(&self, collection: &str) {
         for (name, trigger) in &self.triggers {
             if collection.is_empty() || name == collection {
-                trigger.send(ScanTrigger::default());
+                trigger.send(ScanTrigger {
+                    demand: true,
+                    ..Default::default()
+                });
             }
         }
     }
@@ -831,11 +794,18 @@ pub async fn run_multi(
     name: &str,
     collections: Vec<CollectionConfig>,
     rescan_minutes: u64,
+    scheduler_config: kahawai_core::media::MediahostSchedulerConfig,
     hubs: Vec<HubTarget>,
     detect_segments: bool,
 ) -> Result<()> {
-    let runtime =
-        LocalRuntime::start(state_dir, collections, rescan_minutes, detect_segments).await?;
+    let runtime = LocalRuntime::start(
+        state_dir,
+        collections,
+        rescan_minutes,
+        scheduler_config,
+        detect_segments,
+    )
+    .await?;
     supervise_hubs(runtime, state_dir, name, hubs).await
 }
 
@@ -934,6 +904,11 @@ async fn link_once_v4(
     tls: std::sync::Arc<rustls::ClientConfig>,
     name: &str,
 ) -> Result<()> {
+    let scheduler_owner = format!("hub:{}", hub.id);
+    let _scheduler_owner = SchedulerOwnerGuard {
+        scheduler: runtime.scheduler.clone(),
+        owner: scheduler_owner.clone(),
+    };
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls.clone()).await?;
     let byte_channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls).await?;
     let mut client = MediahostLinkClient::new(channel)
@@ -992,7 +967,8 @@ async fn link_once_v4(
         job_rx,
         tx.clone(),
         selected.clone(),
-        runtime.activity.clone(),
+        runtime.scheduler.clone(),
+        Some(scheduler_owner.clone()),
         None,
     ))]);
     let sent: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>> =
@@ -1104,19 +1080,38 @@ async fn link_once_v4(
                         .context("hub overran the subtitle work queue")?;
                 }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) }) => {
-                    let path = serve::resolve_path(&selected, &request);
-                    let foreground = !request.background;
-                    let busy = foreground.then(|| runtime.activity.lease());
                     let channel = byte_channel.clone();
+                    let scheduler = runtime.scheduler.clone();
+                    let owner = Some(format!("hub:{}", hub.id));
+                    let collections = selected.clone();
                     tokio::spawn(async move {
-                        let _busy = busy;
-                        if let Err(error) = serve::serve_lease(channel, request.lease_token, path).await {
+                        if let Err(error) = serve::serve_request_scheduled(
+                            channel,
+                            request,
+                            collections,
+                            scheduler,
+                            owner,
+                        ).await {
                             tracing::warn!(error = format!("{error:#}"), "byte channel failed");
                         }
                     });
                 }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::DiscoveryWake(wake)) }) => {
                     if wake.kind == "segments" {
+                        runtime.discovery_wake.notify_one();
+                    }
+                }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::DiscoveryPriorityHint(hint)) }) => {
+                    if hint.kind == "segments"
+                        && let Some(source) = hint.source
+                    {
+                        runtime.scheduler.hint_segment(
+                            &scheduler_owner,
+                            &hint.collection_id,
+                            &source.root_token,
+                            &source.path_rel,
+                            Duration::from_secs(u64::from(hint.ttl_seconds.max(1))),
+                        );
                         runtime.discovery_wake.notify_one();
                     }
                 }
@@ -1282,6 +1277,7 @@ pub async fn run(
         name,
         collections,
         rescan_minutes,
+        Default::default(),
         vec![HubTarget {
             id: "default".into(),
             address: hub_addr.to_string(),
@@ -1300,16 +1296,17 @@ pub async fn run_local(
     collections: Vec<scan::CollectionConfig>,
     rescan_minutes: u64,
     state_dir: &Path,
-    activity: Activity,
+    scheduler_config: kahawai_core::media::MediahostSchedulerConfig,
     detect_segments: bool,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
-    let runtime = LocalRuntime::start_with_activity(
+    let scheduler = scheduler::Scheduler::new(&collections, &scheduler_config)?;
+    let runtime = LocalRuntime::start_with_scheduler(
         state_dir,
         collections.clone(),
         rescan_minutes,
-        activity,
+        scheduler,
         detect_segments,
     )
     .await?;
@@ -1325,16 +1322,16 @@ pub async fn run_local_multi(
     rescan_minutes: u64,
     state_dir: &Path,
     name: &str,
-    activity: Activity,
+    scheduler: scheduler::Scheduler,
     detect_segments: bool,
     hubs: Vec<HubTarget>,
     local_link: LocalLinkFactory,
 ) -> Result<()> {
-    let runtime = LocalRuntime::start_with_activity(
+    let runtime = LocalRuntime::start_with_scheduler(
         state_dir,
         collections.clone(),
         rescan_minutes,
-        activity,
+        scheduler,
         detect_segments,
     )
     .await?;
@@ -1370,6 +1367,11 @@ async fn run_local_link(
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     mut rx: tokio::sync::mpsc::Receiver<Result<HubToHost, tonic::Status>>,
 ) -> Result<()> {
+    let scheduler_owner = "hub:local".to_string();
+    let _scheduler_owner = SchedulerOwnerGuard {
+        scheduler: runtime.scheduler.clone(),
+        owner: scheduler_owner.clone(),
+    };
     send_link_message(
         &tx,
         HostToHub {
@@ -1385,7 +1387,8 @@ async fn run_local_link(
         job_rx,
         tx.clone(),
         collections,
-        runtime.activity.clone(),
+        runtime.scheduler.clone(),
+        Some(scheduler_owner.clone()),
         None,
     ))]);
     let mut sent: std::collections::HashMap<String, (String, u64)> = Default::default();
@@ -1502,6 +1505,20 @@ async fn run_local_link(
                             runtime.discovery_wake.notify_one();
                         }
                     }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::DiscoveryPriorityHint(hint)) })) => {
+                        if hint.kind == "segments"
+                            && let Some(source) = hint.source
+                        {
+                            runtime.scheduler.hint_segment(
+                                &scheduler_owner,
+                                &hint.collection_id,
+                                &source.root_token,
+                                &source.path_rel,
+                                Duration::from_secs(u64::from(hint.ttl_seconds.max(1))),
+                            );
+                            runtime.discovery_wake.notify_one();
+                        }
+                    }
                     Some(Ok(_)) => {}
                     Some(Err(_)) | None => bail!("local link closed"),
                 }
@@ -1520,6 +1537,17 @@ impl Drop for AbortOnDrop {
     }
 }
 
+struct SchedulerOwnerGuard {
+    scheduler: scheduler::Scheduler,
+    owner: String,
+}
+
+impl Drop for SchedulerOwnerGuard {
+    fn drop(&mut self) {
+        self.scheduler.cancel_owner(&self.owner);
+    }
+}
+
 /// A request for one incremental scan cycle. `force_dirs` bypasses the
 /// unchanged-skip for media files in those directories — how sidecar
 /// subtitle/artwork changes get noticed (the media file's own
@@ -1531,6 +1559,9 @@ struct ScanTrigger {
     /// the scan when the hub already reflects our last completed one).
     /// Watcher/sweep/manual triggers always scan — they carry intent.
     initial: bool,
+    /// Explicit hub/admin requests are interactive demand; periodic and
+    /// watcher freshness remains the normal catalogue class.
+    demand: bool,
 }
 
 /// Trigger sender that never drops: when the queue is full, the trigger
@@ -1550,6 +1581,11 @@ impl TriggerSink {
             slot.get_or_insert_with(ScanTrigger::default)
                 .force_dirs
                 .extend(t.force_dirs);
+            if t.demand
+                && let Some(merged) = slot.as_mut()
+            {
+                merged.demand = true;
+            }
             drop(slot);
             // Wake the orchestrator if space appeared meanwhile; if the
             // queue is still full, its items already guarantee a wake.
@@ -1559,8 +1595,8 @@ impl TriggerSink {
 }
 
 /// Everything a running mediahost is, minus the transport (AR-5): the
-/// scan orchestrators, filesystem watcher, backup sweep and idle job
-/// worker, fed by a HostToHub sender and driven by dispatch(). Both the
+/// scan orchestrators, filesystem watcher, backup sweep and scheduled job
+/// workers, fed by a HostToHub sender and driven by dispatch(). Both the
 /// gRPC link and the all-in-one in-process link wrap this.
 pub struct Engine {
     triggers: std::collections::HashMap<String, TriggerSink>,
@@ -1577,7 +1613,7 @@ pub struct Engine {
     loudness_tx: tokio::sync::mpsc::UnboundedSender<kahawai_proto::v1::LoudnessWorklist>,
     collections: Vec<CollectionConfig>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
-    pub activity: Activity,
+    scheduler: scheduler::Scheduler,
     _guards: AbortOnDrop,
 }
 
@@ -1588,30 +1624,7 @@ impl Engine {
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
     ) -> Engine {
-        Self::start_with_activity(
-            collections,
-            rescan_minutes,
-            state_dir,
-            tx,
-            Activity::default(),
-        )
-    }
-
-    pub fn start_with_activity(
-        collections: &[scan::CollectionConfig],
-        rescan_minutes: u64,
-        state_dir: &Path,
-        tx: tokio::sync::mpsc::Sender<HostToHub>,
-        activity: Activity,
-    ) -> Engine {
-        Self::start_with_runtime(
-            collections,
-            rescan_minutes,
-            state_dir,
-            tx,
-            activity,
-            std::sync::Arc::new(tokio::sync::Mutex::new(())),
-        )
+        Self::start_with_runtime(collections, rescan_minutes, state_dir, tx)
     }
 
     fn start_with_runtime(
@@ -1619,8 +1632,6 @@ impl Engine {
         rescan_minutes: u64,
         state_dir: &Path,
         tx: tokio::sync::mpsc::Sender<HostToHub>,
-        activity: Activity,
-        segment_serial: std::sync::Arc<tokio::sync::Mutex<()>>,
     ) -> Engine {
         // Manifest responses are routed to the scan task of their collection.
         let manifest_waiters: std::sync::Arc<
@@ -1633,13 +1644,17 @@ impl Engine {
         > = Default::default();
         let mut guards: Vec<tokio::task::JoinHandle<()>> = Vec::new();
         let mut triggers: std::collections::HashMap<String, TriggerSink> = Default::default();
-        // ED2K hasher (MH-9): consumes hub Hashlists, chugs only when idle.
+        let scheduler = scheduler::Scheduler::new(collections, &Default::default())
+            .expect("valid default mediahost scheduler");
+        // ED2K hasher (MH-9): consumes hub Hashlists at its fixed scheduler
+        // priority, below local metadata and above subtitle prewarm.
         let (hash_tx, hash_rx) = tokio::sync::mpsc::channel::<hasher::JobMsg>(32);
         guards.push(tokio::spawn(hasher::run(
             hash_rx,
             tx.clone(),
             collections.to_vec(),
-            activity.clone(),
+            scheduler.clone(),
+            Some("legacy-hub".into()),
             None,
         )));
         let (segment_tx, segment_rx) = tokio::sync::mpsc::unbounded_channel();
@@ -1647,15 +1662,16 @@ impl Engine {
             segment_rx,
             tx.clone(),
             collections.to_vec(),
-            activity.clone(),
-            segment_serial,
+            scheduler.clone(),
+            Some("legacy-hub".into()),
         )));
         let (loudness_tx, loudness_rx) = tokio::sync::mpsc::unbounded_channel();
         guards.push(tokio::spawn(loudness::run(
             loudness_rx,
             tx.clone(),
             collections.to_vec(),
-            activity.clone(),
+            scheduler.clone(),
+            Some("legacy-hub".into()),
         )));
         for c in collections {
             let (ttx, mut trx) = tokio::sync::mpsc::channel::<ScanTrigger>(8);
@@ -1666,7 +1682,7 @@ impl Engine {
             triggers.insert(c.name.clone(), sink.clone());
             let overflow = sink.overflow.clone();
             let (c, tx, waiters) = (c.clone(), tx.clone(), manifest_waiters.clone());
-            let activity = activity.clone();
+            let scan_scheduler = scheduler.clone();
             let ver_path = state_dir.join("sync").join(format!("{}.ver", c.name));
             guards.push(tokio::spawn(async move {
             // The persisted scan generation: bumped after every
@@ -1680,15 +1696,35 @@ impl Engine {
                 while let Ok(more) = trx.try_recv() {
                     trig.force_dirs.extend(more.force_dirs);
                     trig.initial &= more.initial;
+                    trig.demand |= more.demand;
                 }
                 if let Some(o) = overflow.lock().unwrap().take() {
                     trig.force_dirs.extend(o.force_dirs);
                     trig.initial &= o.initial;
+                    trig.demand |= o.demand;
                 }
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
                 let force_dirs = trig.force_dirs;
-                let busy: BlockingActivityGuard = std::sync::Arc::new(activity.scan());
+                let roots = c.resolved_roots().map(|root| root.token).collect::<Vec<_>>();
+                let resources = scan_scheduler.resources(roots.iter().map(String::as_str), true);
+                let priority = if trig.demand {
+                    scheduler::Priority::Demand
+                } else {
+                    scheduler::Priority::CatalogFreshness
+                };
+                let permit = match scan_scheduler
+                    .acquire(
+                        priority,
+                        resources,
+                        Some("legacy-hub".into()),
+                        format!("catalog scan {}", c.name),
+                    )
+                    .await
+                {
+                    Ok(permit) => permit,
+                    Err(_) => return,
+                };
                 loop {
                     match scan_cycle(
                         &c,
@@ -1697,7 +1733,7 @@ impl Engine {
                         force_dirs.clone(),
                         handshake,
                         next,
-                        busy.clone(),
+                        permit.clone(),
                     )
                     .await
                     {
@@ -1764,6 +1800,12 @@ impl Engine {
                         .flat_map(|c| c.roots.iter().map(|r| (c.name.clone(), r.clone())))
                         .collect();
                     let watch_roots = roots.clone();
+                    let watch_tokens = collections
+                        .iter()
+                        .flat_map(CollectionConfig::resolved_roots)
+                        .map(|root| root.token)
+                        .collect::<Vec<_>>();
+                    let watch_scheduler = scheduler.clone();
                     let triggers2 = triggers.clone();
                     guards.push(tokio::spawn(async move {
                     // Installing recursive watches walks every directory
@@ -1771,7 +1813,23 @@ impl Engine {
                     // path so startup manifests and in-sync replies are routed
                     // promptly; protocol 3 waits rather than turning hub
                     // latency into a full scan.
+                    let permit = match watch_scheduler
+                        .acquire(
+                            scheduler::Priority::CatalogFreshness,
+                            watch_scheduler.resources(
+                                watch_tokens.iter().map(String::as_str),
+                                false,
+                            ),
+                            Some("legacy-hub".into()),
+                            "filesystem watch installation",
+                        )
+                        .await
+                    {
+                        Ok(permit) => permit,
+                        Err(_) => return,
+                    };
                     let watcher = tokio::task::spawn_blocking(move || {
+                        let _permit = permit;
                         use notify::Watcher as _;
                         let mut watcher = watcher;
                         for (_, root) in &watch_roots {
@@ -1819,7 +1877,11 @@ impl Engine {
                                         && let Some(t) = triggers2.get(&k)
                                     {
                                         tracing::info!(collection = %k, dirs = dirs.len(), "watcher triggered rescan");
-                                        t.send(ScanTrigger { force_dirs: dirs, initial: false });
+                                        t.send(ScanTrigger {
+                                            force_dirs: dirs,
+                                            initial: false,
+                                            demand: false,
+                                        });
                                     }
                                 }
                             }
@@ -1854,7 +1916,7 @@ impl Engine {
             loudness_tx,
             collections: collections.to_vec(),
             tx,
-            activity,
+            scheduler,
             _guards: AbortOnDrop(guards),
         }
     }
@@ -1877,7 +1939,10 @@ impl Engine {
             hub_to_host::Msg::RescanRequest(r) => {
                 for (name, t) in &self.triggers {
                     if r.collection_id.is_empty() || *name == r.collection_id {
-                        t.send(ScanTrigger::default());
+                        t.send(ScanTrigger {
+                            demand: true,
+                            ..Default::default()
+                        });
                     }
                 }
                 Ok(None)
@@ -1966,8 +2031,9 @@ impl Engine {
             hub_to_host::Msg::RootResolutionWorklist(work) => {
                 let collections = self.collections.clone();
                 let tx = self.tx.clone();
+                let scheduler = self.scheduler.clone();
                 tokio::spawn(async move {
-                    resolve_legacy_roots(&collections, work, &tx).await;
+                    resolve_legacy_roots(&collections, work, &tx, scheduler).await;
                 });
                 Ok(None)
             }
@@ -2010,42 +2076,65 @@ async fn resolve_legacy_roots(
     collections: &[CollectionConfig],
     work: kahawai_proto::v1::RootResolutionWorklist,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
+    scheduler: scheduler::Scheduler,
 ) {
     let Some(collection) = collections.iter().find(|c| c.name == work.collection_id) else {
         return;
     };
-    let mut resolutions = Vec::with_capacity(work.sources.len());
-    for source in work.sources {
-        let mut matches = Vec::new();
-        for root in collection.resolved_roots() {
-            let path = root.path.join(&source.path_rel);
-            let Ok(meta) = std::fs::metadata(&path) else {
-                continue;
-            };
-            if meta.len() != source.size {
-                continue;
+    let roots = collection.resolved_roots().collect::<Vec<_>>();
+    let resources = scheduler.resources(roots.iter().map(|root| root.token.as_str()), false);
+    let Ok(permit) = scheduler
+        .acquire(
+            scheduler::Priority::LocalMetadata,
+            resources,
+            Some("legacy-hub".into()),
+            format!("root resolution {}", work.collection_id),
+        )
+        .await
+    else {
+        return;
+    };
+    let sources = work.sources;
+    let Ok(Ok(resolutions)) = tokio::task::spawn_blocking(move || -> Result<_> {
+        let mut resolutions = Vec::with_capacity(sources.len());
+        for source in sources {
+            permit.checkpoint_blocking()?;
+            let mut matches = Vec::new();
+            for root in &roots {
+                let path = root.path.join(&source.path_rel);
+                let Ok(meta) = std::fs::metadata(&path) else {
+                    continue;
+                };
+                if meta.len() != source.size {
+                    continue;
+                }
+                let Ok((head, tail, oshash)) = scan::identity_hashes(&path, source.size) else {
+                    continue;
+                };
+                if (head, tail, oshash) == (source.head_xxh3, source.tail_xxh3, source.oshash) {
+                    matches.push(root.token.clone());
+                }
             }
-            let Ok((head, tail, oshash)) = scan::identity_hashes(&path, source.size) else {
-                continue;
+            let (root_token, error) = match matches.as_slice() {
+                [token] => (token.clone(), String::new()),
+                [] => (String::new(), "missing".into()),
+                _ => (String::new(), "ambiguous".into()),
             };
-            if (head, tail, oshash) == (source.head_xxh3, source.tail_xxh3, source.oshash) {
-                matches.push(root.token);
-            }
+            resolutions.push(kahawai_proto::v1::RootResolution {
+                path_rel: source.path_rel.clone(),
+                source: (!root_token.is_empty()).then_some(kahawai_proto::v1::SourcePath {
+                    root_token,
+                    path_rel: source.path_rel,
+                }),
+                error,
+            });
         }
-        let (root_token, error) = match matches.as_slice() {
-            [token] => (token.clone(), String::new()),
-            [] => (String::new(), "missing".into()),
-            _ => (String::new(), "ambiguous".into()),
-        };
-        resolutions.push(kahawai_proto::v1::RootResolution {
-            path_rel: source.path_rel.clone(),
-            source: (!root_token.is_empty()).then_some(kahawai_proto::v1::SourcePath {
-                root_token,
-                path_rel: source.path_rel,
-            }),
-            error,
-        });
-    }
+        Ok(resolutions)
+    })
+    .await
+    else {
+        return;
+    };
     let _ = tx
         .send(HostToHub {
             msg: Some(host_to_hub::Msg::RootResolutions(
@@ -2070,7 +2159,6 @@ async fn link_once(
     collections: &[CollectionConfig],
     rescan_minutes: u64,
     state_dir: &Path,
-    jobs: JobRuntime,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
     // The byte plane gets its OWN connection: lease streams pushing (or
@@ -2124,14 +2212,7 @@ async fn link_once(
         None => bail!("hub closed the link before HelloAck"),
     };
 
-    let engine = Engine::start_with_runtime(
-        collections,
-        rescan_minutes,
-        state_dir,
-        tx.clone(),
-        jobs.activity,
-        jobs.segment_serial,
-    );
+    let engine = Engine::start_with_runtime(collections, rescan_minutes, state_dir, tx.clone());
 
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
     loop {
@@ -2155,10 +2236,6 @@ async fn link_once(
                 match msg {
                     Ok(Some(m)) => {
                         if let Some(req) = engine.dispatch(m)? {
-                            let path = serve::resolve_path(collections, &req);
-                            if let Err(e) = &path {
-                                tracing::warn!(error = format!("{e:#}"), "refusing OpenRead");
-                            }
                             let ch = byte_channel.clone();
                             // A background lease is served like any other and
                             // does not make this box busy: the hub's own sweeps
@@ -2178,11 +2255,17 @@ async fn link_once(
                                     "foreground read lease opened"
                                 );
                             }
-                            let busy = (!req.background).then(|| engine.activity.lease());
+                            let scheduler = engine.scheduler.clone();
+                            let collections = collections.to_vec();
                             tokio::spawn(async move {
-                                let _busy = busy;
-                                let result =
-                                    serve::serve_lease(ch, req.lease_token, path).await;
+                                let result = serve::serve_request_scheduled(
+                                    ch,
+                                    req,
+                                    collections,
+                                    scheduler,
+                                    Some("legacy-hub".into()),
+                                )
+                                .await;
                                 if foreground {
                                     tracing::info!(
                                         collection = %collection_id,
@@ -2216,7 +2299,7 @@ async fn scan_cycle(
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     handshake_version: u64,
     report_version: u64,
-    blocking_guard: BlockingActivityGuard,
+    permit: scheduler::JobPermit,
 ) -> Result<scan::ScanOutcome> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
@@ -2251,35 +2334,17 @@ async fn scan_cycle(
         mrx,
         force_dirs,
         report_version,
-        blocking_guard,
+        permit,
     )
     .await
 }
 
 #[cfg(test)]
-mod activity_tests {
+mod scheduler_integration_tests {
     use super::{
-        Activity, CollectionConfig, HubTarget, LocalLinkFactory, ensure_scoped_rescan,
-        run_local_multi, send_catalog_pages, send_link_message_with_timeout,
+        CollectionConfig, HubTarget, LocalLinkFactory, ensure_scoped_rescan, run_local_multi,
+        scheduler, send_catalog_pages, send_link_message_with_timeout,
     };
-
-    #[test]
-    fn urgent_work_is_foreground_and_background_is_exclusive() {
-        let activity = Activity::default();
-        assert!(!activity.busy());
-        let urgent = activity.urgent();
-        assert!(activity.busy());
-        drop(urgent);
-        assert!(!activity.busy());
-
-        let background = activity.try_background().expect("first background job");
-        assert!(
-            activity.try_background().is_none(),
-            "two heavy background jobs entered together"
-        );
-        drop(background);
-        assert!(activity.try_background().is_some());
-    }
 
     #[test]
     fn hub_rescans_name_exactly_one_shared_collection() {
@@ -2409,7 +2474,7 @@ mod activity_tests {
             60,
             dir.path(),
             "test-host",
-            Activity::default(),
+            scheduler::Scheduler::new(&[], &Default::default()).unwrap(),
             false,
             vec![HubTarget {
                 id: "unavailable".into(),
@@ -2429,39 +2494,6 @@ mod activity_tests {
             attempts.load(std::sync::atomic::Ordering::Relaxed) >= 2,
             "the intrinsic link was not recreated after failure"
         );
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn blocking_work_retains_background_permit_after_async_abort() {
-        let activity = Activity::default();
-        let permit: std::sync::Arc<dyn Send + Sync> =
-            std::sync::Arc::new(activity.try_background().unwrap());
-        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
-        let (release_tx, release_rx) = std::sync::mpsc::channel();
-        let task = tokio::spawn(async move {
-            let blocking = permit.clone();
-            tokio::task::spawn_blocking(move || {
-                let _permit = blocking;
-                let _ = started_tx.send(());
-                let _ = release_rx.recv();
-            })
-            .await
-        });
-        started_rx.await.unwrap();
-        task.abort();
-        assert!(
-            activity.try_background().is_none(),
-            "abort released permit while blocking work was live"
-        );
-
-        release_tx.send(()).unwrap();
-        for _ in 0..100 {
-            if activity.try_background().is_some() {
-                return;
-            }
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        panic!("blocking work did not release its permit");
     }
 }
 
@@ -2579,6 +2611,7 @@ mod root_resolution_tests {
             media_type: "movies".into(),
             roots: vec![a.path().into(), b.path().into()],
         }];
+        let scheduler = scheduler::Scheduler::new(&collections, &Default::default()).unwrap();
         let (tx, mut rx) = tokio::sync::mpsc::channel(1);
         resolve_legacy_roots(
             &collections,
@@ -2593,6 +2626,7 @@ mod root_resolution_tests {
                 }],
             },
             &tx,
+            scheduler,
         )
         .await;
         let message = rx.recv().await.unwrap();

@@ -575,9 +575,35 @@ async fn run_hub_inner(
         sessions.set_local_source(LOCAL_ID, move |collection, root_token, path| {
             kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
         });
-        let local_activity = kahawai_mediahost::Activity::default();
-        let lease_activity = local_activity.clone();
-        sessions.set_local_activity(move || Box::new(lease_activity.lease()));
+        let local_scheduler =
+            kahawai_mediahost::scheduler::Scheduler::new(&mh.collections, &mh.scheduler)?;
+        let viewer_scheduler = local_scheduler.clone();
+        sessions.set_local_activity(move |root_token| {
+            Box::new(viewer_scheduler.enter_interactive(
+                viewer_scheduler.resources([root_token], false),
+                format!("local viewer read {root_token}"),
+            ))
+        });
+        let sweep_scheduler = local_scheduler.clone();
+        sessions.set_local_background(move |root_token| {
+            let scheduler = sweep_scheduler.clone();
+            let root_token = root_token.to_string();
+            Arc::new(move || {
+                let scheduler = scheduler.clone();
+                let root_token = root_token.clone();
+                Box::pin(async move {
+                    let permit = scheduler
+                        .acquire(
+                            kahawai_mediahost::scheduler::Priority::LocalMetadata,
+                            scheduler.resources([root_token.as_str()], false),
+                            Some("hub:local".into()),
+                            format!("local background read {root_token}"),
+                        )
+                        .await?;
+                    Ok(Box::new(permit) as Box<dyn Send + Sync>)
+                })
+            })
+        });
         let state_dir = mh.state_dir.clone();
         // AIO's in-process hub is intrinsic, not an implicit network target.
         // Only explicit legacy/named entries become additional mTLS links.
@@ -600,7 +626,7 @@ async fn run_hub_inner(
                 mh.rescan_minutes,
                 &state_dir,
                 &mh.name,
-                local_activity,
+                local_scheduler,
                 mh.detect_segments,
                 external_hubs,
                 local_link,

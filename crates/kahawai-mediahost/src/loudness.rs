@@ -1,13 +1,10 @@
-//! Idle source-local loudness measurement for exact playback layouts.
+//! Source-local loudness measurement for exact playback layouts.
 //!
-//! Separate from the general hasher queue: a programme decode can run for
-//! minutes, while urgent subtitle extraction must remain able to enter and mark
-//! the shared activity gate immediately. One background permit serializes this
-//! work with hashing, extraction and season analysis; a queued season releases
-//! that permit from the loudness buffer checkpoint and takes priority.
+//! Loudness retains its movie/newest-first ordering within the least-important
+//! work class. The process scheduler owns admission and interruption.
 
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{Context, Result};
@@ -16,8 +13,8 @@ use kahawai_proto::v1::{
     host_to_hub,
 };
 
-use crate::Activity;
 use crate::scan::CollectionConfig;
+use crate::scheduler::{JobPermit, Priority, Scheduler};
 
 struct TrimOnDrop(&'static str);
 
@@ -53,19 +50,21 @@ fn priority(left: &PendingSource, right: &PendingSource) -> std::cmp::Ordering {
         .then_with(|| right.source.path_rel.cmp(&left.source.path_rel))
 }
 
-fn enqueue(
+async fn enqueue(
     work: LoudnessWorklist,
     collections: &[CollectionConfig],
+    scheduler: &Scheduler,
+    owner: Option<&str>,
     seen: &mut std::collections::HashSet<(String, String, String)>,
     pending: &mut Vec<PendingSource>,
-) {
+) -> Result<()> {
     if !matches!(work.analyzer, 3 | 4 | 5 | kahawai_media::loudness::ANALYZER) {
         tracing::warn!(
             offered = work.analyzer,
             supported = ?[3, 4, 5, kahawai_media::loudness::ANALYZER],
             "unsupported loudness analyzer worklist ignored"
         );
-        return;
+        return Ok(());
     }
     let movie = collections
         .iter()
@@ -81,16 +80,32 @@ fn enqueue(
         if !seen.insert(key) {
             continue;
         }
-        let mtime_unix = crate::serve::resolve_rel(
-            collections,
-            &work.collection_id,
-            &source.root_token,
-            &source.path_rel,
-        )
-        .ok()
-        .and_then(|path| std::fs::metadata(path).ok())
-        .map(|metadata| mtime_unix(&metadata))
-        .unwrap_or(i64::MIN);
+        let resources = scheduler.resources([source.root_token.as_str()], false);
+        let permit = scheduler
+            .acquire(
+                Priority::LocalMetadata,
+                resources,
+                owner.map(str::to_string),
+                format!(
+                    "loudness ordering {}/{}",
+                    work.collection_id, source.path_rel
+                ),
+            )
+            .await?;
+        let collections = collections.to_vec();
+        let collection_id = work.collection_id.clone();
+        let root_token = source.root_token.clone();
+        let path_rel = source.path_rel.clone();
+        let mtime_unix = tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            crate::serve::resolve_rel(&collections, &collection_id, &root_token, &path_rel)
+                .ok()
+                .and_then(|path| std::fs::metadata(path).ok())
+                .map(|metadata| mtime_unix(&metadata))
+                .unwrap_or(i64::MIN)
+        })
+        .await
+        .context("loudness ordering metadata task failed")?;
         pending.push(PendingSource {
             collection_id: work.collection_id.clone(),
             source,
@@ -106,55 +121,70 @@ fn enqueue(
         category = if movie { "movies" } else { "series/anime" },
         "loudness worklist queued"
     );
+    Ok(())
 }
 
 pub async fn run(
     mut rx: tokio::sync::mpsc::UnboundedReceiver<LoudnessWorklist>,
     tx: tokio::sync::mpsc::Sender<HostToHub>,
     collections: Vec<CollectionConfig>,
-    activity: Activity,
+    scheduler: Scheduler,
+    owner: Option<String>,
 ) {
     let mut seen = std::collections::HashSet::new();
     let mut pending = Vec::new();
-    let mut intake_open = true;
     loop {
         if pending.is_empty() {
             let Some(work) = rx.recv().await else {
                 return;
             };
-            enqueue(work, &collections, &mut seen, &mut pending);
+            if enqueue(
+                work,
+                &collections,
+                &scheduler,
+                owner.as_deref(),
+                &mut seen,
+                &mut pending,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
         }
         while let Ok(work) = rx.try_recv() {
-            enqueue(work, &collections, &mut seen, &mut pending);
+            if enqueue(
+                work,
+                &collections,
+                &scheduler,
+                owner.as_deref(),
+                &mut seen,
+                &mut pending,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
         }
         if pending.is_empty() {
             continue;
         }
 
-        // Do not choose the next file until the permit is actually available:
-        // worklists arriving during a scan, viewer lease, segment job or
-        // another background tier must still be able to jump ahead.
-        let background = loop {
-            if !activity.busy()
-                && !activity.segment_pending()
-                && let Some(guard) = activity.try_background()
-            {
-                break Arc::new(Mutex::new(Some(guard)));
-            }
-            if intake_open {
-                tokio::select! {
-                    work = rx.recv() => match work {
-                        Some(work) => enqueue(work, &collections, &mut seen, &mut pending),
-                        None => intake_open = false,
-                    },
-                    _ = tokio::time::sleep(Duration::from_millis(100)) => {}
-                }
-            } else {
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        };
         while let Ok(work) = rx.try_recv() {
-            enqueue(work, &collections, &mut seen, &mut pending);
+            if enqueue(
+                work,
+                &collections,
+                &scheduler,
+                owner.as_deref(),
+                &mut seen,
+                &mut pending,
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
         }
         pending.sort_by(priority);
         let PendingSource {
@@ -165,9 +195,22 @@ pub async fn run(
             analyzer,
         } = pending.pop().expect("queue was nonempty before permit");
 
+        let resources = scheduler.resources([source.root_token.as_str()], true);
+        let permit = match scheduler
+            .acquire(
+                Priority::Loudness,
+                resources,
+                owner.clone(),
+                format!("loudness {collection_id}/{}", source.path_rel),
+            )
+            .await
+        {
+            Ok(permit) => permit,
+            Err(_) => return,
+        };
+
         let source2 = source.clone();
         let collections2 = collections.clone();
-        let activity2 = activity.clone();
         let started = Instant::now();
         tracing::info!(
             collection = %collection_id,
@@ -181,14 +224,12 @@ pub async fn run(
         let _cancel_on_drop = CancelOnDrop(cancelled.clone());
         let result = tokio::task::spawn_blocking(move || {
             let _trim = TrimOnDrop("loudness analysis");
-            let background = background;
             measure_source(
                 &collections2,
                 &collection2,
                 &source2.root_token,
                 &source2.path_rel,
-                &activity2,
-                &background,
+                &permit,
                 analyzer,
                 cancelled,
             )
@@ -245,73 +286,16 @@ pub async fn run(
     }
 }
 
-type SharedBackground = Arc<Mutex<Option<crate::BackgroundGuard>>>;
 type MeasuredTracks = Result<(Vec<AudioLoudnessTrack>, String)>;
 
-/// Segment detection is watched-first and spans a season; loudness is a
-/// library backfill. Release the lower-priority permit at a GStreamer buffer
-/// boundary, wait without decoding, then resume the same pipeline in place.
 fn checkpoint(
-    activity: &Activity,
-    background: &SharedBackground,
+    permit: &JobPermit,
     trimmer: &crate::BackgroundMemoryTrimmer,
-    foreground_pause: &AtomicBool,
     cancelled: &AtomicBool,
 ) -> Result<()> {
     anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
     trimmer.checkpoint("loudness checkpoint");
-    let snapshot = activity.snapshot();
-    if snapshot.segments == 0 {
-        if !snapshot.foreground_busy() {
-            return Ok(());
-        }
-        let report = foreground_pause
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok();
-        if report {
-            tracing::info!(
-                scans = snapshot.scans,
-                leases = snapshot.leases,
-                urgent = snapshot.urgent,
-                "audio loudness measurement paused for foreground activity"
-            );
-        }
-        while activity.busy() {
-            anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        if report {
-            foreground_pause.store(false, Ordering::Release);
-            tracing::info!("audio loudness measurement resumed after foreground activity");
-        }
-        return Ok(());
-    }
-
-    let released = background.lock().unwrap().take().is_some();
-    if released {
-        tracing::info!("audio loudness measurement yielding to segment detection");
-    }
-    while activity.segment_pending() || activity.busy() {
-        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    loop {
-        anyhow::ensure!(!cancelled.load(Ordering::Acquire), "loudness job cancelled");
-        let mut held = background.lock().unwrap();
-        if held.is_some() {
-            break;
-        }
-        if let Some(guard) = activity.try_background() {
-            *held = Some(guard);
-            if released {
-                tracing::info!("audio loudness measurement resumed");
-            }
-            break;
-        }
-        drop(held);
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    Ok(())
+    permit.checkpoint_blocking()
 }
 
 #[allow(clippy::too_many_arguments)] // exact source + scheduling context
@@ -320,8 +304,7 @@ fn measure_source(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
-    activity: &Activity,
-    background: &SharedBackground,
+    permit: &JobPermit,
     analyzer: i64,
     cancelled: Arc<AtomicBool>,
 ) -> Result<(u64, i64, MeasuredTracks)> {
@@ -346,7 +329,6 @@ fn measure_source(
         anyhow::ensure!(!info.audio.is_empty(), "source has no audio streams");
 
         let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(30));
-        let foreground_pause = Arc::new(AtomicBool::new(false));
         let mut tracks = Vec::with_capacity(info.audio.len());
         let mut failures = Vec::new();
         for stream_index in 0..info.audio.len() {
@@ -359,10 +341,8 @@ fn measure_source(
                 "audio loudness track starting"
             );
             let result = (|| -> Result<AudioLoudnessTrack> {
-                let activity = activity.clone();
-                let background = background.clone();
+                let permit = permit.clone();
                 let trimmer = trimmer.clone();
-                let foreground_pause = foreground_pause.clone();
                 let cancelled = cancelled.clone();
                 let source_layout = kahawai_media::loudness::AudioLayout::from_stream(
                     info.audio[stream_index].channels,
@@ -372,15 +352,7 @@ fn measure_source(
                     &path,
                     stream_index,
                     source_layout,
-                    move || {
-                        checkpoint(
-                            &activity,
-                            &background,
-                            &trimmer,
-                            &foreground_pause,
-                            &cancelled,
-                        )
-                    },
+                    move || checkpoint(&permit, &trimmer, &cancelled),
                 )?;
                 // Positionless noncanonical input has no honest native gain
                 // key; exact canonical layouts remain usable. Legacy scalar
@@ -487,8 +459,8 @@ mod tests {
             ]
         );
     }
-    #[test]
-    fn minor_four_worklists_keep_the_legacy_analyzer() {
+    #[tokio::test]
+    async fn minor_four_worklists_keep_the_legacy_analyzer() {
         let collection = CollectionConfig {
             name: "movies".into(),
             media_type: "movies".into(),
@@ -496,6 +468,8 @@ mod tests {
         };
         let mut seen = std::collections::HashSet::new();
         let mut pending = Vec::new();
+        let scheduler =
+            Scheduler::new(std::slice::from_ref(&collection), &Default::default()).unwrap();
         enqueue(
             LoudnessWorklist {
                 collection_id: "movies".into(),
@@ -503,126 +477,22 @@ mod tests {
                 sources: vec![SourcePath::new("root", "film.mkv")],
             },
             &[collection],
+            &scheduler,
+            None,
             &mut seen,
             &mut pending,
-        );
+        )
+        .await
+        .unwrap();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].analyzer, 3);
     }
 
     #[test]
-    fn dropping_a_link_waiter_cancels_its_blocking_measurement() {
+    fn dropping_a_link_waiter_marks_its_blocking_measurement_cancelled() {
         let cancelled = Arc::new(AtomicBool::new(false));
         drop(CancelOnDrop(cancelled.clone()));
         assert!(cancelled.load(Ordering::Acquire));
-
-        let activity = Activity::default();
-        let background = Arc::new(Mutex::new(Some(
-            activity.try_background().expect("initial loudness permit"),
-        )));
-        let error = checkpoint(
-            &activity,
-            &background,
-            &crate::BackgroundMemoryTrimmer::every(Duration::from_secs(60)),
-            &AtomicBool::new(false),
-            &cancelled,
-        )
-        .unwrap_err();
-        assert!(error.to_string().contains("cancelled"));
-    }
-
-    #[test]
-    fn foreground_pause_exposes_its_owner_and_resumes() {
-        let activity = Activity::default();
-        let background = Arc::new(Mutex::new(Some(
-            activity.try_background().expect("initial loudness permit"),
-        )));
-        let lease = activity.lease();
-        let snapshot = activity.snapshot();
-        assert_eq!(
-            (snapshot.scans, snapshot.leases, snapshot.urgent),
-            (0, 1, 0)
-        );
-
-        let pause = Arc::new(AtomicBool::new(false));
-        let pause2 = pause.clone();
-        let activity2 = activity.clone();
-        let background2 = background.clone();
-        let worker = std::thread::spawn(move || {
-            let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(60));
-            checkpoint(
-                &activity2,
-                &background2,
-                &trimmer,
-                &pause2,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-        });
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while !pause.load(Ordering::Acquire) {
-            assert!(
-                Instant::now() < deadline,
-                "foreground pause was not recorded"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        }
-        drop(lease);
-        worker.join().unwrap();
-        assert!(!pause.load(Ordering::Acquire));
-        assert!(!activity.busy());
-    }
-
-    #[test]
-    fn queued_segment_takes_and_returns_the_loudness_permit() {
-        let activity = Activity::default();
-        let background = Arc::new(Mutex::new(Some(
-            activity.try_background().expect("initial loudness permit"),
-        )));
-        let priority = activity.segment_priority();
-        let activity2 = activity.clone();
-        let trimmer = crate::BackgroundMemoryTrimmer::every(Duration::from_secs(60));
-        let background2 = background.clone();
-        let (done_tx, done_rx) = std::sync::mpsc::channel();
-        let trimmer2 = trimmer.clone();
-        let pause = AtomicBool::new(false);
-        let lower = std::thread::spawn(move || {
-            checkpoint(
-                &activity2,
-                &background2,
-                &trimmer2,
-                &pause,
-                &AtomicBool::new(false),
-            )
-            .unwrap();
-            done_tx.send(()).unwrap();
-        });
-
-        let deadline = Instant::now() + Duration::from_secs(1);
-        let segment_background = loop {
-            if let Some(guard) = activity.try_background() {
-                break guard;
-            }
-            assert!(
-                Instant::now() < deadline,
-                "loudness did not release its permit"
-            );
-            std::thread::sleep(Duration::from_millis(10));
-        };
-        assert!(
-            done_rx.recv_timeout(Duration::from_millis(100)).is_err(),
-            "loudness resumed while segment detection was still pending"
-        );
-        drop(priority);
-        drop(segment_background);
-        done_rx
-            .recv_timeout(Duration::from_secs(1))
-            .expect("loudness did not resume");
-        lower.join().unwrap();
-        assert!(
-            background.lock().unwrap().is_some(),
-            "loudness did not reacquire the permit"
-        );
     }
 
     #[tokio::test]
@@ -639,11 +509,15 @@ mod tests {
             roots: vec![dir.path().to_path_buf()],
         };
         let root_token = collection.resolved_roots().next().unwrap().token;
-        let activity = Activity::default();
-        let foreground = activity.lease();
+        let scheduler =
+            Scheduler::new(std::slice::from_ref(&collection), &Default::default()).unwrap();
+        let foreground = scheduler.enter_interactive(
+            scheduler.resources([root_token.as_str()], false),
+            "test viewer",
+        );
         let (work_tx, work_rx) = tokio::sync::mpsc::unbounded_channel();
         let (result_tx, mut result_rx) = tokio::sync::mpsc::channel(2);
-        let worker = tokio::spawn(run(work_rx, result_tx, vec![collection], activity));
+        let worker = tokio::spawn(run(work_rx, result_tx, vec![collection], scheduler, None));
         let work = LoudnessWorklist {
             collection_id: "series".into(),
             analyzer: kahawai_media::loudness::ANALYZER,

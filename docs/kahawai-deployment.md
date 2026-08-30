@@ -185,14 +185,16 @@ ordinary audio decoders and `audioconvert`, not the optional `rsaudiofx`
 full. One decode feeds capped appsinks for the untouched channel layout and
 every smaller canonical layout playback can emit; each streaming histogram
 meter has constant history. This costs more meter CPU during the one-time
-backfill and makes every later gain an exact indexed lookup. The job holds the
-same idle permit as hashing/segment analysis and backpressures whenever a scan
-or viewer lease becomes active. Music collections are not queued because their
+backfill and makes every later gain an exact indexed lookup. The job is the
+lowest fixed scheduler class and yields at decoder checkpoints whenever higher
+conflicting work needs its CPU slot or storage domain. Music collections are not queued because their
 ReplayGain path remains authoritative.
 
 ### Protocol 4 mediahost cutover
 
-Protocol 4 reverses catalogue and extended-discovery ownership. Upgrade hubs
+Protocol 4 reverses catalogue and extended-discovery ownership. Protocol 4.1
+adds optional playback/up-next priority hints; a 4.0 peer remains usable but
+cannot raise matching local segment work to demand. Upgrade hubs
 and mediahosts together: the major-version handshake rejects protocol-3 peers.
 No catalogue migration from a hub is attempted. Preserve the mediahost
 `state_dir`, start the new mediahost, and let its initial scan populate
