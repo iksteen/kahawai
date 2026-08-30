@@ -4,10 +4,10 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use sqlx::SqlitePool;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions};
+use kahawai_sqlite::Database;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
-pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
+pub async fn open(data_dir: &Path) -> Result<Database> {
     std::fs::create_dir_all(data_dir)
         .with_context(|| format!("creating {}", data_dir.display()))?;
     let path = data_dir.join("hub.db");
@@ -26,7 +26,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
             return Err(error).with_context(|| format!("creating {}", path.display()));
         }
     }
-    let opts = SqliteConnectOptions::new()
+    let writer_options = SqliteConnectOptions::new()
         .filename(&path)
         .journal_mode(SqliteJournalMode::Wal)
         .foreign_keys(true)
@@ -54,9 +54,16 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
         // ("database is locked" in the binder). Waiting longer IS the
         // correct behaviour — no writer here holds the lock unbounded.
         .busy_timeout(std::time::Duration::from_secs(30));
-    let pool = SqlitePoolOptions::new()
-        .max_connections(8)
-        .connect_with(opts)
+    let reader_options = SqliteConnectOptions::new()
+        .filename(&path)
+        .read_only(true)
+        .foreign_keys(true)
+        .pragma("cache_size", "-8192")
+        .pragma("query_only", "on")
+        .busy_timeout(std::time::Duration::from_secs(30));
+    // Preserve the former eight-connection/64 MiB ceiling: seven readers at
+    // 8 MiB each plus the actor's sole 8 MiB writer connection.
+    let database = Database::connect_with(writer_options, reader_options, 7)
         .await
         .with_context(|| format!("opening {}", path.display()))?;
     // WAL and SHM are created by SQLite after the main file, inheriting its
@@ -64,16 +71,22 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
     for suffix in ["-wal", "-shm"] {
         kahawai_core::private::narrow(&data_dir.join(format!("hub.db{suffix}")))?;
     }
-    sqlx::migrate!("./migrations")
-        .run(&pool)
-        .await
-        .context("running migrations")?;
-    install_derived(&pool).await?;
-    backfill_norm_artist(&pool).await?;
-    backfill_revision(&pool).await?;
-    backfill_playable_source_families(&pool).await?;
-    repair_release_tag_titles(&pool).await?;
-    Ok(pool)
+    database
+        .write("hub migrations", |connection| {
+            Box::pin(async move {
+                sqlx::migrate!("./migrations")
+                    .run_direct(None, connection, false)
+                    .await
+                    .context("running migrations")
+            })
+        })
+        .await?;
+    install_derived(&database).await?;
+    backfill_norm_artist(&database).await?;
+    backfill_revision(&database).await?;
+    backfill_playable_source_families(&database).await?;
+    repair_release_tag_titles(&database).await?;
+    Ok(database)
 }
 
 /// Fill `items.norm_artist` where it is missing (0041). Folding is a
@@ -81,7 +94,7 @@ pub async fn open(data_dir: &Path) -> Result<SqlitePool> {
 /// keep it filled from here on, which makes this a no-op after its first
 /// run — the guard query is one indexless scan of a column that is
 /// almost always fully populated.
-async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
+async fn backfill_norm_artist(pool: &Database) -> Result<()> {
     let missing: Vec<(String, String)> = sqlx::query_as(
         "SELECT id, artist FROM items WHERE artist IS NOT NULL AND norm_artist IS NULL",
     )
@@ -106,7 +119,7 @@ async fn backfill_norm_artist(pool: &SqlitePool) -> Result<()> {
 /// Fill `files.revision` where it is missing (0043) — same story as
 /// `norm_artist`: the parse is Rust, so the migration could not do it,
 /// and this is a no-op after its first run.
-async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
+async fn backfill_revision(pool: &Database) -> Result<()> {
     let missing: Vec<(i64, String)> =
         sqlx::query_as("SELECT id,path_rel FROM files WHERE revision IS NULL")
             .fetch_all(pool)
@@ -131,7 +144,7 @@ async fn backfill_revision(pool: &SqlitePool) -> Result<()> {
 /// filename-derived rendition family. Existing ordinary rows are already
 /// final (`file:<id>`). This is bounded to the handful of multipart files and
 /// never changes item identity or scan generations.
-async fn backfill_playable_source_families(pool: &SqlitePool) -> Result<()> {
+async fn backfill_playable_source_families(pool: &Database) -> Result<()> {
     type Row = (i64, String, String, String, Option<i64>, i64, i64, String);
     let rows: Vec<Row> = sqlx::query_as(
         "SELECT ps.id,ps.module_id,ps.collection_id,ps.item_id,ps.root_id,
@@ -211,7 +224,7 @@ async fn backfill_playable_source_families(pool: &SqlitePool) -> Result<()> {
 /// collide with an existing item is left for a human or for hash
 /// reconciliation — renaming into a collision would create twins the
 /// dedup key can no longer tell apart.
-async fn repair_release_tag_titles(pool: &SqlitePool) -> Result<()> {
+async fn repair_release_tag_titles(pool: &Database) -> Result<()> {
     let rows: Vec<(String, String, Option<i64>, String, String, String)> = sqlx::query_as(
         "SELECT id,title,year,kind,module_id,collection_id FROM items
           WHERE kind IN ('show','movie') AND title LIKE '%)'",
@@ -266,7 +279,7 @@ async fn repair_release_tag_titles(pool: &SqlitePool) -> Result<()> {
 /// `busy = 1` means another connection held the log open and nothing was
 /// truncated. `execute()` discards that row, which made a checkpoint that did
 /// nothing look exactly like one that worked.
-pub async fn checkpoint_truncate(db: &SqlitePool) -> Result<()> {
+pub async fn checkpoint_truncate(db: &Database) -> Result<()> {
     let (busy, _log, _checkpointed): (i64, i64, i64) =
         sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
             .fetch_one(db)
@@ -282,14 +295,32 @@ pub async fn checkpoint_truncate(db: &SqlitePool) -> Result<()> {
 }
 
 /// In-memory DB for tests.
-pub async fn open_in_memory() -> Result<SqlitePool> {
-    let pool = SqlitePoolOptions::new()
-        .max_connections(1)
-        .connect("sqlite::memory:")
+pub async fn open_in_memory() -> Result<Database> {
+    let name = format!("file:kahawai-test-{}", ulid::Ulid::generate());
+    let writer = SqliteConnectOptions::new()
+        .filename(&name)
+        .in_memory(true)
+        .shared_cache(true)
+        .foreign_keys(true);
+    let reader = SqliteConnectOptions::new()
+        .filename(&name)
+        .in_memory(true)
+        .shared_cache(true)
+        .foreign_keys(true)
+        .pragma("query_only", "on");
+    let database = Database::connect_with(writer, reader, 1).await?;
+    database
+        .write("hub test migrations", |connection| {
+            Box::pin(async move {
+                sqlx::migrate!("./migrations")
+                    .run_direct(None, connection, false)
+                    .await?;
+                Ok(())
+            })
+        })
         .await?;
-    sqlx::migrate!("./migrations").run(&pool).await?;
-    install_derived(&pool).await?;
-    Ok(pool)
+    install_derived(&database).await?;
+    Ok(database)
 }
 
 /// Derivations are installed on open, not by a migration: they derive
@@ -303,7 +334,7 @@ pub async fn open_in_memory() -> Result<SqlitePool> {
 /// replaced: everything it was maintaining is rebuilt from scratch, which
 /// makes a downgrade-then-upgrade self-healing rather than silently
 /// wrong.
-async fn install_derived(pool: &SqlitePool) -> Result<()> {
+async fn install_derived(pool: &Database) -> Result<()> {
     // Safe by construction: the statement is generated from a fixed field
     // table in providers.rs, with no caller input anywhere in it.
     sqlx::raw_sql(sqlx::AssertSqlSafe(

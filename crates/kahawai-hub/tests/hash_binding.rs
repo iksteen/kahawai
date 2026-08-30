@@ -7,7 +7,7 @@
 //! have cached them.
 
 use kahawai_hub::enrich::Enricher;
-use sqlx::SqlitePool;
+use kahawai_sqlite::Database as SqlitePool;
 
 const AID: u32 = 1234;
 

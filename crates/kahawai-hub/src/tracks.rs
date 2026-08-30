@@ -352,7 +352,7 @@ fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
 /// Sync embedded/sidecar rows for one stable physical source. Track ids remain
 /// stable while stream positions remain stable, independent of root adoption.
 pub async fn sync_source_tracks(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     source_id: i64,
     info: &kahawai_core::media::MediaInfo,
 ) -> Result<()> {
@@ -366,7 +366,7 @@ pub async fn sync_source_tracks(
         .bind(source_id)
         .bind(origin)
         .bind(count)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
     }
 
@@ -383,7 +383,7 @@ pub async fn sync_source_tracks(
             .bind(i as i64)
             .bind(&s.format)
             .bind(&s.language)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
     }
     for (i, s) in info.external_subtitles.iter().enumerate() {
@@ -393,7 +393,7 @@ pub async fn sync_source_tracks(
             .bind(i as i64)
             .bind(&s.format)
             .bind(&s.language)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
     }
     Ok(())

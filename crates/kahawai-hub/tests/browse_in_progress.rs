@@ -17,7 +17,11 @@ use axum::body::Body;
 use axum::http::Request;
 use tower::ServiceExt;
 
-async fn harness() -> (axum::Router, Arc<kahawai_hub::auth::Auth>, sqlx::SqlitePool) {
+async fn harness() -> (
+    axum::Router,
+    Arc<kahawai_hub::auth::Auth>,
+    kahawai_sqlite::Database,
+) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
@@ -94,7 +98,7 @@ fn titles(page: &serde_json::Value) -> Vec<String> {
 /// `(position_ms, duration_ms, played, watched_at)`. `watched_at` is an
 /// offset in seconds from now — bigger is older.
 async fn seed(
-    db: &sqlx::SqlitePool,
+    db: &kahawai_sqlite::Database,
     id: &str,
     kind: &str,
     title: &str,

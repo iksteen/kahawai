@@ -521,7 +521,7 @@ fn test_router_with_net(
 
 async fn auth_harness() -> (
     tempfile::TempDir,
-    sqlx::SqlitePool,
+    kahawai_sqlite::Database,
     Arc<Auth>,
     axum::Router,
     kahawai_hub::auth::TokenPair,
@@ -1515,7 +1515,9 @@ async fn refresh_family_migration_invalidates_legacy_tokens() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(pool.clone(), dir.path()).await.unwrap();
+    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
+        .await
+        .unwrap();
     assert!(matches!(
         auth.refresh(legacy).await,
         Err(kahawai_hub::auth::RefreshError::Invalid)
@@ -1717,7 +1719,9 @@ async fn auth_version_migration_invalidates_existing_access_and_refresh() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(pool.clone(), dir.path()).await.unwrap();
+    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
+        .await
+        .unwrap();
     assert!(auth.authenticate(&access).await.is_err());
     assert!(matches!(
         auth.refresh(refresh).await,

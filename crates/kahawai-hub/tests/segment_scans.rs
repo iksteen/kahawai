@@ -7,7 +7,7 @@
 
 use sqlx::Row;
 
-async fn library() -> (tempfile::TempDir, sqlx::SqlitePool) {
+async fn library() -> (tempfile::TempDir, kahawai_sqlite::Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     sqlx::raw_sql(
@@ -38,7 +38,7 @@ async fn library() -> (tempfile::TempDir, sqlx::SqlitePool) {
 }
 
 /// Record a finished scan the way `analyze_season` does.
-async fn scanned(db: &sqlx::SqlitePool, item: &str, mtime: Option<i64>) {
+async fn scanned(db: &kahawai_sqlite::Database, item: &str, mtime: Option<i64>) {
     sqlx::query(
         "INSERT INTO media_segment_scans(item_id,scanned_at,detector,mtime_unix)
          VALUES(?, unixepoch(), ?, ?)
@@ -52,7 +52,7 @@ async fn scanned(db: &sqlx::SqlitePool, item: &str, mtime: Option<i64>) {
     .unwrap();
 }
 
-async fn pending(db: &sqlx::SqlitePool) -> i64 {
+async fn pending(db: &kahawai_sqlite::Database) -> i64 {
     kahawai_hub::segments::pending_seasons(db)
         .await
         .unwrap()

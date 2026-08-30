@@ -48,10 +48,11 @@ use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
+use kahawai_sqlite::Database;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 
 pub const ACCESS_TTL_SECS: i64 = 15 * 60;
 pub const REFRESH_TTL_SECS: i64 = 30 * 24 * 3600;
@@ -143,7 +144,7 @@ pub enum CompleteSetupError {
 pub struct UsernameTaken;
 
 pub struct Auth {
-    db: SqlitePool,
+    db: Database,
     enc: EncodingKey,
     dec: DecodingKey,
     /// True only while the database has never had its first account created.
@@ -292,7 +293,7 @@ fn verify_password(password: &str, hash: &str) -> bool {
 
 impl Auth {
     /// Load or create the JWT secret; enter setup mode if no users exist.
-    pub async fn new(db: SqlitePool, data_dir: &Path) -> Result<Self> {
+    pub async fn new(db: Database, data_dir: &Path) -> Result<Self> {
         let secret_path = data_dir.join(JWT_SECRET_FILE);
         kahawai_core::private::narrow(&secret_path)
             .with_context(|| format!("restricting {}", secret_path.display()))?;
@@ -805,7 +806,7 @@ impl Auth {
 
 /// CLI escape hatch (OPS-1): overwrite a user's password hash and revoke
 /// every refresh family in the same committed transaction.
-pub async fn reset_password(db: &SqlitePool, username: &str, new_password: &str) -> Result<()> {
+pub async fn reset_password(db: &Database, username: &str, new_password: &str) -> Result<()> {
     let username = validate_credentials(username, new_password)?;
     let hash = hash_password(new_password)?;
     let mut tx = db.begin_with("BEGIN IMMEDIATE").await?;

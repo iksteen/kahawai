@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 struct Hub {
     api: axum::Router,
-    db: sqlx::SqlitePool,
+    db: kahawai_sqlite::Database,
     /// The setup admin: bypasses grants whatever its rows say.
     boss: String,
     /// all_libraries = 0, granted L1 only.

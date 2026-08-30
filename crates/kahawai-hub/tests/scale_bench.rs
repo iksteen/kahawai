@@ -30,7 +30,7 @@ struct Bench {
     api: axum::Router,
     token: String,
     library: String,
-    db: sqlx::SqlitePool,
+    db: kahawai_sqlite::Database,
 }
 
 /// Seed `items` top-level movies spread over `MEDIAHOSTS` collections,

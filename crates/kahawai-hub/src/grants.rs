@@ -66,8 +66,9 @@
 //! search predicate that has always been there.
 
 use anyhow::Result;
+use kahawai_sqlite::Database as SqlitePool;
 use serde::Serialize;
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use utoipa::ToSchema;
 
 use crate::auth::Claims;

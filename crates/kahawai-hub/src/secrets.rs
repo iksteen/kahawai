@@ -21,9 +21,9 @@
 //! account.
 
 use anyhow::{Context, Result, anyhow, bail};
+use kahawai_sqlite::Database;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
-use sqlx::SqlitePool;
 use std::collections::BTreeMap;
 use std::path::Path;
 
@@ -45,7 +45,7 @@ pub struct Secrets {
 impl Secrets {
     /// Load the key, generating it the first time. Unreadable, wrong length
     /// or missing-after-seeding are all fatal.
-    pub async fn load_or_create(data_dir: &Path, db: &SqlitePool) -> Result<Self> {
+    pub async fn load_or_create(data_dir: &Path, db: &Database) -> Result<Self> {
         let path = data_dir.join(KEY_FILE);
         let seeded: Option<String> = sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
             .bind(SEEDED_SETTING)
@@ -172,7 +172,7 @@ impl Secrets {
 /// fatal, the only ways left are tampering or corruption, and answering
 /// "nothing is configured" for either would hide it.
 pub struct Credentials {
-    db: SqlitePool,
+    db: Database,
     secrets: Secrets,
 }
 
@@ -197,7 +197,7 @@ impl std::fmt::Display for UnreadableCredential {
 impl std::error::Error for UnreadableCredential {}
 
 impl Credentials {
-    pub async fn open(data_dir: &Path, db: SqlitePool) -> Result<Self> {
+    pub async fn open(data_dir: &Path, db: Database) -> Result<Self> {
         let secrets = Secrets::load_or_create(data_dir, &db).await?;
         Ok(Self { db, secrets })
     }
@@ -584,14 +584,14 @@ fn narrow(path: &Path) -> Result<()> {
 mod tests {
     use super::*;
 
-    async fn keyed() -> (tempfile::TempDir, SqlitePool, Secrets) {
+    async fn keyed() -> (tempfile::TempDir, Database, Secrets) {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open_in_memory().await.unwrap();
         let s = Secrets::load_or_create(dir.path(), &db).await.unwrap();
         (dir, db, s)
     }
 
-    async fn marker(db: &SqlitePool) -> Option<String> {
+    async fn marker(db: &Database) -> Option<String> {
         sqlx::query_scalar("SELECT value FROM settings WHERE key = ?")
             .bind(SEEDED_SETTING)
             .fetch_optional(db)
@@ -870,7 +870,7 @@ mod store_tests {
         pairs.iter().copied().collect()
     }
 
-    async fn owned(db: &SqlitePool, owner_id: &str) -> i64 {
+    async fn owned(db: &Database, owner_id: &str) -> i64 {
         sqlx::query_scalar("SELECT count(*) FROM credentials WHERE owner_id = ?")
             .bind(owner_id)
             .fetch_one(db)

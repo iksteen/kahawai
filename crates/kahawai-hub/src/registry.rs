@@ -43,9 +43,10 @@ use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
 use kahawai_core::names;
+use kahawai_sqlite::Database;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use sqlx::{Row, SqlitePool};
+use sqlx::Row;
 use utoipa::ToSchema;
 
 /// Generation of the hub's catalogue projection semantics.
@@ -401,7 +402,7 @@ struct TcLink {
 }
 
 pub struct Registry {
-    db: SqlitePool,
+    db: Database,
     /// The credential store. `None` only in tests that never reach one — the
     /// composition root always sets it, and a key it cannot load is fatal
     /// there rather than absent here.
@@ -578,7 +579,7 @@ pub enum RegistryEvent {
 }
 
 impl Registry {
-    pub fn new(db: SqlitePool, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
+    pub fn new(db: Database, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
         Self {
             db,
             credentials: None,
@@ -1774,7 +1775,7 @@ impl Registry {
             .is_some_and(|link| link.supports_loudness_analysis())
     }
 
-    pub fn db(&self) -> &SqlitePool {
+    pub fn db(&self) -> &Database {
         &self.db
     }
 
@@ -2377,8 +2378,13 @@ impl Registry {
         let anime = media_type.as_deref() == Some("anime");
         let resolve_music = media_type.as_deref() == Some("music");
 
-        let mut tx = self.db.begin().await?;
         let n = files.len();
+        let mut tx = self
+            .db
+            .begin_with_label(format!(
+                "catalogue file projection collection={collection_id} files={n}"
+            ))
+            .await?;
         for f in files {
             anyhow::ensure!(!f.root_token.is_empty(), "file record has no root token");
             let media_info: kahawai_core::media::MediaInfo =
@@ -2843,7 +2849,7 @@ impl Registry {
     /// no catalogue-wide regrouping occurs during ingestion.
     #[allow(clippy::too_many_arguments)]
     async fn bind_playable_source(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         module_id: &str,
         collection_id: &str,
         root_id: i64,
@@ -2854,7 +2860,7 @@ impl Registry {
     ) -> Result<()> {
         sqlx::query("DELETE FROM playable_source_parts WHERE file_id=?")
             .bind(file_id)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         let family = part
             .map(|_| kahawai_core::names::rendition_family_key(path_rel))
@@ -2875,7 +2881,7 @@ impl Registry {
         .bind(root_id)
         .bind(&family)
         .bind(expected)
-        .fetch_one(&mut **tx)
+        .fetch_one(&mut *tx)
         .await?;
         sqlx::query(
             "INSERT INTO playable_source_parts
@@ -2887,7 +2893,7 @@ impl Registry {
         .bind(collection_id)
         .bind(expected)
         .bind(file_id)
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
         // Rebinding may leave an empty ordinary source or obsolete family.
         sqlx::query(
@@ -2895,7 +2901,7 @@ impl Registry {
               WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p
                                 WHERE p.playable_source_id=playable_sources.id)",
         )
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
         Ok(())
     }
@@ -3023,7 +3029,7 @@ impl Registry {
     }
 
     async fn archive_playable_sources(
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut sqlx::SqliteConnection,
         source_ids: &[i64],
     ) -> Result<()> {
         type ArchiveSource = (String, i64, Vec<(i64, i64, i64)>);
@@ -3036,7 +3042,7 @@ impl Registry {
                   WHERE ps.id=? ORDER BY p.ordinal,p.file_id",
             )
             .bind(source_id)
-            .fetch_all(&mut **tx)
+            .fetch_all(&mut *tx)
             .await?
             .into_iter()
             .fold(None, |acc, row| {
@@ -3062,7 +3068,7 @@ impl Registry {
             )
             .bind(fingerprint)
             .bind(item_id)
-            .execute(&mut **tx)
+            .execute(&mut *tx)
             .await?;
         }
         Ok(())

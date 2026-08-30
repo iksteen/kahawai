@@ -17,7 +17,7 @@ use tower::ServiceExt;
 async fn harness() -> (
     axum::Router,
     String,
-    sqlx::SqlitePool,
+    kahawai_sqlite::Database,
     Arc<kahawai_hub::registry::Registry>,
 ) {
     let dir = tempfile::tempdir().unwrap();
@@ -101,7 +101,7 @@ struct CompositionState {
     generation: i64,
 }
 
-async fn composition_state(db: &sqlx::SqlitePool) -> CompositionState {
+async fn composition_state(db: &kahawai_sqlite::Database) -> CompositionState {
     CompositionState {
         item_count: sqlx::query_scalar("SELECT count(*) FROM items WHERE id='composed-item'")
             .fetch_one(db)

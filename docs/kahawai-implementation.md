@@ -145,7 +145,31 @@ Nothing in the codebase writes a derivation. Triggers do, on every write to an i
 
 The reference for what each table means is the `hub/providers.rs` module doc, next to the code that enforces it. `tests/item_match_derived.rs` and `tests/sort_title.rs` re-derive the truth independently after every kind of write, raw SQL included.
 
-**Connection pool.** 8 connections, WAL, foreign keys on, and `cache_size = -8192` (8 MiB per connection). SQLite's 2 MB default is smaller than the index a deep browse page walks, which made the same query cost 253 ms or 50 ms depending on which pooled connection served it. Measured at 2/8/16/64 MiB: the bimodality disappears at 8 and nothing improves above it. The memory ceiling is 8 × 8 MiB, allocated lazily.
+**Connections and write serialization.** The hub keeps eight SQLite
+connections in WAL mode with foreign keys on: seven OS/read-only query
+connections and one writable connection owned by a bounded FIFO task. Every
+statement that can mutate state and every explicit transaction goes through
+that task; transactions claim the SQLite writer slot with `BEGIN IMMEDIATE`,
+so application concurrency waits in one visible queue instead of racing
+deferred-transaction upgrades into `SQLITE_BUSY`. The exposed pool also has
+`PRAGMA query_only=ON`, making an accidental bypass fail immediately. The
+queue holds at most 256 requests (senders then apply backpressure), skips work
+cancelled before it starts, rolls back an abandoned started transaction, and
+warns with its operation label when either queue wait or execution exceeds one
+second. A nested request from the task already holding the writer is rejected
+instead of deadlocking.
+
+The existing cache cost model is unchanged: every connection has
+`cache_size = -8192` (8 MiB). SQLite's 2 MB default is smaller than the index a
+deep browse page walks, which made the same query cost 253 ms or 50 ms depending
+on which pooled connection served it. Measured at 2/8/16/64 MiB: the bimodality
+disappears at 8 and nothing improves above it. Seven readers plus one writer
+retain the 8 × 8 MiB memory ceiling, allocated lazily. Reads still run
+concurrently and continue against their prior WAL snapshot while a write is in
+progress. Each physical database owns its own writer task, so all-in-one has
+one for `hub.db` and an independent one for `catalog.db`; a separate process
+writing either file can still contend because it cannot join the in-process
+queue.
 
 ### 4.2 Item resolution pipeline
 
@@ -510,7 +534,7 @@ Pending-season aggregation counts episodes with at least one unfailed current re
 
 **Chapters.** For Matroska/WebM, read at scan from the container itself (other containers keep whatever the demuxer's TOC declared at discovery — MP4 chapters arrive that way), next to the attachment declaration and off the same walk of the header — two facts, one pass, one backfill worklist for files whose records predate either. From the container rather than from the demuxer's TOC because the demuxer misses some: measured on 80 files here, `matroskademux` posts no TOC at all for two that `ffprobe` reads out fine, both ordinary WEBRip episodes with `Recap`/`Intro`/`Credits` marked. Against `ffprobe` the sparse read agrees on all 80 (`scripts/kahawai-chapters.sh`). They are carried on the item, shifted onto its timeline for a multi-part work, and the web app draws them as ticks on the seek bar and as a list on the item page that starts playback at a chapter.
 
-**Scanner and authoritative catalogue.** The mediahost owns `catalog.db` in its state directory (WAL, foreign keys enabled). The configured collection name is its stable ID; its epoch changes only when the namespace is removed/recreated or changes media type, while every file, tombstone and derived fact increments a collection-local version in the same transaction. `catalog_files` is the stat/discovery fast path and seen-generation journal; `catalog_records` stores one current value per replicated entity plus deletion tombstones. A root token is `root-sha256-` plus unpadded base64url of the complete `SHA-256(utf8("kahawai-root-path-v1") || 0x00 || normalized_path_utf8)`. The source key is `(collection, root token, path_rel)` locally and gains the enrolled module ID only when a hub projects it. Changed files are probed with GStreamer and sidecar/container declarations in one scan path; unavailable roots retain their prior rows. Nothing waits for a hub commit.
+**Scanner and authoritative catalogue.** The mediahost owns `catalog.db` in its state directory (WAL, foreign keys enabled). It uses the same serialized-writer invariant as the hub, with three query-only readers plus one actor-owned writer, retaining its former four-connection budget. Scans, claims, acknowledgements and derived results therefore share one FIFO write order while snapshot/delta reads remain concurrent. The configured collection name is its stable ID; its epoch changes only when the namespace is removed/recreated or changes media type, while every file, tombstone and derived fact increments a collection-local version in the same transaction. `catalog_files` is the stat/discovery fast path and seen-generation journal; `catalog_records` stores one current value per replicated entity plus deletion tombstones. A root token is `root-sha256-` plus unpadded base64url of the complete `SHA-256(utf8("kahawai-root-path-v1") || 0x00 || normalized_path_utf8)`. The source key is `(collection, root token, path_rel)` locally and gains the enrolled module ID only when a hub projects it. Changed files are probed with GStreamer and sidecar/container declarations in one scan path; unavailable roots retain their prior rows. Nothing waits for a hub commit.
 
 **Watcher.** Recursive watch installation runs off the async startup path because it can walk a slow network mount. `notify` events wait for a 3 s quiet period and coalesce per directory before feeding the same queue; periodic reconciliation catches missed events (network mounts). Cross-collection overlaps fan one event into every matching namespace. A watcher or scan failure for one unavailable root reports that exact root and leaves its previous manifest rows seen, so reconciliation neither deletes that mount's catalogue nor substitutes another root; other roots continue and later sweeps retry it.
 

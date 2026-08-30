@@ -1991,7 +1991,7 @@ impl Enricher {
     /// ed2k_aid table — AniDB is never asked twice for the same hash.
     pub(crate) async fn anidb_identify(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         client: &mut crate::anidb::Anidb,
         item_id: &str,
         lease: &crate::gate::CredentialLease,
@@ -2050,7 +2050,7 @@ impl Enricher {
     /// run.
     async fn resolve_episode_hashes(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         client: &mut crate::anidb::Anidb,
         show_id: &str,
         budget: usize,
@@ -2109,7 +2109,7 @@ impl Enricher {
     /// were invisible to it, to browse, and to AniDB alike.
     async fn resolve_bare_hashes(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         client: &mut crate::anidb::Anidb,
         budget: usize,
         lease: &crate::gate::CredentialLease,
@@ -2153,7 +2153,7 @@ impl Enricher {
     /// an identity the catalogue holds: an episode slot under the show
     /// matched to that aid, or the movie item itself. Pure database
     /// work; a file whose aid matches nothing stays bare and is logged.
-    pub async fn bind_bare_files(&self, db: &sqlx::SqlitePool) -> Result<usize> {
+    pub async fn bind_bare_files(&self, db: &kahawai_sqlite::Database) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT f.id AS source_id,f.module_id,f.collection_id,f.path_rel,c.aid,c.epno
              FROM files f
@@ -2256,12 +2256,10 @@ impl Enricher {
                     }
                 }
             };
-            crate::registry::bind_file_to_item(
-                &mut *db.acquire().await?,
-                r.get::<i64, _>("source_id"),
-                &target,
-            )
-            .await?;
+            let mut tx = db.begin().await?;
+            crate::registry::bind_file_to_item(&mut tx, r.get::<i64, _>("source_id"), &target)
+                .await?;
+            tx.commit().await?;
             tracing::info!(path = %path, epno = %epno, "bare file identified by hash and bound");
             bound += 1;
         }
@@ -2274,7 +2272,7 @@ impl Enricher {
     /// otherwise. Returns None for non-movie types.
     async fn mint_movie_for_aid(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         aid: u32,
         module_id: &str,
         collection_id: &str,
@@ -2357,7 +2355,7 @@ impl Enricher {
     /// is an artifact of the numbering the hash exists to correct.
     pub async fn bind_hashed_episodes(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         show_id: &str,
         show_aid: u32,
     ) -> Result<Vec<EpisodeRebind>> {
@@ -2521,7 +2519,7 @@ impl Enricher {
     /// stable, claiming nothing about a keyspace this show does not use.
     async fn break_slot_collisions(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         show_id: &str,
         occupants: Vec<SlotOccupant>,
     ) -> Result<Vec<EpisodeRebind>> {
@@ -2613,7 +2611,7 @@ impl Enricher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn anime_one(
         self: &Arc<Self>,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         titles: &crate::anime::AnidbTitles,
         lists: &crate::anime::AnimeLists,
         item_id: &str,
@@ -2715,7 +2713,7 @@ impl Enricher {
     /// Persist an AniList match: metadata upsert + relations graph.
     pub async fn store_anime(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item_id: &str,
         kind: &str,
         media: &crate::anime::AnilistMedia,
@@ -2835,7 +2833,7 @@ impl Enricher {
     /// human's correction or a fresher answer always wins over a
     /// reconstruction.
     pub async fn rebuild_anime_ids(
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         lists: Option<&crate::anime::AnimeLists>,
     ) -> Result<u64> {
         let done = sqlx::query(
@@ -3149,7 +3147,7 @@ impl Enricher {
     #[allow(clippy::too_many_arguments)]
     async fn enrich_show_episodes(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         show_id: &str,
         provider: &str,
         pid: &str,
@@ -4016,7 +4014,7 @@ mod tests {
 impl Enricher {
     pub(crate) async fn store_generic(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item_id: &str,
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
@@ -4028,7 +4026,7 @@ impl Enricher {
     /// Record one provider's answer and re-merge the item (HUB-5).
     pub(crate) async fn store_answer_for(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item_id: &str,
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
@@ -4157,7 +4155,7 @@ impl TmdbProvider {
     /// — that ban applies to anime identity, not to description.
     async fn fill_gaps(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
         owner: &str,
     ) -> Result<crate::providers::Outcome> {
@@ -4238,7 +4236,7 @@ impl crate::providers::Provider for TmdbProvider {
 
     async fn enrich(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -4359,7 +4357,7 @@ impl crate::providers::Provider for TvdbProvider {
 
     async fn enrich(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -4463,7 +4461,7 @@ impl crate::providers::Provider for AnimeProvider {
 
     async fn enrich(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -4553,7 +4551,7 @@ impl crate::providers::Provider for MusicbrainzProvider {
 
     async fn enrich(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
@@ -4666,7 +4664,7 @@ impl crate::providers::Provider for LocalProvider {
 
     async fn enrich(
         &self,
-        db: &sqlx::SqlitePool,
+        db: &kahawai_sqlite::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         // Both local sources come out of the scan record, so an item with

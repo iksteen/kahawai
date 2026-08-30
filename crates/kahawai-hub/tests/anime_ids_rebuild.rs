@@ -9,7 +9,7 @@
 use kahawai_hub::enrich::Enricher;
 use sqlx::Row;
 
-async fn seed(db: &sqlx::SqlitePool) {
+async fn seed(db: &kahawai_sqlite::Database) {
     // One anime show whose first file carries an ed2k AniDB identified,
     // and an AniList answer whose provider_id IS the AniList media id.
     sqlx::query(

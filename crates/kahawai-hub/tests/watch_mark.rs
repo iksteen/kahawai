@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-async fn harness() -> (axum::Router, String, sqlx::SqlitePool) {
+async fn harness() -> (axum::Router, String, kahawai_sqlite::Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     sqlx::query(

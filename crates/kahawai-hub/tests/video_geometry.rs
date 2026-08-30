@@ -1,7 +1,7 @@
 use kahawai_core::media::{MediaInfo, VideoGeometry, VideoStream};
 use kahawai_hub::registry::{FileUpsertRecord, Registry, SourcePath};
 
-async fn fixture() -> (sqlx::SqlitePool, Registry, i64, String) {
+async fn fixture() -> (kahawai_sqlite::Database, Registry, i64, String) {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
     registry

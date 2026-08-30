@@ -10,7 +10,7 @@ use std::sync::Arc;
 
 use kahawai_hub::registry::Registry;
 
-async fn enrolled() -> (Arc<Registry>, sqlx::SqlitePool, tempfile::TempDir) {
+async fn enrolled() -> (Arc<Registry>, kahawai_sqlite::Database, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     sqlx::query(

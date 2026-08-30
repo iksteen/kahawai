@@ -38,7 +38,7 @@
 //! a stale number outlive the truth it described.
 
 use anyhow::Result;
-use sqlx::SqlitePool;
+use kahawai_sqlite::Database as SqlitePool;
 
 /// EWMA weight for a new sample. See the module doc.
 pub const ALPHA: f64 = 0.3;

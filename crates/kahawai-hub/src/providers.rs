@@ -116,7 +116,7 @@
 //!   Maintained by [`repick_triggers`].
 
 use anyhow::Result;
-use sqlx::SqlitePool;
+use kahawai_sqlite::Database as SqlitePool;
 
 /// One item as the chain walker sees it. The `anime_*` fields carry the
 /// selection context the anime chain needs (existing verified match,

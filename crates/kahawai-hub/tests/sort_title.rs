@@ -7,7 +7,7 @@
 //! deliberately mutates through RAW SQL as well as through the provider
 //! API — a hand-written UPDATE is exactly how the old merge drifted.
 
-use sqlx::SqlitePool;
+use kahawai_sqlite::Database as SqlitePool;
 
 /// What `sort_title` must equal at every moment, computed from scratch.
 /// If this and the stored column ever disagree, browse is sorting by

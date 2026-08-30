@@ -23,7 +23,11 @@ use tower::ServiceExt;
 
 const DAY: u64 = 24 * 60 * 60;
 
-async fn harness() -> (axum::Router, Arc<kahawai_hub::auth::Auth>, sqlx::SqlitePool) {
+async fn harness() -> (
+    axum::Router,
+    Arc<kahawai_hub::auth::Auth>,
+    kahawai_sqlite::Database,
+) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
@@ -112,7 +116,7 @@ fn id_added(days_ago: u64) -> String {
     ulid::Ulid::from_parts(now_ms() - days_ago * DAY * 1000, seq as u128).to_string()
 }
 
-async fn collection(db: &sqlx::SqlitePool, library: Option<&str>) -> String {
+async fn collection(db: &kahawai_sqlite::Database, library: Option<&str>) -> String {
     sqlx::query(
         "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
          VALUES('fixture','mediahost','fixture','fp')",
@@ -143,7 +147,7 @@ async fn collection(db: &sqlx::SqlitePool, library: Option<&str>) -> String {
     collection
 }
 
-async fn seed_show(db: &sqlx::SqlitePool, id: &str, title: &str, library: Option<&str>) {
+async fn seed_show(db: &kahawai_sqlite::Database, id: &str, title: &str, library: Option<&str>) {
     let collection = collection(db, library).await;
     sqlx::query(
         "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
@@ -164,7 +168,7 @@ async fn seed_show(db: &sqlx::SqlitePool, id: &str, title: &str, library: Option
 /// Episodes use a twenty-minute runtime so unfinished rows exercise the
 /// Continue Watching threshold as well as the boolean mark.
 async fn seed_episode(
-    db: &sqlx::SqlitePool,
+    db: &kahawai_sqlite::Database,
     show: &str,
     title: &str,
     season: i64,

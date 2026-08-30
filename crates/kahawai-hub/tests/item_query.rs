@@ -561,7 +561,7 @@ struct Fx {
     api: axum::Router,
     bearer: String,
     id: String,
-    db: sqlx::SqlitePool,
+    db: kahawai_sqlite::Database,
     subs_dir: std::path::PathBuf,
 }
 

@@ -4,8 +4,8 @@
 //! that property true.
 
 use kahawai_hub::providers::{Fields, chain_in_force, media_type_of_item, set_chain, store_answer};
+use kahawai_sqlite::Database as SqlitePool;
 use sqlx::Row;
-use sqlx::SqlitePool;
 
 async fn item(db: &SqlitePool, id: &str) {
     sqlx::query(
@@ -1481,7 +1481,7 @@ impl kahawai_hub::providers::Provider for DecliningProvider {
     }
     async fn enrich(
         &self,
-        _db: &SqlitePool,
+        _db: &kahawai_sqlite::Database,
         _item: &kahawai_hub::providers::ItemRef,
     ) -> anyhow::Result<kahawai_hub::providers::Outcome> {
         Ok(kahawai_hub::providers::Outcome::Declined)

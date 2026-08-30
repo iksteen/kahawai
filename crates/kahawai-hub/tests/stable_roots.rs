@@ -163,8 +163,9 @@ async fn level52_fixture() -> (tempfile::TempDir, sqlx::SqlitePool) {
 
 #[tokio::test]
 async fn migration_and_single_root_adoption_preserve_durable_state() {
-    let (_dir, db) = level52_fixture().await;
-    MIGRATOR.run(&db).await.unwrap();
+    let (dir, db) = level52_fixture().await;
+    db.close().await;
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());
     registry
         .announce_collection("host", "movies", "movies", &["/media/only".into()])

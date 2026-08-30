@@ -35,7 +35,7 @@ pub struct Harness {
     pub item_id: String,
     pub registry: Arc<Registry>,
     pub sessions: Arc<kahawai_hub::sessions::Sessions>,
-    pub db: sqlx::SqlitePool,
+    pub db: kahawai_sqlite::Database,
     /// Held so the collection root and PKI outlive the test.
     _root: tempfile::TempDir,
     _pki: tempfile::TempDir,

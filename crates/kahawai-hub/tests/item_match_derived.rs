@@ -11,7 +11,7 @@
 //! Nothing here calls the pick. If a single assertion needs one, the
 //! design has a hole in it.
 
-use sqlx::SqlitePool;
+use kahawai_sqlite::Database as SqlitePool;
 
 /// The assignment, re-derived from scratch: the winning candidate per
 /// item under the same rules, compared against what is stored.
