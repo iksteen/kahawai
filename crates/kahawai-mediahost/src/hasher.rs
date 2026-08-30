@@ -4,7 +4,7 @@
 //! scheduler, not this worker, decides admission and interruption. Urgent
 //! extraction registers immediate demand because a viewer is waiting.
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::Read;
 use std::sync::Arc;
 use std::time::Duration;
@@ -153,7 +153,7 @@ impl Bg {
     }
 
     fn cpu_heavy(self) -> bool {
-        matches!(self, Self::Geometry | Self::Ed2k | Self::Subs)
+        matches!(self, Self::Geometry | Self::Ed2k)
     }
 }
 
@@ -166,8 +166,8 @@ pub async fn run(
     retry_tx: Option<tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
     let mut queues = Queues::default();
-    let mut active = HashSet::new();
     let mut jobs = tokio::task::JoinSet::new();
+    let mut background_jobs = HashMap::new();
     let mut intake_open = true;
     loop {
         while let Ok(message) = rx.try_recv() {
@@ -179,7 +179,8 @@ pub async fn run(
             let collections = collections.clone();
             let tx = tx.clone();
             jobs.spawn(async move {
-                let resources = scheduler.resources([root_token.as_str()], true);
+                // Text subtitle extraction demuxes but does not decode.
+                let resources = scheduler.resources([root_token.as_str()], false);
                 let urgent: BlockingGuard = Arc::new(scheduler.enter_interactive(
                     resources,
                     format!("urgent subtitles {collection_id}/{path_rel}"),
@@ -194,7 +195,6 @@ pub async fn run(
                     &tx,
                 )
                 .await;
-                None
             });
         }
         while let Some(e) = queues.urgent_image.pop_front() {
@@ -203,7 +203,9 @@ pub async fn run(
                 let collections = collections.clone();
                 let tx = tx.clone();
                 jobs.spawn(async move {
-                    let resources = scheduler.resources([source.root_token.as_str()], true);
+                    // Sparse image-track extraction walks the container index;
+                    // decoding remains hub-owned OCR work.
+                    let resources = scheduler.resources([source.root_token.as_str()], false);
                     let urgent: BlockingGuard = Arc::new(scheduler.enter_interactive(
                         resources,
                         format!(
@@ -221,15 +223,11 @@ pub async fn run(
                         &tx,
                     )
                     .await;
-                    None
                 });
             }
         }
 
         for which in [Bg::Atts, Bg::Keyframe, Bg::Geometry, Bg::Ed2k, Bg::Subs] {
-            if active.contains(&which) {
-                continue;
-            }
             let tier = match which {
                 Bg::Ed2k => &mut queues.ed2k,
                 Bg::Subs => &mut queues.subs,
@@ -237,41 +235,39 @@ pub async fn run(
                 Bg::Keyframe => &mut queues.keys,
                 Bg::Geometry => &mut queues.geometry,
             };
-            let Some(key) = tier.q.pop_front() else {
-                continue;
-            };
-            let (collection_id, root_token, path_rel) = key.clone();
-            active.insert(which);
-            let scheduler = scheduler.clone();
-            let collections = collections.clone();
-            let tx = tx.clone();
-            let retry_tx = retry_tx.clone();
-            let owner = owner.clone();
-            jobs.spawn(async move {
-                let resources = scheduler.resources([root_token.as_str()], which.cpu_heavy());
-                let permit = scheduler
-                    .acquire(
-                        which.priority(),
-                        resources,
-                        owner,
-                        format!("{which:?} {collection_id}/{path_rel}"),
-                    )
-                    .await;
-                if let Ok(permit) = permit {
-                    run_background_job(
-                        which,
-                        &collections,
-                        &collection_id,
-                        &root_token,
-                        &path_rel,
-                        permit,
-                        &tx,
-                        retry_tx.as_ref(),
-                    )
-                    .await;
-                }
-                Some((which, key))
-            });
+            while let Some(key) = tier.q.pop_front() {
+                let (collection_id, root_token, path_rel) = key.clone();
+                let scheduler = scheduler.clone();
+                let collections = collections.clone();
+                let tx = tx.clone();
+                let retry_tx = retry_tx.clone();
+                let owner = owner.clone();
+                let task = jobs.spawn(async move {
+                    let resources = scheduler.resources([root_token.as_str()], which.cpu_heavy());
+                    let permit = scheduler
+                        .acquire(
+                            which.priority(),
+                            resources,
+                            owner,
+                            format!("{which:?} {collection_id}/{path_rel}"),
+                        )
+                        .await;
+                    if let Ok(permit) = permit {
+                        run_background_job(
+                            which,
+                            &collections,
+                            &collection_id,
+                            &root_token,
+                            &path_rel,
+                            permit,
+                            &tx,
+                            retry_tx.as_ref(),
+                        )
+                        .await;
+                    }
+                });
+                background_jobs.insert(task.id(), (which, key));
+            }
         }
 
         if !intake_open && jobs.is_empty() {
@@ -282,22 +278,27 @@ pub async fn run(
                 Some(message) => { intake(message, &mut queues); }
                 None => intake_open = false,
             },
-            completed = jobs.join_next(), if !jobs.is_empty() => {
-                match completed {
-                    Some(Ok(Some((which, key)))) => {
-                        active.remove(&which);
-                        let tier = match which {
-                            Bg::Ed2k => &mut queues.ed2k,
-                            Bg::Subs => &mut queues.subs,
-                            Bg::Atts => &mut queues.atts,
-                            Bg::Keyframe => &mut queues.keys,
-                            Bg::Geometry => &mut queues.geometry,
-                        };
-                        tier.seen.remove(&key);
+            completed = jobs.join_next_with_id(), if !jobs.is_empty() => {
+                let completed_id = match completed {
+                    Some(Ok((id, ()))) => Some(id),
+                    Some(Err(error)) => {
+                        let id = error.id();
+                        tracing::warn!(%error, "mediahost work task failed");
+                        Some(id)
                     }
-                    Some(Ok(None)) => {}
-                    Some(Err(error)) => tracing::warn!(%error, "mediahost work task failed"),
-                    None => {}
+                    None => None,
+                };
+                if let Some((which, key)) = completed_id
+                    .and_then(|id| background_jobs.remove(&id))
+                {
+                    let tier = match which {
+                        Bg::Ed2k => &mut queues.ed2k,
+                        Bg::Subs => &mut queues.subs,
+                        Bg::Atts => &mut queues.atts,
+                        Bg::Keyframe => &mut queues.keys,
+                        Bg::Geometry => &mut queues.geometry,
+                    };
+                    tier.seen.remove(&key);
                 }
             }
         }
@@ -315,7 +316,6 @@ async fn run_background_job(
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
     retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
 ) {
-    let background: BlockingGuard = Arc::new(permit.clone());
     match which {
         Bg::Ed2k => {
             let result = hash_one(collections, collection_id, root_token, path_rel, permit).await;
@@ -350,6 +350,7 @@ async fn run_background_job(
             .await;
         }
         Bg::Subs => {
+            let background: BlockingGuard = Arc::new(permit.clone());
             extract_and_send(
                 collections,
                 collection_id,
@@ -362,6 +363,7 @@ async fn run_background_job(
             .await;
         }
         Bg::Atts => {
+            let background: BlockingGuard = Arc::new(permit);
             declare_and_send(
                 collections,
                 collection_id,
@@ -374,6 +376,7 @@ async fn run_background_job(
             .await;
         }
         Bg::Keyframe => {
+            let background: BlockingGuard = Arc::new(permit);
             measure_keyframes_and_send(
                 collections,
                 collection_id,
@@ -386,6 +389,7 @@ async fn run_background_job(
             .await;
         }
         Bg::Geometry => {
+            let background: BlockingGuard = Arc::new(permit);
             probe_geometry_and_send(
                 collections,
                 collection_id,

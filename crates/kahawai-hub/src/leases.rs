@@ -42,8 +42,6 @@ pub fn new_lease_token() -> String {
 struct LeaseInner {
     req_tx: mpsc::Sender<Result<ReadRequest, tonic::Status>>,
     chunk_rx: tokio::sync::Mutex<mpsc::Receiver<ByteChunk>>,
-    /// All-in-one foreground activity, held until the last lease clone drops.
-    _activity_guard: Option<Box<dyn Send + Sync>>,
 }
 
 /// Cloneable handle; all clones share one sequential byte channel.
@@ -127,20 +125,16 @@ impl Lease {
     /// serving task speaks the same ReadRequest/ByteChunk protocol so
     /// every consumer of Lease works unchanged.
     pub fn local(path: std::path::PathBuf) -> Lease {
-        Self::local_guarded(path, None, None)
+        Self::local_guarded(path, None)
     }
 
-    pub fn local_guarded(
-        path: std::path::PathBuf,
-        activity_guard: Option<Box<dyn Send + Sync>>,
-        background_admission: Option<LocalAdmission>,
-    ) -> Lease {
+    pub fn local_guarded(path: std::path::PathBuf, admission: Option<LocalAdmission>) -> Lease {
         let (req_tx, mut req_rx) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(4);
         let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
         tokio::spawn(async move {
             const CHUNK: usize = 256 * 1024;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let _open_permit = match &background_admission {
+            let open_permit = match &admission {
                 Some(admit) => match admit().await {
                     Ok(permit) => Some(permit),
                     Err(error) => {
@@ -158,7 +152,9 @@ impl Lease {
                 },
                 None => None,
             };
-            let mut file = match tokio::fs::File::open(&path).await {
+            let opened = tokio::fs::File::open(&path).await;
+            drop(open_permit);
+            let mut file = match opened {
                 Ok(f) => f,
                 Err(e) => {
                     let _ = chunk_tx
@@ -173,17 +169,55 @@ impl Lease {
                     return;
                 }
             };
+            let metadata_permit = match &admission {
+                Some(admit) => match admit().await {
+                    Ok(permit) => Some(permit),
+                    Err(error) => {
+                        let _ = chunk_tx
+                            .send(ByteChunk {
+                                lease_token: String::new(),
+                                offset: 0,
+                                data: Vec::new(),
+                                eof: false,
+                                error: format!("local metadata admission failed: {error:#}"),
+                            })
+                            .await;
+                        return;
+                    }
+                },
+                None => None,
+            };
             let size = file.metadata().await.map(|m| m.len()).unwrap_or(0);
-            drop(_open_permit);
+            drop(metadata_permit);
             while let Some(Ok(req)) = req_rx.recv().await {
                 let end = req.offset.saturating_add(req.len).min(size);
                 let mut cur = req.offset.min(size);
-                if file.seek(std::io::SeekFrom::Start(cur)).await.is_err() {
+                let seek_permit = match &admission {
+                    Some(admit) => match admit().await {
+                        Ok(permit) => Some(permit),
+                        Err(error) => {
+                            let _ = chunk_tx
+                                .send(ByteChunk {
+                                    lease_token: String::new(),
+                                    offset: cur,
+                                    data: Vec::new(),
+                                    eof: false,
+                                    error: format!("local seek admission failed: {error:#}"),
+                                })
+                                .await;
+                            return;
+                        }
+                    },
+                    None => None,
+                };
+                let seek = file.seek(std::io::SeekFrom::Start(cur)).await;
+                drop(seek_permit);
+                if seek.is_err() {
                     break;
                 }
                 let mut buf = vec![0u8; CHUNK];
                 while cur < end {
-                    let _read_permit = match &background_admission {
+                    let read_permit = match &admission {
                         Some(admit) => match admit().await {
                             Ok(permit) => Some(permit),
                             Err(error) => {
@@ -218,6 +252,7 @@ impl Lease {
                             return;
                         }
                     };
+                    drop(read_permit);
                     if chunk_tx
                         .send(ByteChunk {
                             lease_token: String::new(),
@@ -251,7 +286,6 @@ impl Lease {
         Lease(Arc::new(LeaseInner {
             req_tx,
             chunk_rx: tokio::sync::Mutex::new(chunk_rx),
-            _activity_guard: activity_guard,
         }))
     }
 }
@@ -294,9 +328,62 @@ impl Leases {
         let lease = Lease(Arc::new(LeaseInner {
             req_tx,
             chunk_rx: tokio::sync::Mutex::new(chunk_rx),
-            _activity_guard: None,
         }));
         waiter.send(lease).ok()?;
         Some((ReceiverStream::new(req_rx), chunk_tx))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    struct CountedOperation(Arc<AtomicUsize>);
+
+    impl Drop for CountedOperation {
+        fn drop(&mut self) {
+            self.0.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_stalled_consumer_does_not_hold_local_storage_admission() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.mkv");
+        let file = std::fs::File::create(&path).unwrap();
+        file.set_len(16 * 1024 * 1024).unwrap();
+
+        let active = Arc::new(AtomicUsize::new(0));
+        let entered = Arc::new(AtomicUsize::new(0));
+        let admission: LocalAdmission = {
+            let active = active.clone();
+            let entered = entered.clone();
+            Arc::new(move || {
+                active.fetch_add(1, Ordering::SeqCst);
+                entered.fetch_add(1, Ordering::SeqCst);
+                let guard = CountedOperation(active.clone());
+                Box::pin(async move { Ok(Box::new(guard) as Box<dyn Send + Sync>) })
+            })
+        };
+
+        let lease = Lease::local_guarded(path, Some(admission));
+        // Keep the stream alive without consuming it. Both bounded channels
+        // fill, leaving the producer blocked on delivery rather than I/O.
+        let _stream = lease.read_range(0, 16 * 1024 * 1024);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            loop {
+                if entered.load(Ordering::SeqCst) >= 12 && active.load(Ordering::SeqCst) == 0 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("local producer did not reach downstream backpressure");
+
+        assert_eq!(active.load(Ordering::SeqCst), 0);
+        assert!(entered.load(Ordering::SeqCst) >= 12);
+        drop(lease);
     }
 }

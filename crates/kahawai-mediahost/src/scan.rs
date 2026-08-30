@@ -31,19 +31,40 @@ pub(crate) enum ScanOutcome {
     RootAdoptionAcknowledged,
 }
 
+#[derive(Clone)]
+pub(crate) struct ScanAdmission {
+    scheduler: crate::scheduler::Scheduler,
+    resources: crate::scheduler::Resources,
+    priority: crate::scheduler::Priority,
+    owner: Option<String>,
+}
+
+impl ScanAdmission {
+    pub(crate) fn new(
+        scheduler: crate::scheduler::Scheduler,
+        resources: crate::scheduler::Resources,
+        priority: crate::scheduler::Priority,
+        owner: Option<String>,
+    ) -> Self {
+        Self {
+            scheduler,
+            resources,
+            priority,
+            owner,
+        }
+    }
+}
+
 async fn scan_blocking<T, F>(permit: &crate::scheduler::JobPermit, work: F) -> Result<T>
 where
     T: Send + 'static,
-    F: FnOnce() -> T + Send + 'static,
+    F: FnOnce(crate::scheduler::JobPermit) -> T + Send + 'static,
 {
     permit.checkpoint().await?;
     let permit = permit.clone();
-    tokio::task::spawn_blocking(move || {
-        let _permit = permit;
-        work()
-    })
-    .await
-    .context("scan blocking task failed")
+    tokio::task::spawn_blocking(move || work(permit))
+        .await
+        .context("scan blocking task failed")
 }
 
 /// Protocol-4 scan: reconcile the filesystem into the mediahost's own durable
@@ -66,26 +87,32 @@ pub(crate) async fn scan_local_collection(
         let root_token = configured_root.token;
         let root = configured_root.path;
         let root_for_walk = root.clone();
-        let paths =
-            match scan_blocking(&permit, move || walk(&root_for_walk, include_audio)).await? {
-                Ok(paths) => paths,
-                Err(error) => {
-                    failed += 1;
-                    unavailable_roots.insert(root_token.clone());
-                    tracing::warn!(collection = %cfg.name, %root_token,
+        let paths = match scan_blocking(&permit, move |permit| {
+            walk_interruptible(&root_for_walk, include_audio, || {
+                permit.checkpoint_blocking()
+            })
+        })
+        .await?
+        {
+            Ok(paths) => paths,
+            Err(error) => {
+                failed += 1;
+                unavailable_roots.insert(root_token.clone());
+                tracing::warn!(collection = %cfg.name, %root_token,
                     error = format!("{error:#}"), "collection root unavailable");
-                    continue;
-                }
-            };
+                continue;
+            }
+        };
         for batch in paths.chunks(250) {
             let batch = batch.to_vec();
             let known = known.clone();
             let force_dirs = force_dirs.clone();
             let batch_root_token = root_token.clone();
-            let verdicts = scan_blocking(&permit, move || {
+            let verdicts = scan_blocking(&permit, move |permit| {
                 batch
                     .into_iter()
                     .map(|(root_local, path)| {
+                        permit.checkpoint_blocking()?;
                         let rel = path
                             .strip_prefix(&root_local)
                             .unwrap_or(&path)
@@ -111,11 +138,11 @@ pub(crate) async fn scan_local_collection(
                                                 == stored_sidecar_sig(&old.streams_json)
                                     })
                                 });
-                        (root_local, path, rel, unchanged)
+                        Ok((root_local, path, rel, unchanged))
                     })
-                    .collect::<Vec<_>>()
+                    .collect::<Result<Vec<_>>>()
             })
-            .await?;
+            .await??;
             let mut seen_batch = Vec::new();
             for (root_local, path, rel, unchanged) in verdicts {
                 if unchanged {
@@ -124,7 +151,7 @@ pub(crate) async fn scan_local_collection(
                     continue;
                 }
                 let (root2, path2) = (root_local.clone(), path.clone());
-                match scan_blocking(&permit, move || inspect(&root2, &path2)).await? {
+                match scan_blocking(&permit, move |_permit| inspect(&root2, &path2)).await? {
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                         scanned += 1;
                         catalog
@@ -216,7 +243,7 @@ pub(crate) async fn scan_collection(
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     sync_version: u64,
-    permit: crate::scheduler::JobPermit,
+    admission: ScanAdmission,
 ) -> Result<ScanOutcome> {
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
     // Live progress (HUB-35/HUB-26): a start beacon (after the in-sync
@@ -268,6 +295,18 @@ pub(crate) async fn scan_collection(
             break;
         }
     }
+    // The manifest is control-plane input, not media work. Reserving CPU and
+    // storage while a hub produces it can stall unrelated local work for an
+    // unbounded network/database wait.
+    let permit = admission
+        .scheduler
+        .acquire(
+            admission.priority,
+            admission.resources,
+            admission.owner,
+            format!("catalog scan {}", cfg.name),
+        )
+        .await?;
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::ScanProgress(ScanProgress {
             collection_id: cfg.name.clone(),
@@ -287,7 +326,11 @@ pub(crate) async fn scan_collection(
     for configured_root in cfg.resolved_roots() {
         let root_token = configured_root.token;
         let root = configured_root.path;
-        let paths = match scan_blocking(&permit, move || walk(&root, include_audio)).await? {
+        let paths = match scan_blocking(&permit, move |permit| {
+            walk_interruptible(&root, include_audio, || permit.checkpoint_blocking())
+        })
+        .await?
+        {
             Ok(paths) => paths,
             Err(error) => {
                 // One unavailable mount must not make another root stand in
@@ -331,10 +374,11 @@ pub(crate) async fn scan_collection(
             let force2 = force.clone();
             let compare2 = compare_sidecars;
             let verdicts: Vec<((std::path::PathBuf, std::path::PathBuf), String, bool)> =
-                scan_blocking(&permit, move || {
+                scan_blocking(&permit, move |permit| {
                     stat_batch
                         .into_iter()
                         .map(|(root_local, path)| {
+                            permit.checkpoint_blocking()?;
                             let rel = path
                                 .strip_prefix(&root_local)
                                 .unwrap_or(&path)
@@ -366,11 +410,11 @@ pub(crate) async fn scan_collection(
                                                 || &sidecar_sig(&root_local, &path) == sidecars)
                                     },
                                 );
-                            ((root_local, path), rel, unchanged)
+                            Ok(((root_local, path), rel, unchanged))
                         })
-                        .collect()
+                        .collect::<Result<Vec<_>>>()
                 })
-                .await?;
+                .await??;
             for ((root_local, path), rel, unchanged) in verdicts {
                 if unchanged {
                     skipped += 1;
@@ -384,7 +428,7 @@ pub(crate) async fn scan_collection(
                     continue;
                 }
                 let (r, p) = (root_local.clone(), path.clone());
-                let record = scan_blocking(&permit, move || inspect(&r, &p)).await?;
+                let record = scan_blocking(&permit, move |_permit| inspect(&r, &p)).await?;
                 match record {
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                         scanned += 1;
@@ -496,9 +540,19 @@ async fn send_upsert(
 }
 
 /// Media files under `root`, sorted for deterministic batches.
+#[cfg(test)]
 fn walk(root: &Path, include_audio: bool) -> Result<Vec<(PathBuf, PathBuf)>> {
+    walk_interruptible(root, include_audio, || Ok(()))
+}
+
+fn walk_interruptible(
+    root: &Path,
+    include_audio: bool,
+    mut checkpoint: impl FnMut() -> Result<()>,
+) -> Result<Vec<(PathBuf, PathBuf)>> {
     let mut out = Vec::new();
     for entry in walkdir::WalkDir::new(root).follow_links(false) {
+        checkpoint()?;
         let entry = entry?;
         if !entry.file_type().is_file() {
             continue;
@@ -780,7 +834,7 @@ fn sum_u64_le(bytes: &[u8]) -> u64 {
 mod tests {
     use super::*;
 
-    async fn scan_permit(cfg: &CollectionConfig) -> crate::scheduler::JobPermit {
+    fn scan_admission(cfg: &CollectionConfig) -> ScanAdmission {
         let scheduler =
             crate::scheduler::Scheduler::new(std::slice::from_ref(cfg), &Default::default())
                 .unwrap();
@@ -788,15 +842,13 @@ mod tests {
             .resolved_roots()
             .map(|root| root.token)
             .collect::<Vec<_>>();
-        scheduler
-            .acquire(
-                crate::scheduler::Priority::CatalogFreshness,
-                scheduler.resources(roots.iter().map(String::as_str), true),
-                None,
-                "test scan",
-            )
-            .await
-            .unwrap()
+        let resources = scheduler.resources(roots.iter().map(String::as_str), true);
+        ScanAdmission::new(
+            scheduler,
+            resources,
+            crate::scheduler::Priority::CatalogFreshness,
+            None,
+        )
     }
 
     /// The two sides compare this as a STRING, so they must spell it the
@@ -966,9 +1018,9 @@ id: nl, index: 1
             .unwrap();
         drop(manifest_tx);
 
-        let permit = scan_permit(&cfg).await;
+        let admission = scan_admission(&cfg);
         assert_eq!(
-            scan_collection(cfg, tx, manifest_rx, Default::default(), 1, permit,)
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 1, admission,)
                 .await
                 .unwrap(),
             ScanOutcome::Completed
@@ -1026,9 +1078,9 @@ id: nl, index: 1
             .unwrap();
         drop(manifest_tx);
 
-        let permit = scan_permit(&cfg).await;
+        let admission = scan_admission(&cfg);
         assert_eq!(
-            scan_collection(cfg, tx, manifest_rx, Default::default(), 9, permit,)
+            scan_collection(cfg, tx, manifest_rx, Default::default(), 9, admission,)
                 .await
                 .unwrap(),
             ScanOutcome::Completed
@@ -1079,7 +1131,7 @@ id: nl, index: 1
         let (release_tx, release_rx) = std::sync::mpsc::channel();
         let task_guard = permit.clone();
         let task = tokio::spawn(async move {
-            scan_blocking(&task_guard, move || {
+            scan_blocking(&task_guard, move |_permit| {
                 let _ = started_tx.send(());
                 let _ = release_rx.recv();
             })

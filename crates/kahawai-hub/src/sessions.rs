@@ -2056,13 +2056,23 @@ impl Sessions {
                 .and_then(|(id, resolve)| (id == module_id).then(|| resolve.clone()))
         };
         if let Some(resolve) = local {
-            let activity_guard = (reader == Reader::Viewer)
+            let foreground_admission = (reader == Reader::Viewer)
                 .then(|| {
-                    self.local_activity
-                        .lock()
-                        .unwrap()
-                        .as_ref()
-                        .map(|enter| enter(root_token))
+                    self.local_activity.lock().unwrap().as_ref().map(|enter| {
+                        let enter = enter.clone();
+                        let root_token = root_token.to_string();
+                        std::sync::Arc::new(move || {
+                            let guard = enter(&root_token);
+                            Box::pin(async move { Ok(guard) })
+                                as std::pin::Pin<
+                                    Box<
+                                        dyn std::future::Future<
+                                                Output = Result<Box<dyn Send + Sync>>,
+                                            > + Send,
+                                    >,
+                                >
+                        }) as LocalAdmission
+                    })
                 })
                 .flatten();
             let background_admission = (reader == Reader::Sweep)
@@ -2074,7 +2084,8 @@ impl Sessions {
                         .map(|admit| admit(root_token))
                 })
                 .flatten();
-            let resolution_permit = match &background_admission {
+            let admission = foreground_admission.or(background_admission);
+            let resolution_permit = match &admission {
                 Some(admit) => Some(admit().await?),
                 None => None,
             };
@@ -2087,11 +2098,7 @@ impl Sessions {
             .await
             .context("local media path resolution task failed")?;
             drop(resolution_permit);
-            return Ok(Lease::local_guarded(
-                path?,
-                activity_guard,
-                background_admission,
-            ));
+            return Ok(Lease::local_guarded(path?, admission));
         }
         let token = new_lease_token();
         let msg = HubToHost {
@@ -4307,7 +4314,7 @@ mod lease_purpose_tests {
     }
 
     #[tokio::test]
-    async fn a_local_lease_holds_mediahost_activity_until_drop() {
+    async fn a_local_viewer_is_admitted_only_around_filesystem_operations() {
         struct Guard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -4321,11 +4328,18 @@ mod lease_purpose_tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = crate::registry::Registry::new(db, Default::default());
         let sessions = Sessions::new(dir.path().join("sessions"));
-        sessions.set_local_source("local", move |_, _, _| Ok(source.clone()));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let entered_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolving = active.clone();
+        sessions.set_local_source("local", move |_, _, _| {
+            assert_eq!(resolving.load(std::sync::atomic::Ordering::Relaxed), 1);
+            Ok(source.clone())
+        });
         let entered = active.clone();
+        let counted = entered_count.clone();
         sessions.set_local_activity(move |_| {
             entered.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             Box::new(Guard(entered.clone()))
         });
 
@@ -4333,9 +4347,19 @@ mod lease_purpose_tests {
             .open_lease(&registry, "local", "c", "r", "episode.mkv", Reader::Viewer)
             .await
             .unwrap();
-        assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 1);
-        drop(lease);
+        let mut bytes = lease.read_range(0, 5);
+        let mut read = Vec::new();
+        use tokio_stream::StreamExt as _;
+        while let Some(chunk) = bytes.next().await {
+            read.extend_from_slice(&chunk.unwrap());
+        }
+        assert_eq!(read, b"bytes");
+        assert!(
+            entered_count.load(std::sync::atomic::Ordering::Relaxed) >= 4,
+            "path resolution, open/metadata, seek and read must each be admitted"
+        );
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        drop(lease);
     }
 
     #[tokio::test]

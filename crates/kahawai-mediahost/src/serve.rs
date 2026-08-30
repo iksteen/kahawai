@@ -15,6 +15,26 @@ use crate::scheduler::{Priority, Scheduler};
 
 const CHUNK: usize = 256 * 1024;
 
+async fn enter_operation(
+    scheduler: &Scheduler,
+    resources: &crate::scheduler::Resources,
+    background: bool,
+    owner: Option<String>,
+    label: String,
+) -> Result<Box<dyn Send + Sync>> {
+    if background {
+        Ok(Box::new(
+            scheduler
+                .acquire(Priority::LocalMetadata, resources.clone(), owner, label)
+                .await?,
+        ))
+    } else {
+        Ok(Box::new(
+            scheduler.enter_interactive(resources.clone(), label),
+        ))
+    }
+}
+
 /// Resolve an OpenRead against the configured collections, refusing
 /// anything that escapes a collection root (NFR-4).
 pub fn resolve_path(collections: &[CollectionConfig], req: &OpenRead) -> Result<PathBuf> {
@@ -104,32 +124,19 @@ pub async fn serve_request_scheduled(
     let root_token = source.root_token.clone();
     let background = request.background;
     let resources = scheduler.resources([root_token.as_str()], false);
-    let _interactive = (!background).then(|| {
-        scheduler.enter_interactive(
-            resources.clone(),
-            format!("viewer path resolution {root_token}"),
-        )
-    });
-    let _resolution_permit = if background {
-        Some(
-            scheduler
-                .acquire(
-                    Priority::LocalMetadata,
-                    resources,
-                    owner.clone(),
-                    format!("background path resolution {root_token}"),
-                )
-                .await?,
-        )
-    } else {
-        None
-    };
+    let resolution_permit = enter_operation(
+        &scheduler,
+        &resources,
+        background,
+        owner.clone(),
+        format!("path resolution {root_token}"),
+    )
+    .await?;
     let lease_token = request.lease_token.clone();
     let path = tokio::task::spawn_blocking(move || resolve_path(&collections, &request))
         .await
         .context("path resolution task failed")?;
-    drop(_resolution_permit);
-    drop(_interactive);
+    drop(resolution_permit);
     serve_lease_scheduled(
         channel,
         lease_token,
@@ -155,33 +162,26 @@ pub async fn serve_lease_scheduled(
     let mut client = MediahostLinkClient::new(channel);
     let (tx, rx) = tokio::sync::mpsc::channel::<ByteChunk>(8);
     let resources = scheduler.resources([root_token.as_str()], false);
-    let _interactive = (!background).then(|| {
-        scheduler.enter_interactive(resources.clone(), format!("viewer read {root_token}"))
-    });
 
     // First chunk binds the token; carry a resolution error if there is one.
-    let (bind_error, file) = match path {
+    let (bind_error, file, size) = match path {
         Ok(p) => {
-            let _open_permit = if background {
-                Some(
-                    scheduler
-                        .acquire(
-                            Priority::LocalMetadata,
-                            resources.clone(),
-                            owner.clone(),
-                            format!("background open {root_token}"),
-                        )
-                        .await?,
-                )
-            } else {
-                None
-            };
+            let open_permit = enter_operation(
+                &scheduler,
+                &resources,
+                background,
+                owner.clone(),
+                format!("open and stat {root_token}"),
+            )
+            .await?;
             let f = tokio::fs::File::open(&p)
                 .await
                 .with_context(|| format!("opening {}", p.display()))?;
-            (String::new(), Some(f))
+            let size = f.metadata().await?.len();
+            drop(open_permit);
+            (String::new(), Some(f), size)
         }
-        Err(e) => (format!("{e:#}"), None),
+        Err(e) => (format!("{e:#}"), None, 0),
     };
     tx.send(ByteChunk {
         lease_token: lease_token.clone(),
@@ -201,33 +201,33 @@ pub async fn serve_lease_scheduled(
     let Some(mut file) = file else {
         return Ok(()); // error delivered; hub will drop the lease
     };
-    let size = file.metadata().await?.len();
 
     while let Some(req) = requests.message().await? {
-        let permit = if background {
-            Some(
-                scheduler
-                    .acquire(
-                        Priority::LocalMetadata,
-                        resources.clone(),
-                        owner.clone(),
-                        format!("background read {root_token}"),
-                    )
-                    .await?,
-            )
-        } else {
-            None
-        };
         let end = req.offset.saturating_add(req.len).min(size);
         let mut cur = req.offset.min(size);
+        let seek_permit = enter_operation(
+            &scheduler,
+            &resources,
+            background,
+            owner.clone(),
+            format!("seek {root_token}"),
+        )
+        .await?;
         file.seek(std::io::SeekFrom::Start(cur)).await?;
+        drop(seek_permit);
         let mut buf = vec![0u8; CHUNK];
         while cur < end {
-            if let Some(permit) = &permit {
-                permit.checkpoint().await?;
-            }
+            let read_permit = enter_operation(
+                &scheduler,
+                &resources,
+                background,
+                owner.clone(),
+                format!("read {root_token}"),
+            )
+            .await?;
             let want = ((end - cur) as usize).min(CHUNK);
             let n = file.read(&mut buf[..want]).await?;
+            drop(read_permit);
             if n == 0 {
                 break;
             }

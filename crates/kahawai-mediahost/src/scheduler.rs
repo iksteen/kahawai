@@ -22,6 +22,7 @@ use anyhow::{Result, bail};
 use kahawai_core::media::{CollectionConfig, MediahostSchedulerConfig};
 
 const FALLBACK_DOMAIN: &str = "auto:unknown";
+const MAX_DEMAND_HINT_TTL: std::time::Duration = std::time::Duration::from_secs(60 * 60);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 #[repr(u8)]
@@ -204,10 +205,29 @@ impl Scheduler {
         let mut override_roots = HashMap::new();
         let mut io_capacity = BTreeMap::new();
         for domain in &config.io_domains {
+            anyhow::ensure!(
+                !domain.name.trim().is_empty(),
+                "scheduler I/O domain names must not be empty"
+            );
+            anyhow::ensure!(
+                domain.max_concurrent > 0,
+                "scheduler I/O domain {:?} must admit at least one operation",
+                domain.name
+            );
             let key = format!("config:{}", domain.name);
-            io_capacity.insert(key.clone(), domain.max_concurrent);
+            anyhow::ensure!(
+                io_capacity
+                    .insert(key.clone(), domain.max_concurrent)
+                    .is_none(),
+                "scheduler I/O domain names must be unique: {:?}",
+                domain.name
+            );
             for root in &domain.roots {
-                override_roots.insert(root.clone(), key.clone());
+                anyhow::ensure!(
+                    override_roots.insert(root.clone(), key.clone()).is_none(),
+                    "scheduler root {} occurs in more than one I/O domain",
+                    root.display()
+                );
             }
         }
 
@@ -280,7 +300,6 @@ impl Scheduler {
         label: impl Into<String>,
         job: &kahawai_proto::v1::DetectSegments,
     ) -> Result<JobPermit> {
-        let priority = self.segment_priority(job);
         let demand_sources = job
             .episodes
             .iter()
@@ -293,7 +312,9 @@ impl Scheduler {
                 )
             })
             .collect();
-        self.acquire_with_sources(priority, resources, owner, label, demand_sources)
+        // Demand is always an expiring effective priority. Keeping Segments as
+        // the base is what lets an initial hint demote again after its TTL.
+        self.acquire_with_sources(Priority::Segments, resources, owner, label, demand_sources)
             .await
     }
 
@@ -417,7 +438,7 @@ impl Scheduler {
                 root_token.to_string(),
                 path_rel.to_string(),
             ),
-            now + ttl,
+            now + ttl.min(MAX_DEMAND_HINT_TTL),
         );
         let key = (
             collection_id.to_string(),
@@ -436,27 +457,6 @@ impl Scheduler {
         }
         request_preemption(&mut state);
         dispatch(&mut state);
-    }
-
-    pub fn segment_priority(&self, job: &kahawai_proto::v1::DetectSegments) -> Priority {
-        let mut state = self.inner.state.lock().unwrap();
-        let now = std::time::Instant::now();
-        state.hints.retain(|_, expires| *expires > now);
-        let demanded = job.episodes.iter().any(|episode| {
-            let Some(source) = &episode.source else {
-                return false;
-            };
-            state.hints.keys().any(|(_, collection, root, path)| {
-                collection == &job.collection_id
-                    && root == &source.root_token
-                    && path == &source.path_rel
-            })
-        });
-        if demanded {
-            Priority::Demand
-        } else {
-            Priority::Segments
-        }
     }
 }
 
@@ -1057,5 +1057,66 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_initial_hint_demotes_after_its_ttl() {
+        let (_temp, scheduler, a, _) = scheduler();
+        let blocker = scheduler.enter_interactive(scheduler.resources([a.as_str()], false), "hold");
+        scheduler.hint_segment(
+            "hub:a",
+            "series",
+            &a,
+            "episode.mkv",
+            std::time::Duration::from_millis(1),
+        );
+        let job = kahawai_proto::v1::DetectSegments {
+            request_id: "season".into(),
+            collection_id: "series".into(),
+            episodes: vec![kahawai_proto::v1::SegmentEpisode {
+                source: Some(kahawai_proto::v1::SourcePath::new(&a, "episode.mkv")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let queued_scheduler = scheduler.clone();
+        let queued_root = a.clone();
+        let queued = tokio::spawn(async move {
+            queued_scheduler
+                .acquire_segments(
+                    queued_scheduler.resources([queued_root.as_str()], false),
+                    Some("hub:a".into()),
+                    "queued season",
+                    &job,
+                )
+                .await
+                .unwrap()
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(
+            scheduler.inner.state.lock().unwrap().pending[0].priority,
+            Priority::Demand
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        {
+            let mut state = scheduler.inner.state.lock().unwrap();
+            request_preemption(&mut state);
+            assert_eq!(state.pending[0].priority, Priority::Segments);
+        }
+        drop(blocker);
+        queued.await.unwrap();
+    }
+
+    #[test]
+    fn direct_construction_rejects_an_io_domain_that_can_never_admit_work() {
+        let config = MediahostSchedulerConfig {
+            cpu_slots: 1,
+            io_domains: vec![MediahostIoDomainConfig {
+                name: "stopped".into(),
+                roots: Vec::new(),
+                max_concurrent: 0,
+            }],
+        };
+        assert!(Scheduler::new(&[], &config).is_err());
     }
 }

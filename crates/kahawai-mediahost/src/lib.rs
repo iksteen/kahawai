@@ -340,10 +340,13 @@ impl LocalRuntime {
                         Err(_) => return,
                     };
                     let watcher = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
                         use notify::Watcher as _;
                         let mut watcher = watcher;
                         for (_, root) in &watch_roots {
+                            if let Err(error) = permit.checkpoint_blocking() {
+                                tracing::warn!(%error, "filesystem watch installation cancelled");
+                                return watcher;
+                            }
                             if let Err(error) =
                                 watcher.watch(root, notify::RecursiveMode::Recursive)
                             {
@@ -1713,18 +1716,12 @@ impl Engine {
                 } else {
                     scheduler::Priority::CatalogFreshness
                 };
-                let permit = match scan_scheduler
-                    .acquire(
-                        priority,
-                        resources,
-                        Some("legacy-hub".into()),
-                        format!("catalog scan {}", c.name),
-                    )
-                    .await
-                {
-                    Ok(permit) => permit,
-                    Err(_) => return,
-                };
+                let admission = scan::ScanAdmission::new(
+                    scan_scheduler.clone(),
+                    resources,
+                    priority,
+                    Some("legacy-hub".into()),
+                );
                 loop {
                     match scan_cycle(
                         &c,
@@ -1733,7 +1730,7 @@ impl Engine {
                         force_dirs.clone(),
                         handshake,
                         next,
-                        permit.clone(),
+                        admission.clone(),
                     )
                     .await
                     {
@@ -1829,10 +1826,13 @@ impl Engine {
                         Err(_) => return,
                     };
                     let watcher = tokio::task::spawn_blocking(move || {
-                        let _permit = permit;
                         use notify::Watcher as _;
                         let mut watcher = watcher;
                         for (_, root) in &watch_roots {
+                            if let Err(e) = permit.checkpoint_blocking() {
+                                tracing::warn!(error = %e, "filesystem watch installation cancelled");
+                                return watcher;
+                            }
                             if let Err(e) = watcher.watch(root, notify::RecursiveMode::Recursive) {
                                 tracing::warn!(root = %root.display(), error = %e, "watch failed (sweeps still cover this root)");
                             }
@@ -2299,7 +2299,7 @@ async fn scan_cycle(
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     handshake_version: u64,
     report_version: u64,
-    permit: scheduler::JobPermit,
+    admission: scan::ScanAdmission,
 ) -> Result<scan::ScanOutcome> {
     tx.send(HostToHub {
         msg: Some(host_to_hub::Msg::AnnounceCollection(AnnounceCollection {
@@ -2334,7 +2334,7 @@ async fn scan_cycle(
         mrx,
         force_dirs,
         report_version,
-        permit,
+        admission,
     )
     .await
 }

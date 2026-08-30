@@ -5578,16 +5578,19 @@ async fn up_next(
         for row in &rows {
             separated.push_bind(row.get::<String, _>("id"));
         }
-        separated.push_unseparated(") ORDER BY ps.item_id,ps.id");
+        separated.push_unseparated(
+            ") ORDER BY ps.item_id,ps.module_id,f.mtime_unix DESC,f.path_rel,ps.id",
+        );
         let hint_rows = hints.build().fetch_all(db).await.map_err(internal)?;
         let mut hinted = std::collections::HashSet::new();
         for row in hint_rows {
             let item_id: String = row.get("item_id");
-            if !hinted.insert(item_id) {
+            let module_id: String = row.get("module_id");
+            if !hinted.insert((item_id, module_id.clone())) {
                 continue;
             }
             state.registry.hint_discovery(
-                row.get("module_id"),
+                &module_id,
                 "segments",
                 row.get("collection_id"),
                 kahawai_proto::v1::SourcePath::new(
