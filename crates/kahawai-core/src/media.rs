@@ -474,6 +474,41 @@ pub struct CollectionConfig {
     pub roots: Vec<std::path::PathBuf>,
 }
 
+/// Process-local admission limits for mediahost filesystem and analysis work.
+/// Paths in `io_domains` are normalized against the configuration directory
+/// by `kahawai-runtime`, exactly like collection roots.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct MediahostSchedulerConfig {
+    /// Concurrent jobs whose GStreamer work can consume a decoder's worth of
+    /// CPU. One is deliberately conservative: decoders may fan out internally.
+    pub cpu_slots: usize,
+    /// Operator corrections to automatic filesystem-device grouping.
+    pub io_domains: Vec<MediahostIoDomainConfig>,
+}
+
+impl Default for MediahostSchedulerConfig {
+    fn default() -> Self {
+        Self {
+            cpu_slots: 1,
+            io_domains: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct MediahostIoDomainConfig {
+    pub name: String,
+    pub roots: Vec<std::path::PathBuf>,
+    #[serde(default = "one_io_job")]
+    pub max_concurrent: usize,
+}
+
+const fn one_io_job() -> usize {
+    1
+}
+
 /// Exact identity of one configured collection root.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CollectionRoot {

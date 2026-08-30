@@ -6,6 +6,7 @@ pub mod ed2k;
 pub mod hasher;
 pub mod loudness;
 pub mod scan;
+pub mod scheduler;
 pub mod segments;
 pub mod serve;
 

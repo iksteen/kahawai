@@ -224,6 +224,8 @@ pub struct MediahostConfig {
     /// detector is the filesystem watcher — which network mounts like
     /// sshfs can't serve, so the sweep catches what inotify can't see.
     pub rescan_minutes: u64,
+    /// Process-local media work admission and storage-domain overrides.
+    pub scheduler: kahawai_core::media::MediahostSchedulerConfig,
     /// Legacy decoder-demotion input. When `[gstreamer]` is absent this is
     /// merged with `[transcoder].demote_decoders`; an explicit global section
     /// overrides both. Kept so deployed configs cut over without changing
@@ -350,6 +352,7 @@ impl Default for MediahostConfig {
             collections: Vec::new(),
             detect_segments: true,
             rescan_minutes: 60,
+            scheduler: Default::default(),
             demote_decoders: Vec::new(),
         }
     }
@@ -387,8 +390,60 @@ pub fn load(explicit: Option<&Path>) -> Result<(Config, Option<PathBuf>)> {
     };
     validate_hub_binds(&cfg.hub)?;
     normalize_and_validate_collections(&mut cfg.mediahost.collections, &base)?;
+    normalize_and_validate_scheduler(&mut cfg.mediahost, &base)?;
     validate_mediahost_hubs(&cfg.mediahost)?;
     Ok((cfg, used))
+}
+
+fn normalize_and_validate_scheduler(cfg: &mut MediahostConfig, config_dir: &Path) -> Result<()> {
+    if cfg.scheduler.cpu_slots == 0 {
+        bail!("mediahost.scheduler.cpu_slots must be at least 1");
+    }
+    let configured: std::collections::HashSet<std::path::PathBuf> = cfg
+        .collections
+        .iter()
+        .flat_map(|collection| collection.roots.iter().cloned())
+        .collect();
+    let mut names = std::collections::HashSet::new();
+    let mut roots = std::collections::HashSet::new();
+    for domain in &mut cfg.scheduler.io_domains {
+        if domain.name.trim().is_empty() || !names.insert(domain.name.clone()) {
+            bail!(
+                "mediahost.scheduler.io_domains names must be non-empty and unique: {:?}",
+                domain.name
+            );
+        }
+        if domain.max_concurrent == 0 {
+            bail!(
+                "mediahost.scheduler.io_domains {:?} max_concurrent must be at least 1",
+                domain.name
+            );
+        }
+        if domain.roots.is_empty() {
+            bail!(
+                "mediahost.scheduler.io_domains {:?} must name at least one collection root",
+                domain.name
+            );
+        }
+        for root in &mut domain.roots {
+            *root = kahawai_core::media::normalize_root_path(root, config_dir)
+                .map_err(anyhow::Error::msg)?;
+            if !configured.contains(root) {
+                bail!(
+                    "mediahost.scheduler.io_domains {:?} names unknown collection root {}",
+                    domain.name,
+                    root.display()
+                );
+            }
+            if !roots.insert(root.clone()) {
+                bail!(
+                    "mediahost scheduler root {} occurs in more than one io_domain",
+                    root.display()
+                );
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_mediahost_hubs(cfg: &MediahostConfig) -> Result<()> {
@@ -767,6 +822,59 @@ mod tests {
                 "[[mediahost.collections]]\nname='a'\nmedia_type='movies'\nroots=['/media']\n[[mediahost.collections]]\nname='b'\nmedia_type='series'\nroots=['/media/series']\n",
             )?;
             load(Some(Path::new("kahawai.toml"))).unwrap();
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn scheduler_overrides_normalize_and_group_configured_roots() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_dir("media")?;
+            jail.create_dir("archive")?;
+            jail.create_file(
+                "kahawai.toml",
+                "[mediahost.scheduler]\ncpu_slots=2\n\
+                 [[mediahost.scheduler.io_domains]]\nname='nas'\nmax_concurrent=1\nroots=['media','archive']\n\
+                 [[mediahost.collections]]\nname='movies'\nmedia_type='movies'\nroots=['media','archive']\n",
+            )?;
+            let (cfg, _) = load(Some(Path::new("kahawai.toml"))).unwrap();
+            assert_eq!(cfg.mediahost.scheduler.cpu_slots, 2);
+            assert_eq!(
+                cfg.mediahost.scheduler.io_domains[0].roots,
+                [
+                    jail.directory().join("media"),
+                    jail.directory().join("archive")
+                ]
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn scheduler_rejects_zero_capacity_unknown_and_duplicate_roots() {
+        figment::Jail::expect_with(|jail| {
+            jail.create_dir("media")?;
+            for (needle, scheduler) in [
+                ("cpu_slots", "[mediahost.scheduler]\ncpu_slots=0\n"),
+                (
+                    "unknown collection root",
+                    "[[mediahost.scheduler.io_domains]]\nname='nas'\nroots=['elsewhere']\n",
+                ),
+                (
+                    "more than one io_domain",
+                    "[[mediahost.scheduler.io_domains]]\nname='a'\nroots=['media']\n\
+                     [[mediahost.scheduler.io_domains]]\nname='b'\nroots=['media']\n",
+                ),
+            ] {
+                jail.create_file(
+                    "kahawai.toml",
+                    &format!(
+                        "{scheduler}[[mediahost.collections]]\nname='movies'\nmedia_type='movies'\nroots=['media']\n"
+                    ),
+                )?;
+                let error = load(Some(Path::new("kahawai.toml"))).unwrap_err();
+                assert!(error.to_string().contains(needle), "{error:#}");
+            }
             Ok(())
         });
     }
