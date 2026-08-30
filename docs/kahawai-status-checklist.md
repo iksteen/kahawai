@@ -122,8 +122,10 @@ How something works and why it was built that way belong in
       results persist locally and replicate to every subscribed hub
 - [x] MH-10 Protocol 4 local catalogue: per-collection epoch/version, current
       rows plus tombstones, hub-supplied durable cursors, incremental replay or
-      full live snapshot. Hub ACKs are independent and reconnect never walks
-      the filesystem. Protocol 4 intentionally rejects protocol-3 satellites
+      full live snapshot. Committed versions push each connected hub to resume
+      from its own cursor without polling; hub ACKs are independent and
+      reconnect never walks the filesystem. Protocol 4 intentionally rejects
+      protocol-3 satellites
 - [x] MH-11 One source-owned scheduler admits scans, watcher installation,
       exact-source probes/hashes/extraction, segment/loudness analysis and
       standalone or all-in-one reads as atomic CPU + storage-domain bundles.

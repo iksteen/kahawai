@@ -108,8 +108,6 @@ pub type LocalLinkFactory = std::sync::Arc<
         + Sync,
 >;
 
-type CatalogVersionState = std::collections::HashMap<String, (String, u64, bool)>;
-
 /// The process-local half of protocol 4. It owns every filesystem watcher and
 /// scan task; links only request work through these coalescing triggers.
 #[derive(Clone)]
@@ -119,7 +117,7 @@ struct LocalRuntime {
     triggers: std::collections::HashMap<String, TriggerSink>,
     scheduler: scheduler::Scheduler,
     discovery_wake: std::sync::Arc<tokio::sync::Notify>,
-    catalog_versions: std::sync::Arc<std::sync::RwLock<CatalogVersionState>>,
+    catalog_versions: tokio::sync::watch::Receiver<catalog::VersionState>,
     discovery_status: std::sync::Arc<
         std::sync::RwLock<std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>>,
     >,
@@ -157,24 +155,7 @@ impl LocalRuntime {
                 .await?;
         let mut triggers = std::collections::HashMap::new();
         let mut guards = Vec::new();
-        let catalog_versions = std::sync::Arc::new(std::sync::RwLock::new(Default::default()));
-        let version_catalog = catalog.clone();
-        let version_state = catalog_versions.clone();
-        guards.push(tokio::spawn(async move {
-            let mut ticker = tokio::time::interval(Duration::from_secs(1));
-            loop {
-                ticker.tick().await;
-                match version_catalog.version_states().await {
-                    Ok(versions) => {
-                        *version_state.write().unwrap() = versions;
-                    }
-                    Err(error) => tracing::warn!(
-                        error = format!("{error:#}"),
-                        "reading local catalogue versions failed"
-                    ),
-                }
-            }
-        }));
+        let catalog_versions = catalog.subscribe_versions();
         let discovery_status: std::sync::Arc<
             std::sync::RwLock<
                 std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>,
@@ -746,13 +727,14 @@ async fn ready_catalog_offer(
     selected: &[CollectionConfig],
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) -> Result<CatalogOffer> {
+    let mut versions = runtime.catalog_versions.clone();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
     // Consume Tokio's immediate first tick. Hello itself establishes
     // liveness; subsequent ticks keep a genuinely long first scan alive.
     heartbeat.tick().await;
     loop {
         let ready = {
-            let versions = runtime.catalog_versions.read().unwrap();
+            let versions = versions.borrow_and_update();
             selected.iter().all(|collection| {
                 versions
                     .get(&collection.name)
@@ -765,13 +747,80 @@ async fn ready_catalog_offer(
             });
         }
         tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(1)) => {}
+            changed = versions.changed() => {
+                changed.context("local catalogue version publisher stopped")?;
+            }
             _ = heartbeat.tick() => {
                 send_link_message(tx, HostToHub {
                     msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
                 }).await?;
             }
         }
+    }
+}
+
+struct CatalogSyncQueue {
+    active: std::collections::HashSet<String>,
+    tasks: tokio::task::JoinSet<(String, Result<(String, u64)>)>,
+    limit: std::sync::Arc<tokio::sync::Semaphore>,
+}
+
+impl CatalogSyncQueue {
+    fn new() -> Self {
+        Self {
+            active: Default::default(),
+            tasks: tokio::task::JoinSet::new(),
+            limit: std::sync::Arc::new(tokio::sync::Semaphore::new(1)),
+        }
+    }
+}
+
+fn schedule_catalog_updates(
+    catalog: &catalog::Catalog,
+    outbound: &tokio::sync::mpsc::Sender<HostToHub>,
+    selected: &[CollectionConfig],
+    sent: &std::collections::HashMap<String, (String, u64)>,
+    advertised: &catalog::VersionState,
+    queue: &mut CatalogSyncQueue,
+) {
+    for collection in selected {
+        let Some((epoch, cursor)) = sent.get(&collection.name) else {
+            continue;
+        };
+        if !advertised
+            .get(&collection.name)
+            .is_some_and(|(current_epoch, current, _)| current_epoch == epoch && current > cursor)
+        {
+            continue;
+        }
+        if !queue.active.insert(collection.name.clone()) {
+            continue;
+        }
+        let catalog = catalog.clone();
+        let outbound = outbound.clone();
+        let link_limit = queue.limit.clone();
+        let collection_id = collection.name.clone();
+        let cursor = *cursor;
+        let expected_epoch = epoch.clone();
+        queue.tasks.spawn(async move {
+            let result = send_catalog_pages(
+                &catalog,
+                &outbound,
+                &collection_id,
+                cursor,
+                false,
+                link_limit,
+            )
+            .await
+            .and_then(|(epoch, through)| {
+                anyhow::ensure!(
+                    epoch == expected_epoch,
+                    "catalogue epoch changed under a live link"
+                );
+                Ok((epoch, through))
+            });
+            (collection_id, result)
+        });
     }
 }
 
@@ -974,59 +1023,46 @@ async fn link_once_v4(
         Some(scheduler_owner.clone()),
         None,
     ))]);
-    let sent: std::sync::Arc<tokio::sync::Mutex<std::collections::HashMap<String, (String, u64)>>> =
-        Default::default();
-    let mut syncing = std::collections::HashSet::new();
-    let mut syncs = tokio::task::JoinSet::new();
-    let link_syncs = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let mut sent: std::collections::HashMap<String, (String, u64)> = Default::default();
+    let mut catalog_syncs = CatalogSyncQueue::new();
     let mut heartbeat = tokio::time::interval(HEARTBEAT_INTERVAL);
-    let mut changes = tokio::time::interval(Duration::from_secs(1));
+    let mut catalog_versions = runtime.catalog_versions.clone();
     let mut status = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
-            completed = syncs.join_next(), if !syncs.is_empty() => {
+            completed = catalog_syncs.tasks.join_next(), if !catalog_syncs.tasks.is_empty() => {
                 let (collection, result) = completed
                     .context("catalogue sync task disappeared")?
                     .context("catalogue sync task panicked")?;
-                syncing.remove(&collection);
+                catalog_syncs.active.remove(&collection);
                 let (epoch, through) = result?;
-                sent.lock().await.insert(collection, (epoch, through));
+                sent.insert(collection, (epoch, through));
+                let advertised = catalog_versions.borrow_and_update();
+                schedule_catalog_updates(
+                    &runtime.catalog,
+                    &tx,
+                    &selected,
+                    &sent,
+                    &advertised,
+                    &mut catalog_syncs,
+                );
             }
             _ = heartbeat.tick() => {
                 send_link_message(&tx, HostToHub {
                     msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
                 }).await?;
             }
-            _ = changes.tick() => {
-                let states = sent.lock().await.clone();
-                let advertised = runtime.catalog_versions.read().unwrap().clone();
-                for collection in &selected {
-                    let Some((epoch, cursor)) = states.get(&collection.name) else { continue };
-                    if !advertised.get(&collection.name).is_some_and(
-                        |(current_epoch, current, _)| current_epoch == epoch && current > cursor
-                    ) {
-                        continue;
-                    }
-                    if !syncing.insert(collection.name.clone()) {
-                        continue;
-                    }
-                    let catalog = runtime.catalog.clone();
-                    let outbound = tx.clone();
-                    let link_limit = link_syncs.clone();
-                    let collection_id = collection.name.clone();
-                    let cursor = *cursor;
-                    let expected_epoch = epoch.clone();
-                    syncs.spawn(async move {
-                        let result = send_catalog_pages(
-                            &catalog, &outbound, &collection_id, cursor, false, link_limit
-                        ).await.and_then(|(epoch, through)| {
-                            anyhow::ensure!(epoch == expected_epoch,
-                                "catalogue epoch changed under a live link");
-                            Ok((epoch, through))
-                        });
-                        (collection_id, result)
-                    });
-                }
+            changed = catalog_versions.changed() => {
+                changed.context("local catalogue version publisher stopped")?;
+                let advertised = catalog_versions.borrow_and_update();
+                schedule_catalog_updates(
+                    &runtime.catalog,
+                    &tx,
+                    &selected,
+                    &sent,
+                    &advertised,
+                    &mut catalog_syncs,
+                );
             }
             _ = status.tick() => {
                 let statuses = runtime.discovery_status.read().unwrap().clone();
@@ -1050,13 +1086,13 @@ async fn link_once_v4(
                         || cursor.version < offer.oldest_replayable_version
                         || cursor.version > offer.current_version;
                     let start = if snapshot { 0 } else { cursor.version };
-                    anyhow::ensure!(syncing.insert(cursor.collection_id.clone()),
+                    anyhow::ensure!(catalog_syncs.active.insert(cursor.collection_id.clone()),
                         "hub requested a second concurrent catalogue sync");
                     let catalog = runtime.catalog.clone();
                     let outbound = tx.clone();
-                    let link_limit = link_syncs.clone();
+                    let link_limit = catalog_syncs.limit.clone();
                     let collection_id = cursor.collection_id;
-                    syncs.spawn(async move {
+                    catalog_syncs.tasks.spawn(async move {
                         let result = send_catalog_pages(
                             &catalog, &outbound, &collection_id, start, snapshot, link_limit
                         ).await;
@@ -1395,55 +1431,45 @@ async fn run_local_link(
         None,
     ))]);
     let mut sent: std::collections::HashMap<String, (String, u64)> = Default::default();
-    let mut syncing = std::collections::HashSet::new();
-    let mut syncs = tokio::task::JoinSet::new();
-    let link_syncs = std::sync::Arc::new(tokio::sync::Semaphore::new(1));
+    let mut catalog_syncs = CatalogSyncQueue::new();
     let mut ticker = tokio::time::interval(HEARTBEAT_INTERVAL);
-    let mut changes = tokio::time::interval(Duration::from_secs(1));
+    let mut catalog_versions = runtime.catalog_versions.clone();
     let mut status = tokio::time::interval(Duration::from_secs(30));
     loop {
         tokio::select! {
-            completed = syncs.join_next(), if !syncs.is_empty() => {
+            completed = catalog_syncs.tasks.join_next(), if !catalog_syncs.tasks.is_empty() => {
                 let (collection, result) = completed
                     .context("local catalogue sync task disappeared")?
                     .context("local catalogue sync task panicked")?;
-                syncing.remove(&collection);
+                catalog_syncs.active.remove(&collection);
                 let (epoch, through) = result?;
                 sent.insert(collection, (epoch, through));
+                let advertised = catalog_versions.borrow_and_update();
+                schedule_catalog_updates(
+                    &runtime.catalog,
+                    &tx,
+                    &runtime.collections,
+                    &sent,
+                    &advertised,
+                    &mut catalog_syncs,
+                );
             }
             _ = ticker.tick() => {
                 send_link_message(&tx, HostToHub {
                     msg: Some(host_to_hub::Msg::Heartbeat(Heartbeat {})),
                 }).await.context("local link heartbeat failed")?;
             }
-            _ = changes.tick() => {
-                let states = sent.clone();
-                let advertised = runtime.catalog_versions.read().unwrap().clone();
-                for (collection, (epoch, cursor)) in states {
-                    if !advertised.get(&collection).is_some_and(
-                        |(current_epoch, current, _)| {
-                            current_epoch == &epoch && *current > cursor
-                        }
-                    ) {
-                        continue;
-                    }
-                    if !syncing.insert(collection.clone()) {
-                        continue;
-                    }
-                    let catalog = runtime.catalog.clone();
-                    let outbound = tx.clone();
-                    let link_limit = link_syncs.clone();
-                    syncs.spawn(async move {
-                        let result = send_catalog_pages(
-                            &catalog, &outbound, &collection, cursor, false, link_limit
-                        ).await.and_then(|(current_epoch, through)| {
-                            anyhow::ensure!(current_epoch == epoch,
-                                "local catalogue epoch changed under a live link");
-                            Ok((current_epoch, through))
-                        });
-                        (collection, result)
-                    });
-                }
+            changed = catalog_versions.changed() => {
+                changed.context("local catalogue version publisher stopped")?;
+                let advertised = catalog_versions.borrow_and_update();
+                schedule_catalog_updates(
+                    &runtime.catalog,
+                    &tx,
+                    &runtime.collections,
+                    &sent,
+                    &advertised,
+                    &mut catalog_syncs,
+                );
             }
             _ = status.tick() => {
                 let statuses = runtime.discovery_status.read().unwrap().clone();
@@ -1466,14 +1492,14 @@ async fn run_local_link(
                         let snapshot = cursor.snapshot || cursor.epoch != offer.epoch
                             || cursor.version < offer.oldest_replayable_version
                             || cursor.version > offer.current_version;
-                        anyhow::ensure!(syncing.insert(cursor.collection_id.clone()),
+                        anyhow::ensure!(catalog_syncs.active.insert(cursor.collection_id.clone()),
                             "local hub requested a second concurrent catalogue sync");
                         let catalog = runtime.catalog.clone();
                         let outbound = tx.clone();
-                        let link_limit = link_syncs.clone();
+                        let link_limit = catalog_syncs.limit.clone();
                         let collection = cursor.collection_id;
                         let start = if snapshot { 0 } else { cursor.version };
-                        syncs.spawn(async move {
+                        catalog_syncs.tasks.spawn(async move {
                             let result = send_catalog_pages(
                                 &catalog, &outbound, &collection, start, snapshot, link_limit
                             ).await;
@@ -2342,8 +2368,9 @@ async fn scan_cycle(
 #[cfg(test)]
 mod scheduler_integration_tests {
     use super::{
-        CollectionConfig, HubTarget, LocalLinkFactory, ensure_scoped_rescan, run_local_multi,
-        scheduler, send_catalog_pages, send_link_message_with_timeout,
+        CatalogSyncQueue, CollectionConfig, HubTarget, LocalLinkFactory, ensure_scoped_rescan,
+        run_local_multi, schedule_catalog_updates, scheduler, send_catalog_pages,
+        send_link_message_with_timeout,
     };
 
     #[test]
@@ -2455,6 +2482,81 @@ mod scheduler_integration_tests {
         for task in stalled {
             task.abort();
         }
+    }
+
+    #[tokio::test]
+    async fn completing_a_sync_reconciles_a_coalesced_update() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let collection = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().to_path_buf()],
+        };
+        let catalog =
+            super::catalog::Catalog::open(state.path(), std::slice::from_ref(&collection))
+                .await
+                .unwrap();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        for path_rel in ["one.mkv", "two.mkv"] {
+            catalog
+                .upsert_file(
+                    "movies",
+                    &kahawai_proto::v1::FileRecord {
+                        source: Some(kahawai_proto::v1::SourcePath::new(
+                            kahawai_core::media::root_token(root.path()),
+                            path_rel,
+                        )),
+                        size: 1,
+                        mtime_unix: 1,
+                        streams_json: "{}".into(),
+                        ..Default::default()
+                    },
+                    generation,
+                )
+                .await
+                .unwrap();
+        }
+        let offer = catalog
+            .offers(std::slice::from_ref(&collection))
+            .await
+            .unwrap()
+            .remove(0);
+        let advertised = catalog.subscribe_versions().borrow().clone();
+        let sent = std::collections::HashMap::from([("movies".to_string(), (offer.epoch, 1))]);
+        let mut queue = CatalogSyncQueue::new();
+        queue.active.insert("movies".to_string());
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+
+        schedule_catalog_updates(
+            &catalog,
+            &tx,
+            std::slice::from_ref(&collection),
+            &sent,
+            &advertised,
+            &mut queue,
+        );
+        assert!(
+            queue.tasks.is_empty(),
+            "an active stream was scheduled twice"
+        );
+
+        queue.active.remove("movies");
+        schedule_catalog_updates(
+            &catalog,
+            &tx,
+            std::slice::from_ref(&collection),
+            &sent,
+            &advertised,
+            &mut queue,
+        );
+        let (_, result) = queue.tasks.join_next().await.unwrap().unwrap();
+        assert_eq!(result.unwrap().1, 2);
+        let message = rx.recv().await.unwrap().msg.unwrap();
+        let kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(delta) = message else {
+            panic!("follow-up sync did not send a catalogue delta")
+        };
+        assert_eq!(delta.through_version, 2);
     }
 
     #[tokio::test]

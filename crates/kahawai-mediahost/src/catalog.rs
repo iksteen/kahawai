@@ -59,9 +59,12 @@ pub(crate) fn is_stale_fact(error: &anyhow::Error) -> bool {
 
 use crate::scan::CollectionConfig;
 
+pub(crate) type VersionState = HashMap<String, (String, u64, bool)>;
+
 #[derive(Clone)]
 pub struct Catalog {
     db: Database,
+    versions: tokio::sync::watch::Sender<VersionState>,
 }
 
 #[derive(Debug, Clone)]
@@ -193,7 +196,9 @@ impl Catalog {
         sqlx::query("UPDATE catalog_collections SET scanning=1 WHERE retired=0")
             .execute(&db)
             .await?;
-        Ok(Self { db })
+        let initial_versions = Self::read_version_states(&db).await?;
+        let (versions, _) = tokio::sync::watch::channel(initial_versions);
+        Ok(Self { db, versions })
     }
 
     async fn ensure_discovery_generation(
@@ -293,12 +298,12 @@ impl Catalog {
         Ok(offers)
     }
 
-    pub async fn version_states(&self) -> Result<HashMap<String, (String, u64, bool)>> {
+    async fn read_version_states(db: &Database) -> Result<VersionState> {
         let rows = sqlx::query(
             "SELECT id,epoch,current_version,completed_generation
                FROM catalog_collections WHERE retired=0",
         )
-        .fetch_all(&self.db)
+        .fetch_all(db)
         .await?;
         Ok(rows
             .into_iter()
@@ -313,6 +318,37 @@ impl Catalog {
                 )
             })
             .collect())
+    }
+
+    pub async fn version_states(&self) -> Result<VersionState> {
+        Self::read_version_states(&self.db).await
+    }
+
+    pub(crate) fn subscribe_versions(&self) -> tokio::sync::watch::Receiver<VersionState> {
+        self.versions.subscribe()
+    }
+
+    /// Publish only committed catalogue state. Versions merge monotonically so
+    /// tasks resuming out of commit order cannot make a connected hub overlook
+    /// a newer transaction. The epoch cannot change while this catalogue is
+    /// open; collection recreation happens during `open` before publication.
+    fn publish_version(&self, collection: &str, version: u64, complete: bool) {
+        self.versions.send_if_modified(|versions| {
+            let Some((_, current, completed)) = versions.get_mut(collection) else {
+                tracing::error!(
+                    collection,
+                    version,
+                    "committed unknown catalogue collection"
+                );
+                return false;
+            };
+            let next = (*current).max(version);
+            let next_completed = *completed || complete;
+            let changed = next != *current || next_completed != *completed;
+            *current = next;
+            *completed = next_completed;
+            changed
+        });
     }
 
     pub async fn segment_scan_state(&self, collection: &str) -> Result<(i64, bool)> {
@@ -606,12 +642,12 @@ impl Catalog {
             false,
         )
         .await?;
-        if revision_changed {
+        let derived_version = if revision_changed {
             // Expensive derived answers belong to the media bytes, not to
             // sidecar/catalogue presentation. Preserve them when only NFO,
             // artwork or external-subtitle metadata changes; replace them
             // when the guarded content identity changes.
-            Self::tombstone_derived_records(
+            let derived_version = Self::tombstone_derived_records(
                 &mut tx,
                 collection,
                 &source_key(&source.root_token, &source.path_rel),
@@ -626,6 +662,7 @@ impl Catalog {
             .bind(&source.path_rel)
             .execute(&mut *tx)
             .await?;
+            derived_version
         } else {
             if let Some(stored) = previous.as_ref() {
                 sqlx::query(
@@ -651,9 +688,11 @@ impl Catalog {
                 collection,
                 &source_key(&source.root_token, &source.path_rel),
             )
-            .await?;
-        }
+            .await?
+        };
+        let published_version = derived_version.unwrap_or(version);
         tx.commit().await?;
+        self.publish_version(collection, published_version, false);
         Ok(Some(version))
     }
 
@@ -745,6 +784,7 @@ impl Catalog {
         )
         .await?;
         tx.commit().await?;
+        self.publish_version(collection, version, false);
         Ok(version)
     }
 
@@ -796,6 +836,7 @@ impl Catalog {
                 .fetch_one(&mut *tx)
                 .await?;
         tx.commit().await?;
+        self.publish_version(collection, current as u64, true);
         Ok(current as u64)
     }
 
@@ -840,7 +881,7 @@ impl Catalog {
         tx: &mut sqlx::SqliteConnection,
         collection: &str,
         key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let kinds: Vec<String> = sqlx::query_scalar(
             "SELECT kind FROM catalog_records
               WHERE collection_id=? AND record_key=? AND kind!='file' AND deleted=0",
@@ -849,18 +890,20 @@ impl Catalog {
         .bind(key)
         .fetch_all(&mut *tx)
         .await?;
+        let mut last = None;
         for kind in kinds {
             let version = Self::next_version(tx, collection).await?;
             Self::put_record(tx, collection, &kind, key, version, Vec::new(), true).await?;
+            last = Some(version);
         }
-        Ok(())
+        Ok(last)
     }
 
     async fn reversion_derived_records(
         tx: &mut sqlx::SqliteConnection,
         collection: &str,
         key: &[u8],
-    ) -> Result<()> {
+    ) -> Result<Option<u64>> {
         let records = sqlx::query(
             "SELECT kind,payload FROM catalog_records
               WHERE collection_id=? AND record_key=? AND kind!='file' AND deleted=0",
@@ -869,13 +912,15 @@ impl Catalog {
         .bind(key)
         .fetch_all(&mut *tx)
         .await?;
+        let mut last = None;
         for record in records {
             let kind: String = record.get("kind");
             let payload: Vec<u8> = record.get("payload");
             let version = Self::next_version(tx, collection).await?;
             Self::put_record(tx, collection, &kind, key, version, payload, false).await?;
+            last = Some(version);
         }
-        Ok(())
+        Ok(last)
     }
 
     pub async fn delta(&self, collection: &str, cursor: u64, snapshot: bool) -> Result<Delta> {
@@ -1704,6 +1749,7 @@ impl Catalog {
             .execute(&mut *tx)
             .await?;
         tx.commit().await?;
+        self.publish_version(collection, version, false);
         Ok(version)
     }
 }
@@ -1894,6 +1940,78 @@ mod tests {
         let reopened = second.offers(&[config]).await.unwrap().remove(0);
         assert_eq!(reopened.epoch, offer.epoch);
         assert_eq!(reopened.current_version, offer.current_version);
+    }
+
+    #[tokio::test]
+    async fn committed_versions_wake_each_subscriber() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = collection(root.path());
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        let mut first = catalog.subscribe_versions();
+        let mut second = catalog.subscribe_versions();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        let file = FileRecord {
+            source: Some(SourcePath {
+                root_token: kahawai_core::media::root_token(root.path()),
+                path_rel: "Film.mkv".into(),
+            }),
+            size: 123,
+            mtime_unix: 7,
+            streams_json: serde_json::to_string(&media_info(true)).unwrap(),
+            ..Default::default()
+        };
+
+        catalog
+            .upsert_file("movies", &file, generation)
+            .await
+            .unwrap();
+        assert!(first.has_changed().unwrap());
+        assert!(second.has_changed().unwrap());
+        assert_eq!(first.borrow_and_update()["movies"].1, 1);
+        assert_eq!(second.borrow_and_update()["movies"].1, 1);
+
+        assert!(
+            catalog
+                .upsert_file("movies", &file, generation)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(!first.has_changed().unwrap());
+        assert!(!second.has_changed().unwrap());
+
+        assert!(
+            catalog
+                .upsert_file("missing", &file, generation)
+                .await
+                .is_err()
+        );
+        assert!(!first.has_changed().unwrap());
+        assert!(!second.has_changed().unwrap());
+    }
+
+    #[tokio::test]
+    async fn empty_first_scan_completion_is_published() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = collection(root.path());
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        let mut versions = catalog.subscribe_versions();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+
+        catalog
+            .finish_scan("movies", generation, &Default::default())
+            .await
+            .unwrap();
+
+        assert!(versions.has_changed().unwrap());
+        assert_eq!(versions.borrow_and_update()["movies"].1, 0);
+        assert!(versions.borrow()["movies"].2);
     }
 
     #[tokio::test]
@@ -2481,6 +2599,8 @@ mod tests {
             .unwrap();
         let cursor =
             catalog.offers(std::slice::from_ref(&config)).await.unwrap()[0].current_version;
+        let mut published = catalog.subscribe_versions();
+        published.borrow_and_update();
         let mut metadata_only = original;
         let mut info = media_info(true);
         info.tags.insert("title".into(), "From an NFO".into());
@@ -2509,6 +2629,11 @@ mod tests {
             "snapshot projected a derived fact before its current file row"
         );
         let incremental = catalog.delta("movies", cursor, false).await.unwrap();
+        assert_eq!(
+            published.borrow_and_update()["movies"].1,
+            incremental.current_version,
+            "publisher stopped at the file row before re-versioned derived facts"
+        );
         assert_eq!(
             incremental
                 .records
