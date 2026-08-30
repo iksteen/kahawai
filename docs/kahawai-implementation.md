@@ -156,8 +156,11 @@ deferred-transaction upgrades into `SQLITE_BUSY`. The exposed pool also has
 queue holds at most 256 requests (senders then apply backpressure), skips work
 cancelled before it starts, rolls back an abandoned started transaction, and
 warns with its operation label when either queue wait or execution exceeds one
-second. A nested request from the task already holding the writer is rejected
-instead of deadlocking.
+second. A nested request for the same database from the task already holding
+its writer is rejected instead of deadlocking; another physical database stays
+independent. Raw `BEGIN`/savepoint/commit/rollback statements are rejected at
+the generic executor boundary so a caller cannot return the sole connection in
+transaction state; callers use the serialized transaction API instead.
 
 The existing cache cost model is unchanged: every connection has
 `cache_size = -8192` (8 MiB). SQLite's 2 MB default is smaller than the index a

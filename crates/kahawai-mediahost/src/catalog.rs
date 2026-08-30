@@ -115,7 +115,6 @@ impl Catalog {
             .filename(&path)
             .read_only(true)
             .foreign_keys(true)
-            .pragma("query_only", "on")
             .busy_timeout(Duration::from_secs(30));
         // The former four-connection budget becomes three concurrent WAL
         // readers plus the one actor-owned writer connection.

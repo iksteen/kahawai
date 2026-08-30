@@ -8,12 +8,13 @@
 //! and starts multi-statement writes with `BEGIN IMMEDIATE`.
 //!
 //! The connection budget is explicit: callers choose the reader count and the
-//! actor adds one writer. Reader connections must also be opened with
+//! actor adds one writer. The reader pool is always opened with
 //! `PRAGMA query_only=ON`; disk databases should additionally use OS-level
-//! read-only connections. A wrongly routed write therefore fails immediately
+//! read-only options. A wrongly routed write therefore fails immediately
 //! instead of silently bypassing serialization.
 
 use std::ops::{Deref, DerefMut};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,8 +31,10 @@ pub const WRITER_QUEUE_CAPACITY: usize = 256;
 const SLOW_OPERATION: Duration = Duration::from_secs(1);
 
 tokio::task_local! {
-    static WRITER_CONTEXT: ();
+    static WRITER_CONTEXT: u64;
 }
+
+static NEXT_WRITER_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, thiserror::Error)]
 pub enum WriterError {
@@ -43,8 +46,24 @@ pub enum WriterError {
 
 #[derive(Clone, Debug)]
 struct Writer {
+    id: u64,
     requests: mpsc::Sender<Request>,
-    active_task: Arc<Mutex<Option<tokio::task::Id>>>,
+    active_task: Arc<Mutex<Option<TaskOwner>>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TaskOwner {
+    Tokio(tokio::task::Id),
+    RuntimeRoot(std::thread::ThreadId),
+}
+
+impl TaskOwner {
+    fn current() -> Self {
+        tokio::task::try_id().map_or_else(
+            || Self::RuntimeRoot(std::thread::current().id()),
+            Self::Tokio,
+        )
+    }
 }
 
 #[derive(Debug)]
@@ -52,7 +71,7 @@ enum Request {
     Lease {
         label: String,
         queued_at: Instant,
-        task_id: Option<tokio::task::Id>,
+        task_owner: TaskOwner,
         response: oneshot::Sender<LeaseParts>,
     },
     Close(oneshot::Sender<()>),
@@ -60,10 +79,23 @@ enum Request {
 
 #[derive(Debug)]
 struct LeaseParts {
-    connection: SqliteConnection,
-    returned: oneshot::Sender<ReturnedConnection>,
+    connection: Option<SqliteConnection>,
+    returned: Option<oneshot::Sender<ReturnedConnection>>,
     label: String,
     started_at: Instant,
+}
+
+impl Drop for LeaseParts {
+    fn drop(&mut self) {
+        let (Some(connection), Some(returned)) = (self.connection.take(), self.returned.take())
+        else {
+            return;
+        };
+        let _ = returned.send(ReturnedConnection {
+            connection,
+            rollback: false,
+        });
+    }
 }
 
 #[derive(Debug)]
@@ -76,7 +108,7 @@ struct ReturnedConnection {
 pub struct WriterLease {
     connection: Option<SqliteConnection>,
     returned: Option<oneshot::Sender<ReturnedConnection>>,
-    active_task: Arc<Mutex<Option<tokio::task::Id>>>,
+    active_task: Arc<Mutex<Option<TaskOwner>>>,
     label: String,
     started_at: Instant,
     rollback: bool,
@@ -128,6 +160,7 @@ impl Writer {
         let active_task = Arc::new(Mutex::new(None));
         tokio::spawn(writer_task(connection, receiver, active_task.clone()));
         Self {
+            id: NEXT_WRITER_ID.fetch_add(1, Ordering::Relaxed),
             requests,
             active_task,
         }
@@ -137,11 +170,14 @@ impl Writer {
         &self,
         label: impl Into<String>,
     ) -> std::result::Result<WriterLease, WriterError> {
-        if WRITER_CONTEXT.try_with(|()| ()).is_ok() {
+        if WRITER_CONTEXT
+            .try_with(|writer_id| *writer_id == self.id)
+            .unwrap_or(false)
+        {
             return Err(WriterError::Nested);
         }
-        let task_id = tokio::task::try_id();
-        if task_id.is_some() && *self.active_task.lock().unwrap() == task_id {
+        let task_owner = TaskOwner::current();
+        if *self.active_task.lock().unwrap() == Some(task_owner) {
             return Err(WriterError::Nested);
         }
         let (response, receive) = oneshot::channel();
@@ -149,17 +185,17 @@ impl Writer {
             .send(Request::Lease {
                 label: label.into(),
                 queued_at: Instant::now(),
-                task_id,
+                task_owner,
                 response,
             })
             .await
             .map_err(|_| WriterError::Stopped)?;
-        let parts = receive.await.map_err(|_| WriterError::Stopped)?;
+        let mut parts = receive.await.map_err(|_| WriterError::Stopped)?;
         Ok(WriterLease {
-            connection: Some(parts.connection),
-            returned: Some(parts.returned),
+            connection: parts.connection.take(),
+            returned: parts.returned.take(),
             active_task: self.active_task.clone(),
-            label: parts.label,
+            label: std::mem::take(&mut parts.label),
             started_at: parts.started_at,
             rollback: false,
         })
@@ -176,7 +212,7 @@ impl Writer {
 async fn writer_task(
     mut connection: SqliteConnection,
     mut requests: mpsc::Receiver<Request>,
-    active_task: Arc<Mutex<Option<tokio::task::Id>>>,
+    active_task: Arc<Mutex<Option<TaskOwner>>>,
 ) {
     while let Some(request) = requests.recv().await {
         match request {
@@ -190,7 +226,7 @@ async fn writer_task(
             Request::Lease {
                 label,
                 queued_at,
-                task_id,
+                task_owner,
                 response,
             } => {
                 if response.is_closed() {
@@ -205,18 +241,14 @@ async fn writer_task(
                     );
                 }
                 let (returned, receive) = oneshot::channel();
-                *active_task.lock().unwrap() = task_id;
+                *active_task.lock().unwrap() = Some(task_owner);
                 let parts = LeaseParts {
-                    connection,
-                    returned,
+                    connection: Some(connection),
+                    returned: Some(returned),
                     label,
                     started_at: Instant::now(),
                 };
-                if let Err(parts) = response.send(parts) {
-                    connection = parts.connection;
-                    *active_task.lock().unwrap() = None;
-                    continue;
-                }
+                let _ = response.send(parts);
                 let Ok(returned) = receive.await else {
                     tracing::error!(
                         "SQLite writer lease vanished without returning its connection"
@@ -252,7 +284,10 @@ impl Database {
         let writer = SqliteConnection::connect_with(&writer_options).await?;
         let readers = SqlitePoolOptions::new()
             .max_connections(reader_connections)
-            .connect_with(reader_options)
+            // Enforce the serialization boundary here rather than relying on
+            // every caller to remember it. Disk callers additionally use
+            // `read_only(true)` so the operating-system open mode agrees.
+            .connect_with(reader_options.pragma("query_only", "on"))
             .await?;
         Ok(Self {
             readers,
@@ -285,7 +320,9 @@ impl Database {
             + Send,
     {
         let mut lease = self.writer.lease(label).await?;
-        WRITER_CONTEXT.scope((), operation(&mut lease)).await
+        WRITER_CONTEXT
+            .scope(self.writer.id, operation(&mut lease))
+            .await
     }
 
     /// Run an atomic write after claiming SQLite's writer slot up front.
@@ -298,7 +335,9 @@ impl Database {
             + Send,
     {
         let mut transaction = self.begin_with_label(label).await?;
-        let result = WRITER_CONTEXT.scope((), operation(&mut transaction)).await;
+        let result = WRITER_CONTEXT
+            .scope(self.writer.id, operation(&mut transaction))
+            .await;
         match result {
             Ok(value) => {
                 transaction.commit().await?;
@@ -333,8 +372,17 @@ impl Database {
             .lease(label)
             .await
             .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *lease).await?;
+        // Arm rollback before the await: SQLite may accept BEGIN and then the
+        // caller may be cancelled before this future is polled again. In that
+        // window the lease drop must still return a clean connection.
         lease.rollback = true;
+        if let Err(error) = sqlx::query("BEGIN IMMEDIATE").execute(&mut *lease).await {
+            // A delivered BEGIN error means SQLite did not enter the
+            // transaction. Cancellation cannot reach this branch and leaves
+            // rollback armed for the actor instead.
+            lease.rollback = false;
+            return Err(error);
+        }
         Ok(WriterTransaction { lease })
     }
 
@@ -386,15 +434,44 @@ impl DerefMut for WriterTransaction {
     }
 }
 
-fn is_read_only(sql: &str) -> bool {
-    let sql = sql.trim_start();
-    let keyword = sql
-        .split(|character: char| character.is_ascii_whitespace() || character == '(')
-        .next()
-        .unwrap_or_default();
-    keyword.eq_ignore_ascii_case("SELECT")
+fn first_keyword(mut sql: &str) -> &str {
+    loop {
+        sql = sql.trim_start();
+        if let Some(comment) = sql.strip_prefix("--") {
+            let Some(end) = comment.find(['\n', '\r']) else {
+                return "";
+            };
+            sql = &comment[end + 1..];
+            continue;
+        }
+        if let Some(comment) = sql.strip_prefix("/*") {
+            let Some(end) = comment.find("*/") else {
+                return "";
+            };
+            sql = &comment[end + 2..];
+            continue;
+        }
+        return sql
+            .split(|character: char| character.is_ascii_whitespace() || character == '(')
+            .next()
+            .unwrap_or_default();
+    }
+}
+
+fn query_is_read_only(sql: &str) -> Result<bool, sqlx::Error> {
+    let keyword = first_keyword(sql);
+    if ["BEGIN", "SAVEPOINT", "COMMIT", "END", "ROLLBACK", "RELEASE"]
+        .iter()
+        .any(|control| keyword.eq_ignore_ascii_case(control))
+    {
+        return Err(sqlx::Error::Protocol(
+            "raw SQLite transaction control is not allowed; use Database::begin or Database::transaction"
+                .to_string(),
+        ));
+    }
+    Ok(keyword.eq_ignore_ascii_case("SELECT")
         || keyword.eq_ignore_ascii_case("EXPLAIN")
-        || keyword.eq_ignore_ascii_case("VALUES")
+        || keyword.eq_ignore_ascii_case("VALUES"))
 }
 
 fn writer_label(sql: &str) -> String {
@@ -430,9 +507,9 @@ impl<'database> Executor<'database> for &'database Database {
         E: 'query + Execute<'query, Sqlite>,
     {
         let (sql, arguments) = take_query(query);
-        let read_only = is_read_only(sql.as_str());
         let database = self.clone();
         Box::pin(async_stream::try_stream! {
+            let read_only = query_is_read_only(sql.as_str())?;
             let arguments = arguments?;
             if read_only {
                 let mut connection = database.readers.acquire().await?;
@@ -460,9 +537,9 @@ impl<'database> Executor<'database> for &'database Database {
         E: 'query + Execute<'query, Sqlite>,
     {
         let (sql, arguments) = take_query(query);
-        let read_only = is_read_only(sql.as_str());
         let database = self.clone();
         Box::pin(async move {
+            let read_only = query_is_read_only(sql.as_str())?;
             let arguments = arguments?;
             if read_only {
                 database
@@ -520,10 +597,9 @@ mod tests {
             .filename(&path)
             .create_if_missing(true)
             .journal_mode(SqliteJournalMode::Wal);
-        let reader = SqliteConnectOptions::new()
-            .filename(&path)
-            .read_only(true)
-            .pragma("query_only", "on");
+        // Deliberately omit both OS read-only mode and query_only: the
+        // Database constructor itself must enforce the latter.
+        let reader = SqliteConnectOptions::new().filename(&path);
         let database = Database::connect_with(writer, reader, 3).await.unwrap();
         sqlx::query("CREATE TABLE events(sequence INTEGER PRIMARY KEY, value TEXT UNIQUE)")
             .execute(&database)
@@ -593,7 +669,7 @@ mod tests {
                 database
                     .transaction("first", move |connection| {
                         Box::pin(async move {
-                            sqlx::query("INSERT INTO events VALUES(1, 'first')")
+                            sqlx::query("INSERT INTO events(value) VALUES('first')")
                                 .execute(&mut *connection)
                                 .await?;
                             entered.notify_one();
@@ -605,19 +681,22 @@ mod tests {
             })
         };
         entered.notified().await;
+        let second_queued = Arc::new(Notify::new());
         let second = {
             let database = database.clone();
+            let second_queued = second_queued.clone();
             tokio::spawn(async move {
-                sqlx::query("INSERT INTO events VALUES(2, 'second')")
+                second_queued.notify_one();
+                sqlx::query("INSERT INTO events(value) VALUES('second')")
                     .execute(&database)
                     .await
             })
         };
-        tokio::task::yield_now().await;
+        second_queued.notified().await;
         let third = {
             let database = database.clone();
             tokio::spawn(async move {
-                sqlx::query("INSERT INTO events VALUES(3, 'third')")
+                sqlx::query("INSERT INTO events(value) VALUES('third')")
                     .execute(&database)
                     .await
             })
@@ -682,6 +761,31 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn cancelled_connection_handoff_returns_the_writer() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("handoff.db");
+        let connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let (returned, receive) = oneshot::channel();
+        drop(LeaseParts {
+            connection: Some(connection),
+            returned: Some(returned),
+            label: "cancelled handoff".to_string(),
+            started_at: Instant::now(),
+        });
+        let mut returned = receive.await.unwrap().connection;
+        sqlx::query("CREATE TABLE survived(value INTEGER)")
+            .execute(&mut returned)
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
     async fn errors_and_abandoned_transactions_do_not_poison_the_writer() {
         let (_directory, database) = database().await;
         sqlx::query("INSERT INTO events VALUES(1, 'same')")
@@ -706,6 +810,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn raw_transaction_control_does_not_poison_the_writer() {
+        let (_directory, database) = database().await;
+        let error = sqlx::query("BEGIN IMMEDIATE")
+            .execute(&database)
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("raw SQLite transaction control"));
+        let commented = sqlx::query("-- caller comment\nBEGIN IMMEDIATE")
+            .execute(&database)
+            .await
+            .unwrap_err();
+        assert!(
+            commented
+                .to_string()
+                .contains("raw SQLite transaction control")
+        );
+        sqlx::query("INSERT INTO events(value) VALUES('after leaked begin')")
+            .execute(&database)
+            .await
+            .unwrap();
+        let values: Vec<String> = sqlx::query_scalar("SELECT value FROM events")
+            .fetch_all(&database)
+            .await
+            .unwrap();
+        assert_eq!(values, ["after leaked begin"]);
+    }
+
+    #[tokio::test]
     async fn nested_writer_requests_fail_instead_of_deadlocking() {
         let (_directory, database) = database().await;
         let nested = database.clone();
@@ -720,5 +852,59 @@ mod tests {
             .await
             .unwrap_err();
         assert!(error.to_string().contains("nested SQLite writer request"));
+    }
+
+    #[tokio::test]
+    async fn writes_to_independent_databases_may_be_nested() {
+        let (_first_directory, first) = database().await;
+        let (_second_directory, second) = database().await;
+        let nested = second.clone();
+        first
+            .write("first database", move |_connection| {
+                Box::pin(async move {
+                    nested
+                        .write("second database", |connection| {
+                            Box::pin(async move {
+                                sqlx::query("INSERT INTO events(value) VALUES('independent')")
+                                    .execute(connection)
+                                    .await?;
+                                Ok(())
+                            })
+                        })
+                        .await
+                })
+            })
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM events")
+            .fetch_one(&second)
+            .await
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn runtime_root_transactions_detect_nested_writer_requests() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                let (_directory, database) = database().await;
+                let transaction = database.begin().await.unwrap();
+                let error = tokio::time::timeout(
+                    Duration::from_millis(250),
+                    sqlx::query("INSERT INTO events(value) VALUES('nested')").execute(&database),
+                )
+                .await
+                .expect("nested writer request deadlocked")
+                .unwrap_err();
+                assert!(error.to_string().contains("nested SQLite writer request"));
+                drop(transaction);
+                sqlx::query("INSERT INTO events(value) VALUES('after')")
+                    .execute(&database)
+                    .await
+                    .unwrap();
+            });
     }
 }

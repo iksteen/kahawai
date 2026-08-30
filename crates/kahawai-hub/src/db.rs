@@ -59,7 +59,6 @@ pub async fn open(data_dir: &Path) -> Result<Database> {
         .read_only(true)
         .foreign_keys(true)
         .pragma("cache_size", "-8192")
-        .pragma("query_only", "on")
         .busy_timeout(std::time::Duration::from_secs(30));
     // Preserve the former eight-connection/64 MiB ceiling: seven readers at
     // 8 MiB each plus the actor's sole 8 MiB writer connection.
@@ -306,8 +305,7 @@ pub async fn open_in_memory() -> Result<Database> {
         .filename(&name)
         .in_memory(true)
         .shared_cache(true)
-        .foreign_keys(true)
-        .pragma("query_only", "on");
+        .foreign_keys(true);
     let database = Database::connect_with(writer, reader, 1).await?;
     database
         .write("hub test migrations", |connection| {
