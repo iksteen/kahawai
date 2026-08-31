@@ -4,6 +4,7 @@ const port = 18420
 
 export default defineConfig({
   testDir: './test/browser',
+  testMatch: 'csp.spec.ts',
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 1 : 0,
@@ -11,7 +12,7 @@ export default defineConfig({
   use: {
     baseURL: `http://127.0.0.1:${port}`,
     browserName: 'chromium',
-    channel: 'chromium',
+    channel: 'chrome',
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
   },

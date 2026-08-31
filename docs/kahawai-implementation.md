@@ -520,14 +520,33 @@ and [MIME sniffing](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/
 
 `scripts/kahawai-csp-check.sh` builds the production bundle and serves it from
 the real Rust web router through a database-free fixture. Its Playwright
-Chromium gate renders the SPA and starts the emitted JASSUB module worker,
+Chrome gate renders the SPA and starts the emitted JASSUB module worker,
 WASM and bundled font; exercises data images, blob workers/media and dynamic
 style attributes; then proves JavaScript eval, inline script, foreign fetches,
 all framing and JSON loaded as script are refused. Exact-header Rust
 integration tests cover redirects, assets, SPA fallbacks and error responses.
-CI and stamped release source gates install the lockfile-matched Chromium and
-run the same suite. This is deliberately narrower than the still-open full
-Chromium/WebKit product-flow suite (CI-9).
+CI and stamped release source gates use the lockfile-pinned Playwright CLI to
+install Chrome stable and run the same suite.
+
+`scripts/kahawai-browser-check.sh chrome|webkit` runs the CI-9 product
+gate. Its supervisor creates a disposable media tree and separate hub and
+mediahost state directories, renders tiny direct, remux, transcode and
+embedded-ASS sources with the real GStreamer helpers, and starts the real
+all-in-one entry point. The control listener is deliberately outside the
+product router: it can crash and replace the child while retaining those
+directories, so the browser proves that libraries, users and grants survive a
+process restart. No product API is mocked. The serial journey performs local
+first-run setup, login/logout, administration, narrowed grants, browse/search
+and deep-link reload, then decodes direct, remux and transcode sessions. The
+remux case loses one segment and seeks near the generated frontier, proving
+player recovery; the ASS case waits for JASSUB's actual canvas. All requests
+are confined to loopback and unexpected page errors fail the run.
+
+Branded Chrome covers Chromium/MSE. A separate macOS WebKit job covers the same
+product journey plus a forced MediaSource-absent session whose `<video>` must
+accept HLS natively and receive the real master playlist. Pull requests and
+stamped release source both run the two gates; retained traces, screenshots
+and video are uploaded on failure.
 
 **Capability profile.** On startup the player probes the browser honestly rather than shipping a static profile: `MediaSource.isTypeSupported()` / `mediaCapabilities.decodingInfo()` across the codec matrix (H.264 profiles/levels, HEVC, AV1, AAC/AC-3/Opus/FLAC), container support (fMP4 via MSE; native HLS on Safari), HDR via `matchMedia('(dynamic-range: high)')` + codec profile support, and screen dimensions — serialized into the `CapabilityProfile` sent to `/playback/decisions`. This makes the web player the reference implementation of negotiation from the client side.
 

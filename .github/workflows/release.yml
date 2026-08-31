@@ -59,8 +59,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            gstreamer1.0-tools gstreamer1.0-plugins-base \
+            gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+            gstreamer1.0-plugins-ugly gstreamer1.0-libav \
+            ca-certificates ffmpeg \
             libass-dev libva-dev libgudev-1.0-dev \
-            libleptonica-dev libtesseract-dev \
+            libleptonica-dev libtesseract-dev tesseract-ocr-eng \
             protobuf-compiler clang cmake
       - name: Cache cargo registry and target
         uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
@@ -101,17 +105,76 @@ jobs:
         working-directory: web
       - run: npm test
         working-directory: web
-      # Release the browser policy only after Chromium has executed the exact
-      # stamped bundle, including JASSUB's worker and WASM. Keep the install
-      # paired with the lockfile-pinned Playwright package.
-      - run: npx playwright install --with-deps --no-shell chromium
+      # Release the browser policy and product journey only after branded
+      # Chrome has executed the exact stamped bundle. Playwright keeps branded
+      # browsers behind an explicit channel: https://playwright.dev/docs/browsers
+      - run: npx playwright install --with-deps chrome
         working-directory: web
       - run: npm run test:csp
         working-directory: web
+      - run: npm run test:product -- --project=chromium
+        working-directory: web
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-browser-chrome-${{ github.run_attempt }}
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore
+
+  source-gates-webkit:
+    name: stamped source WebKit gate
+    needs: prepare
+    runs-on: macos-15
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      KAHAWAI_REQUIRE_WEB: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.prepare.outputs.release_commit }}
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # One formula supplies core plus all gst-* plugin families on current
+      # Homebrew: https://formulae.brew.sh/formula/gstreamer
+      - run: brew install gstreamer tesseract protobuf cmake pkgconf
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-15-release-browser-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-15-release-browser-rust-1.97.1-
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: npx playwright install webkit
+        working-directory: web
+      - run: npm run test:product -- --project=webkit
+        working-directory: web
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-browser-webkit-${{ github.run_attempt }}
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore
 
   draft-release:
     name: create draft release
-    needs: [prepare, source-gates]
+    needs: [prepare, source-gates, source-gates-webkit]
     runs-on: ubuntu-26.04
     permissions:
       contents: write

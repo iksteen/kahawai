@@ -111,15 +111,27 @@ jobs:
         env:
           KAHAWAI_MEDIA_SKIP_FILE: ${{ runner.temp }}/kahawai-media-skips.txt
       # SEC-WEB-1 is a browser contract: execute the production bundle, its
-      # JASSUB worker/WASM path, and the negative CSP cases in real Chromium.
-      # Playwright's official CI guidance installs browser OS dependencies with
-      # the matching pinned npm package: https://playwright.dev/docs/ci
+      # JASSUB worker/WASM path, negative CSP cases, and the real all-in-one
+      # product journey in branded Chrome. Playwright documents both the
+      # browser-specific install and `channel: chrome`:
+      # https://playwright.dev/docs/browsers
       - run: npm run build
         working-directory: web
-      - run: npx playwright install --with-deps --no-shell chromium
+      - run: npx playwright install --with-deps chrome
         working-directory: web
       - run: npm run test:csp
         working-directory: web
+      - run: npm run test:product -- --project=chromium
+        working-directory: web
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-chrome-${{ github.run_attempt }}
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore
       - name: Report media paths not exercised
         if: always()
         env:
@@ -196,3 +208,50 @@ jobs:
       # toolchain details and are deliberately not compared with Git.
       - run: npm run build
         working-directory: web
+
+  browser-webkit:
+    name: product browser (WebKit/macOS)
+    runs-on: macos-15
+    env:
+      # The fixture needs production pipelines, not debug symbols; this keeps
+      # the complete Rust/media build inside the standard runner's 14 GB disk.
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+      # Homebrew's current GStreamer formula bundles all gst-* plugins and
+      # their codec dependencies: https://formulae.brew.sh/formula/gstreamer
+      - name: Install media build dependencies
+        run: brew install gstreamer tesseract protobuf cmake pkgconf
+      - name: Cache cargo registry and target
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            target
+          key: macos-15-browser-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: macos-15-browser-rust-1.97.1-
+      - run: npm ci
+        working-directory: web
+      - run: npm run build
+        working-directory: web
+      - run: npx playwright install webkit
+        working-directory: web
+      - run: npm run test:product -- --project=webkit
+        working-directory: web
+      - name: Upload browser failure evidence
+        if: failure()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: browser-webkit-${{ github.run_attempt }}
+          path: |
+            web/playwright-report
+            web/test-results
+          if-no-files-found: ignore

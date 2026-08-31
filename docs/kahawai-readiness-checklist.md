@@ -584,11 +584,14 @@ marked in that document.
 - [ ] CI-8 Test backup configuration restoration, Unix permissions, corrupt and
       truncated manifests, invalid SQLite, stale-file removal, interruption
       rollback and refusal while the live hub owns the data lock
-- [ ] CI-9 Run Playwright against Chromium and WebKit for setup, login/logout,
+- [x] CI-9 Run Playwright against Chromium and WebKit for setup, login/logout,
       user grants, administration, browse/search/deep links, direct/remux/
       transcode playback, seek/recovery, subtitles and native HLS behaviour;
       assert persisted and browser-visible outcomes rather than only command
-      success
+      success. A disposable real all-in-one fixture generates each media mode;
+      branded Chrome gates MSE and WebKit on macOS gates native HLS. The suite
+      crashes/restarts the child over retained databases and asserts the UI
+      still exposes the library and narrowed grant
 - [ ] CI-10 Run automated accessibility checks on the primary authentication,
       browse, detail, player, settings and administration screens
 - [ ] CI-11 Add a modular Compose release test with separate hub, mediahost and
