@@ -592,8 +592,10 @@ marked in that document.
       branded Chrome gates MSE and WebKit on macOS gates native HLS. The suite
       crashes/restarts the child over retained databases and asserts the UI
       still exposes the library and narrowed grant
-- [ ] CI-10 Run automated accessibility checks on the primary authentication,
-      browse, detail, player, settings and administration screens
+- [x] CI-10 Run automated accessibility checks on the primary authentication,
+      browse, detail, player, settings and administration screens. Axe scans
+      the rendered Chrome product journey through WCAG 2.0/2.1 A+AA and the
+      applicable WCAG 2.2 AA rules; UX-3 retains the separate manual review
 - [ ] CI-11 Add a modular Compose release test with separate hub, mediahost and
       transcoder processes; disconnect/restart satellites and workers and prove
       recovery without duplicate, leaked or permanently stuck sessions

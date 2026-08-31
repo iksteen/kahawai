@@ -528,7 +528,7 @@ integration tests cover redirects, assets, SPA fallbacks and error responses.
 CI and stamped release source gates use the lockfile-pinned Playwright CLI to
 install Chrome stable and run the same suite.
 
-`scripts/kahawai-browser-check.sh chrome|webkit` runs the CI-9 product
+`scripts/kahawai-browser-check.sh chrome|webkit` runs the CI-9/CI-10 product
 gate. Its supervisor creates a disposable media tree and separate hub and
 mediahost state directories, renders tiny direct, remux, transcode and
 embedded-ASS sources with the real GStreamer helpers, and starts the real
@@ -542,11 +542,14 @@ remux case loses one segment and seeks near the generated frontier, proving
 player recovery; the ASS case waits for JASSUB's actual canvas. All requests
 are confined to loopback and unexpected page errors fail the run.
 
-Branded Chrome covers Chromium/MSE. A separate macOS WebKit job covers the same
-product journey plus a forced MediaSource-absent session whose `<video>` must
-accept HLS natively and receive the real master playlist. Pull requests and
-stamped release source both run the two gates; retained traces, screenshots
-and video are uploaded on failure.
+Branded Chrome covers Chromium/MSE and runs Axe against setup, authentication,
+browse, detail, player, settings and the primary administration tabs. A
+separate macOS WebKit job covers the same product journey plus a forced
+MediaSource-absent session whose `<video>` must accept HLS natively and receive
+the real master playlist. Pull requests and stamped release source both run
+the two gates; retained traces, screenshots, video and Axe JSON are uploaded on
+failure. This closes the automated portions of CI-9/CI-10, but not UX-3's
+manual keyboard, focus, zoom and screen-reader review.
 
 **Capability profile.** On startup the player probes the browser honestly rather than shipping a static profile: `MediaSource.isTypeSupported()` / `mediaCapabilities.decodingInfo()` across the codec matrix (H.264 profiles/levels, HEVC, AV1, AAC/AC-3/Opus/FLAC), container support (fMP4 via MSE; native HLS on Safari), HDR via `matchMedia('(dynamic-range: high)')` + codec profile support, and screen dimensions — serialized into the `CapabilityProfile` sent to `/playback/decisions`. This makes the web player the reference implementation of negotiation from the client side.
 

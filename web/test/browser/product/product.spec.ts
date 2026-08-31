@@ -1,3 +1,4 @@
+import AxeBuilder from '@axe-core/playwright'
 import { expect, test, type BrowserContext, type Page } from '@playwright/test'
 
 const PUBLIC = 'http://127.0.0.1:18430'
@@ -14,6 +15,27 @@ const foreignRequests: string[] = []
 
 function watch(target: Page) {
   target.on('pageerror', (error) => pageErrors.push(error.message))
+}
+
+async function accessible(name: string) {
+  if (engine !== 'chromium') return
+  const result = await new AxeBuilder({ page })
+    .withTags(['wcag2a', 'wcag2aa', 'wcag21a', 'wcag21aa', 'wcag22aa'])
+    .analyze()
+  if (result.violations.length) {
+    await test.info().attach(`axe-${name}.json`, {
+      body: JSON.stringify(result, null, 2),
+      contentType: 'application/json',
+    })
+  }
+  expect(
+    result.violations.map((violation) => ({
+      id: violation.id,
+      impact: violation.impact,
+      targets: violation.nodes.map((node) => node.target),
+    })),
+    `${name} has automated accessibility violations`,
+  ).toEqual([])
 }
 
 async function login(username: string, password: string) {
@@ -96,6 +118,7 @@ test.describe.serial('real all-in-one product flows', () => {
 
     await page.goto(`${SETUP}/app/`)
     await expect(page.getByText('First run. Create the initial administrator')).toBeVisible()
+    await accessible('setup')
     await page.getByLabel('Username').fill('admin')
     await page.getByLabel('Password').fill(ADMIN_PASSWORD)
     await page.getByRole('button', { name: 'Create admin account' }).click()
@@ -112,17 +135,21 @@ test.describe.serial('real all-in-one product flows', () => {
       .toBe(true)
 
     await page.goto(`${PUBLIC}/app/`)
+    await accessible('login')
     await page.getByLabel('Username').fill('admin')
     await page.getByLabel('Password').fill(ADMIN_PASSWORD)
     await page.getByRole('button', { name: 'Sign in' }).click()
     await expect(page.getByRole('heading', { name: 'Your libraries' })).toBeVisible()
+    await accessible('browse-home')
   })
 
   test('administration creates a composed library and a narrowed account', async () => {
     await page.goto(`${PUBLIC}/app/admin`)
     await expect(page.getByRole('heading', { name: 'Satellites' })).toBeVisible()
+    await accessible('admin-satellites')
 
     await page.getByRole('tab', { name: 'Libraries' }).click()
+    await accessible('admin-libraries')
     await page.getByLabel('New library name').fill('Browser Library')
     await page.getByRole('button', { name: 'Create' }).click()
     const library = page.getByRole('listitem').filter({ hasText: 'Browser Library' })
@@ -135,7 +162,9 @@ test.describe.serial('real all-in-one product flows', () => {
     await expect(library.getByLabel(/Detach .*\/movies from Browser Library/)).toBeVisible()
 
     await page.getByRole('tab', { name: 'Providers' }).click()
+    await accessible('admin-providers')
     await page.getByRole('tab', { name: 'Users & grants' }).click()
+    await accessible('admin-users')
     await page.getByLabel('New username').fill('viewer')
     await page.getByLabel('Password').fill(VIEWER_PASSWORD)
     await page.getByRole('button', { name: 'Create' }).click()
@@ -153,6 +182,7 @@ test.describe.serial('real all-in-one product flows', () => {
     )
 
     await page.getByRole('tab', { name: 'Sessions' }).click()
+    await accessible('admin-sessions')
   })
 
   test('a process restart preserves state and the grant is enforced in the UI', async () => {
@@ -182,6 +212,7 @@ test.describe.serial('real all-in-one product flows', () => {
     await page.reload()
     await expect(page.getByRole('heading', { name: /Direct Fixture/ })).toBeVisible()
     expect(page.url()).toBe(deepLink)
+    await accessible('detail')
   })
 
   test('direct, remux and transcode modes decode and recover in the browser', async () => {
@@ -238,11 +269,13 @@ test.describe.serial('real all-in-one product flows', () => {
     await expect
       .poll(() => canvas.evaluate((element) => [element.clientWidth, element.clientHeight]))
       .not.toEqual([0, 0])
+    await accessible('player')
   })
 
   test('settings and all primary screens pass the automated accessibility gate', async () => {
     await page.goto(`${PUBLIC}/app/settings`)
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
+    await accessible('settings')
     expect(pageErrors).toEqual([])
     expect(foreignRequests).toEqual([])
   })

@@ -227,12 +227,12 @@ const marooned = (user: UserAccess) =>
           >
             no access
           </span>
-          <span class="ml-auto font-mono text-[11px] text-dimmer">
+          <span class="ml-auto font-mono text-[11px] text-dim">
             since {{ since(user.created_at) }}
           </span>
           <!-- The API refuses deleting the account you are signed in as, so
                saying it before the click is kinder than an error afterwards. -->
-          <span v-if="user.username === me" class="font-mono text-[11px] text-dimmer">
+          <span v-if="user.username === me" class="font-mono text-[11px] text-dim">
             signed in as this account
           </span>
           <Armed

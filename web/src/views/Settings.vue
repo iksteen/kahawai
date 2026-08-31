@@ -495,7 +495,7 @@ async function disconnect() {
           </span>
           <span
             v-if="listFor(kind, mediaType).length === 0"
-            class="flex min-h-[1.6rem] flex-[1_1_240px] items-center text-[12px] text-dimmer"
+            class="flex min-h-[1.6rem] flex-[1_1_240px] items-center text-[12px] text-dim"
           >
             no subtitles
           </span>
