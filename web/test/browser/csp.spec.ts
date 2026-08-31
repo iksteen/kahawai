@@ -236,20 +236,36 @@ test('framing and MIME-sniffed script execution are refused', async ({ page }) =
 test('the minimal permissions policy is delivered and understood by Chromium', async ({ page }) => {
   const response = await page.goto('/app/')
   expect(response?.headers()['permissions-policy']).toBe(
-    'accelerometer=(), autoplay=(self), camera=(), clipboard-read=(), clipboard-write=(self), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), hid=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(self), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()',
+    'accelerometer=(), aria-notify=(), attribution-reporting=(), autoplay=(self), browsing-topics=(), camera=(), captured-surface-control=(), ch-device-memory=(), ch-downlink=(), ch-dpr=(), ch-ect=(), ch-prefers-color-scheme=(), ch-prefers-reduced-motion=(), ch-prefers-reduced-transparency=(), ch-rtt=(), ch-save-data=(), ch-ua=(), ch-ua-arch=(), ch-ua-bitness=(), ch-ua-form-factors=(), ch-ua-full-version=(), ch-ua-full-version-list=(), ch-ua-high-entropy-values=(), ch-ua-mobile=(), ch-ua-model=(), ch-ua-platform=(), ch-ua-platform-version=(), ch-ua-wow64=(), ch-viewport-height=(), ch-viewport-width=(), ch-width=(), clipboard-read=(), clipboard-write=(self), compute-pressure=(), cross-origin-isolated=(), deferred-fetch=(), deferred-fetch-minimal=(), digital-credentials-get=(), display-capture=(), encrypted-media=(), fullscreen=(self), gamepad=(), geolocation=(), gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), interest-cohort=(), join-ad-interest-group=(), keyboard-map=(), language-detector=(), language-model=(), local-fonts=(), local-network=(), local-network-access=(), loopback-network=(), magnetometer=(), microphone=(), midi=(), on-device-speech-recognition=(), otp-credentials=(), payment=(), picture-in-picture=(self), private-aggregation=(), private-state-token-issuance=(), private-state-token-redemption=(), publickey-credentials-create=(), publickey-credentials-get=(), run-ad-auction=(), screen-wake-lock=(), serial=(), shared-storage=(), shared-storage-select-url=(), storage-access=(), summarizer=(), sync-xhr=(), translator=(), unload=(), usb=(), window-management=(), xr-spatial-tracking=()',
   )
   const policy = await page.evaluate(() => {
     const documentPolicy =
       (
         document as typeof document & {
-          permissionsPolicy?: { allowsFeature(name: string): boolean }
-          featurePolicy?: { allowsFeature(name: string): boolean }
+          permissionsPolicy?: {
+            allowsFeature(name: string): boolean
+            features(): string[]
+          }
+          featurePolicy?: {
+            allowsFeature(name: string): boolean
+            features(): string[]
+          }
         }
       ).permissionsPolicy ??
-      (document as typeof document & { featurePolicy?: { allowsFeature(name: string): boolean } })
-        .featurePolicy
+      (
+        document as typeof document & {
+          featurePolicy?: {
+            allowsFeature(name: string): boolean
+            features(): string[]
+          }
+        }
+      ).featurePolicy
     if (!documentPolicy) throw new Error('Chromium exposes no Permissions Policy API')
     return {
+      allowed: documentPolicy
+        .features()
+        .filter((feature) => documentPolicy.allowsFeature(feature))
+        .sort(),
       autoplay: documentPolicy.allowsFeature('autoplay'),
       fullscreen: documentPolicy.allowsFeature('fullscreen'),
       camera: documentPolicy.allowsFeature('camera'),
@@ -258,6 +274,7 @@ test('the minimal permissions policy is delivered and understood by Chromium', a
     }
   })
   expect(policy).toEqual({
+    allowed: ['autoplay', 'clipboard-write', 'fullscreen', 'picture-in-picture'],
     autoplay: true,
     fullscreen: true,
     camera: false,

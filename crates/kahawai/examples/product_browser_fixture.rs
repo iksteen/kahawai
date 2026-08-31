@@ -260,6 +260,7 @@ fn child_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<Chil
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    kahawai_runtime::init_tracing();
     match std::env::args_os().nth(1).as_deref() {
         Some(command)
             if command == std::ffi::OsStr::new("remux-worker")

@@ -1,9 +1,7 @@
 import AxeBuilder from '@axe-core/playwright'
-import { expect, test, type BrowserContext, type Page } from '@playwright/test'
+import { expect, test, type BrowserContext, type Locator, type Page } from '@playwright/test'
 
-const PUBLIC = 'http://127.0.0.1:18430'
-const SETUP = 'http://127.0.0.1:18431'
-const CONTROL = 'http://127.0.0.1:18433'
+import { CONTROL, PUBLIC, SETUP } from './addresses.ts'
 const ADMIN_PASSWORD = 'browser-password'
 const VIEWER_PASSWORD = 'viewer-password'
 
@@ -15,6 +13,27 @@ const foreignRequests: string[] = []
 
 function watch(target: Page) {
   target.on('pageerror', (error) => pageErrors.push(error.message))
+}
+
+async function brightPixels(target: Page, canvas: Locator): Promise<number> {
+  const png = await canvas.screenshot()
+  return target.evaluate(async (encoded) => {
+    const image = new Image()
+    image.src = `data:image/png;base64,${encoded}`
+    await image.decode()
+    const sample = document.createElement('canvas')
+    sample.width = image.naturalWidth
+    sample.height = image.naturalHeight
+    const context = sample.getContext('2d')
+    if (!context) return 0
+    context.drawImage(image, 0, 0)
+    const pixels = context.getImageData(0, 0, sample.width, sample.height).data
+    let bright = 0
+    for (let at = 0; at < pixels.length; at += 4) {
+      if (pixels[at]! + pixels[at + 1]! + pixels[at + 2]! > 90) bright++
+    }
+    return bright
+  }, png.toString('base64'))
 }
 
 async function accessible(name: string) {
@@ -112,6 +131,11 @@ test.describe.serial('real all-in-one product flows', () => {
     await context?.close()
   })
 
+  test.afterEach(() => {
+    expect(pageErrors, 'the product emitted an uncaught page error').toEqual([])
+    expect(foreignRequests, 'the hermetic product journey attempted a foreign request').toEqual([])
+  })
+
   test('setup is local-only and hands the installation to normal login', async () => {
     await page.goto(`${PUBLIC}/app/`)
     await expect(page.getByText('Initial setup is available only')).toBeVisible()
@@ -146,10 +170,10 @@ test.describe.serial('real all-in-one product flows', () => {
   test('administration creates a composed library and a narrowed account', async () => {
     await page.goto(`${PUBLIC}/app/admin`)
     await expect(page.getByRole('heading', { name: 'Satellites' })).toBeVisible()
+    await expect(page.getByText('No satellites enrolled.')).toBeVisible()
     await accessible('admin-satellites')
 
     await page.getByRole('tab', { name: 'Libraries' }).click()
-    await accessible('admin-libraries')
     await page.getByLabel('New library name').fill('Browser Library')
     await page.getByRole('button', { name: 'Create' }).click()
     const library = page.getByRole('listitem').filter({ hasText: 'Browser Library' })
@@ -160,11 +184,12 @@ test.describe.serial('real all-in-one product flows', () => {
     expect(movies).toBeGreaterThan(0)
     await attach.selectOption({ index: movies })
     await expect(library.getByLabel(/Detach .*\/movies from Browser Library/)).toBeVisible()
+    await accessible('admin-libraries')
 
     await page.getByRole('tab', { name: 'Providers' }).click()
+    await expect(page.getByRole('heading', { name: 'Matching order' })).toBeVisible()
     await accessible('admin-providers')
     await page.getByRole('tab', { name: 'Users & grants' }).click()
-    await accessible('admin-users')
     await page.getByLabel('New username').fill('viewer')
     await page.getByLabel('Password').fill(VIEWER_PASSWORD)
     await page.getByRole('button', { name: 'Create' }).click()
@@ -180,8 +205,10 @@ test.describe.serial('real all-in-one product flows', () => {
       'aria-pressed',
       'true',
     )
+    await accessible('admin-users')
 
     await page.getByRole('tab', { name: 'Sessions' }).click()
+    await expect(page.getByText('Nobody is streaming.')).toBeVisible()
     await accessible('admin-sessions')
   })
 
@@ -261,7 +288,7 @@ test.describe.serial('real all-in-one product flows', () => {
 
   test('embedded ASS reaches the real browser subtitle renderer', async () => {
     await openFixture('Subtitle Fixture')
-    await startPlayback('REMUX')
+    const video = await startPlayback('REMUX')
     const subtitles = page.getByLabel('Subtitles')
     await subtitles.selectOption({ index: 1 })
     const canvas = page.locator('.videobox canvas')
@@ -269,6 +296,13 @@ test.describe.serial('real all-in-one product flows', () => {
     await expect
       .poll(() => canvas.evaluate((element) => [element.clientWidth, element.clientHeight]))
       .not.toEqual([0, 0])
+    await video.evaluate(async (element) => {
+      const player = element as HTMLVideoElement
+      player.playbackRate = 0.1
+      player.currentTime = 0.5
+      await player.play()
+    })
+    await expect.poll(() => brightPixels(page, canvas)).toBeGreaterThan(0)
     await accessible('player')
   })
 
@@ -276,8 +310,6 @@ test.describe.serial('real all-in-one product flows', () => {
     await page.goto(`${PUBLIC}/app/settings`)
     await expect(page.getByRole('heading', { name: 'Settings' })).toBeVisible()
     await accessible('settings')
-    expect(pageErrors).toEqual([])
-    expect(foreignRequests).toEqual([])
   })
 
   test('WebKit consumes HLS natively when MediaSource is unavailable', async () => {

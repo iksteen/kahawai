@@ -509,8 +509,10 @@ fallbacks follow [CSP Level 3](https://www.w3.org/TR/CSP3/).
 The accompanying Permissions Policy grants this origin only the four browser
 features the app actually invokes — autoplay, clipboard write, fullscreen and
 picture-in-picture — and explicitly denies camera, microphone, location,
-display capture, local fonts and the remaining enumerated device/payment
-features. Its dictionary and `()`/`(self)` syntax follow the
+display capture, local fonts and every other feature Chromium currently
+recognises. The browser gate asserts that the runtime's complete allowed set is
+exactly those four, so a newly exposed feature fails closed in CI until the
+header explicitly denies it. Its dictionary and `()`/`(self)` syntax follow the
 [Permissions Policy specification](https://www.w3.org/TR/permissions-policy/).
 Web responses additionally send `Referrer-Policy: no-referrer`; every web,
 public API and setup response sends `X-Content-Type-Options: nosniff`, matching
@@ -539,8 +541,9 @@ process restart. No product API is mocked. The serial journey performs local
 first-run setup, login/logout, administration, narrowed grants, browse/search
 and deep-link reload, then decodes direct, remux and transcode sessions. The
 remux case loses one segment and seeks near the generated frontier, proving
-player recovery; the ASS case waits for JASSUB's actual canvas. All requests
-are confined to loopback and unexpected page errors fail the run.
+player recovery; the ASS case waits for visible pixels on JASSUB's actual
+offscreen-rendered canvas. All requests are confined to loopback and unexpected
+page errors fail the run, including errors raised by the final native-HLS case.
 
 Branded Chrome covers Chromium/MSE and runs Axe against setup, authentication,
 browse, detail, player, settings and the primary administration tabs. A

@@ -102,9 +102,12 @@ const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; obje
 
 /// Permissions Policy is a Structured Header dictionary: `()` denies a
 /// feature and `(self)` grants only this origin. Keep the app's four used
-/// capabilities and deny the rest explicitly. Syntax and inheritance model:
+/// capabilities and deny every feature recognized by the browser gate. That
+/// gate also requires the allowed-feature set to be exactly these four, so a
+/// newly exposed browser capability fails CI until this reviewed list denies
+/// it. Syntax and inheritance model:
 /// https://www.w3.org/TR/permissions-policy/.
-const PERMISSIONS_POLICY: &str = "accelerometer=(), autoplay=(self), camera=(), clipboard-read=(), clipboard-write=(self), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), hid=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(self), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()";
+const PERMISSIONS_POLICY: &str = "accelerometer=(), aria-notify=(), attribution-reporting=(), autoplay=(self), browsing-topics=(), camera=(), captured-surface-control=(), ch-device-memory=(), ch-downlink=(), ch-dpr=(), ch-ect=(), ch-prefers-color-scheme=(), ch-prefers-reduced-motion=(), ch-prefers-reduced-transparency=(), ch-rtt=(), ch-save-data=(), ch-ua=(), ch-ua-arch=(), ch-ua-bitness=(), ch-ua-form-factors=(), ch-ua-full-version=(), ch-ua-full-version-list=(), ch-ua-high-entropy-values=(), ch-ua-mobile=(), ch-ua-model=(), ch-ua-platform=(), ch-ua-platform-version=(), ch-ua-wow64=(), ch-viewport-height=(), ch-viewport-width=(), ch-width=(), clipboard-read=(), clipboard-write=(self), compute-pressure=(), cross-origin-isolated=(), deferred-fetch=(), deferred-fetch-minimal=(), digital-credentials-get=(), display-capture=(), encrypted-media=(), fullscreen=(self), gamepad=(), geolocation=(), gyroscope=(), hid=(), identity-credentials-get=(), idle-detection=(), interest-cohort=(), join-ad-interest-group=(), keyboard-map=(), language-detector=(), language-model=(), local-fonts=(), local-network=(), local-network-access=(), loopback-network=(), magnetometer=(), microphone=(), midi=(), on-device-speech-recognition=(), otp-credentials=(), payment=(), picture-in-picture=(self), private-aggregation=(), private-state-token-issuance=(), private-state-token-redemption=(), publickey-credentials-create=(), publickey-credentials-get=(), run-ad-auction=(), screen-wake-lock=(), serial=(), shared-storage=(), shared-storage-select-url=(), storage-access=(), summarizer=(), sync-xhr=(), translator=(), unload=(), usb=(), window-management=(), xr-spatial-tracking=()";
 
 pub fn router(web_dir: Option<PathBuf>) -> Router {
     Router::new()

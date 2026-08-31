@@ -1,7 +1,13 @@
 import { defineConfig, devices } from '@playwright/test'
 
-const publicPort = Number(process.env.KAHAWAI_E2E_PUBLIC_PORT ?? 18430)
-const controlPort = Number(process.env.KAHAWAI_E2E_CONTROL_PORT ?? 18433)
+import {
+  CONTROL,
+  CONTROL_ADDRESS,
+  PUBLIC,
+  PUBLIC_ADDRESS,
+  SATELLITE_ADDRESS,
+  SETUP_ADDRESS,
+} from './test/browser/product/addresses.ts'
 
 export default defineConfig({
   testDir: './test/browser/product',
@@ -13,8 +19,7 @@ export default defineConfig({
   reporter: process.env.CI ? [['line'], ['html', { open: 'never' }]] : 'line',
   outputDir: 'test-results/product',
   use: {
-    baseURL: `http://127.0.0.1:${publicPort}`,
-    reducedMotion: 'reduce',
+    baseURL: PUBLIC,
     trace: 'retain-on-failure',
     screenshot: 'only-on-failure',
     video: 'retain-on-failure',
@@ -30,9 +35,15 @@ export default defineConfig({
     },
   ],
   webServer: {
-    command: 'cargo run --quiet -p kahawai --example product_browser_fixture',
+    command: 'cargo run --quiet --locked -p kahawai --example product_browser_fixture',
     cwd: '..',
-    url: `http://127.0.0.1:${controlPort}/ready`,
+    env: {
+      KAHAWAI_E2E_PUBLIC: PUBLIC_ADDRESS,
+      KAHAWAI_E2E_SETUP: SETUP_ADDRESS,
+      KAHAWAI_E2E_SATELLITE: SATELLITE_ADDRESS,
+      KAHAWAI_E2E_CONTROL: CONTROL_ADDRESS,
+    },
+    url: `${CONTROL}/ready`,
     reuseExistingServer: false,
     timeout: 180_000,
   },

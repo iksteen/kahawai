@@ -254,7 +254,7 @@ const marooned = (user: UserAccess) =>
              swallowed it instead, and took the just-pressed button out of the
              tab order with nothing announcing why. -->
         <div v-if="!seesEverything(grants.asShown(user))" class="mt-2 flex flex-wrap gap-1">
-          <span class="font-mono text-[11px] text-dimmer">granted</span>
+          <span class="font-mono text-[11px] text-dim">granted</span>
           <button
             v-for="library in props.libraries"
             :key="library.id"

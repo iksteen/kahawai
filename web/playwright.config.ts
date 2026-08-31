@@ -17,7 +17,7 @@ export default defineConfig({
     screenshot: 'only-on-failure',
   },
   webServer: {
-    command: `cargo run --quiet -p kahawai-hub --example csp_browser_fixture -- web/dist 127.0.0.1:${port}`,
+    command: `cargo run --quiet --locked -p kahawai-hub --example csp_browser_fixture -- web/dist 127.0.0.1:${port}`,
     cwd: '..',
     url: `http://127.0.0.1:${port}/app/`,
     reuseExistingServer: false,
