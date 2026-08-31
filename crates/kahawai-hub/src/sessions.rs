@@ -496,9 +496,6 @@ impl PendingSeek {
     }
 }
 
-/// The local process's verified encoder codec names — negotiation's
-/// target pool when no fleet box would run the encode (HUB-15b),
-/// mirroring the tonemap_available() fallback.
 /// What the box that would run an encode can do. A PARAMETER rather
 /// than part of [`Negotiation`], because the two callers learn it from
 /// different places and the difference is load-bearing: a session start
@@ -748,27 +745,34 @@ impl<'a> Negotiation<'a> {
             work_class: None,
             source_kbps: None,
         };
-        let (tonemap, full_targets, full_protocol) = match self.registry.pick_transcoder(&need) {
-            Some(tc) => (
-                self.registry.transcoder_reports_tonemap(&tc),
-                self.registry.transcoder_encoders(&tc),
-                self.registry
-                    .transcoder_protocol_features(&tc)
-                    .unwrap_or_default(),
-            ),
-            None if self.registry.local_video_executor_enabled() => (
-                local_tonemap_available(self.registry),
-                local_encoder_names(self.registry),
-                kahawai_proto::ProtocolFeatures::current(),
-            ),
-            None => (false, Vec::new(), Default::default()),
-        };
+        let local_audio_targets = local_audio_encoder_names();
+        let (tonemap, video_targets, full_audio_targets, full_protocol) =
+            match self.registry.pick_transcoder(&need) {
+                Some(tc) => {
+                    let targets = self.registry.transcoder_encoders(&tc);
+                    (
+                        self.registry.transcoder_reports_tonemap(&tc),
+                        video_encoder_names(&targets),
+                        audio_encoder_names(&targets),
+                        self.registry
+                            .transcoder_protocol_features(&tc)
+                            .unwrap_or_default(),
+                    )
+                }
+                None if self.registry.local_video_executor_enabled() => (
+                    local_tonemap_available(self.registry),
+                    local_video_encoder_names(self.registry),
+                    local_audio_targets.clone(),
+                    kahawai_proto::ProtocolFeatures::current(),
+                ),
+                None => (false, Vec::new(), Vec::new(), Default::default()),
+            };
         ExecutorFacts {
             tonemap,
-            video_targets: video_encoder_names(&full_targets),
-            full_audio_targets: audio_encoder_names(&full_targets),
+            video_targets,
+            full_audio_targets,
             full_protocol,
-            local_audio_targets: local_audio_encoder_names(),
+            local_audio_targets,
             burn_capable,
         }
     }
@@ -1057,7 +1061,11 @@ impl<'a> Negotiation<'a> {
     }
 }
 
-fn local_encoder_names(registry: &Registry) -> Vec<String> {
+/// The local process's benchmark-verified VIDEO encoder codec names —
+/// negotiation's video target pool when no fleet box would run the encode
+/// (HUB-15b), mirroring the `tonemap_available()` fallback. Audio encoders are
+/// discovered separately by [`local_audio_encoder_names`].
+fn local_video_encoder_names(registry: &Registry) -> Vec<String> {
     let Some(bench) = registry.local_bench() else {
         return Vec::new();
     };
@@ -3586,7 +3594,7 @@ impl Sessions {
                 }
                 _ => {
                     let video = if registry.local_video_executor_enabled() {
-                        video_encoder_names(&local_encoder_names(registry))
+                        local_video_encoder_names(registry)
                     } else {
                         Vec::new()
                     };
@@ -4407,8 +4415,8 @@ mod lease_purpose_tests {
 mod tests {
     use super::{
         LoudnessPreference, Negotiation, PartSource, Sessions, apply_audio_loudness_measurement,
-        fold_facts, local_encoder_names, local_tonemap_available, part_index, replanned_verdict,
-        same_video_path, source_choice_key, wire_scalar_loudness,
+        fold_facts, local_audio_encoder_names, local_tonemap_available, local_video_encoder_names,
+        part_index, replanned_verdict, same_video_path, source_choice_key, wire_scalar_loudness,
     };
 
     /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
@@ -4471,7 +4479,7 @@ mod tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = crate::registry::Registry::new(db, Default::default());
         assert!(
-            local_encoder_names(&registry).is_empty(),
+            local_video_encoder_names(&registry).is_empty(),
             "unmeasured local encoder was offered"
         );
 
@@ -4493,7 +4501,7 @@ mod tests {
         );
         kahawai_media::bench::store(&cache, &measured);
         registry.set_local_bench(measured);
-        assert_eq!(local_encoder_names(&registry), [codec]);
+        assert_eq!(local_video_encoder_names(&registry), [codec]);
         assert_eq!(
             local_tonemap_available(&registry),
             kahawai_media::remux::tonemap_available()
@@ -4505,7 +4513,7 @@ mod tests {
         );
         registry.set_local_bench(kahawai_media::bench::load(&cache).unwrap());
         assert!(
-            !local_encoder_names(&registry)
+            !local_video_encoder_names(&registry)
                 .iter()
                 .any(|candidate| candidate == codec),
             "quarantined local encoder remained a serving capability"
@@ -4514,6 +4522,108 @@ mod tests {
         kahawai_media::bench::record_crash(&cache, &kahawai_media::bench::BenchmarkJob::ToneMap);
         registry.set_local_bench(kahawai_media::bench::load(&cache).unwrap());
         assert!(!local_tonemap_available(&registry));
+    }
+
+    /// A video encode moves the whole pipeline onto the full executor, so its
+    /// target set must include that executor's independently discovered audio
+    /// encoders. The local video list is benchmark-derived and intentionally
+    /// contains no audio codecs; deriving both target sets from it made an
+    /// all-in-one tone-map silently drop E-AC-3 instead of encoding AAC.
+    #[tokio::test]
+    async fn the_full_local_executor_keeps_its_audio_targets() {
+        let expected = local_audio_encoder_names();
+        if !expected.iter().any(|codec| codec == "aac") {
+            eprintln!("skip: no local AAC encoder on this test host");
+            return;
+        }
+        let Some((_, h264_element, _)) = kahawai_media::remux::encoder_capabilities()
+            .iter()
+            .find(|(codec, _, _)| *codec == "h264")
+            .copied()
+        else {
+            eprintln!("skip: no local H.264 encoder on this test host");
+            return;
+        };
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry =
+            crate::registry::Registry::new(db, Default::default()).with_local_video_executor(true);
+        let mut bench = kahawai_media::bench::BenchResults {
+            gst: kahawai_media::bench::gst_version(),
+            ..Default::default()
+        };
+        bench.encoders.insert(
+            h264_element.into(),
+            kahawai_media::bench::Speeds {
+                s1080: Some(1.0),
+                s2160: Some(1.0),
+            },
+        );
+        registry.set_local_bench(bench);
+        let sessions = Sessions::new(tempfile::tempdir().unwrap().path().join("sessions"));
+        let negotiation = Negotiation {
+            registry: &registry,
+            sessions: &sessions,
+            profile: Default::default(),
+            loudness: LoudnessPreference::Off,
+            ass: Default::default(),
+            ocr_set: Default::default(),
+            burn_row: None,
+            audio_track: 0,
+            video_track: 0,
+            force_audio_encode: false,
+            force_measurement: None,
+        };
+
+        let facts = negotiation.probe(&Default::default(), false, None);
+        assert_eq!(facts.full_audio_targets, expected);
+        let mut profile = kahawai_core::media::CapabilityProfile::default();
+        profile.containers.clear();
+        profile.video = vec![kahawai_core::media::VideoCap {
+            codec: "h264".into(),
+            ..Default::default()
+        }];
+        profile.audio = vec!["aac".into()];
+        profile.max_height = Some(1920);
+        let info = kahawai_core::media::MediaInfo {
+            container: Some("matroska".into()),
+            video: vec![kahawai_core::media::VideoStream {
+                codec: "h264".into(),
+                width: 3840,
+                height: 2076,
+                ..Default::default()
+            }],
+            audio: vec![kahawai_core::media::AudioStream {
+                codec: "mp3".into(),
+                channels: 6,
+                sample_rate: 48_000,
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        let plan = kahawai_media::negotiate::negotiate_for_executors(
+            &profile,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            facts.tonemap,
+            false,
+            &[],
+            None,
+            &Default::default(),
+            &facts.video_targets,
+            &facts.full_audio_targets,
+            &facts.local_audio_targets,
+            false,
+        );
+        assert_eq!(plan.plan.video, kahawai_media::remux::StreamMode::Encode);
+        assert_eq!(
+            plan.plan.audio,
+            kahawai_media::remux::StreamMode::Encode,
+            "{}",
+            plan.audio_verdict
+        );
     }
 
     /// Facts amend the verdict by kind, exactly once — a seek-restart
