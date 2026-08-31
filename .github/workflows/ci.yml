@@ -66,6 +66,11 @@ jobs:
     runs-on: ubuntu-26.04
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version-file: .node-version
+          cache: npm
+          cache-dependency-path: web/package-lock.json
       - name: Install build and media dependencies
         run: |
           sudo apt-get update
@@ -98,9 +103,23 @@ jobs:
             gst-inspect-1.0 --version
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
+      # Cargo's hub build embeds the production bundle, so install its pinned
+      # toolchain before compiling either the workspace or the browser fixture.
+      - run: npm ci
+        working-directory: web
       - run: cargo test --locked --workspace
         env:
           KAHAWAI_MEDIA_SKIP_FILE: ${{ runner.temp }}/kahawai-media-skips.txt
+      # SEC-WEB-1 is a browser contract: execute the production bundle, its
+      # JASSUB worker/WASM path, and the negative CSP cases in real Chromium.
+      # Playwright's official CI guidance installs browser OS dependencies with
+      # the matching pinned npm package: https://playwright.dev/docs/ci
+      - run: npm run build
+        working-directory: web
+      - run: npx playwright install --with-deps --no-shell chromium
+        working-directory: web
+      - run: npm run test:csp
+        working-directory: web
       - name: Report media paths not exercised
         if: always()
         env:

@@ -493,6 +493,42 @@ Sessions with video marked `Encode` are placed on a full transcoder by a scorer 
 
 **Serving.** `vite build` output is embedded with `rust-embed` and served by an axum fallback route: `/app/*` → SPA `index.html` (client-side routing), hashed assets with immutable cache headers, `/` redirects to `/app`. `web/dist` is generated and ignored, never committed: web CI proves a clean checkout builds it, while every release/container path runs the pinned Node build before Cargo and sets `KAHAWAI_REQUIRE_WEB=1` so an accidentally UI-less artifact fails. Ordinary Rust-only checks and satellite builds need no Node installation and may compile with an empty asset set. A `--dev-web-proxy` flag proxies to the Vite dev server for frontend development against a live hub. The SPA authenticates with the same JWT flow as any client and calls only `/api/v1` and `/admin/v1` — no private endpoints (HUB-28); admin routes render only for users whose token carries the admin role, but authorization is enforced server-side as usual.
 
+**Browser authority (SEC-WEB-1).** Every production web response — the shell,
+redirects, immutable assets, worker and WASM files, SPA fallbacks and web
+errors — receives one static policy at the web-router boundary. CSP begins at
+`default-src 'none'`; scripts are same-origin with only
+`'wasm-unsafe-eval'` (not JavaScript `'unsafe-eval'`), element styles are
+same-origin while Vue's generated style attributes get the narrower
+`style-src-attr 'unsafe-inline'`, images alone may use `data:`, and only media
+and workers may use `blob:`. Connections are same-origin plus the exact
+IntroDB API origin. Forms are same-origin, and bases, objects, child frames and
+all ancestors are refused. `frame-ancestors` is explicit because it does not
+fall back to `default-src`; the WASM/JavaScript distinction and directive
+fallbacks follow [CSP Level 3](https://www.w3.org/TR/CSP3/).
+
+The accompanying Permissions Policy grants this origin only the four browser
+features the app actually invokes — autoplay, clipboard write, fullscreen and
+picture-in-picture — and explicitly denies camera, microphone, location,
+display capture, local fonts and the remaining enumerated device/payment
+features. Its dictionary and `()`/`(self)` syntax follow the
+[Permissions Policy specification](https://www.w3.org/TR/permissions-policy/).
+Web responses additionally send `Referrer-Policy: no-referrer`; every web,
+public API and setup response sends `X-Content-Type-Options: nosniff`, matching
+the browser behavior documented by
+[MDN for referrers](https://developer.mozilla.org/en-US/docs/Web/Security/Practical_implementation_guides/Referrer_policy)
+and [MIME sniffing](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options).
+
+`scripts/kahawai-csp-check.sh` builds the production bundle and serves it from
+the real Rust web router through a database-free fixture. Its Playwright
+Chromium gate renders the SPA and starts the emitted JASSUB module worker,
+WASM and bundled font; exercises data images, blob workers/media and dynamic
+style attributes; then proves JavaScript eval, inline script, foreign fetches,
+all framing and JSON loaded as script are refused. Exact-header Rust
+integration tests cover redirects, assets, SPA fallbacks and error responses.
+CI and stamped release source gates install the lockfile-matched Chromium and
+run the same suite. This is deliberately narrower than the still-open full
+Chromium/WebKit product-flow suite (CI-9).
+
 **Capability profile.** On startup the player probes the browser honestly rather than shipping a static profile: `MediaSource.isTypeSupported()` / `mediaCapabilities.decodingInfo()` across the codec matrix (H.264 profiles/levels, HEVC, AV1, AAC/AC-3/Opus/FLAC), container support (fMP4 via MSE; native HLS on Safari), HDR via `matchMedia('(dynamic-range: high)')` + codec profile support, and screen dimensions — serialized into the `CapabilityProfile` sent to `/playback/decisions`. This makes the web player the reference implementation of negotiation from the client side.
 
 **Capability debug mask.** The negotiation matrix and the subtitle tiers have branches most browsers never take — no HEVC decode, no HDR display, no ASS renderer, no display-set compositor — and hunting for a browser that genuinely lacks each one is slow and unrepeatable. So the player can SUBTRACT from its own probe: a mask (`localStorage`, edited from a panel next to the playback-info verdict) is applied at the single choke point where the profile is built, after the source-aware refinements so a precise cap cannot smuggle back a family the mask dropped. What it changes is not cosmetic — the same masked answer drives the player's own rendering (`ass_render: false` really takes the flattened-VTT path instead of JASSUB; `graphics_overlay: false` really asks the hub to withhold image subtitles), so a masked client behaves like the real thing rather than merely reporting different verdict text. Codec and container entries can only be dropped, since claiming a decoder the browser lacks would produce a stream it cannot play; the three declaration booleans may go either way, because they are claims rather than probes. A mask only reaches the hub on a NEW session (the hub stores the effective profile per session and re-plans track switches against it), so applying one restarts playback at the current position, and the active mask is always printed beside the verdict — a forgotten mask must never read as a bug in the hub. The panel also copies the effective profile as JSON for `kahawai-play.sh -P` and `kahawai-sweep --profile`, so a browser-side finding reproduces headlessly across the whole library. Its first catch was the HUB-15 channel ceiling: `channels=[1,2]` range caps fixate to their minimum, so every client declaring a stereo limit had been receiving mono.

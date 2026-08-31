@@ -176,10 +176,16 @@ marked in that document.
 
 ## Browser and credential security (SEC-WEB)
 
-- [ ] SEC-WEB-1 Serve a tested Content-Security-Policy compatible with the SPA,
+- [x] SEC-WEB-1 Serve a tested Content-Security-Policy compatible with the SPA,
       JASSUB workers and WASM, plus `frame-ancestors 'none'`, nosniff, a strict
       referrer policy and a minimal permissions policy. Derive browser-policy
-      details from current primary browser specifications/documentation
+      details from current primary browser specifications/documentation.
+      `web_dir::every_web_response_has_the_exact_browser_policy` pins every
+      response class and `scripts/kahawai-csp-check.sh` runs the production
+      bundle in Chromium: the real JASSUB worker/WASM and required data/blob/
+      style paths succeed, while eval, inline script, foreign connections,
+      framing and MIME-sniffed script execution fail. CI and stamped release
+      source gates run that browser check
 - [x] SEC-WEB-2 A viewer's OpenSubtitles account has its own routes —
       `GET`/`POST`/`DELETE /api/v1/account/opensubtitles` — and is stored under
       that viewer's own owner id. The read answers `ProviderConfiguration` and

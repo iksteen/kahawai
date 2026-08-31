@@ -526,7 +526,12 @@ How something works and why it was built that way belong in
 
 ## Hub — web interface
 
-- [x] HUB-25 Embedded web UI compiled into the binary
+- [x] HUB-25 Embedded web UI compiled into the binary. Every production web
+      response carries the static CSP, no-referrer, explicit minimal
+      Permissions Policy and nosniff boundary; API/setup responses carry
+      nosniff too. The production-bundle Chromium gate executes JASSUB's real
+      worker/WASM path and both positive and negative policy cases in CI and
+      release source gates (`scripts/kahawai-csp-check.sh`)
 - [x] HUB-26 Admin UI: enrollments, satellites, libraries (with per-library
       refresh + live per-collection scan progress), providers, users,
       match review

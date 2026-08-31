@@ -101,6 +101,13 @@ jobs:
         working-directory: web
       - run: npm test
         working-directory: web
+      # Release the browser policy only after Chromium has executed the exact
+      # stamped bundle, including JASSUB's worker and WASM. Keep the install
+      # paired with the lockfile-pinned Playwright package.
+      - run: npx playwright install --with-deps --no-shell chromium
+        working-directory: web
+      - run: npm run test:csp
+        working-directory: web
 
   draft-release:
     name: create draft release

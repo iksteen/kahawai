@@ -13,11 +13,12 @@
     "dev": "vite",
     "prebuild": "npm run api:prepare",
     "build": "vue-tsc -b && vite build",
-    "lint": "oxlint --deny-warnings src test scripts orval.config.ts",
-    "fmt": "oxfmt src test scripts orval.config.ts",
-    "fmt:check": "oxfmt --check src test scripts orval.config.ts",
+    "lint": "oxlint --deny-warnings src test scripts orval.config.ts playwright.config.ts",
+    "fmt": "oxfmt src test scripts orval.config.ts playwright.config.ts",
+    "fmt:check": "oxfmt --check src test scripts orval.config.ts playwright.config.ts",
     "pretest": "npm run api:prepare",
     "test": "vitest run",
+    "test:csp": "playwright test",
     "preview": "vite preview",
     "pretypecheck": "npm run api:prepare",
     "typecheck": "vue-tsc -b"
@@ -30,6 +31,7 @@
     "vue-router": "^5.2.0"
   },
   "devDependencies": {
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/vite": "^4.3.3",
     "@types/node": "^26.1.1",
     "@vitejs/plugin-vue": "^6.0.8",
