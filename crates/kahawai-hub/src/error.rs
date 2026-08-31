@@ -94,7 +94,7 @@ pub async fn request_context(
     // boundary covers every public API/setup response; the web router also
     // installs it directly so assets retain the guarantee when that router is
     // exercised on its own. Browser behavior:
-    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options
+    // https://fetch.spec.whatwg.org/#x-content-type-options-header
     response.headers_mut().insert(
         axum::http::HeaderName::from_static("x-content-type-options"),
         axum::http::HeaderValue::from_static("nosniff"),

@@ -516,9 +516,9 @@ header explicitly denies it. Its dictionary and `()`/`(self)` syntax follow the
 [Permissions Policy specification](https://www.w3.org/TR/permissions-policy/).
 Web responses additionally send `Referrer-Policy: no-referrer`; every web,
 public API and setup response sends `X-Content-Type-Options: nosniff`, matching
-the browser behavior documented by
-[MDN for referrers](https://developer.mozilla.org/en-US/docs/Web/Security/Practical_implementation_guides/Referrer_policy)
-and [MIME sniffing](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options).
+the browser behavior defined by the
+[W3C Referrer Policy specification](https://w3c.github.io/webappsec-referrer-policy/)
+and [WHATWG Fetch's `nosniff` algorithm](https://fetch.spec.whatwg.org/#should-response-to-request-be-blocked-due-to-nosniff?).
 
 `scripts/kahawai-csp-check.sh` builds the production bundle and serves it from
 the real Rust web router through a database-free fixture. Its Playwright
