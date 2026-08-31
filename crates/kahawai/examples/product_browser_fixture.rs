@@ -79,6 +79,21 @@ struct Supervisor {
     args: ChildArgs,
 }
 
+#[cfg(unix)]
+async fn shutdown_signal() {
+    let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .expect("installing fixture SIGTERM handler");
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = terminate.recv() => {}
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() {
+    let _ = tokio::signal::ctrl_c().await;
+}
+
 fn address(name: &str, default: &str) -> Result<SocketAddr> {
     std::env::var(name)
         .unwrap_or_else(|_| default.to_string())
@@ -161,6 +176,14 @@ async fn restart(State(state): State<Arc<Supervisor>>) -> impl IntoResponse {
         StatusCode::OK,
         Json(json!({ "before": before, "after": after })),
     )
+}
+
+async fn stop_child(state: &Supervisor) {
+    let mut child = state.child.lock().await;
+    if child.try_wait().ok().flatten().is_none() {
+        let _ = child.kill().await;
+    }
+    let _ = child.wait().await;
 }
 
 fn generate_media(root: &Path) -> Result<()> {
@@ -307,10 +330,13 @@ async fn main() -> Result<()> {
     let app = axum::Router::new()
         .route("/ready", get(ready))
         .route("/restart", post(restart))
-        .with_state(state);
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(control).await?;
     println!("browser fixture control listening on http://{control}/ready");
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(listener, app)
+        .with_graceful_shutdown(shutdown_signal())
+        .await;
+    stop_child(&state).await;
     drop(root);
     result.context("serving browser fixture control")
 }

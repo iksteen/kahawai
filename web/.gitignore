@@ -9,6 +9,11 @@ dist-ssr
 src/api/generated
 node_modules/.tmp
 
+# Playwright traces, screenshots, videos, and HTML reports are disposable
+# local/CI failure evidence. CI uploads them before its workspace disappears.
+test-results
+playwright-report
+
 # The half-written document `api:export` produces before the fingerprint is
 # stamped into it.
 openapi.json.tmp
