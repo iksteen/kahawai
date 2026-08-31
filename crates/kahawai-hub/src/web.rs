@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::extract::State;
-use axum::http::{Uri, header};
+use axum::http::{HeaderName, HeaderValue, Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
@@ -90,6 +90,22 @@ pub fn resolve_dir(dir: &Path) -> Result<PathBuf> {
 /// pretending that this page is the application.
 const NO_WEB_UI: &str = "<!doctype html><html><head><title>kahawai</title></head><body><h1>kahawai</h1><p>The web UI was not embedded in this build.</p></body></html>";
 
+/// Browser authority granted to the production SPA.
+///
+/// This is deliberately static: every capability has to be visible in review,
+/// and a response-time nonce would require rewriting the embedded body and
+/// defeat its immutable representation. CSP3 gives `wasm-unsafe-eval` the
+/// narrow meaning JASSUB needs without also enabling JavaScript `eval`, and
+/// requires `frame-ancestors` to be stated explicitly because it does not fall
+/// back to `default-src`: https://www.w3.org/TR/CSP3/.
+const CONTENT_SECURITY_POLICY: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; script-src-attr 'none'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; media-src 'self' blob:; connect-src 'self' https://api.theintrodb.org; worker-src 'self' blob:;";
+
+/// Permissions Policy is a Structured Header dictionary: `()` denies a
+/// feature and `(self)` grants only this origin. Keep the app's four used
+/// capabilities and deny the rest explicitly. Syntax and inheritance model:
+/// https://www.w3.org/TR/permissions-policy/.
+const PERMISSIONS_POLICY: &str = "accelerometer=(), autoplay=(self), camera=(), clipboard-read=(), clipboard-write=(self), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), hid=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(self), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()";
+
 pub fn router(web_dir: Option<PathBuf>) -> Router {
     Router::new()
         .route("/", get(|| async { Redirect::permanent("/app/") }))
@@ -103,7 +119,34 @@ pub fn router(web_dir: Option<PathBuf>) -> Router {
         // precisely because these are the responses that carry
         // `immutable` — a returning client does not ask again.
         .layer(CompressionLayer::new())
+        .layer(axum::middleware::from_fn(browser_policy))
         .with_state(Arc::new(web_dir))
+}
+
+/// Apply the browser boundary to every response from the web router, including
+/// redirects, immutable assets, SPA fallbacks and structured web errors. A
+/// worker uses the policy delivered with its own script response, so putting
+/// this only on `index.html` would leave the JASSUB worker ungoverned.
+async fn browser_policy(request: axum::extract::Request, next: axum::middleware::Next) -> Response {
+    let mut response = next.run(request).await;
+    let headers = response.headers_mut();
+    headers.insert(
+        header::CONTENT_SECURITY_POLICY,
+        HeaderValue::from_static(CONTENT_SECURITY_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("permissions-policy"),
+        HeaderValue::from_static(PERMISSIONS_POLICY),
+    );
+    headers.insert(
+        HeaderName::from_static("referrer-policy"),
+        HeaderValue::from_static("no-referrer"),
+    );
+    headers.insert(
+        HeaderName::from_static("x-content-type-options"),
+        HeaderValue::from_static("nosniff"),
+    );
+    response
 }
 
 async fn index(State(dir): State<WebDir>) -> Response {

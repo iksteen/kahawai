@@ -64,6 +64,14 @@ async fn refusal_with_id(
 ) -> (StatusCode, String, String, String) {
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff"),
+        "every public response must disable MIME sniffing"
+    );
     let header_id = response
         .headers()
         .get("x-request-id")
@@ -236,6 +244,27 @@ async fn request_ids_are_unique_and_never_copied_from_the_caller() {
     let (_, _, _, second) = refusal_with_id(router, ask()).await;
     assert_ne!(first, "attacker-chosen");
     assert_ne!(first, second);
+}
+
+#[tokio::test]
+async fn successful_api_responses_disable_mime_sniffing_too() {
+    let router = axum::Router::new()
+        .route("/ok", axum::routing::get(|| async { "ok" }))
+        .layer(axum::middleware::from_fn(
+            kahawai_hub::error::request_context,
+        ));
+    let response = router
+        .oneshot(Request::get("/ok").body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    assert_eq!(
+        response
+            .headers()
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
 }
 
 /// The generic answer and complete privileged diagnosis are joined by one id.

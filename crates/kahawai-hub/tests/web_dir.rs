@@ -11,18 +11,26 @@
 //! the only untrusted string that reaches a filesystem here.
 
 use axum::body::Body;
-use axum::http::{Request, StatusCode};
+use axum::http::{HeaderMap, Request, StatusCode};
+use axum::response::Response;
 use tower::ServiceExt;
+
+const CSP: &str = "default-src 'none'; base-uri 'none'; object-src 'none'; frame-src 'none'; frame-ancestors 'none'; form-action 'self'; script-src 'self' 'wasm-unsafe-eval'; script-src-attr 'none'; style-src-elem 'self'; style-src-attr 'unsafe-inline'; img-src 'self' data:; font-src 'self'; media-src 'self' blob:; connect-src 'self' https://api.theintrodb.org; worker-src 'self' blob:;";
+const PERMISSIONS: &str = "accelerometer=(), autoplay=(self), camera=(), clipboard-read=(), clipboard-write=(self), display-capture=(), encrypted-media=(), fullscreen=(self), geolocation=(), gyroscope=(), hid=(), local-fonts=(), magnetometer=(), microphone=(), midi=(), payment=(), picture-in-picture=(self), screen-wake-lock=(), serial=(), usb=(), xr-spatial-tracking=()";
 
 /// Through `resolve_dir`, as the hub does. The containment check compares
 /// resolved paths, so a router handed an unresolved root would refuse
 /// everything — on a box where the temp dir is reached through a symlink, a
 /// helper that skipped this would fail every test for the wrong reason.
-async fn get(dir: &std::path::Path, path: &str) -> (StatusCode, String) {
-    let response = kahawai_hub::web::router(kahawai_hub::web::resolve_dir(dir).ok())
+async fn response(dir: &std::path::Path, path: &str) -> Response {
+    kahawai_hub::web::router(kahawai_hub::web::resolve_dir(dir).ok())
         .oneshot(Request::builder().uri(path).body(Body::empty()).unwrap())
         .await
-        .unwrap();
+        .unwrap()
+}
+
+async fn get(dir: &std::path::Path, path: &str) -> (StatusCode, String) {
+    let response = response(dir, path).await;
     let status = response.status();
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
@@ -30,11 +38,53 @@ async fn get(dir: &std::path::Path, path: &str) -> (StatusCode, String) {
     (status, String::from_utf8_lossy(&body).into_owned())
 }
 
+fn assert_browser_policy(headers: &HeaderMap) {
+    assert_eq!(
+        headers
+            .get("content-security-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some(CSP)
+    );
+    assert_eq!(
+        headers
+            .get("permissions-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some(PERMISSIONS)
+    );
+    assert_eq!(
+        headers
+            .get("referrer-policy")
+            .and_then(|value| value.to_str().ok()),
+        Some("no-referrer")
+    );
+    assert_eq!(
+        headers
+            .get("x-content-type-options")
+            .and_then(|value| value.to_str().ok()),
+        Some("nosniff")
+    );
+
+    // These are the security distinctions most likely to disappear in an
+    // innocent-looking policy edit. In particular, plain `unsafe-eval` also
+    // enables JavaScript evaluation; JASSUB needs only the narrower WASM token.
+    assert!(CSP.contains("script-src 'self' 'wasm-unsafe-eval'"));
+    assert!(!CSP.split_whitespace().any(|token| token == "'unsafe-eval'"));
+    assert!(!CSP.contains("script-src 'self' 'unsafe-inline'"));
+    assert!(CSP.contains("frame-ancestors 'none'"));
+    assert!(CSP.contains("connect-src 'self' https://api.theintrodb.org"));
+    assert!(CSP.contains("worker-src 'self' blob:"));
+    assert!(CSP.contains("style-src-elem 'self'"));
+    assert!(CSP.contains("style-src-attr 'unsafe-inline'"));
+}
+
 fn bundle() -> tempfile::TempDir {
     let dir = tempfile::tempdir().unwrap();
     std::fs::write(dir.path().join("index.html"), "<!doctype html>from disk").unwrap();
     std::fs::create_dir(dir.path().join("assets")).unwrap();
     std::fs::write(dir.path().join("assets/app-abc123.js"), "export {}").unwrap();
+    std::fs::write(dir.path().join("assets/app-abc123.css"), "body{}").unwrap();
+    std::fs::write(dir.path().join("assets/worker-abc123.js"), "self.close()").unwrap();
+    std::fs::write(dir.path().join("assets/subtitles-abc123.wasm"), b"\0asm").unwrap();
     // Reachable, and meant to be: pointing the hub at a directory serves
     // everything readable under it. Here to pin that down — an earlier draft
     // of this file claimed `safe_rel` was an allowlist of build artefacts,
@@ -46,6 +96,25 @@ fn bundle() -> tempfile::TempDir {
     // serving modes disagree about which builds they could serve.
     std::fs::write(dir.path().join("assets/café-a1b2c3.png"), "not ascii").unwrap();
     dir
+}
+
+#[tokio::test]
+async fn every_web_response_has_the_exact_browser_policy() {
+    let dir = bundle();
+    for path in [
+        "/",
+        "/app",
+        "/app/",
+        "/app/library/films/item/7",
+        "/app/assets/app-abc123.js",
+        "/app/assets/app-abc123.css",
+        "/app/assets/worker-abc123.js",
+        "/app/assets/subtitles-abc123.wasm",
+        "/app/assets/gone-999.js",
+    ] {
+        let response = response(dir.path(), path).await;
+        assert_browser_policy(response.headers());
+    }
 }
 
 #[tokio::test]
@@ -160,6 +229,7 @@ async fn a_bundle_mid_rebuild_says_so_rather_than_blaming_the_build() {
         .await
         .unwrap();
     assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert_browser_policy(response.headers());
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();

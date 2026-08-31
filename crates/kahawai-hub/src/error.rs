@@ -90,6 +90,15 @@ pub async fn request_context(
         axum::http::HeaderName::from_static("x-request-id"),
         axum::http::HeaderValue::from_str(&id).expect("a ULID is an HTTP header value"),
     );
+    // A mismatched type must never be guessed as script or stylesheet. This
+    // boundary covers every public API/setup response; the web router also
+    // installs it directly so assets retain the guarantee when that router is
+    // exercised on its own. Browser behavior:
+    // https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/X-Content-Type-Options
+    response.headers_mut().insert(
+        axum::http::HeaderName::from_static("x-content-type-options"),
+        axum::http::HeaderValue::from_static("nosniff"),
+    );
     response
 }
 
