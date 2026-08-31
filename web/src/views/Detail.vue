@@ -641,7 +641,7 @@ function markSeason(season: number | null, played: boolean) {
             </div>
             <div
               v-for="source in work.parts"
-              :key="source.path_rel"
+              :key="`${source.source_id}-${source.part}`"
               class="truncate font-mono text-[12px] text-dim"
             >
               {{ source.path_rel }}

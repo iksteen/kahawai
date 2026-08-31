@@ -31,6 +31,20 @@ async fn body_bytes(resp: axum::response::Response) -> Vec<u8> {
         .to_vec()
 }
 
+fn refusal_body(body: &[u8]) -> (String, String, ulid::Ulid) {
+    let value: serde_json::Value = serde_json::from_slice(body).unwrap();
+    let object = value.as_object().unwrap();
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["code", "message", "request_id"]
+    );
+    (
+        object["code"].as_str().unwrap().to_owned(),
+        object["message"].as_str().unwrap().to_owned(),
+        object["request_id"].as_str().unwrap().parse().unwrap(),
+    )
+}
+
 #[tokio::test]
 async fn direct_play_ranges_end_to_end() {
     // Media root with one known file.
@@ -305,11 +319,13 @@ async fn direct_play_ranges_end_to_end() {
             .unwrap();
         assert_eq!(live.status(), StatusCode::NOT_FOUND, "{method} {suffix}");
         assert_eq!(live.status(), absent.status(), "{method} {suffix}");
-        assert_eq!(
-            body_bytes(live).await,
-            body_bytes(absent).await,
-            "{method} {suffix}"
-        );
+        let live_body = body_bytes(live).await;
+        let absent_body = body_bytes(absent).await;
+        let (live_code, live_message, live_request_id) = refusal_body(&live_body);
+        let (absent_code, absent_message, absent_request_id) = refusal_body(&absent_body);
+        assert_eq!(live_code, absent_code, "{method} {suffix}");
+        assert_eq!(live_message, absent_message, "{method} {suffix}");
+        assert_ne!(live_request_id, absent_request_id, "{method} {suffix}");
     }
 
     let get = |range: Option<&str>| {

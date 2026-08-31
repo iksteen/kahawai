@@ -1,4 +1,4 @@
-//! Every refusal reaches a client as `{code, message}`, over the wire.
+//! Every refusal reaches a client as `{code, message, request_id}`, over the wire.
 //!
 //! The module's own unit tests pin the code→status table; this pins that the
 //! table is what a real request gets back, on real routes, through axum's
@@ -16,10 +16,60 @@ use axum::http::{Request, StatusCode};
 use kahawai_hub::auth::Auth;
 use tower::ServiceExt;
 
-/// Status and the parsed body, which is the pair a client actually sees.
-async fn refusal(router: axum::Router, request: Request<Body>) -> (StatusCode, String, String) {
+#[derive(Clone, Default)]
+struct LogCapture(Arc<std::sync::Mutex<Vec<u8>>>);
+
+struct LogWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogCapture {
+    type Writer = LogWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        LogWriter(self.0.clone())
+    }
+}
+
+impl LogCapture {
+    fn text(&self) -> String {
+        String::from_utf8(self.0.lock().unwrap().clone()).unwrap()
+    }
+}
+
+async fn failure_with_private_cause() -> Result<(), kahawai_hub::error::ApiError> {
+    Err(kahawai_hub::error::ApiError::log(
+        kahawai_hub::error::ErrorCode::Internal,
+        "the hub could not complete this request",
+        anyhow::anyhow!(
+            "SELECT password_hash FROM users; /srv/private/movie.mkv; provider-body-secret; \
+             pipeline stderr; access-token-secret; refresh-token-secret; credential-secret"
+        ),
+    ))
+}
+
+/// Status and the parsed body, including its correlation id.
+async fn refusal_with_id(
+    router: axum::Router,
+    request: Request<Body>,
+) -> (StatusCode, String, String, String) {
     let response = router.oneshot(request).await.unwrap();
     let status = response.status();
+    let header_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .expect("every served response carries its request id")
+        .to_string();
     let content_type = response
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -34,8 +84,32 @@ async fn refusal(router: axum::Router, request: Request<Body>) -> (StatusCode, S
         .await
         .unwrap();
     let body: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+    let fields = body.as_object().expect("an error object");
+    assert_eq!(
+        fields
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>(),
+        std::collections::BTreeSet::from(["code", "message", "request_id"]),
+        "the stable refusal shape changed: {body}"
+    );
     let code = body["code"].as_str().expect("a code").to_string();
     let message = body["message"].as_str().expect("a message").to_string();
+    let request_id = body["request_id"]
+        .as_str()
+        .expect("a request_id")
+        .to_string();
+    assert_eq!(request_id, header_id);
+    assert!(
+        ulid::Ulid::from_string(&request_id).is_ok(),
+        "request_id is not a ULID: {request_id}"
+    );
+    (status, code, message, request_id)
+}
+
+/// Status and the client-facing fields most tests care about.
+async fn refusal(router: axum::Router, request: Request<Body>) -> (StatusCode, String, String) {
+    let (status, code, message, _) = refusal_with_id(router, request).await;
     (status, code, message)
 }
 
@@ -99,6 +173,34 @@ async fn api_harness() -> (tempfile::TempDir, axum::Router) {
     (dir, router)
 }
 
+async fn bearer(router: &axum::Router) -> String {
+    let response = router
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/auth/token")
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "client": "api",
+                        "username": "admin",
+                        "password": "hunter22222hunter"
+                    })
+                    .to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::OK);
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()["access_token"]
+        .as_str()
+        .unwrap()
+        .to_string()
+}
+
 fn setup_request(username: &str, password: &str) -> Request<Body> {
     Request::post("/api/v1/setup")
         .header("host", "localhost:8422")
@@ -117,6 +219,71 @@ async fn a_refusal_is_json_with_a_code() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(code, "bad_request");
     assert!(!message.is_empty());
+}
+
+/// Correlation ids belong to the hub, not the caller. Accepting one from a
+/// header would let an attacker forge a privileged log's correlation field.
+#[tokio::test]
+async fn request_ids_are_unique_and_never_copied_from_the_caller() {
+    let (_dir, router, _auth) = setup_router().await;
+    let ask = || {
+        Request::get("/api/v1/no-such-thing")
+            .header("x-request-id", "attacker-chosen")
+            .body(Body::empty())
+            .unwrap()
+    };
+    let (_, _, _, first) = refusal_with_id(router.clone(), ask()).await;
+    let (_, _, _, second) = refusal_with_id(router, ask()).await;
+    assert_ne!(first, "attacker-chosen");
+    assert_ne!(first, second);
+}
+
+/// The generic answer and complete privileged diagnosis are joined by one id.
+/// This is the boundary SEC-WEB-6 and SEC-WEB-7 need simultaneously: the
+/// caller learns none of the cause, while an operator can find all of it.
+#[tokio::test]
+async fn a_generic_refusal_correlates_with_its_complete_server_log() {
+    let capture = LogCapture::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_ansi(false)
+        .with_target(false)
+        .with_writer(capture.clone())
+        .finish();
+    let _subscriber = tracing::subscriber::set_default(subscriber);
+    let router = axum::Router::new()
+        .route("/fail", axum::routing::get(failure_with_private_cause))
+        .layer(axum::middleware::from_fn(
+            kahawai_hub::error::request_context,
+        ));
+    let (status, code, message, request_id) =
+        refusal_with_id(router, Request::get("/fail").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    assert_eq!(code, "internal");
+    assert_eq!(message, "the hub could not complete this request");
+    for private in [
+        "SELECT password_hash",
+        "/srv/private",
+        "provider-body-secret",
+        "pipeline stderr",
+        "access-token-secret",
+        "refresh-token-secret",
+        "credential-secret",
+    ] {
+        assert!(!message.contains(private), "client saw {private:?}");
+    }
+    let log = capture.text();
+    assert!(
+        log.contains(&request_id),
+        "log has no correlation id: {log}"
+    );
+    assert!(
+        log.contains("SELECT password_hash")
+            && log.contains("/srv/private/movie.mkv")
+            && log.contains("provider-body-secret")
+            && log.contains("pipeline stderr"),
+        "complete cause was lost: {log}"
+    );
 }
 
 /// Setup is a first-run flow. Its second attempt is a different refusal from
@@ -374,6 +541,24 @@ async fn a_preflight_from_an_allowed_origin_is_answered_and_not_refused() {
 #[tokio::test]
 async fn the_fallbacks_survive_the_cors_layer() {
     let (_dir, router) = api_harness().await;
+    let visible = router
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/no-such-thing")
+                .header("origin", "https://app.example.com")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert!(
+        visible
+            .headers()
+            .get("access-control-expose-headers")
+            .and_then(|value| value.to_str().ok())
+            .is_some_and(|value| value.eq_ignore_ascii_case("x-request-id")),
+        "a cross-origin client cannot read the documented correlation header"
+    );
     let (status, code, _) = refusal(
         router,
         Request::get("/api/v1/no-such-thing")
@@ -390,7 +575,7 @@ async fn the_fallbacks_survive_the_cors_layer() {
 ///
 /// Its defaults are a bare 404 and a bare 405 — no body, no content type — so
 /// a typo in a path handed a client generated from the document nothing to
-/// parse on a status it was told would carry `{code, message}`. They are the
+/// parse on a status it was told would carry `{code, message, request_id}`. They are the
 /// router's own answer now.
 #[tokio::test]
 async fn an_unknown_route_and_a_wrong_method_refuse_in_the_same_shape() {
@@ -451,6 +636,23 @@ async fn a_query_parameter_that_will_not_parse_refuses_in_the_same_shape() {
             .and_then(|v| v.to_str().ok()),
         Some("application/json")
     );
+}
+
+/// Ownership middleware extracts the item id before the handler runs. Its
+/// path rejection must use the same boundary too; otherwise one malformed
+/// percent-encoded segment bypasses `ApiPath` and falls back to axum's plain
+/// text 400.
+#[tokio::test]
+async fn a_path_that_is_not_utf8_refuses_in_the_same_shape() {
+    let (_dir, router) = api_harness().await;
+    let token = bearer(&router).await;
+    let request = Request::get("/api/v1/items/%FF")
+        .header("authorization", format!("Bearer {token}"))
+        .body(Body::empty())
+        .unwrap();
+    let (status, code, _) = refusal(router, request).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(code, "bad_request");
 }
 
 /// A wrong `Content-Type` is not the same bug as a body that will not parse,

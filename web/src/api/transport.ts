@@ -28,7 +28,7 @@ export function configureApiClient(
   refresh = refreshTokens
 }
 
-/// The hub answers every 4xx and 5xx with `{code, message}`. A body that is
+/// The hub answers every 4xx and 5xx with `{code, message, request_id}`. A body that is
 /// not that shape is still shown: a reverse proxy in front of the hub answers
 /// its own failures, and "502 Bad Gateway" as HTML is more use on screen than
 /// a bare status number.
@@ -40,10 +40,16 @@ export async function apiFailure(response: Response): Promise<ApiError> {
     if (
       typeof body === 'object' &&
       body !== null &&
-      typeof (body as { message?: unknown }).message === 'string'
+      typeof (body as { code?: unknown }).code === 'string' &&
+      typeof (body as { message?: unknown }).message === 'string' &&
+      typeof (body as { request_id?: unknown }).request_id === 'string'
     ) {
-      const { code, message } = body as { code?: unknown; message: string }
-      error = new ApiError(response.status, message, typeof code === 'string' ? code : undefined)
+      const { code, message, request_id } = body as {
+        code: string
+        message: string
+        request_id: string
+      }
+      error = new ApiError(response.status, message, code, request_id)
     }
   } catch {
     // Not JSON: the raw text stands.

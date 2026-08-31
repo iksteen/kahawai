@@ -236,7 +236,47 @@ pub fn openapi_document() -> utoipa::openapi::OpenApi {
     // accept the verb. Generate the operation through its POST arm, then
     // move it to the correct 3.2 Path Item field.
     item.query = item.post.take();
+    for item in openapi.paths.paths.values_mut() {
+        for operation in [
+            item.get.as_mut(),
+            item.put.as_mut(),
+            item.post.as_mut(),
+            item.delete.as_mut(),
+            item.options.as_mut(),
+            item.head.as_mut(),
+            item.patch.as_mut(),
+            item.trace.as_mut(),
+            item.query.as_mut(),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            document_request_id_header(operation);
+        }
+        for operation in item.additional_operations.values_mut() {
+            document_request_id_header(operation);
+        }
+    }
     openapi
+}
+
+/// The request-context layer puts this header on successes and refusals alike.
+/// Add it centrally for the same reason the runtime behavior is central: an
+/// operation added later must not have to remember correlation separately.
+fn document_request_id_header(operation: &mut utoipa::openapi::path::Operation) {
+    let mut header = utoipa::openapi::header::Header::default();
+    header.description = Some(
+        "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+            .into(),
+    );
+    for response in operation.responses.responses.values_mut() {
+        let utoipa::openapi::RefOr::T(response) = response else {
+            panic!("response references must carry X-Request-Id on their component")
+        };
+        response
+            .headers
+            .insert("X-Request-Id".into(), header.clone().into());
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -513,7 +553,10 @@ pub fn router(
     if let Some(cors) = cors {
         app = app.layer(cors);
     }
-    app
+    // Outermost: it must wrap CORS responses, router fallbacks and every auth
+    // rejection as well as ordinary handlers. The hub generates the id; a
+    // caller cannot choose what privileged logs use as their correlation key.
+    app.layer(axum::middleware::from_fn(crate::error::request_context))
 }
 
 async fn unknown_route() -> ApiError {
@@ -544,6 +587,7 @@ pub fn setup_router(auth: Arc<Auth>, web_dir: Option<std::path::PathBuf>) -> Rou
         .merge(crate::web::router(web_dir))
         .fallback(unknown_route)
         .method_not_allowed_fallback(wrong_method)
+        .layer(axum::middleware::from_fn(crate::error::request_context))
 }
 
 /// OPS-8 CORS: absent config = no CORS headers (same-origin only, the
@@ -567,7 +611,8 @@ fn cors_layer(origins: &[String]) -> Option<tower_http::cors::CorsLayer> {
         CorsLayer::new()
             .allow_origin(origin)
             .allow_methods(Any)
-            .allow_headers(Any),
+            .allow_headers(Any)
+            .expose_headers([axum::http::HeaderName::from_static("x-request-id")]),
     )
 }
 
@@ -1264,7 +1309,7 @@ async fn require_auth(
 /// session ids. A session disappearing after this check gets the same response.
 async fn require_session_owner(
     State(state): State<AppState>,
-    axum::extract::Path(params): axum::extract::Path<std::collections::HashMap<String, String>>,
+    ApiPath(params): ApiPath<std::collections::HashMap<String, String>>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     req: Request,
     next: Next,
@@ -1302,7 +1347,7 @@ fn hidden(what: &str) -> ApiError {
 /// otherwise be one refactor away from checking the font number.
 async fn require_item_access(
     State(state): State<AppState>,
-    axum::extract::Path(params): axum::extract::Path<std::collections::HashMap<String, String>>,
+    ApiPath(params): ApiPath<std::collections::HashMap<String, String>>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     req: Request,
     next: Next,
@@ -4487,10 +4532,7 @@ async fn item_artwork(
             } else {
                 [(axum::http::header::CACHE_CONTROL, "private, max-age=30")]
             },
-            axum::Json(ApiErrorBody {
-                code: ErrorCode::NotFound,
-                message: "no artwork".into(),
-            }),
+            axum::Json(ApiErrorBody::new(ErrorCode::NotFound, "no artwork")),
         )
             .into_response()),
     }
@@ -5836,6 +5878,10 @@ async fn item_children(
 struct ItemSource {
     module_id: String,
     collection_id: String,
+    /// Collection-relative media path. This is intentional client data: the
+    /// release name often carries rendition facts that discovery cannot
+    /// normalize (edition, source, codec, group, or revision). It never
+    /// contains the configured root or an absolute host path (SEC-WEB-7).
     path_rel: String,
     size: i64,
     available: bool,
@@ -5859,7 +5905,181 @@ struct ItemSource {
     /// Outer `None` omits streams from GET; inner `None` preserves a
     /// malformed legacy stream record as JSON null on QUERY.
     #[serde(skip_serializing_if = "Option::is_none")]
-    streams: Option<Option<kahawai_core::media::MediaInfo>>,
+    streams: Option<Option<ClientMediaInfo>>,
+    /// The complete catalogue record is needed to fold chapters after QUERY
+    /// chooses a different rendition. It is never an API field.
+    #[serde(skip_serializing)]
+    #[schema(ignore)]
+    catalog_info: Option<kahawai_core::media::MediaInfo>,
+}
+
+/// The technical facts a playback client can act on.
+///
+/// `MediaInfo` is a source-owned catalogue record and is intentionally not an
+/// API type: besides these facts it contains sidecar, artwork and NFO paths,
+/// attachment byte ranges, container tags and a terminal probe error. Passing
+/// it through made an authenticated viewer a catalogue-debugging endpoint.
+#[derive(Serialize, ToSchema)]
+struct ClientMediaInfo {
+    #[schema(required)]
+    container: Option<String>,
+    #[schema(required)]
+    duration_ms: Option<u64>,
+    video: Vec<ClientVideoStream>,
+    audio: Vec<ClientAudioStream>,
+    /// Embedded and sidecar tracks have the same client-visible facts. A
+    /// sidecar's path is deliberately discarded while its format/language is
+    /// retained.
+    subtitles: Vec<ClientSubtitleStream>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    replay_gain: Option<ClientReplayGain>,
+}
+
+/// The explicit client projection continues through every nested value.
+/// Reusing the catalogue structs here would make a future source-only field an
+/// API field merely by adding it to `VideoStream`, `AudioStream`, or
+/// `ReplayGain`.
+#[derive(Serialize, ToSchema)]
+struct ClientVideoStream {
+    codec: String,
+    width: u32,
+    height: u32,
+    #[schema(required)]
+    fps: Option<(u32, u32)>,
+    #[schema(required)]
+    bit_depth: Option<u32>,
+    interlaced: bool,
+    #[schema(required)]
+    hdr: Option<String>,
+    #[schema(required)]
+    profile: Option<String>,
+    #[schema(required)]
+    level: Option<String>,
+    #[schema(required)]
+    bitrate_kbps: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_keyframe_interval_ms: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pixel_aspect_ratio: Option<(u32, u32)>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    orientation: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_width: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    display_height: Option<u32>,
+}
+
+impl From<kahawai_core::media::VideoStream> for ClientVideoStream {
+    fn from(stream: kahawai_core::media::VideoStream) -> Self {
+        Self {
+            codec: stream.codec,
+            width: stream.width,
+            height: stream.height,
+            fps: stream.fps,
+            bit_depth: stream.bit_depth,
+            interlaced: stream.interlaced,
+            hdr: stream.hdr,
+            profile: stream.profile,
+            level: stream.level,
+            bitrate_kbps: stream.bitrate_kbps,
+            max_keyframe_interval_ms: stream.max_keyframe_interval_ms,
+            pixel_aspect_ratio: stream.pixel_aspect_ratio,
+            orientation: stream.orientation,
+            display_width: stream.display_width,
+            display_height: stream.display_height,
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct ClientAudioStream {
+    codec: String,
+    channels: u32,
+    sample_rate: u32,
+    #[schema(required)]
+    language: Option<String>,
+    #[schema(required)]
+    bitrate_kbps: Option<u32>,
+    #[schema(required)]
+    layout: Option<String>,
+}
+
+impl From<kahawai_core::media::AudioStream> for ClientAudioStream {
+    fn from(stream: kahawai_core::media::AudioStream) -> Self {
+        Self {
+            codec: stream.codec,
+            channels: stream.channels,
+            sample_rate: stream.sample_rate,
+            language: stream.language,
+            bitrate_kbps: stream.bitrate_kbps,
+            layout: stream.layout,
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct ClientSubtitleStream {
+    format: String,
+    #[schema(required)]
+    language: Option<String>,
+}
+
+impl From<kahawai_core::media::SubtitleStream> for ClientSubtitleStream {
+    fn from(stream: kahawai_core::media::SubtitleStream) -> Self {
+        Self {
+            format: stream.format,
+            language: stream.language,
+        }
+    }
+}
+
+#[derive(Serialize, ToSchema)]
+struct ClientReplayGain {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track_gain_db: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    track_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    album_gain_db: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    album_peak: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    reference_level_db: Option<f64>,
+}
+
+impl From<kahawai_core::media::ReplayGain> for ClientReplayGain {
+    fn from(gain: kahawai_core::media::ReplayGain) -> Self {
+        Self {
+            track_gain_db: gain.track_gain_db,
+            track_peak: gain.track_peak,
+            album_gain_db: gain.album_gain_db,
+            album_peak: gain.album_peak,
+            reference_level_db: gain.reference_level_db,
+        }
+    }
+}
+
+impl From<kahawai_core::media::MediaInfo> for ClientMediaInfo {
+    fn from(info: kahawai_core::media::MediaInfo) -> Self {
+        let mut subtitles: Vec<ClientSubtitleStream> =
+            info.subtitles.into_iter().map(Into::into).collect();
+        subtitles.extend(
+            info.external_subtitles
+                .into_iter()
+                .map(|track| ClientSubtitleStream {
+                    format: track.format,
+                    language: track.language,
+                }),
+        );
+        Self {
+            container: info.container,
+            duration_ms: info.duration_ms,
+            video: info.video.into_iter().map(Into::into).collect(),
+            audio: info.audio.into_iter().map(Into::into).collect(),
+            subtitles,
+            replay_gain: info.replay_gain.map(Into::into),
+        }
+    }
 }
 
 #[derive(Serialize, ToSchema)]
@@ -5996,8 +6216,13 @@ struct NegotiatedItem {
 
 #[derive(Serialize, ToSchema)]
 struct NegotiatedSource {
+    /// Opaque source-group identity shared with `ItemSource::source_id`.
+    /// Clients may correlate on this without treating a path as identity.
+    source_id: i64,
     module_id: String,
     collection_id: String,
+    /// The collection-relative media path of the selected part. Exposing this
+    /// is deliberate; absolute roots and catalogue-internal paths stay private.
     path_rel: String,
     #[schema(required)]
     display_width: Option<u32>,
@@ -6131,6 +6356,14 @@ async fn item_body(
         .iter()
         .map(|r| {
             let module_id: String = r.get("module_id");
+            let catalog_info = with_streams
+                .then(|| {
+                    serde_json::from_str::<kahawai_core::media::MediaInfo>(
+                        r.get::<String, _>("streams_json").as_str(),
+                    )
+                    .ok()
+                })
+                .flatten();
             ItemSource {
                 available: state.registry.is_connected(&module_id),
                 module_id,
@@ -6141,9 +6374,8 @@ async fn item_body(
                 source_id: r.get("source_id"),
                 part: r.get("part"),
                 parts: r.get("parts"),
-                streams: with_streams.then(|| {
-                    serde_json::from_str(r.get::<String, _>("streams_json").as_str()).ok()
-                }),
+                streams: with_streams.then(|| catalog_info.clone().map(ClientMediaInfo::from)),
+                catalog_info,
             }
         })
         .collect();
@@ -6554,10 +6786,10 @@ async fn item_query(
             // An error body like every other refusal. It was empty, which on
             // the one route that answers 405 by hand made it the exception to
             // a contract the document states without qualification.
-            axum::Json(ApiErrorBody {
-                code: ErrorCode::MethodNotAllowed,
-                message: "use GET or QUERY on an item".into(),
-            }),
+            axum::Json(ApiErrorBody::new(
+                ErrorCode::MethodNotAllowed,
+                "use GET or QUERY on an item",
+            )),
         )
             .into_response());
     }
@@ -6606,10 +6838,7 @@ async fn item_query(
         Ok(v) => v,
         Err(e) => {
             let unavailable = if out.item.sources.is_empty() {
-                ApiErrorBody {
-                    code: ErrorCode::Unplayable,
-                    message: "this item has no media of its own".to_string(),
-                }
+                ApiErrorBody::new(ErrorCode::Unplayable, "this item has no media of its own")
             } else {
                 let code = if e.downcast_ref::<crate::sessions::SourceOffline>().is_some() {
                     ErrorCode::SourceOffline
@@ -6620,15 +6849,15 @@ async fn item_query(
                 // Authored, for the reason `session_refusal` gives: the error
                 // reaching here is the same one, and its outermost layer is
                 // the pipeline's, not a sentence.
-                ApiErrorBody {
+                ApiErrorBody::new(
                     code,
-                    message: match code {
+                    match code {
                         ErrorCode::SourceOffline => {
-                            "the machine holding this file is not connected right now".into()
+                            "the machine holding this file is not connected right now"
                         }
-                        _ => "this item cannot be played".into(),
+                        _ => "this item cannot be played",
                     },
-                }
+                )
             };
             let out = ItemQueryResponse {
                 item: out,
@@ -6712,20 +6941,30 @@ async fn item_query(
                     .all(|(at, s)| s.part == at as i64 + 1)
         });
         if complete {
-            out.chapters = group_chapters(members.into_iter().map(|s| s.streams.clone().flatten()));
+            out.chapters = group_chapters(members.into_iter().map(|s| s.catalog_info.clone()));
         }
     }
 
-    let source = parts.first().map(|part| {
+    let source = parts.first().and_then(|part| {
         let video = info.video.first();
-        NegotiatedSource {
-            module_id: part.module_id.clone(),
-            collection_id: part.collection_id.clone(),
-            path_rel: part.path_rel.clone(),
-            display_width: video.and_then(|stream| stream.display_width),
-            display_height: video.and_then(|stream| stream.display_height),
-            orientation: video.and_then(|stream| stream.orientation.clone()),
-        }
+        out.item
+            .sources
+            .iter()
+            .find(|source| {
+                source.module_id == part.module_id
+                    && source.collection_id == part.collection_id
+                    && source.path_rel == part.path_rel
+                    && source.size == part.size as i64
+            })
+            .map(|source| NegotiatedSource {
+                source_id: source.source_id,
+                module_id: part.module_id.clone(),
+                collection_id: part.collection_id.clone(),
+                path_rel: part.path_rel.clone(),
+                display_width: video.and_then(|stream| stream.display_width),
+                display_height: video.and_then(|stream| stream.display_height),
+                orientation: video.and_then(|stream| stream.orientation.clone()),
+            })
     });
     let out = ItemQueryResponse {
         item: out,
@@ -7606,6 +7845,24 @@ mod tests {
                 ["schema"]["$ref"],
             "#/components/schemas/ItemQueryResponse"
         );
+        let client_media = &document["components"]["schemas"]["ClientMediaInfo"];
+        for (field, schema) in [
+            ("video", "ClientVideoStream"),
+            ("audio", "ClientAudioStream"),
+            ("subtitles", "ClientSubtitleStream"),
+        ] {
+            assert_eq!(
+                client_media["properties"][field]["items"]["$ref"],
+                format!("#/components/schemas/{schema}"),
+                "{field} fell back to a source-owned catalogue schema"
+            );
+        }
+        assert!(
+            client_media["properties"]["replay_gain"]
+                .to_string()
+                .contains("#/components/schemas/ClientReplayGain"),
+            "loudness fell back to a source-owned catalogue schema"
+        );
         for (path, method, name) in [
             ("/admin/v1/libraries/{id}/refresh", "post", "deep"),
             ("/api/v1/items", "get", "library"),
@@ -7705,7 +7962,14 @@ mod tests {
         assert!(is_required("ItemDetailResponse", "show_title"));
         assert!(!is_required("ItemDetailResponse", "metadata"));
         assert!(!is_required("ItemDetailResponse", "related"));
-        assert!(!is_required("ItemSource", "streams"));
+        let item_source = &document["components"]["schemas"]["ItemRow_Vec_ItemSource"]["properties"]
+            ["sources"]["items"];
+        let item_source_required = item_source["required"]
+            .as_array()
+            .expect("detail source fields have a required list");
+        assert!(item_source_required.iter().any(|field| field == "path_rel"));
+        assert!(!item_source_required.iter().any(|field| field == "streams"));
+        assert!(is_required("NegotiatedSource", "path_rel"));
         assert!(is_required("ItemQueryResult", "negotiated"));
         assert!(!is_required("ItemQueryResult", "unavailable"));
         assert!(!is_required("VerificationResponse", "error"));
@@ -7736,6 +8000,10 @@ mod tests {
                 .flatten()
                 .map(|(_, response)| response)
             {
+                assert!(
+                    response["headers"].get("X-Request-Id").is_some(),
+                    "{method} {path} response omits X-Request-Id"
+                );
                 if let Some(schema) = response["content"]["application/json"]["schema"].as_object()
                 {
                     assert!(

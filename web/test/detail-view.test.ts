@@ -275,6 +275,9 @@ describe('the files it is made of', () => {
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('Source')
     expect(wrapper.text()).toContain('3 parts')
+    expect(wrapper.text()).toContain('Heat.part1.mkv')
+    expect(wrapper.text()).toContain('Heat.part2.mkv')
+    expect(wrapper.text()).toContain('Heat.part3.mkv')
     expect(wrapper.findAll('li')).toHaveLength(1)
   })
 

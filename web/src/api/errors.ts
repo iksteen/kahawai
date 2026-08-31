@@ -1,7 +1,7 @@
 /// What the hub said when it refused, in the shape the rest of the app reasons
 /// about.
 ///
-/// The hub answers every 4xx and 5xx with `{code, message}` — see
+/// The hub answers every 4xx and 5xx with `{code, message, request_id}` — see
 /// `crates/kahawai-hub/src/error.rs`. `code` is enumerated and stable;
 /// `message` is written for a person and its wording is not contractual, so
 /// nothing here may branch on it.
@@ -32,13 +32,17 @@ export class ApiError extends Error {
   /// thing here, and `exactOptionalPropertyTypes` would otherwise make
   /// assigning one to the other an error at every call site.
   code: string | undefined
+  /// Server-generated correlation key for an operator. Undefined only when
+  /// the response was not the hub's stable error body.
+  requestId: string | undefined
   /// From `Retry-After`, when the hub sent one. See `retryAfter`.
   retryAfterSecs: number | undefined
-  constructor(status: number, message: string, code?: string) {
+  constructor(status: number, message: string, code?: string, requestId?: string) {
     super(message)
     this.name = 'ApiError'
     this.status = status
     this.code = code
+    this.requestId = requestId
     this.retryAfterSecs = undefined
   }
   override toString() {

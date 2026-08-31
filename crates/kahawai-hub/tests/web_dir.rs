@@ -68,8 +68,11 @@ async fn client_routes_fall_back_to_the_shell_but_assets_do_not() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(body, "<!doctype html>from disk");
 
-    let (status, _) = get(dir.path(), "/app/assets/gone-999.js").await;
+    let (status, body) = get(dir.path(), "/app/assets/gone-999.js").await;
     assert_eq!(status, StatusCode::NOT_FOUND);
+    let body: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(body["code"], "not_found");
+    assert!(body["request_id"].is_string());
 }
 
 #[tokio::test]
@@ -160,9 +163,14 @@ async fn a_bundle_mid_rebuild_says_so_rather_than_blaming_the_build() {
     let body = axum::body::to_bytes(response.into_body(), 1 << 20)
         .await
         .unwrap();
-    let body = String::from_utf8_lossy(&body);
-    assert!(body.contains("rebuilt"), "{body}");
-    assert!(!body.contains("not embedded"), "{body}");
+    let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+    assert_eq!(body["code"], "web_unavailable");
+    assert!(
+        body["message"].as_str().unwrap().contains("rebuilt"),
+        "{body}"
+    );
+    assert!(!body.to_string().contains("not embedded"), "{body}");
+    assert!(body["request_id"].is_string());
 }
 
 /// The case a string filter cannot see. `safe_rel` refuses a `..` in the

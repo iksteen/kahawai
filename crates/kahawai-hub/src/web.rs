@@ -15,7 +15,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail};
 use axum::Router;
 use axum::extract::State;
-use axum::http::{StatusCode, Uri, header};
+use axum::http::{Uri, header};
 use axum::response::{IntoResponse, Redirect, Response};
 use axum::routing::get;
 use tower_http::compression::CompressionLayer;
@@ -258,7 +258,11 @@ async fn shell_or_404(dir: &WebDir, path: &str) -> Response {
     // could never work and only a reload helped. A 404 lets the client
     // tell "this build is gone" from "this route is yours to handle".
     if path.starts_with("assets/") {
-        return (StatusCode::NOT_FOUND, "no such asset in this build").into_response();
+        return crate::error::ApiError::new(
+            crate::error::ErrorCode::NotFound,
+            "no such asset in this build",
+        )
+        .into_response();
     }
     // Client-side routes fall back to the SPA shell.
     match load(dir, "index.html").await {
@@ -270,15 +274,17 @@ async fn shell_or_404(dir: &WebDir, path: &str) -> Response {
         // "not embedded in this build" there blames the binary for a state
         // that lasts a second, so this says the true thing and says it
         // with a status a client will retry.
-        None if dir.is_some() => (
-            StatusCode::SERVICE_UNAVAILABLE,
-            [
-                (header::CONTENT_TYPE, "text/plain; charset=utf-8"),
-                (header::CACHE_CONTROL, "no-store"),
-            ],
-            "the web bundle is being rebuilt",
-        )
-            .into_response(),
+        None if dir.is_some() => {
+            let mut response = crate::error::ApiError::new(
+                crate::error::ErrorCode::WebUnavailable,
+                "the web bundle is being rebuilt",
+            )
+            .into_response();
+            response
+                .headers_mut()
+                .insert(header::CACHE_CONTROL, "no-store".parse().unwrap());
+            response
+        }
         None => (
             [
                 (header::CONTENT_TYPE, "text/html; charset=utf-8"),

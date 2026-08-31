@@ -53,6 +53,31 @@ pub fn create_dir(path: &Path) -> io::Result<()> {
     builder.create(path)
 }
 
+/// Restrict an existing directory to 0700.
+///
+/// A directory needs execute bits to remain traversable, so [`narrow`] cannot
+/// safely be reused for this. Persistent private directories call this when
+/// they may predate the code which creates them at 0700.
+#[cfg(unix)]
+pub fn narrow_dir(path: &Path) -> io::Result<Option<u32>> {
+    use std::os::unix::fs::PermissionsExt;
+    let found = match std::fs::metadata(path) {
+        Ok(meta) => meta.permissions().mode() & 0o777,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if found == 0o700 {
+        return Ok(None);
+    }
+    std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700))?;
+    Ok(Some(found))
+}
+
+#[cfg(not(unix))]
+pub fn narrow_dir(_path: &Path) -> io::Result<Option<u32>> {
+    Ok(None)
+}
+
 /// Write `bytes`, replacing whatever is there. The mode applies only when the
 /// file is created, so an existing one is narrowed first: overwriting a
 /// world-readable file otherwise leaves it world-readable.
@@ -108,11 +133,14 @@ mod tests {
         let previous = unsafe { libc::umask(0) };
         let created = create(&dir.path().join("key")).map(drop);
         let written = write(&dir.path().join("secret"), b"s3cret");
+        let private_dir = create_dir(&dir.path().join("diagnostics"));
         unsafe { libc::umask(previous) };
         created.unwrap();
         written.unwrap();
+        private_dir.unwrap();
         assert_eq!(mode(&dir.path().join("key")), 0o600);
         assert_eq!(mode(&dir.path().join("secret")), 0o600);
+        assert_eq!(mode(&dir.path().join("diagnostics")), 0o700);
     }
 
     #[test]
@@ -163,5 +191,16 @@ mod tests {
     fn a_file_that_is_not_there_is_not_an_error() {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(narrow(&dir.path().join("absent")).unwrap(), None);
+    }
+
+    #[test]
+    fn an_existing_private_directory_keeps_its_execute_bits() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("diagnostics");
+        std::fs::create_dir(&path).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(narrow_dir(&path).unwrap(), Some(0o755));
+        assert_eq!(mode(&path), 0o700);
+        assert_eq!(narrow_dir(&path).unwrap(), None);
     }
 }

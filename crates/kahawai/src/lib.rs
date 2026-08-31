@@ -454,6 +454,16 @@ async fn run_hub_inner(
             let _ = std::fs::remove_file(cfg.data_dir.join("bootstrap.sock"));
         }
     }
+    // Durable pipeline bundles predate the 0700 storage rule on some hubs.
+    // Repair them before either HTTP diagnostics route is mounted, and fail
+    // closed when the deployment does not own the directory: warning and
+    // continuing would leave the evidence readable to other OS accounts.
+    kahawai_hub::sessionlog::restrict(&cfg.data_dir).with_context(|| {
+        format!(
+            "restricting session diagnostics under {}",
+            cfg.data_dir.display()
+        )
+    })?;
     let sessions = Arc::new(
         kahawai_hub::sessions::Sessions::with_limits(
             cfg.data_dir.join("sessions"),

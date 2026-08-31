@@ -696,10 +696,14 @@ a new hash is written.
 
 #### Refusals
 
-Every 4xx and 5xx is `application/json` — `{"code": …, "message": …}`. `code`
-is drawn from the `ErrorCode` enumeration published in the OpenAPI document
-and is stable; `message` is written for a person and its wording is not
-contractual.
+Every 4xx and 5xx is `application/json` —
+`{"code": …, "message": …, "request_id": …}`. `code` is drawn from the
+`ErrorCode` enumeration published in the OpenAPI document and is stable;
+`message` is written for a person and its wording is not contractual. The hub
+generates a fresh ULID at the outer edge of each request, ignores an inbound
+`X-Request-Id`, and returns its value both in the body and the response header.
+The same id is on the tracing span around the complete server-side cause, so a
+generic 500 is diagnosable without accepting an attacker-chosen log key.
 
 Two responses sit outside that. Item artwork's 404 carries the same body but
 is CACHEABLE, because a shelf of coverless cards was otherwise one live
@@ -721,6 +725,25 @@ And an internal failure returns a fixed sentence: the anyhow chain, which
 carried the hub's scratch layout, the pipeline worker's argv and GStreamer's
 stderr, goes to the log. `item_artwork` had answered this way since SEC-WEB-7;
 it is the rule now.
+
+The catalogue's `MediaInfo` is not a browser API type. Item QUERY projects an
+explicit client view containing codecs, dimensions, duration, languages and
+loudness facts. The collection-relative media path is intentional client data:
+release filenames often carry the exact edition, source, codec, group or
+revision a viewer needs to distinguish renditions. Configured roots, absolute
+host paths, sidecar/artwork/NFO paths, attachment ranges, container tags and
+probe errors remain private. The chosen rendition carries both that relative
+path and the opaque `source_id` used to group multipart sources; clients use
+the id, not the path, as identity. Complete session and pipeline diagnostic bundles are intentionally
+unsanitised operator evidence
+and exist only behind the bearer-plus-admin route group; an ordinary account
+gets the same 403 before a bundle lookup occurs. Their persistent directory is
+0700 and bundle files are created 0600; live hub and transcoder run directories
+are 0700 as well, so a second OS account cannot bypass the HTTP gate.
+Authentication endpoints are
+the sole intentional token-delivery boundary and return only the caller's new
+token pair (API mode) or access token (browser mode); no other response or log
+serialises password hashes, stored credentials or tokens.
 
 `GET`/`QUERY` on an item reports the same distinction in a success body:
 `query.unavailable` is an error body rather than a string, so a detail page can

@@ -56,7 +56,7 @@ chain in the log and returning the outermost context only, or a fixed string
 per status.
 
 **Fixed.** `crates/kahawai-hub/src/error.rs`: every 4xx and 5xx is now
-`{"code", "message"}`, the chain goes to the log, and a 500 returns a fixed
+`{"code", "message", "request_id"}`, the chain goes to the log, and a 500 returns a fixed
 sentence. `session_refusal` downcasts rather than formats. See finding 16 for
 the half of this that was about statuses.
 
@@ -211,10 +211,10 @@ page can tell an absent mediahost from an unplayable item.
 
 All user-facing routes below a session id now cross one ownership middleware,
 including stream, playlist, segment, subtitle, seek, progress and end. Missing
-and foreign live ids are the same byte-for-byte 404; administrative session
-routes remain separately administrator-gated. `direct_play_ranges_end_to_end`
-exercises every route shape with two users and then proves the owner's session
-was not touched.
+and foreign live ids have the same 404 code and message, with a unique
+correlation id on each response; administrative session routes remain separately
+administrator-gated. `direct_play_ranges_end_to_end` exercises every route shape
+with two users and then proves the owner's session was not touched.
 
 ## 8. Ours, recorded here because it is a rule about your constants
 

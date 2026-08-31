@@ -142,7 +142,7 @@ not the rule.
 HTTP/1.1 409 Conflict
 content-type: application/json
 
-{"code": "session_cap", "message": "too many concurrent streams; close one first"}
+{"code": "session_cap", "message": "too many concurrent streams; close one first", "request_id": "01K..."}
 ```
 
 One shape for every 4xx and 5xx. `code` is an enumerated, stable identifier

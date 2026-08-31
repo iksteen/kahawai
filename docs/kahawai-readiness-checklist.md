@@ -153,9 +153,10 @@ marked in that document.
       about at startup
 - [x] AUTH-11 One owner middleware wraps every user-facing session resource:
       stream, playlist, segment, subtitle, seek, progress and end. Missing and
-      foreign live ids return the same 404 body; administrative session routes
-      remain separately administrator-gated. The web player's recovery contract
-      follows the owner-scoped 404 rather than retaining the former 410 oracle
+      foreign live ids return the same 404 code and message, with a unique
+      correlation id on each response; administrative session routes remain
+      separately administrator-gated. The web player's recovery contract follows
+      the owner-scoped 404 rather than retaining the former 410 oracle
 - [x] AUTH-12 Initial-admin creation is absent from the public router. First run
       exposes only a dedicated, port-distinct loopback browser listener with strict same-origin
       validation and a mode-0600 Unix socket inside an atomically private
@@ -216,12 +217,29 @@ marked in that document.
       `credentials.secret`, `metrics.secret`) and a restore refuses a snapshot
       that has lost one. `secrets::adoption_tests::plaintext_survives_a_seal_that_does_not_read_back`
       and `backup_restore::a_snapshot_missing_what_its_manifest_lists_is_refused`
-- [ ] SEC-WEB-6 Replace `(StatusCode, String)` and raw internal errors with the
-      stable JSON shape `{ "code", "message", "request_id" }`; unexpected
-      errors use a generic message while complete causes are logged server-side
-- [ ] SEC-WEB-7 Ensure responses and logs never disclose password hashes,
-      credentials, access/refresh tokens, filesystem paths, SQL text, provider
-      response bodies or media pipeline internals to non-administrators
+- [x] SEC-WEB-6 `ApiError` is the single refusal boundary and every exercised
+      4xx/5xx has exactly `{ "code", "message", "request_id" }`. The outer
+      request layer generates the ULID (never trusts an inbound id), returns it
+      in `X-Request-Id`, and attaches it to the tracing span that holds the
+      complete cause; unexpected failures keep the fixed generic message.
+      `error_bodies::a_generic_refusal_correlates_with_its_complete_server_log`
+      and `::request_ids_are_unique_and_never_copied_from_the_caller` pin both
+      sides of the boundary
+- [x] SEC-WEB-7 Non-admin item responses use `ClientMediaInfo`, not the source
+      catalogue record: collection-relative media paths are intentionally
+      exposed because release filenames carry useful rendition facts, while
+      absolute roots, sidecar/provider paths, tags, attachment ranges and probe
+      errors are absent. The opaque source-group id correlates the chosen rendition.
+      Refusal messages are authored rather than derived from errors; raw
+      session/pipeline bundles are mounted only below the bearer-plus-admin
+      route group. Provider configuration returns booleans, users never carry
+      password hashes, and authentication responses are the sole intentional
+      delivery of the caller's newly issued access/refresh tokens.
+      `item_query::query_projects_only_client_safe_media_facts`,
+      `error_bodies::a_generic_refusal_correlates_with_its_complete_server_log`
+      and the diagnostics assertions in `admin_api` cover the disclosure and
+      HTTP privilege boundaries; `sessionlog::tests::diagnostic_storage_is_owner_only`
+      pins the filesystem boundary
 
 ## Data, scanning and playback correctness (DATA)
 
@@ -545,8 +563,9 @@ marked in that document.
       all exited 0 locally on 2026-08-09
 - [x] CI-6 `direct_play_ranges_end_to_end` creates two users and sends the
       foreign account through stream, playlist, segment, subtitle, seek,
-      progress and end routes. Every response is byte-for-byte the same 404 as
-      an absent id, and the owner then reads and ends the still-live session
+      progress and end routes. Every response has the same 404 code and message
+      as an absent id plus a distinct valid correlation id, and the owner then
+      reads and ends the still-live session
 - [x] CI-7 Pin deterministic root-token test vectors and exercise identical
       relative paths in separate roots through scan, persistence, source
       selection, byte leases and playback. Prove root reordering changes
@@ -622,12 +641,11 @@ marked in that document.
 
 ## API contracts and maintainability (ENG)
 
-- [~] ENG-1 Every application request and JSON response now has one concrete
+- [x] ENG-1 Every application request and JSON response has one concrete
       Rust DTO, including producer-owned registry, health, grants, enrichment,
-      subtitle and negotiation values; no stable handler assembles
-      `serde_json::Value`. The remaining gap is SEC-WEB-6's stable JSON error
-      DTO: failures still use `(StatusCode, String)`. A separate shared API
-      crate remains unjustified while the binary is the only Rust consumer
+      subtitle, negotiation and stable error values; no stable handler
+      assembles `serde_json::Value`. A separate shared API crate remains
+      unjustified while the binary is the only Rust consumer
 - [~] ENG-2 The same DTOs generate a complete OpenAPI 3.2 document for the
       exact 68-operation application surface and vendored Swagger UI.
       Generation fails closed on operation membership, typed JSON schemas,

@@ -206,7 +206,8 @@ impl Runner {
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let dir = self.scratch_root.join(session_id).join(format!("r{run}"));
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        kahawai_core::private::create_dir(&dir)
+            .with_context(|| format!("creating private session dir {}", dir.display()))?;
 
         // One socket per part of a split source (CD1/CD2): the worker
         // joins them with concat into a single pipeline, so the boundary

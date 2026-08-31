@@ -162,13 +162,16 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             .unwrap()
     };
 
-    // Admin gate: pleb is refused, admin passes.
-    let resp = api
-        .clone()
-        .oneshot(get("/admin/v1/satellites", &pleb_bearer))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    // Admin gate: ordinary users cannot reach either structured admin state
+    // or the raw pipeline diagnostics that may contain paths and stderr.
+    for path in [
+        "/admin/v1/satellites",
+        "/admin/v1/sessions/unknown/log",
+        "/admin/v1/items/unknown/log",
+    ] {
+        let resp = api.clone().oneshot(get(path, &pleb_bearer)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{path}");
+    }
     let v = body_json(
         api.clone()
             .oneshot(get("/admin/v1/satellites", &admin_bearer))

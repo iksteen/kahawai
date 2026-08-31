@@ -1,6 +1,6 @@
 /// The refusal contract, from the client's side.
 ///
-/// The hub answers every 4xx and 5xx with `{code, message}`, and the STATUS —
+/// The hub answers every 4xx and 5xx with `{code, message, request_id}`, and the STATUS —
 /// not the code — decides whether asking again could work. These pin that
 /// split, because getting it wrong is invisible until a proxy or an outage
 /// makes it visible.
@@ -17,9 +17,12 @@ const respond = (status: number, body: string, headers: Record<string, string> =
 
 describe('reading a refusal', () => {
   test('the hub body becomes a status, a code and a message', async () => {
-    const e = await apiFailure(respond(429, '{"code":"session_cap","message":"close one first"}'))
+    const e = await apiFailure(
+      respond(429, '{"code":"session_cap","message":"close one first","request_id":"01ABC"}'),
+    )
     expect(e.status).toBe(429)
     expect(e.code).toBe('session_cap')
+    expect(e.requestId).toBe('01ABC')
     expect(String(e)).toBe('close one first')
   })
 
@@ -34,16 +37,21 @@ describe('reading a refusal', () => {
   test('JSON that is not an error body is not read as one', async () => {
     // A misconfigured proxy returning some other service's JSON must not have
     // one of its fields promoted into a code the app then branches on.
-    const e = await apiFailure(respond(503, '{"code":"maintenance"}'))
+    const e = await apiFailure(respond(503, '{"code":"maintenance","message":"down"}'))
     expect(e.code).toBeUndefined()
+    expect(e.requestId).toBeUndefined()
   })
 
   test('Retry-After comes through only when the hub sent one', async () => {
     const timed = await apiFailure(
-      respond(429, '{"code":"login_throttled","message":"wait"}', { 'retry-after': '90' }),
+      respond(429, '{"code":"login_throttled","message":"wait","request_id":"01ABC"}', {
+        'retry-after': '90',
+      }),
     )
     expect(retryAfter(timed)).toBe(90)
-    const untimed = await apiFailure(respond(429, '{"code":"session_cap","message":"x"}'))
+    const untimed = await apiFailure(
+      respond(429, '{"code":"session_cap","message":"x","request_id":"01DEF"}'),
+    )
     expect(retryAfter(untimed)).toBeUndefined()
   })
 })

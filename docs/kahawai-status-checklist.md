@@ -535,10 +535,11 @@ How something works and why it was built that way belong in
 - [x] HUB-28 Web UI is a pure client of the public API — including session
       recovery, which is driven by the owner-scoped 404 contract rather than by
       any client-side copy of the hub's idle timeout. Every 4xx/5xx is
-      `{code, message}` with `code` enumerated in the OpenAPI document; the
-      status carries transience (429/503 clear, other 4xx are final), so a
-      third-party client needs no table of kahawai's codes
-      (`tests/error_bodies.rs`, `web/test/api-failure.test.ts`)
+      `{code, message, request_id}` with `code` enumerated in the OpenAPI
+      document and the server-generated correlation id also returned in the
+      response header; the status carries transience (429/503 clear, other 4xx
+      are final), so a third-party client needs no table of kahawai's codes
+      (`tests/error_bodies.rs`, `web/test/errors.test.ts`)
       Library grants take a `grants_version`, so two admins editing one account
       cannot silently discard each other (UI-25). Two more gaps are closed on
       the wire and not yet on screen, so they stay open in the UI ledger:
@@ -797,6 +798,9 @@ How something works and why it was built that way belong in
       at session end (a hang never fails, so crash capture never fired)
       and on demand while live; admin download from the session list,
       the player, and item detail. Design in implementation §4.6.
+      The unsanitised bundle remains behind the administrator gate; its
+      persistent directory and live run directories are owner-only, and new
+      bundle files are created mode 0600.
       Earned its keep on 2026-08-02: the burn-in resume offset above was
       diagnosed from one downloaded bundle — `start.pos` and the blend's
       own first-frame line, side by side, named the bug.

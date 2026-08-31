@@ -63,6 +63,22 @@ async fn get(api: &axum::Router, token: &str, uri: &str) -> (StatusCode, Value) 
     )
 }
 
+fn assert_not_found(body: &str, message: &str) {
+    let value: Value = serde_json::from_str(body).unwrap();
+    let object = value.as_object().unwrap();
+    assert_eq!(
+        object.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["code", "message", "request_id"]
+    );
+    assert_eq!(object["code"], "not_found");
+    assert_eq!(object["message"], message);
+    object["request_id"]
+        .as_str()
+        .unwrap()
+        .parse::<ulid::Ulid>()
+        .unwrap();
+}
+
 /// Titles on a browse page, in the order served.
 fn titles(page: &Value) -> Vec<String> {
     page["items"]
@@ -340,8 +356,8 @@ async fn a_grant_bounds_browse_search_and_detail() {
     // handle on the two paths from outside.
     let (_, denied) = call(&h.api, &h.kid, "GET", "/api/v1/items/s1/artwork", None).await;
     let (_, granted) = call(&h.api, &h.kid, "GET", "/api/v1/items/m1/artwork", None).await;
-    assert_eq!(denied, r#"{"code":"not_found","message":"no such item"}"#);
-    assert_eq!(granted, r#"{"code":"not_found","message":"no artwork"}"#);
+    assert_not_found(&denied, "no such item");
+    assert_not_found(&granted, "no artwork");
 
     // QUERY — the negotiation endpoint, and the one route in the group
     // that is a METHOD-ROUTER FALLBACK rather than a method. Worth its

@@ -209,7 +209,7 @@ async fn chapters_come_from_the_source_playback_would_pick() {
         .await
         .unwrap();
     let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    let first_source = item["sources"][0]["path_rel"].as_str().unwrap().to_string();
+    let first_source_size = item["sources"][0]["size"].as_u64().unwrap();
     let titles: Vec<&str> = item["chapters"]
         .as_array()
         .unwrap()
@@ -218,7 +218,7 @@ async fn chapters_come_from_the_source_playback_would_pick() {
         .collect();
     assert_eq!(
         titles,
-        [if first_source.contains("REPACK") {
+        [if first_source_size == 400 {
             "Whole"
         } else {
             "Split"
@@ -361,6 +361,30 @@ async fn an_offline_sole_source_still_lists_its_chapters() {
         .unwrap();
     let item: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert_eq!(item["chapters"][0]["title"], "Act 2");
+
+    // QUERY embeds the same error shape in a successful item response. It is
+    // constructed inside the request context rather than converted through
+    // `ApiError::into_response`, so pin that it still shares the outer id.
+    let response = fx
+        .api
+        .oneshot(query(
+            &format!("/api/v1/items/{}", fx.id),
+            Some(&fx.bearer),
+            Some("application/json"),
+            "{}",
+        ))
+        .await
+        .unwrap();
+    let request_id = response
+        .headers()
+        .get("x-request-id")
+        .unwrap()
+        .to_str()
+        .unwrap()
+        .to_string();
+    let item = json_of(response).await;
+    assert_eq!(item["unavailable"]["code"], "source_offline");
+    assert_eq!(item["unavailable"]["request_id"], request_id);
 }
 
 /// QUERY's ticks must describe the file the client will PLAY. Ranking says
@@ -412,15 +436,17 @@ async fn query_chapters_and_force_follow_the_cheapest_source() {
     assert_eq!(resp.status(), 200);
     let j = json_of(resp).await;
     // Rank (height DESC) lists the 4K first…
-    assert!(
-        j["sources"][0]["path_rel"]
-            .as_str()
-            .unwrap()
-            .contains("Heat (1995).mkv")
-    );
+    assert_eq!(j["sources"][0]["streams"]["video"][0]["height"], 2160);
     // …but an h264-only client plays the 1080p, and the ticks say so.
+    let chosen = j["negotiated"]["source"]["source_id"].as_i64().unwrap();
+    let chosen_source = j["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["source_id"] == chosen)
+        .unwrap();
     assert_eq!(
-        j["negotiated"]["source"]["path_rel"], "Heat (1995) [1080p].mkv",
+        chosen_source["streams"]["video"][0]["height"], 1080,
         "premise: negotiation picked the cheaper file"
     );
     assert_eq!(j["chapters"][0]["title"], "From the 1080p");
@@ -508,8 +534,17 @@ async fn query_chapters_and_force_follow_the_cheapest_source() {
         .unwrap();
     assert_eq!(forced.status(), 200);
     let forced = json_of(forced).await;
+    let chosen = forced["negotiated"]["source"]["source_id"]
+        .as_i64()
+        .unwrap();
+    let chosen_source = forced["sources"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|source| source["source_id"] == chosen)
+        .unwrap();
     assert_eq!(
-        forced["negotiated"]["source"]["path_rel"], "Heat (1995) [1080p].mkv",
+        chosen_source["streams"]["video"][0]["height"], 1080,
         "force normalization promoted a measured video transcode over ordinary direct play"
     );
 }
@@ -1166,9 +1201,12 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
     assert_eq!(j["title"], "Heat");
     // The discovered half is still there — QUERY is a superset of GET.
     assert_eq!(j["sources"][0]["streams"]["container"], "matroska");
-    // ...and the converged half names the source it judged, so a
+    // ...and the converged half names the source it judged by the same opaque
+    // id as the discovered half, so a
     // multi-source item cannot describe one file and play another.
     let n = &j["negotiated"];
+    assert_eq!(n["source"]["source_id"], j["sources"][0]["source_id"]);
+    assert_eq!(j["sources"][0]["path_rel"], "Heat (1995).mkv");
     assert_eq!(n["source"]["path_rel"], "Heat (1995).mkv");
     // A REAL verdict, not merely a present one: "none" and "unplayable"
     // are non-empty strings, so the loose form of this assertion sat
@@ -1177,6 +1215,89 @@ async fn query_returns_the_item_and_what_it_would_be_served() {
     assert_ne!(n["streams"]["video"], "none", "{n}");
     assert_ne!(n["streams"]["audio"], "none", "{n}");
     assert!(n["subtitles"].is_array());
+}
+
+/// The catalogue record is richer than the client contract. The exact media
+/// path relative to its collection root is intentional client data, but
+/// sidecar/provider paths, terminal probe diagnostics, attachment ranges and
+/// untrusted container tags may not hitch a ride through QUERY merely because
+/// the UI needs codecs and dimensions (SEC-WEB-7).
+#[tokio::test]
+async fn query_projects_only_client_safe_media_facts() {
+    let Fx {
+        api,
+        bearer,
+        id,
+        db,
+        ..
+    } = fixture().await;
+    let mut private = info(&[]);
+    private.external_subtitles = vec![kahawai_core::media::SidecarSubtitle {
+        path_rel: "private/subtitles/credential-secret.ass".into(),
+        format: "ass".into(),
+        language: Some("en".into()),
+        track: None,
+    }];
+    private.artwork = Some("private/artwork/provider-body-secret.jpg".into());
+    private.nfo = Some("private/metadata/refresh-token-secret.nfo".into());
+    private.tags.insert(
+        "comment".into(),
+        "password-hash-secret access-token-secret SELECT * FROM credentials".into(),
+    );
+    private.attachments = Some(vec![kahawai_core::media::Attachment {
+        file_name: "pipeline-internal-secret".into(),
+        mime_type: "application/octet-stream".into(),
+        offset: 42,
+        size: 7,
+    }]);
+    private.video_geometry_error = Some("GStreamer stderr /srv/private/movie.mkv".into());
+    sqlx::query("UPDATE files SET streams_json=?")
+        .bind(serde_json::to_string(&private).unwrap())
+        .execute(&db)
+        .await
+        .unwrap();
+
+    let profile = r#"{"profile":{"containers":["mp4"],
+        "video":[{"codec":"h264"}],"audio":["aac"],
+        "hdr":false,"graphics_overlay":false,"ass_render":false,
+        "target_duration":{"mode":"ignore"}}}"#;
+    let response = api
+        .oneshot(query(
+            &format!("/api/v1/items/{id}"),
+            Some(&bearer),
+            Some("application/json"),
+            profile,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let body = json_of(response).await;
+    let text = body.to_string();
+    for private in [
+        "credential-secret",
+        "provider-body-secret",
+        "refresh-token-secret",
+        "password-hash-secret",
+        "access-token-secret",
+        "SELECT * FROM credentials",
+        "pipeline-internal-secret",
+        "GStreamer stderr",
+        "/srv/private",
+    ] {
+        assert!(
+            !text.contains(private),
+            "response leaked {private:?}: {text}"
+        );
+    }
+    assert_eq!(body["sources"][0]["path_rel"], "Heat (1995).mkv");
+    assert_eq!(
+        body["sources"][0]["streams"]["subtitles"][0]["format"],
+        "ass"
+    );
+    assert_eq!(
+        body["sources"][0]["streams"]["subtitles"][0]["language"],
+        "en"
+    );
 }
 
 /// HUB-37. The skip boundaries ride on QUERY, and this is the only way a

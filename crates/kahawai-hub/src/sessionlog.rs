@@ -76,6 +76,16 @@ pub fn dir(data_dir: &Path) -> PathBuf {
     data_dir.join("session-logs")
 }
 
+/// Restrict persistent diagnostics left by an older build before the hub
+/// serves or appends to them.
+///
+/// The caller supplies the actual hub data directory. Deriving it from a
+/// session scratch path is unsafe for library and test embeddings where the
+/// scratch directory is standalone and its parent belongs to something else.
+pub fn restrict(data_dir: &Path) -> std::io::Result<()> {
+    kahawai_core::private::narrow_dir(&dir(data_dir)).map(drop)
+}
+
 /// Keep one session's diagnostics. `item_id` rides in the filename so a
 /// later "logs for this item" lookup is a directory glob.
 pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
@@ -83,15 +93,23 @@ pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
         return;
     }
     let dir = dir(data_dir);
-    if std::fs::create_dir_all(&dir).is_err() {
-        return;
+    match kahawai_core::private::create_dir(&dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if kahawai_core::private::narrow_dir(&dir).is_err() {
+                return;
+            }
+        }
+        Err(_) => return,
     }
     let stamp = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
     let name = format!("{stamp}-{item_id}-{session_id}.log");
-    if std::fs::write(dir.join(&name), head_and_tail(body, MAX_BYTES)).is_ok() {
+    if kahawai_core::private::write(&dir.join(&name), head_and_tail(body, MAX_BYTES).as_bytes())
+        .is_ok()
+    {
         tracing::debug!(bundle = %dir.join(&name).display(), "session diagnostics kept");
     }
     prune(&dir);
@@ -174,5 +192,41 @@ mod tests {
         assert!(cut.starts_with("line 0\n"), "lost the head");
         assert!(cut.trim_end().ends_with("line 39999"), "lost the tail");
         assert!(cut.contains("omitted from the middle"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn diagnostic_storage_is_owner_only() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        store(d.path(), "item", "session", "private pipeline detail");
+        let directory_mode = std::fs::metadata(dir(d.path()))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        let file_mode = std::fs::metadata(for_session(d.path(), "session").unwrap())
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(directory_mode, 0o700);
+        assert_eq!(file_mode, 0o600);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_restricts_a_directory_from_an_older_build() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let d = tempfile::tempdir().unwrap();
+        let diagnostics = dir(d.path());
+        std::fs::create_dir(&diagnostics).unwrap();
+        std::fs::set_permissions(&diagnostics, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        restrict(d.path()).unwrap();
+        let mode = std::fs::metadata(diagnostics).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
     }
 }

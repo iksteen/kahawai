@@ -2740,7 +2740,8 @@ impl Sessions {
         // socket (EADDRINUSE killed the TC-6 fallback) and a stale
         // playlist the readiness check would mistake for output.
         let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+        kahawai_core::private::create_dir(&dir)
+            .with_context(|| format!("creating private session dir {}", dir.display()))?;
         anyhow::ensure!(!parts.is_empty(), "no source parts for the session");
         let ass_path = match ass {
             Some(text) => {
