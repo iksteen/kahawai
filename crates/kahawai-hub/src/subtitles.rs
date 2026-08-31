@@ -80,6 +80,66 @@ pub enum AssBody {
 #[cfg(feature = "ocr")]
 const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
 
+#[cfg(feature = "ocr")]
+const OCR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
+
+enum ImageSetsState {
+    Ready(std::path::PathBuf),
+    RetryOnReconnect,
+    Unavailable,
+}
+
+#[cfg(feature = "ocr")]
+enum OcrGeneration {
+    Generated,
+    NoText,
+    RetryOnReconnect { module_id: String },
+}
+
+/// Failures in hub-owned OCR work are remembered for this process run so a
+/// corrupt track cannot consume ~15 seconds of Tesseract CPU every sweep.
+/// Failures whose input depends on one mediahost are different: reconnecting
+/// that host is a state change, so only those entries become eligible again.
+#[cfg(feature = "ocr")]
+#[derive(Default)]
+struct OcrSweepFailures(std::collections::HashMap<i64, Option<String>>);
+
+#[cfg(feature = "ocr")]
+impl OcrSweepFailures {
+    fn contains(&self, track_id: i64) -> bool {
+        self.0.contains_key(&track_id)
+    }
+
+    fn remember_permanent(&mut self, track_id: i64) {
+        self.0.insert(track_id, None);
+    }
+
+    fn remember_until_reconnect(&mut self, track_id: i64, module_id: String) {
+        self.0.insert(track_id, Some(module_id));
+    }
+
+    fn host_reconnected(&mut self, module_id: &str) {
+        self.0
+            .retain(|_, retry_host| retry_host.as_deref() != Some(module_id));
+    }
+
+    fn reconsider_connected(&mut self, registry: &Registry) {
+        self.0.retain(|_, retry_host| {
+            retry_host
+                .as_deref()
+                .is_none_or(|module_id| !registry.is_connected(module_id))
+        });
+    }
+}
+
+#[cfg(feature = "ocr")]
+#[derive(Debug, PartialEq, Eq)]
+enum OcrSweepWake {
+    Periodic,
+    MediahostReconnected(String),
+    EventsLagged,
+}
+
 /// HUB-32d: how long a starting session waits for a rasterisation it
 /// needs. Generous next to the measured ~3.5 s an episode takes, and
 /// bounded for the same reason the burn path's wait is: a tier that is
@@ -1111,7 +1171,7 @@ impl Subtitles {
         parent_id: i64,
         user_id: &str,
         sets_wait: std::time::Duration,
-    ) -> Result<Option<i64>> {
+    ) -> Result<OcrGeneration> {
         // One generation per parent at a time: the idle sweep and the
         // button race here, and losing the race means the work is
         // already done — return the winner's row instead of redoing it.
@@ -1120,14 +1180,15 @@ impl Subtitles {
             map.entry(format!("ocr:{parent_id}")).or_default().clone()
         };
         let _guard = lock.lock_owned().await;
-        if let Some(id) = sqlx::query_scalar::<_, i64>(
+        if sqlx::query_scalar::<_, i64>(
             "SELECT id FROM subtitle_tracks WHERE derived_from = ? AND origin = 'ocr'",
         )
         .bind(parent_id)
         .fetch_optional(registry.db())
         .await?
+        .is_some()
         {
-            return Ok(Some(id));
+            return Ok(OcrGeneration::Generated);
         }
         let parent = crate::tracks::get_internal(registry.db(), parent_id)
             .await?
@@ -1143,8 +1204,8 @@ impl Subtitles {
         // The display sets: cached from any earlier burn/overlay use, or
         // walked by the mediahost now. A viewer may be waiting (the
         // urgent case), so the wait is bounded like the burn path's.
-        let sets = self
-            .image_sets(
+        let sets = match self
+            .image_sets_state(
                 registry,
                 &module_id,
                 &collection_id,
@@ -1154,7 +1215,15 @@ impl Subtitles {
                 sets_wait,
             )
             .await
-            .context("display sets unavailable (mediahost offline or unindexed track)")?;
+        {
+            ImageSetsState::Ready(path) => path,
+            ImageSetsState::RetryOnReconnect => {
+                return Ok(OcrGeneration::RetryOnReconnect { module_id });
+            }
+            ImageSetsState::Unavailable => {
+                anyhow::bail!("display sets unavailable (unindexed or unreadable track)");
+            }
+        };
         let cues = tokio::task::spawn_blocking({
             let sets = sets.clone();
             let model = model.clone();
@@ -1179,7 +1248,7 @@ impl Subtitles {
             .await?;
             tracing::info!(item = %parent.item_id, parent = parent_id, %model,
                 "image subtitle OCRed to nothing; recorded so it is not asked again");
-            return Ok(None);
+            return Ok(OcrGeneration::NoText);
         }
         let n_cues = cues.len();
         let ex = Extracted { cues, ass: None };
@@ -1201,7 +1270,86 @@ impl Subtitles {
         std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
         tracing::info!(item = %parent.item_id, parent = parent_id, track = id,
             %model, cues = n_cues, "image subtitle OCRed to text");
-        Ok(Some(id))
+        Ok(OcrGeneration::Generated)
+    }
+
+    #[cfg(feature = "ocr")]
+    async fn wait_for_next_ocr_round(
+        registry: &Registry,
+        events: &mut tokio::sync::broadcast::Receiver<crate::registry::RegistryEvent>,
+        interval: std::time::Duration,
+    ) -> OcrSweepWake {
+        let deadline = tokio::time::sleep(interval);
+        tokio::pin!(deadline);
+        loop {
+            tokio::select! {
+                _ = &mut deadline => return OcrSweepWake::Periodic,
+                event = events.recv() => match event {
+                    Ok(event) => {
+                        if let Some(module_id) = Self::reconnected_mediahost(registry, event) {
+                            return OcrSweepWake::MediahostReconnected(module_id);
+                        }
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
+                        return OcrSweepWake::EventsLagged;
+                    }
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return OcrSweepWake::Periodic;
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "ocr")]
+    fn reconnected_mediahost(
+        registry: &Registry,
+        event: crate::registry::RegistryEvent,
+    ) -> Option<String> {
+        let crate::registry::RegistryEvent::Satellite {
+            module_id,
+            connected: true,
+            ..
+        } = event
+        else {
+            return None;
+        };
+        registry
+            .snapshot()
+            .into_iter()
+            .any(|(id, state)| {
+                id == module_id && state.connected && state.module_type == "mediahost"
+            })
+            .then_some(module_id)
+    }
+
+    /// Reconnects can arrive during a long library pass. Drain them between
+    /// tracks so a track skipped earlier in the same pass is revisited without
+    /// waiting for every remaining OCR job to finish first.
+    #[cfg(feature = "ocr")]
+    fn drain_ocr_reconnects(
+        registry: &Registry,
+        events: &mut tokio::sync::broadcast::Receiver<crate::registry::RegistryEvent>,
+        failed: &mut OcrSweepFailures,
+    ) -> bool {
+        let mut retry_earlier_candidates = false;
+        loop {
+            match events.try_recv() {
+                Ok(event) => {
+                    if let Some(module_id) = Self::reconnected_mediahost(registry, event) {
+                        failed.host_reconnected(&module_id);
+                        retry_earlier_candidates = true;
+                    }
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
+                    failed.reconsider_connected(registry);
+                    retry_earlier_candidates = true;
+                }
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        retry_earlier_candidates
     }
 
     /// HUB-32c idle sweep: OCR every image subtitle track in the library
@@ -1218,17 +1366,26 @@ impl Subtitles {
         sessions: Arc<crate::sessions::Sessions>,
     ) {
         let subs = self.clone();
+        // Subscribe before spawning so a reconnect racing task startup remains
+        // queued for the first post-settle retry decision.
+        let mut events = registry.subscribe_events();
         tokio::spawn(async move {
             // Let links and reconnect scans settle first.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             // Tracks that failed stay failed for this hub run — a
             // corrupt track must not become a 15-second crash loop.
-            let mut failed: std::collections::HashSet<i64> = Default::default();
+            let mut failed = OcrSweepFailures::default();
             loop {
+                Self::drain_ocr_reconnects(&registry, &mut events, &mut failed);
                 let candidates = subs.ocr_candidates(&registry).await;
                 let mut generated = 0usize;
+                let mut retry_earlier_candidates = false;
                 for id in candidates {
-                    if failed.contains(&id) {
+                    if Self::drain_ocr_reconnects(&registry, &mut events, &mut failed) {
+                        retry_earlier_candidates = true;
+                        break;
+                    }
+                    if failed.contains(id) {
                         continue;
                     }
                     // Idle means idle: playback outranks the sweep.
@@ -1240,7 +1397,7 @@ impl Subtitles {
                     // the mediahost exist.
                     let Ok(Some(track)) = crate::tracks::get_internal(registry.db(), id).await
                     else {
-                        failed.insert(id);
+                        failed.remember_permanent(id);
                         continue;
                     };
                     let Ok((
@@ -1252,7 +1409,7 @@ impl Subtitles {
                         language,
                     )) = subs.extract_ref(&registry, &track).await
                     else {
-                        failed.insert(id);
+                        failed.remember_permanent(id);
                         continue;
                     };
                     if !registry.is_connected(&module_id) {
@@ -1275,21 +1432,26 @@ impl Subtitles {
                                 SETS_WAIT_IDLE,
                             )
                             .await;
-                        failed.insert(id);
+                        failed.remember_permanent(id);
                         continue;
                     }
                     match subs
                         .ocr_generate_within(&registry, id, "idle-sweep", SETS_WAIT_IDLE)
                         .await
                     {
-                        Ok(Some(_)) => generated += 1,
+                        Ok(OcrGeneration::Generated) => generated += 1,
                         // No text is an answer and it is now recorded;
                         // the next candidates query no longer offers it.
-                        Ok(None) => {}
+                        Ok(OcrGeneration::NoText) => {}
+                        Ok(OcrGeneration::RetryOnReconnect { module_id }) => {
+                            tracing::info!(track = id, item = %track.item_id, %module_id,
+                                "idle OCR paused until mediahost reconnects");
+                            failed.remember_until_reconnect(id, module_id);
+                        }
                         Err(e) => {
                             tracing::warn!(track = id, item = %track.item_id,
                                 error = format!("{e:#}"), "idle OCR failed; skipping this run");
-                            failed.insert(id);
+                            failed.remember_permanent(id);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -1297,7 +1459,23 @@ impl Subtitles {
                 if generated > 0 {
                     tracing::info!(generated, "idle OCR sweep round complete");
                 }
-                tokio::time::sleep(std::time::Duration::from_secs(600)).await;
+                if retry_earlier_candidates {
+                    continue;
+                }
+                match Self::wait_for_next_ocr_round(&registry, &mut events, OCR_SWEEP_INTERVAL)
+                    .await
+                {
+                    OcrSweepWake::MediahostReconnected(module_id) => {
+                        failed.host_reconnected(&module_id);
+                        tracing::info!(%module_id, "mediahost reconnect woke idle OCR sweep");
+                    }
+                    // A periodic pass is also the lost-event fallback. Lagging
+                    // means at least one state hint was dropped, so reconcile
+                    // against authoritative connection state immediately.
+                    OcrSweepWake::Periodic | OcrSweepWake::EventsLagged => {
+                        failed.reconsider_connected(&registry);
+                    }
+                }
             }
         });
     }
@@ -1472,6 +1650,34 @@ impl Subtitles {
         sub_index: usize,
         wait: std::time::Duration,
     ) -> Option<std::path::PathBuf> {
+        match self
+            .image_sets_state(
+                registry,
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                sub_index,
+                wait,
+            )
+            .await
+        {
+            ImageSetsState::Ready(path) => Some(path),
+            ImageSetsState::RetryOnReconnect | ImageSetsState::Unavailable => None,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)] // exact source/track identity plus wait policy
+    async fn image_sets_state(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+        sub_index: usize,
+        wait: std::time::Duration,
+    ) -> ImageSetsState {
         let key = format!("i{sub_index}");
         let cache_path = self.dir.join(format!(
             "{}.sets",
@@ -1490,10 +1696,10 @@ impl Subtitles {
             let _ = promote_legacy_cache(&cache_path, &legacy_path);
         }
         if tokio::fs::metadata(&cache_path).await.is_ok() {
-            return Some(cache_path);
+            return ImageSetsState::Ready(cache_path);
         }
         if !registry.is_connected(module_id) {
-            return None;
+            return ImageSetsState::RetryOnReconnect;
         }
         // Already asked about these exact bytes and told no. Without
         // this the idle sweep re-asks every run — one .mp4 with no image
@@ -1510,7 +1716,7 @@ impl Subtitles {
             )
             .await
         {
-            return None;
+            return ImageSetsState::Unavailable;
         }
         let msg = kahawai_proto::v1::HubToHost {
             msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractImageSubs(
@@ -1524,7 +1730,13 @@ impl Subtitles {
                 },
             )),
         };
-        registry.send_to_host(module_id, msg).await.ok()?;
+        let Some(link) = registry.host_link(module_id) else {
+            return ImageSetsState::RetryOnReconnect;
+        };
+        let link_generation = link.generation();
+        if link.send(msg).await.is_err() {
+            return ImageSetsState::RetryOnReconnect;
+        }
         tracing::info!(collection = %collection_id, path = %path_rel, track = sub_index,
             "image display sets requested from mediahost");
         // A viewer is waiting on this one: bounded, unlike the text
@@ -1532,16 +1744,16 @@ impl Subtitles {
         let deadline = std::time::Instant::now() + wait;
         while std::time::Instant::now() < deadline {
             if tokio::fs::metadata(&cache_path).await.is_ok() {
-                return Some(cache_path);
+                return ImageSetsState::Ready(cache_path);
             }
-            if !registry.is_connected(module_id) {
-                return None;
+            if !registry.host_link_is_current(module_id, link_generation) {
+                return ImageSetsState::RetryOnReconnect;
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
         tracing::warn!(collection = %collection_id, path = %path_rel, track = sub_index,
             "image display sets did not arrive in time");
-        None
+        ImageSetsState::Unavailable
     }
 
     /// Store what the mediahost walked, in the worker's own format.
@@ -1902,6 +2114,100 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 #[cfg(all(test, feature = "ocr"))]
 mod ocr_memory_tests {
     use std::sync::Arc;
+
+    #[test]
+    fn reconnect_releases_only_failures_owned_by_that_mediahost() {
+        let mut failed = super::OcrSweepFailures::default();
+        failed.remember_permanent(1);
+        failed.remember_until_reconnect(2, "host-a".into());
+        failed.remember_until_reconnect(3, "host-b".into());
+
+        failed.host_reconnected("host-a");
+
+        assert!(failed.contains(1), "a corrupt track remains suppressed");
+        assert!(!failed.contains(2), "the returning host's track is retried");
+        assert!(
+            failed.contains(3),
+            "another offline host remains suppressed"
+        );
+    }
+
+    #[tokio::test]
+    async fn mediahost_reconnect_wakes_the_ocr_sweep() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        let mut events = registry.subscribe_events();
+        registry.connected("tc", "transcoder", "encoder", "fp-tc", "test");
+        registry.connected("mh", "mediahost", "storage", "fp-mh", "test");
+
+        let wake = super::Subtitles::wait_for_next_ocr_round(
+            &registry,
+            &mut events,
+            std::time::Duration::from_secs(1),
+        )
+        .await;
+
+        assert_eq!(
+            wake,
+            super::OcrSweepWake::MediahostReconnected("mh".into()),
+            "transcoder events must not wake mediahost-dependent OCR work"
+        );
+    }
+
+    #[tokio::test]
+    async fn stale_connected_state_with_no_link_is_retryable() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        registry.connected("mh", "mediahost", "storage", "fp", "test");
+        let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
+
+        let state = subs
+            .image_sets_state(
+                &registry,
+                "mh",
+                "series",
+                "root",
+                "episode.mkv",
+                0,
+                std::time::Duration::from_secs(1),
+            )
+            .await;
+
+        assert!(matches!(state, super::ImageSetsState::RetryOnReconnect));
+    }
+
+    #[tokio::test]
+    async fn replacing_the_extraction_link_makes_the_wait_retryable() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry = crate::registry::Registry::new(db, Default::default());
+        let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link("mh", old_tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.connected("mh", "mediahost", "storage", "fp", "test");
+        let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
+        let wait = subs.image_sets_state(
+            &registry,
+            "mh",
+            "series",
+            "root",
+            "episode.mkv",
+            0,
+            std::time::Duration::from_secs(2),
+        );
+        tokio::pin!(wait);
+
+        tokio::select! {
+            request = old_rx.recv() => assert!(request.is_some(), "extraction was requested"),
+            state = &mut wait => panic!("wait ended before link replacement: {}", matches!(state, super::ImageSetsState::RetryOnReconnect)),
+        }
+        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
+        registry.register_link("mh", new_tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.connected("mh", "mediahost", "storage", "fp", "test");
+
+        assert!(matches!(
+            wait.await,
+            super::ImageSetsState::RetryOnReconnect
+        ));
+    }
 
     /// "OCR produced no text" is an answer, not weather: once recorded,
     /// the idle sweep must stop offering the track — before this memory

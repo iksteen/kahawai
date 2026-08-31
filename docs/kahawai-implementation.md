@@ -302,6 +302,8 @@ Two ordering rules the wiring has to respect, both of which fail silently. The r
 
 Feature gating: cargo feature `ocr` on `kahawai-hub` (forwarded by the `kahawai` binary), **default-on**, gating the `leptess` dependency — `--no-default-features` builds have no Tesseract linkage for minimal deployments. Runtime, model presence is probed by asking Tesseract itself (a `LepTess::new` per model, cached — the one probe that cannot disagree with TESSDATA_PREFIX); `doctor` reports engine usability and the common models present; the API answers 501 with the reason on feature-off builds. Negotiation: a cached OCR text row flips the image stream's tier from Burn to `Ocr` — the forced video encode disappears and direct play comes back (the tier order bitmap → OCR text → burn, HUB-32c). Licensing (NFR-8, amended): all-MIT-side linkage; no copyleft consequence in any build.
 
+The OCR sweep's “failures stick for the hub run” rule applies to corrupt tracks, extraction timeouts and hub-local OCR failures. A link loss while obtaining input from a mediahost is retained only until that host reconnects: the connection event wakes the sweep immediately and the ten-minute pass reconciles authoritative connection state if an event was lost.
+
 **Dual audio.** Per-user, per-library preference `audio: original_subbed | dubbed(lang)` feeds default stream selection at negotiation time (HUB-33); the chosen default is overridable per session in the player as usual.
 
 ### 4.4 Client API (v1 sketch)

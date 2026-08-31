@@ -590,7 +590,9 @@ How something works and why it was built that way belong in
       dropped, no copyleft), default-on `ocr` feature, idle sweep over
       the whole library (playback outranks it) + per-track button as the
       urgent path, `tier: ocr` spares the burn encode, doctor row.
-      Covers embedded image tracks AND VobSub sidecar tracks.
+      Covers embedded image tracks AND VobSub sidecar tracks. OCR attempts
+      interrupted by a mediahost disconnect retry when that host reconnects;
+      corrupt/local failures remain suppressed for the hub run.
       Deferred: the bandwidth-threshold selection (needs measurement)
 - [x] Subtitle unification (HUB-32c mechanics amendment, 2026-07-31):
       one `subtitle_tracks` keyspace for every origin
