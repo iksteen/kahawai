@@ -13,7 +13,11 @@ export default defineConfig({
   testDir: './test/browser/product',
   fullyParallel: false,
   workers: 1,
-  retries: process.env.CI ? 1 : 0,
+  // The journey deliberately mutates one retained catalog (setup, grants,
+  // then a crash-style restart). Playwright keeps webServer alive across a
+  // retry, so rerunning the serial group would inherit that state and fail for
+  // the wrong reason. A fresh CI job is the only honest retry boundary.
+  retries: 0,
   timeout: 90_000,
   expect: { timeout: 15_000 },
   reporter: process.env.CI ? [['line'], ['html', { open: 'never' }]] : 'line',
