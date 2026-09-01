@@ -892,18 +892,25 @@ pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> 
     )
 }
 
-/// Streams parsebin must be stopped from parsing, so the parser we
-/// attach gets the demuxer's own buffers instead of parsebin's output.
+/// Streams parsebin must be stopped from parsing, so the chain we attach
+/// gets the demuxer's own buffers instead of parsebin's output.
 ///
-/// AV1, and deliberately nothing else. parsebin fixes a pad's caps when
-/// it exposes it and never renegotiates, so it settles AV1 on
+/// AV1 is stopped for every container. parsebin fixes a pad's caps when it
+/// exposes it and never renegotiates, so it settles AV1 on
 /// `alignment=frame`; isofmp4mux demands `alignment=tu`, and the
 /// frame→tu conversion a second av1parse performs drops every buffer
 /// timestamp — 16,796 dropped by `guard_pts`, muxer starved, session
 /// frozen. Fed raw OBUs, our av1parse produces `tu` directly.
 ///
-/// This is NOT the general rule "one parser per stream", which was
-/// tried and measurably costs more than it buys. Applied to h264 it
+/// Already-packetized HEVC is also stopped, but only for fMP4. A Dolby
+/// Vision profile 8.1 SPS carries a multilayer extension GStreamer's
+/// h265parse cannot preserve; parsebin's parser rewrites the codec_data and
+/// isofmp4mux rejects it. The Matroska demuxer already supplied hvc1/au, so
+/// that parser had no conversion to perform. The untouched caps work through
+/// h265timestamper and isofmp4mux.
+///
+/// This is NOT the general rule "one parser per stream", which was tried
+/// and measurably costs more than it buys. Applied to h264 it
 /// makes mpegtsmux emit one timestamp-less PES per keyframe — a bare
 /// 9-byte PPS, which ffmpeg reports as an access unit with no picture
 /// and the sweep flags as a missing DTS (6 of 60 files). The bytes
@@ -913,16 +920,35 @@ pub fn plan_summary(info: &kahawai_core::media::MediaInfo, plan: &RemuxPlan) -> 
 /// kahawai involved: `qtdemux ! h264parse ! mpegtsmux` gives 106
 /// timestamp-less packets, `qtdemux ! h264parse ! h264parse !
 /// mpegtsmux` gives none.
-fn parsebin_must_not_parse(caps: &gst::CapsRef) -> bool {
+fn fmp4_ready_hevc(caps: &gst::CapsRef) -> bool {
+    caps.structure(0).is_some_and(|s| {
+        s.name() == "video/x-h265"
+            && matches!(s.get::<&str>("stream-format").ok(), Some("hvc1" | "hev1"))
+            && s.get::<&str>("alignment").ok() == Some("au")
+    })
+}
+
+fn parsebin_must_not_parse(caps: &gst::CapsRef, format: SegmentFormat) -> bool {
     caps.structure(0).is_some_and(|s| s.name() == "video/x-av1")
+        || (format == SegmentFormat::Fmp4 && fmp4_ready_hevc(caps))
 }
 
 /// TS muxing needs specific stream-formats (h26x as Annex-B byte-stream,
 /// AAC as ADTS) while containers store avc/hvc1/raw. A per-stream parser
 /// between demux and muxer converts during caps negotiation — pure
 /// repackaging, still no re-encoding.
-fn parser_for(caps: &gst::CapsRef) -> Option<&'static str> {
+///
+/// Do not parse HEVC twice when Matroska has already supplied the exact
+/// hvc1/au shape fMP4 needs. GStreamer's H.265 parser cannot preserve the
+/// multilayer SPS extension carried by Dolby Vision profile 8.1: a second
+/// pass rewrites `codec_data`, after which `isofmp4mux` rejects caps that it
+/// accepted before the rewrite. `h265timestamper` still follows and supplies
+/// the DTS fMP4 requires.
+fn parser_for(caps: &gst::CapsRef, format: SegmentFormat) -> Option<&'static str> {
     let s = caps.structure(0)?;
+    if format == SegmentFormat::Fmp4 && fmp4_ready_hevc(caps) {
+        return None;
+    }
     let element = match s.name().as_str() {
         "video/x-h264" => "h264parse",
         "video/x-h265" => "h265parse",
@@ -1609,7 +1635,7 @@ fn route_stream(
             let mut tail = from.clone();
             // parser → timestamper, each present only when it applies;
             // every hop is pure repackaging, no decode.
-            for name in [parser_for(caps), timestamper_for(caps)]
+            for name in [parser_for(caps, plan.segment_format), timestamper_for(caps)]
                 .into_iter()
                 .flatten()
             {
@@ -4334,9 +4360,10 @@ pub fn start_parts(
         // returning false exposes the stream as the demuxer produced it.
         // Container caps are never in `parsebin_must_not_parse`, so
         // demuxing always continues.
-        parsebin.connect("autoplug-continue", false, |args| {
+        let segment_format = plan.segment_format;
+        parsebin.connect("autoplug-continue", false, move |args| {
             let caps = args[2].get::<gst::Caps>().ok()?;
-            Some((!parsebin_must_not_parse(&caps)).to_value())
+            Some((!parsebin_must_not_parse(&caps, segment_format)).to_value())
         });
         pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
         gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
@@ -5994,7 +6021,7 @@ mod tests {
         for name in ["audio/x-flac", "audio/x-vorbis", "video/x-vp8"] {
             let caps = gst::Caps::builder(name).build();
             assert!(
-                parser_for(&caps).is_none(),
+                parser_for(&caps, SegmentFormat::Fmp4).is_none(),
                 "{name} now has a parser — pick another uncovered codec"
             );
         }
@@ -6110,7 +6137,8 @@ mod tests {
         );
     }
 
-    /// parsebin keeps its parser for everything except AV1.
+    /// parsebin keeps its parser except for AV1 and the separately tested
+    /// fMP4-ready HEVC shape.
     ///
     /// The general form of this rule — block wherever `parser_for` has
     /// an answer, one parser per stream — was tried and reverted: for
@@ -6126,10 +6154,17 @@ mod tests {
     /// over a real one 106 — so the end-to-end property belongs to the
     /// corpus sweep, which is what caught it.
     #[test]
-    fn only_av1_is_kept_from_parsebins_parser() {
+    fn parsebin_parser_exceptions_stay_narrow() {
         crate::init().unwrap();
         let caps = |n: &str| gst::Caps::builder(n).build();
-        assert!(parsebin_must_not_parse(&caps("video/x-av1")));
+        assert!(parsebin_must_not_parse(
+            &caps("video/x-av1"),
+            SegmentFormat::Ts
+        ));
+        assert!(parsebin_must_not_parse(
+            &caps("video/x-av1"),
+            SegmentFormat::Fmp4
+        ));
         for name in [
             "video/x-h264",
             "video/x-h265",
@@ -6140,10 +6175,12 @@ mod tests {
             "video/quicktime",
             "video/x-matroska",
         ] {
-            assert!(
-                !parsebin_must_not_parse(&caps(name)),
-                "{name} would lose parsebin's parser; only AV1 may"
-            );
+            for format in [SegmentFormat::Ts, SegmentFormat::Fmp4] {
+                assert!(
+                    !parsebin_must_not_parse(&caps(name), format),
+                    "{name} would lose parsebin's parser in {format:?}"
+                );
+            }
             // The codecs above still get a parser from us afterwards —
             // that is the double parse the h264 path depends on.
         }
@@ -6772,6 +6809,40 @@ mod tests {
         std::fs::write(&joined, bytes).unwrap();
         let info = crate::discover(&joined, Duration::from_secs(30)).unwrap();
         assert_eq!(info.video[0].codec, "hevc", "{info:?}");
+    }
+
+    /// A Dolby Vision profile 8.1 source exposed the already parsed
+    /// `hvc1/au` caps below. Running it through another h265parse changed
+    /// its multilayer SPS codec_data, and isofmp4mux then refused the stream
+    /// with `not-negotiated`. fMP4 needs only the timestamper in this case;
+    /// TS still needs h265parse to convert the stream to Annex B.
+    #[test]
+    fn fmp4_does_not_reparse_packetized_hevc() {
+        crate::init().unwrap();
+        let ready = gst::Caps::builder("video/x-h265")
+            .field("stream-format", "hvc1")
+            .field("alignment", "au")
+            .field("profile", "main-10")
+            .field("width", 3840i32)
+            .field("height", 2160i32)
+            .build();
+        assert!(parsebin_must_not_parse(&ready, SegmentFormat::Fmp4));
+        assert!(!parsebin_must_not_parse(&ready, SegmentFormat::Ts));
+        assert_eq!(parser_for(&ready, SegmentFormat::Fmp4), None);
+        assert_eq!(parser_for(&ready, SegmentFormat::Ts), Some("h265parse"));
+
+        let needs_conversion = gst::Caps::builder("video/x-h265")
+            .field("stream-format", "byte-stream")
+            .field("alignment", "nal")
+            .build();
+        assert!(!parsebin_must_not_parse(
+            &needs_conversion,
+            SegmentFormat::Fmp4
+        ));
+        assert_eq!(
+            parser_for(&needs_conversion, SegmentFormat::Fmp4),
+            Some("h265parse")
+        );
     }
 
     /// A script whose one event fills the LEFT HALF of a 320x240 frame
