@@ -43,7 +43,6 @@ pub fn init() -> Result<()> {
         #[cfg(target_os = "macos")]
         for name in ["vtdec_hw", "vtdec"] {
             if let Some(f) = gst::ElementFactory::find(name) {
-                use gst::prelude::PluginFeatureExt;
                 f.set_rank(gst::Rank::NONE);
             }
         }
