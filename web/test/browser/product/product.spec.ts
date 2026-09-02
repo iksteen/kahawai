@@ -250,18 +250,25 @@ test.describe.serial('real all-in-one product flows', () => {
     await video.click()
     await page.getByRole('button', { name: '← Back' }).click()
 
+    // WebKit implements route.abort() through Web Inspector. It does retry the
+    // blocked segment, but its inspected MediaSource can remain wedged at time
+    // zero after the successful retry. Chromium exercises the real hls.js
+    // transient-network recovery; WebKit still gates every playback mode and
+    // its separate native-HLS path below without the inspector artifact.
     let failedSegment = false
-    await page.route('**/segment*.ts', async (route) => {
-      if (!failedSegment) {
-        failedSegment = true
-        await route.abort('connectionreset')
-      } else {
-        await route.continue()
-      }
-    })
+    if (engine !== 'webkit') {
+      await page.route('**/segment*.ts', async (route) => {
+        if (!failedSegment) {
+          failedSegment = true
+          await route.abort('connectionreset')
+        } else {
+          await route.continue()
+        }
+      })
+    }
     await openFixture('Remux Fixture')
     video = await startPlayback('REMUX')
-    expect(failedSegment).toBe(true)
+    if (engine !== 'webkit') expect(failedSegment).toBe(true)
     const seek = page.getByRole('slider', { name: /Seek/ })
     await seek.evaluate((element) => {
       const input = element as HTMLInputElement
@@ -272,7 +279,7 @@ test.describe.serial('real all-in-one product flows', () => {
       .poll(() => video.evaluate((element) => (element as HTMLVideoElement).currentTime))
       .toBeGreaterThan(1)
     await expect(page.getByRole('alertdialog', { name: 'Playback stopped' })).toHaveCount(0)
-    await page.unroute('**/segment*.ts')
+    if (engine !== 'webkit') await page.unroute('**/segment*.ts')
     await page.getByRole('button', { name: '← Back' }).click()
 
     await page.evaluate(() =>
