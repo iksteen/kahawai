@@ -54,7 +54,8 @@ export default defineConfig({
     url: `${CONTROL}/ready`,
     reuseExistingServer: false,
     // The macOS release gate starts without a workspace build. A cold Rust +
-    // GStreamer compile may take minutes; this ceiling covers startup only.
+    // GStreamer compile and the all-in-one's real capability benchmarks may
+    // take minutes; this ceiling covers startup only.
     timeout: 600_000,
     gracefulShutdown: { signal: 'SIGTERM', timeout: 30_000 },
   },

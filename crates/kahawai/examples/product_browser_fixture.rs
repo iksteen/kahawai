@@ -127,11 +127,22 @@ async fn public_ready(state: &Supervisor) -> bool {
         .is_ok()
 }
 
+fn benchmarks_settled(root: &Path) -> bool {
+    let cache = root.join("hub/benchmarks.json");
+    kahawai_media::bench::load(&cache)
+        .is_some_and(|measured| kahawai_media::bench::benchmark_jobs(Some(&measured)).is_empty())
+}
+
 async fn ready(State(state): State<Arc<Supervisor>>) -> impl IntoResponse {
-    if public_ready(&state).await {
+    // The real all-in-one waits sixty seconds before measuring missing local
+    // capabilities. On the small hosted Mac those isolated jobs can saturate
+    // every core for longer than a browser scenario's honest timeout. Keep the
+    // production behavior in the fixture, but spend that cost inside
+    // Playwright's startup allowance instead of racing it against playback.
+    if public_ready(&state).await && benchmarks_settled(&state.args.root) {
         (StatusCode::OK, "ready")
     } else {
-        (StatusCode::SERVICE_UNAVAILABLE, "starting")
+        (StatusCode::SERVICE_UNAVAILABLE, "starting or benchmarking")
     }
 }
 
