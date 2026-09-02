@@ -173,7 +173,11 @@ How something works and why it was built that way belong in
       never transfers state across different content at the same path
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
-      composite, MusicBrainz + CAA). Which record an item IS is derived
+      composite, MusicBrainz + CAA), plus Fanart.tv → TheAudioDB Album Artist
+      artwork
+      keyed only by an exact MusicBrainz artist identity. Album credits supply
+      it first; otherwise a direct artist search must return exactly one strict
+      name match. Which record an item IS is derived
       by triggers from stored answers, chain order, refusals and pins —
       design in implementation §4.1/§4.2; per-media-type ordering is the
       2026-07-26 amendment recorded in the requirement.
@@ -198,6 +202,8 @@ How something works and why it was built that way belong in
       rather than a TTL response cache (implementation §4.3). Stored
       limits were corrected against the specs 2026-07-26 — three of four
       were wrong in our favour.
+      TheAudioDB defaults to its public `123` key at 30 requests/minute and an
+      admin may store a premium user key for its documented 100/minute tier.
       TMDB, TheTVDB and AniDB plaintext snapshots carry revocable runtime
       leases: replacement wakes queued/paced work before its next send,
       creates no retry debt, and coalesces one fresh follow-up pass.
@@ -424,9 +430,32 @@ How something works and why it was built that way belong in
       release year the album card displays;
       search returns matching artists alongside albums and songs and matches
       track titles within an artist's albums. A strict synthetic `artist_key`
-      keeps fuzzy-search equivalents such as “One” and “1” distinct while
-      avoiding an artist entity/enrichment path; a rename changes the route
-      key (`kahawai-list.sh -r/-A`).
+      keeps fuzzy-search equivalents such as “One” and “1” distinct; a rename
+      changes the route key. A durable artwork projection requires exactly one
+      credited-artist MusicBrainz identity, tries Fanart.tv before TheAudioDB,
+      prefetches the selected portrait and every named size before exposing its
+      cache version, and serves it through a
+      library-grant-checked endpoint (`kahawai-list.sh -r/-A`).
+      Legacy MusicBrainz rows are resolved per distinct release group and
+      synthetic artist until every identity agrees or a conflict makes the
+      portrait ambiguous; backfill never crosses into a differently tagged
+      artist group that shares the release.
+      Personal Fanart credentials use its documented secret-bearing `client-key`
+      header, and the enrichment status covers the full prefetch rather than
+      ending before it. A provider backoff stops the batch and schedules one
+      artist-only retry after the quiet period; it does not repeat the full
+      catalogue enrichment pipeline. A Fanart authentication refusal stops
+      immediately and waits for a replacement credential rather than failing
+      once per artist. Provider transport/server failures coalesce into the
+      same artist-only retry; a systemic local cache-write failure stops rather
+      than downloading once per remaining artist. A ready row whose original
+      or any named derivative is absent/empty is re-prefetched and versioned
+      again instead of remaining a permanent 404. Saving Fanart or TheAudioDB
+      credentials or
+      attaching an existing collection schedules this artist-only pass, not
+      full enrichment. Portrait selection prefers Fanart's square
+      `artistthumb`, then uses an `artistbackground` when the square form is
+      absent.
       `in_progress=true` narrows the same endpoint to what is meaningfully
       started and unfinished, most recently watched first — the
       continue-watching row (`kahawai-list.sh -p`). Meaningful means both one

@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "f11cd90dae5fc6b6ddf2f631bc5e3565dfad0448d07ff08353e7487936e662da",
+  "x-kahawai-source-sha256": "cf8d1629e98b5cd8680fa75ca85bb355d41539708571a7903064e7365aac759b",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -2110,7 +2110,7 @@
           "Admin providers"
         ],
         "summary": "Metadata provider configuration",
-        "description": "Admin only. Reports whether TMDB, TVDB and AniDB credentials are\nconfigured, plus the effective and default provider chain for each media\ntype.",
+        "description": "Admin only. Reports credential state for metadata and artwork providers,\nplus the effective and default provider chain for each media type.",
         "operationId": "admin_providers",
         "responses": {
           "200": {
@@ -2652,6 +2652,338 @@
         ]
       }
     },
+    "/admin/v1/providers/fanart": {
+      "post": {
+        "tags": [
+          "Admin providers"
+        ],
+        "summary": "Set Fanart.tv credentials",
+        "description": "Admin only. Stores the personal API key and starts the Album Artist artwork\nprefetch in the background. Fanart.tv supplies artwork only and is not\ninserted into the music metadata chain.",
+        "operationId": "admin_set_fanart",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetFanart"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/providers/theaudiodb": {
+      "post": {
+        "tags": [
+          "Admin providers"
+        ],
+        "summary": "Set a premium TheAudioDB API key",
+        "description": "Admin only. Overrides TheAudioDB's public free key and retries Album Artist\nartwork misses. Deleting this provider's credentials restores the free key.",
+        "operationId": "admin_set_theaudiodb",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetTheAudioDb"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SavedResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/admin/v1/providers/tmdb": {
       "post": {
         "tags": [
@@ -2990,7 +3322,7 @@
           "Admin providers"
         ],
         "summary": "Disconnect a provider",
-        "description": "Admin only. Deletes every credential stored for one provider; the hub then\nanswers `configured: false` for it and stops contacting it. Metadata\nalready merged from that provider stays.",
+        "description": "Admin only. Deletes every credential stored for one provider. TheAudioDB\nreturns to its public free key; other providers become unconfigured.\nMetadata already merged from that provider stays.",
         "operationId": "admin_disconnect_provider",
         "parameters": [
           {
@@ -5667,6 +5999,179 @@
         "security": [
           {
             "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/artists/{key}/artwork": {
+      "get": {
+        "tags": [
+          "Item media"
+        ],
+        "summary": "Fetch Album Artist artwork",
+        "description": "Serves a fully prefetched Fanart.tv artist thumb. The library parameter is\nrequired because an artist key is synthetic and can occur in more than one\nlibrary. Accepts a bearer token or the media cookie.",
+        "operationId": "artist_artwork",
+        "parameters": [
+          {
+            "name": "key",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "library",
+            "in": "query",
+            "description": "Music library providing both navigation and grant context.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "v",
+            "in": "query",
+            "description": "Client cache-buster from `ArtistSummary.art_version`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              },
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              },
+              "cache-control": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          },
+          {
+            "media_token": []
           }
         ]
       }
@@ -10523,12 +11028,21 @@
         "required": [
           "key",
           "name",
-          "album_count"
+          "album_count",
+          "art_version"
         ],
         "properties": {
           "album_count": {
             "type": "integer",
             "format": "int64"
+          },
+          "art_version": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Changes when the selected portrait or its availability changes."
           },
           "key": {
             "type": "string",
@@ -12857,6 +13371,8 @@
           "tmdb",
           "tvdb",
           "anidb",
+          "fanart",
+          "theaudiodb",
           "chains"
         ],
         "properties": {
@@ -12871,6 +13387,12 @@
             "propertyNames": {
               "type": "string"
             }
+          },
+          "fanart": {
+            "$ref": "#/components/schemas/ProviderConfiguration"
+          },
+          "theaudiodb": {
+            "$ref": "#/components/schemas/TheAudioDbConfiguration"
           },
           "tmdb": {
             "$ref": "#/components/schemas/ProviderConfiguration"
@@ -13575,6 +14097,17 @@
           }
         }
       },
+      "SetFanart": {
+        "type": "object",
+        "required": [
+          "client_key"
+        ],
+        "properties": {
+          "client_key": {
+            "type": "string"
+          }
+        }
+      },
       "SetOpenSubtitlesAccount": {
         "type": "object",
         "required": [
@@ -13586,6 +14119,17 @@
             "type": "string"
           },
           "username": {
+            "type": "string"
+          }
+        }
+      },
+      "SetTheAudioDb": {
+        "type": "object",
+        "required": [
+          "api_key"
+        ],
+        "properties": {
+          "api_key": {
             "type": "string"
           }
         }
@@ -13998,6 +14542,18 @@
           }
         ],
         "description": "What a client needs from `EXT-X-TARGETDURATION`, which is three\ndifferent needs and not a boolean.\n\nOur segmenters close fragments at keyframes, so on a COPY the\ndeclared value is bounded by the source's keyframe spacing —\nmeasured here to run past 147 s. (That bound is a property of\n`splitmuxsink`/`isofmp4mux`, not of HLS; see\n`VideoStream::max_keyframe_interval_ms`.) RFC 8216 §4.3.3.1 makes\nunder-declaring a violation, and §6.3.3 tells a client not to start\nwithin three target durations of the end, so an HONEST value on\nsuch a file is conforming and still awkward. The client is the only\nparty that knows which it can live with, so it says."
+      },
+      "TheAudioDbConfiguration": {
+        "type": "object",
+        "required": [
+          "premium_key_configured"
+        ],
+        "properties": {
+          "premium_key_configured": {
+            "type": "boolean",
+            "description": "The free public key is always active; this only reports an override."
+          }
+        }
       },
       "TokenPair": {
         "type": "object",

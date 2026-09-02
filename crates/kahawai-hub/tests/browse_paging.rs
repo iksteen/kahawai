@@ -19,6 +19,7 @@ async fn harness() -> (
     String,
     kahawai_sqlite::Database,
     Arc<kahawai_hub::registry::Registry>,
+    std::path::PathBuf,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
@@ -45,6 +46,7 @@ async fn harness() -> (
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
+    let artwork_dir = dir.path().join("artwork");
     let api = kahawai_hub::api::router(
         registry.clone(),
         auth.clone(),
@@ -54,7 +56,7 @@ async fn harness() -> (
             tempfile::tempdir().unwrap().keep(),
         )),
         Arc::new(kahawai_hub::artwork::Artwork::new(
-            tempfile::tempdir().unwrap().keep(),
+            artwork_dir.clone(),
             enricher.clone(),
         )),
         enricher,
@@ -70,7 +72,7 @@ async fn harness() -> (
         .unwrap()
         .access_token;
     std::mem::forget(dir);
-    (api, token, db, registry)
+    (api, token, db, registry, artwork_dir)
 }
 
 async fn page(api: &axum::Router, token: &str, uri: &str) -> serde_json::Value {
@@ -152,7 +154,7 @@ fn item_ids(v: &serde_json::Value) -> Vec<&str> {
 /// file upsert nor rewrite any durable catalogue/user state.
 #[tokio::test]
 async fn attach_and_detach_change_only_visibility() {
-    let (api, token, db, registry) = harness().await;
+    let (api, token, db, registry, _artwork_dir) = harness().await;
     sqlx::raw_sql(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
            VALUES('compose-host','mediahost','compose-host','fp');
@@ -261,7 +263,7 @@ async fn attach_and_detach_change_only_visibility() {
 
 #[tokio::test]
 async fn pages_partition_a_library_even_across_ties() {
-    let (api, token, db, _registry) = harness().await;
+    let (api, token, db, _registry, _artwork_dir) = harness().await;
 
     sqlx::query("INSERT INTO libraries (id, name, media_type) VALUES ('L','l','movies')")
         .execute(&db)
@@ -351,7 +353,7 @@ async fn pages_partition_a_library_even_across_ties() {
 /// titles — through the real router, folded like a person types.
 #[tokio::test]
 async fn search_finds_artists_and_episode_titles() {
-    let (api, token, db, _registry) = harness().await;
+    let (api, token, db, _registry, _artwork_dir) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
@@ -460,7 +462,7 @@ async fn search_finds_artists_and_episode_titles() {
 
 #[tokio::test]
 async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
-    let (api, token, db, _registry) = harness().await;
+    let (api, token, db, _registry, artwork_dir) = harness().await;
     sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES('M','Music','music')")
         .execute(&db)
         .await
@@ -573,9 +575,51 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
     let first = page(&api, &token, "/api/v1/artists?library=M&limit=1").await;
     assert_eq!(first["total"], 2, "the group count must precede paging");
     assert_eq!(first["artists"][0]["name"], "Björk");
+    assert!(first["artists"][0]["art_version"].is_null());
     let second = page(&api, &token, "/api/v1/artists?library=M&limit=1&offset=1").await;
     assert_eq!(second["artists"][0]["name"], "Various Artists");
     assert_eq!(second["artists"][0]["album_count"], 2);
+
+    const ARTIST_URL: &str = "https://assets.fanart.tv/a.jpg";
+    sqlx::query(
+        "INSERT INTO artist_artwork
+           (artist_key,artist_name,musicbrainz_id,image_id,image_url,outcome,source_revision,updated_at)
+         VALUES('artist-Ympvcms','Björk','mbid','image','https://assets.fanart.tv/a.jpg',
+                'ready','revision',1234)",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let with_art = page(&api, &token, "/api/v1/artists?library=M&limit=1").await;
+    assert_eq!(with_art["artists"][0]["art_version"], 1234);
+
+    let cache_key = format!(
+        "fanart-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(ARTIST_URL.as_bytes())
+    );
+    let derivative = artwork_dir.join("size-card-480").join(cache_key);
+    std::fs::create_dir_all(derivative.parent().unwrap()).unwrap();
+    std::fs::write(&derivative, b"cached-artist-jpeg").unwrap();
+    let response = api
+        .clone()
+        .oneshot(
+            Request::get("/api/v1/artists/artist-Ympvcms/artwork?library=M&size=card&v=1234")
+                .header("authorization", format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::OK);
+    assert_eq!(response.headers()["content-type"], "image/jpeg");
+    assert_eq!(
+        response.headers()["cache-control"],
+        "private, max-age=86400"
+    );
+    let bytes = axum::body::to_bytes(response.into_body(), 1 << 20)
+        .await
+        .unwrap();
+    assert_eq!(&bytes[..], b"cached-artist-jpeg");
 
     let albums = page(
         &api,
@@ -632,7 +676,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
 #[tokio::test]
 async fn capability_changes_delivery_not_existence() {
     // No router needed: this one asks `Subtitles::list` directly.
-    let (_api, _token, db, _registry) = harness().await;
+    let (_api, _token, db, _registry, _artwork_dir) = harness().await;
     let q = |sql: &'static str| {
         let db = db.clone();
         async move {
@@ -747,7 +791,7 @@ async fn capability_changes_delivery_not_existence() {
 /// orphan them); a vanished stream deletes its reproducible derivatives.
 #[tokio::test]
 async fn scan_sync_preserves_track_ids() {
-    let (_api, _token, db, _registry) = harness().await;
+    let (_api, _token, db, _registry, _artwork_dir) = harness().await;
     sqlx::query(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
                  VALUES('sync','mediahost','sync','fp')",

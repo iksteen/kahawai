@@ -20,6 +20,8 @@ import {
   adminProviders,
   adminSetAnidb,
   adminSetChain,
+  adminSetFanart,
+  adminSetTheaudiodb,
   adminSetTmdb,
   adminSetTvdb,
 } from '../../api/generated/kahawai.ts'
@@ -90,6 +92,8 @@ watch(readError, (why) => {
 })
 
 const tmdb = ref('')
+const fanart = ref('')
+const theaudiodb = ref('')
 const tvdb = ref({ key: '', pin: '' })
 const anidb = ref({ username: '', password: '', udp: '' })
 
@@ -102,13 +106,28 @@ const anyProvider = computed(
     !!configured.value &&
     (configured.value.tmdb.configured ||
       configured.value.tvdb.configured ||
-      configured.value.anidb.configured),
+      configured.value.anidb.configured ||
+      configured.value.fanart.configured),
 )
 
 async function saveTmdb() {
   if (!(await props.act(() => adminSetTmdb({ api_key: tmdb.value })))) return
   tmdb.value = ''
   notify('TMDB key saved — enrichment started.')
+  void reload()
+}
+
+async function saveFanart() {
+  if (!(await props.act(() => adminSetFanart({ client_key: fanart.value })))) return
+  fanart.value = ''
+  notify('Fanart.tv key saved — artist artwork prefetch started.')
+  void reload()
+}
+
+async function saveTheAudioDb() {
+  if (!(await props.act(() => adminSetTheaudiodb({ api_key: theaudiodb.value })))) return
+  theaudiodb.value = ''
+  notify('TheAudioDB premium key saved — artist artwork prefetch started.')
   void reload()
 }
 
@@ -149,9 +168,12 @@ async function saveAnidb() {
 /// Asked twice (see `Armed`): nothing here can show what is about to go — a
 /// stored key is never read back — so a stray press costs a trip to the
 /// provider's site to fetch it again.
-async function disconnect(provider: 'tmdb' | 'tvdb' | 'anidb', name: string) {
+async function disconnect(
+  provider: 'tmdb' | 'tvdb' | 'anidb' | 'fanart' | 'theaudiodb',
+  name: string,
+) {
   if (!(await props.act(() => adminDisconnectProvider(provider)))) return
-  notify(`${name} disconnected.`)
+  notify(provider === 'theaudiodb' ? 'TheAudioDB reset to its free key.' : `${name} disconnected.`)
   void reload()
 }
 
@@ -409,6 +431,72 @@ async function detect() {
         />
       </div>
       <p class="mt-2 text-dim">AniList and the AniDB↔TVDB mapping need no key.</p>
+    </section>
+
+    <section class="rounded border border-line bg-surface p-3" aria-labelledby="providers-music">
+      <h2
+        id="providers-music"
+        class="mb-3 flex items-center gap-2 text-[14px] leading-none font-[600] capitalize"
+      >
+        <Icon name="album" />
+        Music artwork
+      </h2>
+      <p class="mb-2 max-w-[80ch] text-dim">
+        Fanart.tv supplies Album Artist portraits first; TheAudioDB fills its gaps. The hub
+        downloads and sizes every portrait in the background so browsing remains local when either
+        provider is unavailable. Fanart calls its personal API key a client key. TheAudioDB works
+        with its free public key unless you supply a premium key.
+      </p>
+      <div class="mb-2 flex flex-wrap items-center gap-2">
+        <label class="w-20 font-mono text-[12px] text-dim" for="fanart-key">Fanart.tv</label>
+        <input
+          id="fanart-key"
+          v-model="fanart"
+          class="flex-1 rounded border border-line bg-bg px-2 py-1"
+          type="password"
+          autocomplete="off"
+          :placeholder="
+            configured?.fanart?.configured
+              ? 'key configured — paste to replace'
+              : 'personal API key'
+          "
+        />
+        <Btn small :disabled="!fanart" @click="saveFanart">Save</Btn>
+        <Armed
+          v-if="configured?.fanart?.configured"
+          label="Disconnect"
+          armed-label="Really disconnect?"
+          name="Disconnect Fanart.tv"
+          armed-name="Really disconnect Fanart.tv?"
+          title="Deletes the stored Fanart.tv key from this hub"
+          @confirm="disconnect('fanart', 'Fanart.tv')"
+        />
+      </div>
+      <div class="flex flex-wrap items-center gap-2">
+        <label class="w-20 font-mono text-[12px] text-dim" for="theaudiodb-key">TheAudioDB</label>
+        <input
+          id="theaudiodb-key"
+          v-model="theaudiodb"
+          class="flex-1 rounded border border-line bg-bg px-2 py-1"
+          type="password"
+          autocomplete="off"
+          :placeholder="
+            configured?.theaudiodb?.premium_key_configured
+              ? 'premium key configured — paste to replace'
+              : 'premium key — free key is active'
+          "
+        />
+        <Btn small :disabled="!theaudiodb" @click="saveTheAudioDb">Save premium key</Btn>
+        <Armed
+          v-if="configured?.theaudiodb?.premium_key_configured"
+          label="Use free key"
+          armed-label="Really use free key?"
+          name="Reset TheAudioDB to free key"
+          armed-name="Really reset TheAudioDB to its free key?"
+          title="Deletes the stored premium key and restores TheAudioDB's public free key"
+          @confirm="disconnect('theaudiodb', 'TheAudioDB')"
+        />
+      </div>
     </section>
 
     <section

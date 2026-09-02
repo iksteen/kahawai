@@ -218,7 +218,7 @@ trait MetadataProvider {
 }
 ```
 
-Implementations: `thetvdb` (v4 API, JWT login flow), `tmdb`, `musicbrainz` (+ Cover Art Archive), `local` (NFO + sidecar art + embedded tags). Providers compose into per-media-type chains with **first-claim-wins** field merging (HUB-5) — the earliest provider to supply a field owns it.
+Implementations: `thetvdb` (v4 API, JWT login flow), `tmdb`, `musicbrainz` (+ Cover Art Archive), `local` (NFO + sidecar art + embedded tags). Providers compose into per-media-type chains with **first-claim-wins** field merging (HUB-5) — the earliest provider to supply a field owns it. Fanart.tv and TheAudioDB are deliberately outside that chain: they answer the separate Album Artist artwork projection described in §4.4.
 
 **How that is stored.** Each provider's answer is a row in `provider_metadata (item_id, provider, …)`, and one row per top-level item — `item_match` — says which of those records the item IS, plus whether a human chose it. Nothing descriptive is stored merged: the row the API serves is resolved per read by the `resolved_metadata` view, assigned provider first and then `provider_ranks`, first non-null per field. Episodes and tracks carry no assignment and render through their parent's, so an episode of a TMDB-assigned show shows TMDB's episode data and side-fills from TVDB where TMDB has none.
 
@@ -230,11 +230,11 @@ That shape is deliberate, and it replaced a stored merge that produced a day of 
 
 The view is installed on open rather than by a migration (it derives rather than stores, so its definition is free to change), and it has one non-obvious rule with a runnable check: a `JOIN` in its FROM makes it unflattenable inside a `LEFT JOIN`, which every read site is, and per-item reads then go from sub-millisecond to ~45 ms while still returning correct rows.
 
-**Provider pacing (HUB-7), one chokepoint.** Every outbound provider request — TMDB, TheTVDB, MusicBrainz, Cover Art Archive, AniList, the AniDB HTTP API, OpenSubtitles, artwork CDNs — goes through `hub/gate.rs`, which keeps **one queue per provider host**: a single request in flight, spaced by that provider's published limit, and a `429`/`503` treated as silence for that provider alone (honouring `Retry-After`, capped at an hour) rather than a retry that walks into a ban. The queues are process-wide, because that is the unit providers count: per IP, not per struct. There is deliberately no unpaced path — `Http::send` is the only way out, so the next provider added inherits pacing instead of needing someone to remember it.
+**Provider pacing (HUB-7), one chokepoint.** Every outbound provider request — TMDB, TheTVDB, MusicBrainz, Cover Art Archive, Fanart.tv, TheAudioDB, AniList, the AniDB HTTP API, OpenSubtitles, artwork CDNs — goes through `hub/gate.rs`, which keeps **one queue per provider host**: a single request in flight, spaced by that provider's published limit, and a `429`/`503` treated as silence for that provider alone (honouring `Retry-After`, capped at an hour) rather than a retry that walks into a ban. The queues are process-wide, because that is the unit providers count: per IP, not per struct. There is deliberately no unpaced path — `Http::send` is the only way out, so the next provider added inherits pacing instead of needing someone to remember it.
 
 Credentialed TMDB, TheTVDB and AniDB work also carries a runtime lease over the plaintext snapshot and its provider revision. Replacing or deleting that provider's fields wakes requests parked on the host/token/UDP mutex or pacing delay before they transmit; an operation already on the wire may finish. Revision is neutral cancellation rather than provider failure: its existing `enrichment_queue` row is left untouched, no retry debt is created, later providers still run, and the zero-delay scheduler coalesces save requests into one pass using the new snapshot. Debt for a disconnected network provider stays dormant until that provider is configured again; local-provider debt remains runnable.
 
-The numbers are each provider's own, and are the thing to re-check when behaviour changes (they move): MusicBrainz and CAA 1 req/s per IP (they answer 503 above it, and require an identifying User-Agent with contact); AniList 2.1 s — its documented 90/min has been *degraded to 30/min* for years; AniDB 2.2 s ("one page every two seconds", ban decaying only after ~24 h of silence); OpenSubtitles 1.1 s (1 req/s standard tier); TMDB 60 ms (~40/s, unpublished); TheTVDB 200 ms (no published limit); CDNs unpaced. An unknown host gets 500 ms — the forgotten provider is the dangerous one. Corrected against the published rules on 2026-07-26, after three of these numbers turned out to be wrong in our favour.
+The numbers are each provider's own, and are the thing to re-check when behaviour changes (they move): MusicBrainz and CAA 1 req/s per IP (they answer 503 above it, and require an identifying User-Agent with contact); AniList 2.1 s — its documented 90/min has been *degraded to 30/min* for years; AniDB 2.2 s ("one page every two seconds", ban decaying only after ~24 h of silence); OpenSubtitles 1.1 s (1 req/s standard tier); TheAudioDB 2.1 s with the public free key (30/min) or 650 ms with a premium key (100/min); TMDB 60 ms (~40/s, unpublished); TheTVDB 200 ms (no published limit); CDNs unpaced. An unknown host gets 500 ms — the forgotten provider is the dangerous one. Corrected against the published rules on 2026-07-26, with TheAudioDB checked against its official API page on 2026-09-03.
 
 ### 4.3a Subtitle acquisition (HUB-21..24)
 
@@ -447,13 +447,74 @@ artist's candidate albums rather than every album in the library; persisting a
 second copy would add write amplification and another derived value to keep
 correct. The artist index and album grid reserve their full result height,
 render only nearby rows, and fetch 100-row chunks as those rows approach the
-viewport—there is no separate load-more interaction. This deliberately costs
-no artist table or artwork/enrichment pipeline. The additive identity column
-costs one bounded backfill over album rows, avoiding a permanent
-artist entity and its lifecycle. Its trade-off is explicit: an Album Artist
-rename changes the synthetic key. The web music library starts at
-this artist index, searches artists alongside albums and songs, and keeps the
-artist in the URL while an album is open so Back returns to the right level.
+viewport—there is no separate load-more interaction. The artist index remains
+a synthetic grouping rather than a canonical artist entity, and an Album
+Artist rename therefore changes its key.
+
+Artist portraits are a durable projection over that group. MusicBrainz album
+answers retain the exact credited-artist MBID; precisely one distinct MBID is
+required for a group, so same-named or conflicting credits produce no image
+rather than a confident wrong one. When no album supplies an identity, one
+direct MusicBrainz artist search is accepted only if exactly one returned MBID
+has the same strict artist identity; its answer is stored on the group's album
+rows without pretending their release-group misses were matches. A configured
+Fanart.tv pass prefers the square `artistthumb`, falls back to an
+`artistbackground` cropped by the card, and selects deterministically by likes
+and id. When Fanart has no usable image, TheAudioDB is queried by the already
+verified MusicBrainz artist ID; its returned MBID and strict artist name must
+both still agree before its thumb (or fanart image) is accepted. The original
+and every named size are materialised before publishing a version to the browse
+API. The administrator supplies a personal Fanart key, sent in the provider's
+documented `client-key` header so transport-error URLs cannot disclose it
+(project `api-key` is a different credential). TheAudioDB uses its documented
+public `123` key at 30 requests/minute by default; an administrator can store a
+premium user key, which uses the documented 100/minute tier, or delete it to
+return to the public key. Old album answers
+missing the credited-artist field cost one MusicBrainz lookup per distinct
+release group, reused across copies of that same synthetic artist only. Every
+such answer is resolved until all identities agree or one conflict proves the
+group ambiguous; checking only one album, or donating its identity to another
+local artist group on the same release, could attribute the wrong portrait.
+The enrichment-running state remains true through this pass; reporting the run
+complete before the prefetch began made the administrator's only progress
+signal false for the longest part of the run.
+MusicBrainz may reject a request because its global service is busy even while
+this hub complies with the one-request-per-second client limit. That response
+stops the current portrait batch, observes the provider's backoff, then queues
+one coalesced artist-only retry. It does not rerun unrelated catalogue
+enrichment merely to resume portrait discovery. A Fanart authentication
+refusal also stops the batch immediately, but does not retry unchanged
+credentials hundreds of times; saving a replacement key starts the next pass.
+Transport failures, invalid provider responses and other server errors likewise
+stop fan-out and receive one artist-only retry. A local cache-write failure
+stops without a download loop and waits for the storage fault to be corrected.
+Saving either artwork credential and attaching an existing collection both change
+portrait owed work. Those lifecycle hooks request the same artist-only pass:
+its local scan and current-revision checks are cheap, while a full catalogue
+enrichment pass would spend unrelated provider traffic.
+
+The cache decision uses both cost axes. Rebuilding a portrait costs provider
+requests, an image download and every resize; discovering that work while a
+grid is scrolling adds visible network/provider latency at the exact point of
+use. The provider fallback costs one paced TheAudioDB lookup only when Fanart
+has no usable portrait, plus the selected image download; direct identity
+recovery adds at most one
+paced MusicBrainz request per otherwise-unidentified artist. Therefore
+enrichment eagerly prefetches every Album Artist and retains
+the originals and derivatives permanently, consistent with OPS-6. Terminal
+missing/unidentified/ambiguous answers are versioned by their current album
+evidence; transient provider failures are not persisted and retry on the next
+run. Portraits whose identity is already established run before identity
+recovery, so MusicBrainz backoff cannot delay independent artwork requests. A
+`ready` row is skipped only while its original and every named
+derivative remain non-empty on disk; an incomplete cache is rebuilt in the
+background and publishes a new version. `GET
+/api/v1/artists/{key}/artwork?library=...` checks that the caller may
+see the music library and that the artist belongs to it, then serves only the
+local cache. The web uses the same fixed-height card shell and density-aware
+sizes for artist and album grids, searches artists alongside albums and songs,
+and keeps the artist in the URL while an album is open so Back returns to the
+right level.
 
 **Artwork sizes.** `?size=` names one of a fixed list in code (`thumb` 96 px, `card` 480 px, longest edge), resized on first request and cached thereafter. Names rather than free-form `w=`/`h=`: a client that can ask for any width can mint unbounded cache entries. An unknown name serves the original rather than failing, so retiring a size cannot break a page already open.
 

@@ -5,7 +5,7 @@
 //! recorded `miss` so the next run doesn't re-search it. The admin can
 //! re-run after fixing titles; a review queue (HUB-8) comes later.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -15,6 +15,8 @@ use sqlx::Row;
 use utoipa::ToSchema;
 
 use crate::registry::Registry;
+
+const ARTIST_TRANSIENT_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
 
 /// `error_for_status`, without the URL.
 ///
@@ -40,10 +42,37 @@ pub const TMDB_API_KEY: &str = "api_key";
 pub const TVDB: &str = "tvdb";
 pub const TVDB_API_KEY: &str = "api_key";
 pub const TVDB_PIN: &str = "pin";
+pub const FANART: &str = "fanart";
+pub const FANART_CLIENT_KEY: &str = "client_key";
+pub const THEAUDIODB: &str = "theaudiodb";
+pub const THEAUDIODB_API_KEY: &str = "api_key";
+/// TheAudioDB publishes `123` as the shared test/free API key.
+/// Source: https://www.theaudiodb.com/free_music_api (read 2026-09-03).
+pub const THEAUDIODB_FREE_API_KEY: &str = "123";
 
 /// This deployment's TMDB key, or `None` if it has not been configured.
 pub async fn tmdb_key(registry: &Registry) -> Result<Option<String>> {
     Ok(registry.hub_credential(TMDB).await?.remove(TMDB_API_KEY))
+}
+
+/// This deployment's Fanart.tv personal key, or `None` when artist portraits
+/// are not configured. Fanart is auxiliary artwork, not a member of a metadata
+/// chain. Fanart's API calls this a `client_key`; an `api_key` is a different,
+/// project-level credential.
+pub async fn fanart_client_key(registry: &Registry) -> Result<Option<String>> {
+    Ok(registry
+        .hub_credential(FANART)
+        .await?
+        .remove(FANART_CLIENT_KEY))
+}
+
+/// A configured premium key replaces TheAudioDB's documented `123` free key.
+/// Absence is therefore an active free-tier provider, not "unconfigured".
+pub async fn theaudiodb_premium_key(registry: &Registry) -> Result<Option<String>> {
+    Ok(registry
+        .hub_credential(THEAUDIODB)
+        .await?
+        .remove(THEAUDIODB_API_KEY))
 }
 
 /// This deployment's TVDB credentials. The pin is optional — a subscriber
@@ -58,9 +87,337 @@ pub(crate) async fn tvdb_creds(registry: &Registry) -> Result<Option<TvdbCreds>>
 
 struct MbReleaseGroup {
     id: String,
+    artist_id: String,
     title: String,
     first_release_date: Option<String>,
     genres: Vec<String>,
+}
+
+#[derive(Deserialize)]
+struct FanartArtist {
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    mbid_id: String,
+    #[serde(default)]
+    artistthumb: Vec<FanartImage>,
+    #[serde(default)]
+    artistbackground: Vec<FanartImage>,
+}
+
+#[derive(Deserialize)]
+struct FanartImage {
+    id: String,
+    url: String,
+    #[serde(default)]
+    likes: String,
+}
+
+#[derive(Deserialize)]
+struct TheAudioDbResponse {
+    artists: Option<Vec<TheAudioDbArtist>>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct TheAudioDbArtist {
+    #[serde(default)]
+    id_artist: String,
+    #[serde(default)]
+    str_artist: String,
+    #[serde(default, rename = "strMusicBrainzID")]
+    str_music_brainz_id: String,
+    str_artist_thumb: Option<String>,
+    str_artist_fanart: Option<String>,
+    str_artist_fanart2: Option<String>,
+    str_artist_fanart3: Option<String>,
+    str_artist_fanart4: Option<String>,
+}
+
+enum TheAudioDbAnswer {
+    Missing,
+    Artist(TheAudioDbArtist),
+    Ambiguous,
+}
+
+struct ArtistImageCandidate {
+    id: String,
+    url: String,
+    source: ArtistImageSource,
+}
+
+enum ArtistImageSource {
+    Fanart,
+    TheAudioDb,
+}
+
+impl TheAudioDbArtist {
+    fn best_image(&self) -> Option<(&str, &str)> {
+        [
+            ("thumb", self.str_artist_thumb.as_deref()),
+            ("fanart", self.str_artist_fanart.as_deref()),
+            ("fanart2", self.str_artist_fanart2.as_deref()),
+            ("fanart3", self.str_artist_fanart3.as_deref()),
+            ("fanart4", self.str_artist_fanart4.as_deref()),
+        ]
+        .into_iter()
+        .find_map(|(kind, url)| url.filter(|url| !url.is_empty()).map(|url| (kind, url)))
+    }
+}
+
+fn exact_theaudiodb_artist(
+    response: TheAudioDbResponse,
+    wanted_id: &str,
+    wanted_name: &str,
+) -> TheAudioDbAnswer {
+    let Some(mut artists) = response.artists else {
+        return TheAudioDbAnswer::Missing;
+    };
+    if artists.len() != 1 {
+        return if artists.is_empty() {
+            TheAudioDbAnswer::Missing
+        } else {
+            TheAudioDbAnswer::Ambiguous
+        };
+    }
+    let artist = artists.pop().expect("one artist checked above");
+    if artist.str_music_brainz_id != wanted_id
+        || artist_key(&artist.str_artist) != artist_key(wanted_name)
+    {
+        return TheAudioDbAnswer::Ambiguous;
+    }
+    TheAudioDbAnswer::Artist(artist)
+}
+
+impl FanartArtist {
+    fn best_image(&mut self) -> Option<&FanartImage> {
+        fn best(images: &mut [FanartImage]) -> Option<&FanartImage> {
+            images.sort_by(|a, b| {
+                b.likes
+                    .parse::<i64>()
+                    .unwrap_or_default()
+                    .cmp(&a.likes.parse::<i64>().unwrap_or_default())
+                    .then_with(|| a.id.cmp(&b.id))
+            });
+            images.first()
+        }
+        // `artistthumb` is already composed for a square card. Fanart has
+        // substantially wider coverage in `artistbackground`; the web's
+        // square, object-cover frame crops that fallback without changing the
+        // API or putting image work on the browse path.
+        if let Some(image) = best(&mut self.artistthumb) {
+            return Some(image);
+        }
+        best(&mut self.artistbackground)
+    }
+}
+
+fn trusted_artist_image(url: &str) -> bool {
+    reqwest::Url::parse(url).is_ok_and(|url| {
+        url.scheme() == "https"
+            && url.host_str().is_some_and(|host| {
+                host == "fanart.tv"
+                    || host.ends_with(".fanart.tv")
+                    || host == "theaudiodb.com"
+                    || host.ends_with(".theaudiodb.com")
+            })
+    })
+}
+
+struct ArtistAlbumEvidence {
+    release_group_id: Option<String>,
+    artist_id: Option<String>,
+}
+
+struct ArtistEvidence {
+    name: String,
+    albums: Vec<ArtistAlbumEvidence>,
+}
+
+fn unresolved_artist_release_groups(evidence: &ArtistEvidence) -> BTreeSet<String> {
+    evidence
+        .albums
+        .iter()
+        .filter(|album| album.artist_id.is_none())
+        .filter_map(|album| album.release_group_id.clone())
+        .collect()
+}
+
+fn artist_requires_identity_lookup(evidence: &ArtistEvidence) -> bool {
+    let identities: BTreeSet<&str> = evidence
+        .albums
+        .iter()
+        .filter_map(|album| album.artist_id.as_deref())
+        .collect();
+    identities.len() <= 1
+        && evidence
+            .albums
+            .iter()
+            .any(|album| album.artist_id.is_none())
+}
+
+fn artist_art_revision(artist_key: &str, artist_name: &str, evidence: &ArtistEvidence) -> String {
+    // Keep each release-group-to-artist claim intact. Independent sets lose
+    // which release is still unresolved: clearing one of two identical artist
+    // claims would otherwise leave both sets unchanged and preserve a portrait
+    // whose evidence is no longer complete.
+    let claims: BTreeSet<String> = evidence
+        .albums
+        .iter()
+        .map(|album| {
+            format!(
+                "release-group:{}\nartist:{}",
+                album.release_group_id.as_deref().unwrap_or("?"),
+                album.artist_id.as_deref().unwrap_or("?")
+            )
+        })
+        .collect();
+    format!(
+        "artist-art-v4-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(
+            format!(
+                "{artist_key}\n{artist_name}\n{}",
+                claims.into_iter().collect::<Vec<_>>().join("\n")
+            )
+            .as_bytes()
+        )
+    )
+}
+
+/// Resolve one exact artist credit without borrowing title-search folding for
+/// identity. MusicBrainz search is deliberately fuzzy; the acceptance check is
+/// not. In particular, `One`/`1` and `P!nk`/`Pink` are separate catalogue
+/// groups and must not donate identities (and therefore portraits) to each
+/// other.
+fn exact_artist_credit_id(
+    credits: Option<&Vec<serde_json::Value>>,
+    wanted_artist: &str,
+) -> Option<String> {
+    let wanted = artist_key(wanted_artist);
+    let matches: BTreeSet<String> = credits
+        .into_iter()
+        .flatten()
+        .filter_map(|credit| {
+            let exact = credit["name"]
+                .as_str()
+                .is_some_and(|name| artist_key(name) == wanted)
+                || credit["artist"]["name"]
+                    .as_str()
+                    .is_some_and(|name| artist_key(name) == wanted);
+            exact
+                .then(|| credit["artist"]["id"].as_str().map(str::to_string))
+                .flatten()
+        })
+        .collect();
+    (matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten()
+}
+
+/// MusicBrainz artist search is fuzzy even for a quoted query. Accept only a
+/// single distinct result whose catalogue name has the exact local artist
+/// identity; same-named artists remain unresolved instead of receiving a
+/// plausible stranger's portrait.
+fn exact_artist_search_id(
+    artists: Option<&Vec<serde_json::Value>>,
+    wanted_artist: &str,
+) -> Option<String> {
+    let wanted = artist_key(wanted_artist);
+    let matches: BTreeSet<String> = artists
+        .into_iter()
+        .flatten()
+        .filter(|artist| {
+            artist["name"]
+                .as_str()
+                .is_some_and(|name| artist_key(name) == wanted)
+        })
+        .filter_map(|artist| artist["id"].as_str().map(str::to_string))
+        .collect();
+    (matches.len() == 1)
+        .then(|| matches.into_iter().next())
+        .flatten()
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn store_artist_artwork(
+    db: &kahawai_sqlite::Database,
+    artist_key: &str,
+    artist_name: &str,
+    musicbrainz_id: Option<&str>,
+    image_id: Option<&str>,
+    image_url: Option<&str>,
+    outcome: &str,
+    source_revision: &str,
+) -> Result<()> {
+    sqlx::query(
+        "INSERT INTO artist_artwork
+             (artist_key,artist_name,musicbrainz_id,image_id,image_url,outcome,
+              source_revision,updated_at)
+         VALUES(?,?,?,?,?,?,?,unixepoch())
+         ON CONFLICT(artist_key) DO UPDATE SET
+             artist_name=excluded.artist_name,
+             musicbrainz_id=excluded.musicbrainz_id,
+             image_id=excluded.image_id,
+             image_url=excluded.image_url,
+             outcome=excluded.outcome,
+             source_revision=excluded.source_revision,
+             updated_at=MAX(unixepoch(),artist_artwork.updated_at+1)",
+    )
+    .bind(artist_key)
+    .bind(artist_name)
+    .bind(musicbrainz_id)
+    .bind(image_id)
+    .bind(image_url)
+    .bind(outcome)
+    .bind(source_revision)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn store_backfilled_artist_identity(
+    db: &kahawai_sqlite::Database,
+    artist_key: &str,
+    release_group: &str,
+    artist_id: &str,
+) -> Result<()> {
+    // A release group can be attached to more than one locally tagged Album
+    // Artist (compilations and incorrect tags are common). The exact-credit
+    // check proved this identity only for the group currently being resolved;
+    // do not donate it to another synthetic artist merely because both rows
+    // happen to carry the same release-group MBID.
+    sqlx::query(
+        "UPDATE provider_metadata SET provider_artist_id=?
+          WHERE provider='musicbrainz' AND provider_id=?
+            AND provider_artist_id IS NULL
+            AND item_id IN (SELECT id FROM items WHERE artist_key=?)",
+    )
+    .bind(artist_id)
+    .bind(release_group)
+    .bind(artist_key)
+    .execute(db)
+    .await?;
+    Ok(())
+}
+
+async fn store_direct_artist_identity(
+    db: &kahawai_sqlite::Database,
+    artist_key: &str,
+    artist_id: &str,
+) -> Result<()> {
+    // This answer identifies the synthetic Album Artist, not an album. Keep
+    // each album's own release-group miss intact while making the independently
+    // resolved artist identity durable for future portrait revisions.
+    sqlx::query(
+        "UPDATE provider_metadata SET provider_artist_id=?
+          WHERE provider='musicbrainz' AND provider_artist_id IS NULL
+            AND item_id IN (SELECT id FROM items WHERE artist_key=?)",
+    )
+    .bind(artist_id)
+    .bind(artist_key)
+    .execute(db)
+    .await?;
+    Ok(())
 }
 
 /// TheTVDB credentials as configured. Carried where a token used to
@@ -82,6 +439,12 @@ pub struct Enricher {
     running: AtomicBool,
     scheduled: AtomicBool,
     rerun_requested: AtomicBool,
+    /// Artist-only work ready to run through the shared enrichment runner.
+    /// A full run consumes it because the full pass includes artist artwork.
+    artist_run_requested: AtomicBool,
+    /// At most one delayed retry for an artist batch stopped by provider
+    /// backoff. A successful intervening batch cancels it.
+    artist_retry_pending: AtomicBool,
     /// Disconnect epochs. A copied credential is usable only while its epoch
     /// matches. `watch` wakes requests parked in a provider queue immediately;
     /// its value prevents reconnecting from reviving work that still holds the
@@ -89,6 +452,8 @@ pub struct Enricher {
     tmdb_generation: tokio::sync::watch::Sender<u64>,
     tvdb_generation: tokio::sync::watch::Sender<u64>,
     anidb_generation: tokio::sync::watch::Sender<u64>,
+    fanart_generation: tokio::sync::watch::Sender<u64>,
+    theaudiodb_generation: tokio::sync::watch::Sender<u64>,
     /// Orders credential replacement and disconnect through their database
     /// write plus epoch change. Never held across provider I/O.
     credential_change: tokio::sync::Mutex<()>,
@@ -122,6 +487,10 @@ pub struct Enricher {
     /// mediahost that holds it. Attached at startup; absent in tests, where
     /// the local provider then simply is not in the chain.
     sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
+    /// Weak to avoid the cycle: Artwork uses this enricher for ordinary
+    /// provider posters, while artist enrichment asks Artwork to prewarm the
+    /// same durable cache before publishing a portrait.
+    artwork: std::sync::OnceLock<std::sync::Weak<crate::artwork::Artwork>>,
 }
 
 /// Names the credential a token was minted from, without keeping a second
@@ -531,11 +900,26 @@ pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title
 /// series ids TVDB v4 dropped, movies that changed namespace) — and
 /// must record its question and decline terminally, not reschedule
 /// forever as if the network had hiccuped.
-fn is_http_404(e: &anyhow::Error) -> bool {
+fn is_http_status(e: &anyhow::Error, wanted: reqwest::StatusCode) -> bool {
     e.chain().any(|c| {
         c.downcast_ref::<reqwest::Error>()
             .and_then(reqwest::Error::status)
-            .is_some_and(|s| s == reqwest::StatusCode::NOT_FOUND)
+            .is_some_and(|status| status == wanted)
+    })
+}
+
+fn is_http_404(e: &anyhow::Error) -> bool {
+    is_http_status(e, reqwest::StatusCode::NOT_FOUND)
+}
+
+fn is_http_transient(e: &anyhow::Error) -> bool {
+    e.chain().any(|cause| {
+        cause.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+            error
+                .status()
+                .is_some_and(|status| status.is_server_error())
+                || (error.status().is_none() && !error.is_builder())
+        })
     })
 }
 
@@ -652,9 +1036,13 @@ impl Enricher {
             running: AtomicBool::new(false),
             scheduled: AtomicBool::new(false),
             rerun_requested: AtomicBool::new(false),
+            artist_run_requested: AtomicBool::new(false),
+            artist_retry_pending: AtomicBool::new(false),
             tmdb_generation: tokio::sync::watch::channel(0).0,
             tvdb_generation: tokio::sync::watch::channel(0).0,
             anidb_generation: tokio::sync::watch::channel(0).0,
+            fanart_generation: tokio::sync::watch::channel(0).0,
+            theaudiodb_generation: tokio::sync::watch::channel(0).0,
             credential_change: Default::default(),
             last_nudge: std::sync::atomic::AtomicU64::new(0),
             progress: Default::default(),
@@ -662,6 +1050,7 @@ impl Enricher {
             tvdb: Default::default(),
             anidb_stale: AtomicBool::new(false),
             sessions: Default::default(),
+            artwork: Default::default(),
         }
     }
 
@@ -669,6 +1058,10 @@ impl Enricher {
     /// left out of the chain rather than failing per item.
     pub fn attach_sessions(&self, sessions: Arc<crate::sessions::Sessions>) {
         let _ = self.sessions.set(sessions);
+    }
+
+    pub fn attach_artwork(&self, artwork: &Arc<crate::artwork::Artwork>) {
+        let _ = self.artwork.set(Arc::downgrade(artwork));
     }
 
     /// Where anime/AniDB state lives (the api's verify path needs it).
@@ -685,6 +1078,8 @@ impl Enricher {
             TMDB => &self.tmdb_generation,
             TVDB => &self.tvdb_generation,
             crate::anidb::ANIDB => &self.anidb_generation,
+            FANART => &self.fanart_generation,
+            THEAUDIODB => &self.theaudiodb_generation,
             _ => unreachable!("unknown credentialed provider"),
         }
     }
@@ -1159,6 +1554,38 @@ impl Enricher {
         self.schedule(registry, std::time::Duration::ZERO);
     }
 
+    /// Re-evaluate Album Artist portraits without paying for the unrelated
+    /// movie, series, anime, and album-metadata passes. Library composition is
+    /// part of the portrait owed-work set, so attaching an existing music
+    /// collection uses this path.
+    pub(crate) fn request_artist_run(self: &Arc<Self>, registry: Arc<Registry>) {
+        self.artist_run_requested.store(true, Ordering::SeqCst);
+        self.start_scheduler(registry, std::time::Duration::ZERO);
+    }
+
+    fn schedule_artist_retry(
+        self: &Arc<Self>,
+        registry: Arc<Registry>,
+        delay: std::time::Duration,
+    ) {
+        if self
+            .artist_retry_pending
+            .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+            .is_err()
+        {
+            return;
+        }
+        tracing::info!(secs = delay.as_secs(), "artist artwork retry scheduled");
+        let this = self.clone();
+        tokio::spawn(async move {
+            tokio::time::sleep(delay).await;
+            if this.artist_retry_pending.swap(false, Ordering::SeqCst) {
+                this.artist_run_requested.store(true, Ordering::SeqCst);
+                this.start_scheduler(registry, std::time::Duration::ZERO);
+            }
+        });
+    }
+
     /// A completed scan is authoritative owed-work input even when every file
     /// was already hashed. Completions settle briefly and coalesce; a request
     /// arriving during a run causes one follow-up pass.
@@ -1168,6 +1595,10 @@ impl Enricher {
 
     fn schedule(self: &Arc<Self>, registry: Arc<Registry>, settle: std::time::Duration) {
         self.rerun_requested.store(true, Ordering::SeqCst);
+        self.start_scheduler(registry, settle);
+    }
+
+    fn start_scheduler(self: &Arc<Self>, registry: Arc<Registry>, settle: std::time::Duration) {
         if self
             .scheduled
             .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1184,18 +1615,30 @@ impl Enricher {
                     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                     continue;
                 }
-                this.rerun_requested.store(false, Ordering::SeqCst);
-                if let Err(e) = this.run_once(&registry).await {
-                    tracing::warn!(error = format!("{e:#}"), "scheduled enrichment failed");
+                if this.rerun_requested.swap(false, Ordering::SeqCst) {
+                    // A full pass includes artist work, so an older artist-only
+                    // request is already covered. A request arriving during
+                    // the pass remains set and gets its own follow-up.
+                    this.artist_run_requested.store(false, Ordering::SeqCst);
+                    if let Err(e) = this.run_once(&registry).await {
+                        tracing::warn!(error = format!("{e:#}"), "scheduled enrichment failed");
+                    }
+                } else if this.artist_run_requested.swap(false, Ordering::SeqCst)
+                    && let Err(e) = this.run_artist_once(&registry).await
+                {
+                    tracing::warn!(error = format!("{e:#}"), "scheduled artist artwork failed");
                 }
-                if this.rerun_requested.load(Ordering::SeqCst) {
+                if this.rerun_requested.load(Ordering::SeqCst)
+                    || this.artist_run_requested.load(Ordering::SeqCst)
+                {
                     continue;
                 }
 
                 this.scheduled.store(false, Ordering::SeqCst);
                 // Close the request-vs-exit race: a requester either spawned
                 // its own worker or left the flag set for this one to reacquire.
-                if !this.rerun_requested.load(Ordering::SeqCst)
+                if !(this.rerun_requested.load(Ordering::SeqCst)
+                    || this.artist_run_requested.load(Ordering::SeqCst))
                     || this
                         .scheduled
                         .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
@@ -1217,6 +1660,66 @@ impl Enricher {
         let result = self.run_inner(registry).await;
         self.running.store(false, Ordering::SeqCst);
         result
+    }
+
+    async fn run_artist_once(self: &Arc<Self>, registry: &Arc<Registry>) -> Result<()> {
+        if self.running.swap(true, Ordering::SeqCst) {
+            // The scheduler checked immediately before this, but a manual run
+            // can win the gap. Preserve this request for the worker's next
+            // iteration instead of losing the provider recovery event.
+            self.artist_run_requested.store(true, Ordering::SeqCst);
+            anyhow::bail!("enrichment already running");
+        }
+        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
+            kind: "enrich",
+            running: true,
+        });
+        let result = async {
+            let fanart = Self::usable(
+                FANART,
+                self.credential_snapshot(registry, FANART)
+                    .await
+                    .map(|(mut fields, lease)| {
+                        fields.remove(FANART_CLIENT_KEY).map(|key| (key, lease))
+                    }),
+            );
+            let (theaudiodb_key, premium, theaudiodb_lease) =
+                self.theaudiodb_credential(registry).await?;
+            self.prefetch_artist_artwork(
+                registry,
+                fanart.as_ref().map(|(key, lease)| (key.as_str(), lease)),
+                &theaudiodb_key,
+                premium,
+                &theaudiodb_lease,
+            )
+            .await?;
+            Ok(())
+        }
+        .await;
+        self.running.store(false, Ordering::SeqCst);
+        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
+            kind: "enrich",
+            running: false,
+        });
+        self.observe_artist_result(registry, &result);
+        result
+    }
+
+    fn observe_artist_result(self: &Arc<Self>, registry: &Arc<Registry>, result: &Result<()>) {
+        match result {
+            Ok(()) => self.artist_retry_pending.store(false, Ordering::SeqCst),
+            Err(error) => {
+                tracing::warn!(
+                    error = format!("{error:#}"),
+                    "artist artwork prefetch failed"
+                );
+                if let Some(backoff) = error.downcast_ref::<crate::gate::ProviderBackoff>() {
+                    self.schedule_artist_retry(registry.clone(), backoff.retry_after());
+                } else if is_http_transient(error) {
+                    self.schedule_artist_retry(registry.clone(), ARTIST_TRANSIENT_RETRY);
+                }
+            }
+        }
     }
 
     /// Provider chains, per media type (ordered; first identity wins):
@@ -1306,6 +1809,25 @@ impl Enricher {
                     })
                 }),
         );
+        let fanart_credential = Self::usable(
+            FANART,
+            self.credential_snapshot(registry, FANART)
+                .await
+                .map(|(mut fields, lease)| {
+                    fields.remove(FANART_CLIENT_KEY).map(|key| (key, lease))
+                }),
+        );
+        let theaudiodb_credential = match self.theaudiodb_credential(registry).await {
+            Ok(credential) => Some(credential),
+            Err(e) => {
+                tracing::warn!(
+                    error = format!("{e:#}"),
+                    provider = THEAUDIODB,
+                    "stored credential unreadable; artist artwork will retry later"
+                );
+                None
+            }
+        };
         for c in [&self.progress.0, &self.progress.1, &self.progress.2] {
             c.store(0, Ordering::SeqCst);
         }
@@ -1489,11 +2011,6 @@ impl Enricher {
             self.progress.1.load(Ordering::SeqCst),
             self.progress.2.load(Ordering::SeqCst),
         );
-        tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
-        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
-            kind: "enrich",
-            running: false,
-        });
         // Both are TMDB's own passes: no key, nothing for them to do.
         // Skipped, not fatal — the chains above may have enriched
         // plenty without one (HUB-5a).
@@ -1511,7 +2028,26 @@ impl Enricher {
         if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
         }
+        if let Some((theaudiodb_key, premium, theaudiodb_lease)) = theaudiodb_credential.as_ref() {
+            let result = self
+                .prefetch_artist_artwork(
+                    registry,
+                    fanart_credential
+                        .as_ref()
+                        .map(|(key, lease)| (key.as_str(), lease)),
+                    theaudiodb_key,
+                    *premium,
+                    theaudiodb_lease,
+                )
+                .await;
+            self.observe_artist_result(registry, &result);
+        }
         providers.finish().await;
+        tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
+        registry.emit(crate::registry::RegistryEvent::EnrichRunning {
+            kind: "enrich",
+            running: false,
+        });
         Ok((m, w, x))
     }
 
@@ -1643,30 +2179,15 @@ impl Enricher {
             .cloned()
             .unwrap_or_default();
         let want_title = fold(title);
-        let want_artist = fold(artist);
         for g in &groups {
             let gtitle = g["title"].as_str().unwrap_or_default();
             if fold(gtitle) != want_title {
                 continue;
             }
-            let artist_ok = g["artist-credit"]
-                .as_array()
-                .map(|credits| {
-                    credits.iter().any(|c| {
-                        c["name"]
-                            .as_str()
-                            .map(|n| fold(n) == want_artist)
-                            .unwrap_or(false)
-                            || c["artist"]["name"]
-                                .as_str()
-                                .map(|n| fold(n) == want_artist)
-                                .unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false);
-            if !artist_ok {
+            let artist_id = exact_artist_credit_id(g["artist-credit"].as_array(), artist);
+            let Some(artist_id) = artist_id else {
                 continue;
-            }
+            };
             let genres: Vec<String> = g["tags"]
                 .as_array()
                 .map(|t| {
@@ -1678,12 +2199,562 @@ impl Enricher {
                 .unwrap_or_default();
             return Ok(Some(MbReleaseGroup {
                 id: g["id"].as_str().unwrap_or_default().to_string(),
+                artist_id,
                 title: gtitle.to_string(),
                 first_release_date: g["first-release-date"].as_str().map(str::to_string),
                 genres,
             }));
         }
         Ok(None)
+    }
+
+    /// Recover the credited artist identity for an album answer written by a
+    /// build that stored only the release-group MBID. This is one request per
+    /// pre-existing artist, not one per album.
+    async fn musicbrainz_release_group_artist(
+        &self,
+        release_group: &str,
+        wanted_artist: &str,
+    ) -> Result<Option<String>> {
+        let url = format!(
+            "https://musicbrainz.org/ws/2/release-group/{release_group}?inc=artist-credits&fmt=json"
+        );
+        let response: serde_json::Value = self
+            .http
+            .send(self.http.get(url))
+            .await?
+            .status_checked()?
+            .json()
+            .await?;
+        Ok(exact_artist_credit_id(
+            response["artist-credit"].as_array(),
+            wanted_artist,
+        ))
+    }
+
+    /// Resolve an Album Artist independently when none of its albums matched a
+    /// release group. MusicBrainz exposes artist as a first-class searchable
+    /// resource; using it here avoids making a compilation's album identity a
+    /// prerequisite for its artist portrait.
+    /// Source: https://musicbrainz.org/doc/MusicBrainz_API (read 2026-09-03).
+    async fn musicbrainz_artist(&self, artist: &str) -> Result<Option<String>> {
+        let query = format!("artist:\"{}\"", artist.replace('"', ""));
+        let encoded: String = query
+            .bytes()
+            .flat_map(|b| match b {
+                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                    vec![b as char]
+                }
+                _ => format!("%{b:02X}").chars().collect(),
+            })
+            .collect();
+        let url = format!("https://musicbrainz.org/ws/2/artist?query={encoded}&fmt=json&limit=100");
+        let response: serde_json::Value = self
+            .http
+            .send(self.http.get(url))
+            .await?
+            .status_checked()?
+            .json()
+            .await?;
+        Ok(exact_artist_search_id(
+            response["artists"].as_array(),
+            artist,
+        ))
+    }
+
+    async fn fanart_artist(
+        &self,
+        client_key: &str,
+        artist_id: &str,
+        lease: crate::gate::CredentialLease,
+    ) -> Result<Option<FanartArtist>> {
+        let response = self
+            .http
+            .send_current(self.fanart_artist_request(client_key, artist_id), lease)
+            .await?;
+        if response.status() == reqwest::StatusCode::NOT_FOUND {
+            return Ok(None);
+        }
+        Ok(Some(response.status_checked()?.json().await?))
+    }
+
+    fn fanart_artist_request(&self, client_key: &str, artist_id: &str) -> reqwest::RequestBuilder {
+        self.http
+            // Do not let the provider forward its custom credential header to
+            // another origin through a redirect.
+            .get_no_redirect(format!(
+                "https://webservice.fanart.tv/v3.2/music/{artist_id}"
+            ))
+            // Fanart.tv API v3.2: personal keys may be used alone in the
+            // `client-key` header. Project keys use the distinct `api-key`
+            // header. Prefer headers over the equivalent query parameters so
+            // a transport error cannot print the secret as part of its URL.
+            // Source: https://api.fanart.tv/ (read 2026-09-03).
+            .header("client-key", client_key)
+    }
+
+    async fn theaudiodb_artist(
+        &self,
+        api_key: &str,
+        premium: bool,
+        artist_id: &str,
+        artist_name: &str,
+        lease: crate::gate::CredentialLease,
+    ) -> Result<TheAudioDbAnswer> {
+        let request = self.theaudiodb_artist_request(api_key, artist_id)?;
+        let response = if premium {
+            self.http
+                .send_current_at_spacing(request, lease, crate::gate::THEAUDIODB_PREMIUM_SPACING)
+                .await?
+        } else {
+            self.http.send_current(request, lease).await?
+        };
+        if matches!(
+            response.status(),
+            reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
+        ) {
+            return Ok(TheAudioDbAnswer::Missing);
+        }
+        let answer = response
+            .status_checked()?
+            .json::<TheAudioDbResponse>()
+            .await?;
+        Ok(exact_theaudiodb_artist(answer, artist_id, artist_name))
+    }
+
+    fn theaudiodb_artist_request(
+        &self,
+        api_key: &str,
+        artist_id: &str,
+    ) -> Result<reqwest::RequestBuilder> {
+        // TheAudioDB v1 documents artist-mb.php as the MusicBrainz-ID lookup.
+        // Source: https://www.theaudiodb.com/free_music_api
+        // (read 2026-09-03).
+        let mut url = reqwest::Url::parse("https://www.theaudiodb.com/")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("TheAudioDB base URL cannot hold path segments"))?
+            .extend(["api", "v1", "json"])
+            .push(api_key)
+            .push("artist-mb.php");
+        url.query_pairs_mut().append_pair("i", artist_id);
+        Ok(self.http.get_no_redirect(url))
+    }
+
+    async fn theaudiodb_credential(
+        &self,
+        registry: &Registry,
+    ) -> Result<(String, bool, crate::gate::CredentialLease)> {
+        let (mut fields, lease) = self.credential_snapshot(registry, THEAUDIODB).await?;
+        let premium_key = fields
+            .remove(THEAUDIODB_API_KEY)
+            .filter(|key| !key.is_empty());
+        let premium = premium_key.is_some();
+        Ok((
+            premium_key.unwrap_or_else(|| THEAUDIODB_FREE_API_KEY.to_string()),
+            premium,
+            lease,
+        ))
+    }
+
+    /// The artist group is synthetic and may span collections. Its persisted
+    /// artwork answer therefore belongs to `artist_key`, while the evidence
+    /// remains on each MusicBrainz album row. Exactly one distinct credited
+    /// MBID is required: a blank portrait is preferable to a confident photo
+    /// of the wrong same-named artist.
+    async fn prefetch_artist_artwork(
+        &self,
+        registry: &Registry,
+        fanart: Option<(&str, &crate::gate::CredentialLease)>,
+        theaudiodb_key: &str,
+        theaudiodb_premium: bool,
+        theaudiodb_lease: &crate::gate::CredentialLease,
+    ) -> Result<()> {
+        let Some(artwork) = self.artwork.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        let rows = sqlx::query(
+            "SELECT DISTINCT i.artist_key,i.artist,
+                    NULLIF(pm.provider_id,'') AS release_group_id,
+                    pm.provider_artist_id
+               FROM items i
+               LEFT JOIN provider_metadata pm
+                 ON pm.item_id=i.id AND pm.provider='musicbrainz'
+              WHERE i.kind='album' AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
+                AND EXISTS (
+                    SELECT 1 FROM library_collections lc
+                     WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id))
+              ORDER BY i.artist_key,i.id",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        let mut artists: BTreeMap<String, ArtistEvidence> = BTreeMap::new();
+        for row in rows {
+            let artist_key: String = row.get("artist_key");
+            artists
+                .entry(artist_key)
+                .or_insert_with(|| ArtistEvidence {
+                    name: row.get("artist"),
+                    albums: Vec::new(),
+                })
+                .albums
+                .push(ArtistAlbumEvidence {
+                    release_group_id: row.get("release_group_id"),
+                    artist_id: row.get("provider_artist_id"),
+                });
+        }
+        let mut artists: Vec<_> = artists.into_iter().collect();
+        // Artist artwork with an established identity has no dependency on
+        // MusicBrainz. Finish it first so a transient MusicBrainz backoff in
+        // the identity-recovery tail cannot withhold otherwise-ready images.
+        artists.sort_by_key(|(_, evidence)| artist_requires_identity_lookup(evidence));
+        tracing::info!(artists = artists.len(), "artist artwork prefetch starting");
+        let mut ready = 0usize;
+        let mut missing = 0usize;
+        let mut ambiguous = 0usize;
+        let mut failed = 0usize;
+        for (n, (artist_key, mut evidence)) in artists.into_iter().enumerate() {
+            theaudiodb_lease.check()?;
+            if let Some((_, lease)) = fanart {
+                lease.check()?;
+            }
+            let mut identities: BTreeSet<String> = evidence
+                .albums
+                .iter()
+                .filter_map(|album| album.artist_id.clone())
+                .collect();
+            let initial_revision = artist_art_revision(&artist_key, &evidence.name, &evidence);
+            let current: Option<(String, String, Option<String>, Option<String>)> = sqlx::query_as(
+                "SELECT source_revision,outcome,musicbrainz_id,image_url
+                   FROM artist_artwork WHERE artist_key=?",
+            )
+            .bind(&artist_key)
+            .fetch_optional(registry.db())
+            .await?;
+            if let Some((revision, outcome, _, image_url)) = current.as_ref()
+                && revision == &initial_revision
+            {
+                if outcome != "ready"
+                    || image_url
+                        .as_deref()
+                        .is_some_and(|url| artwork.remote_cache_complete(url))
+                {
+                    continue;
+                }
+                tracing::warn!(artist = %evidence.name,
+                    "ready artist portrait has an incomplete cache; prefetching again");
+            }
+            let unresolved_release_groups = unresolved_artist_release_groups(&evidence);
+            let mut unresolved_identity = false;
+            let mut transient_backfill_failure = false;
+            for release_group in unresolved_release_groups {
+                if identities.len() > 1 {
+                    break;
+                }
+                // Another copy of this release group may already carry the
+                // answer. Reuse it before spending a provider request.
+                let known: BTreeSet<String> = evidence
+                    .albums
+                    .iter()
+                    .filter(|album| album.release_group_id.as_deref() == Some(&release_group))
+                    .filter_map(|album| album.artist_id.clone())
+                    .collect();
+                let resolved = if known.len() == 1 {
+                    known.into_iter().next()
+                } else {
+                    match self
+                        .musicbrainz_release_group_artist(&release_group, &evidence.name)
+                        .await
+                    {
+                        Ok(id) => id,
+                        Err(error) => {
+                            failed += 1;
+                            tracing::warn!(artist = %evidence.name, release_group,
+                                error = format!("{error:#}"),
+                                "MusicBrainz artist identity backfill failed");
+                            if error.is::<crate::gate::ProviderBackoff>()
+                                || is_http_transient(&error)
+                            {
+                                return Err(error);
+                            }
+                            transient_backfill_failure = true;
+                            break;
+                        }
+                    }
+                };
+                let Some(id) = resolved else {
+                    unresolved_identity = true;
+                    continue;
+                };
+                store_backfilled_artist_identity(registry.db(), &artist_key, &release_group, &id)
+                    .await?;
+                for album in &mut evidence.albums {
+                    if album.release_group_id.as_deref() == Some(&release_group)
+                        && album.artist_id.is_none()
+                    {
+                        album.artist_id = Some(id.clone());
+                    }
+                }
+                identities.insert(id);
+                if identities.len() > 1 {
+                    // One proven conflict is sufficient. Remaining legacy
+                    // answers cannot make this group safe to publish.
+                    break;
+                }
+            }
+            if transient_backfill_failure {
+                continue;
+            }
+            if identities.len() <= 1 && (identities.is_empty() || unresolved_identity) {
+                let direct = match self.musicbrainz_artist(&evidence.name).await {
+                    Ok(id) => id,
+                    Err(error) => {
+                        failed += 1;
+                        tracing::warn!(artist = %evidence.name, error = format!("{error:#}"),
+                            "MusicBrainz direct artist lookup failed");
+                        if error.is::<crate::gate::ProviderBackoff>() || is_http_transient(&error) {
+                            return Err(error);
+                        }
+                        continue;
+                    }
+                };
+                if let Some(id) = direct {
+                    if identities.is_empty() || identities.contains(&id) {
+                        store_direct_artist_identity(registry.db(), &artist_key, &id).await?;
+                        for album in &mut evidence.albums {
+                            if album.artist_id.is_none() {
+                                album.artist_id = Some(id.clone());
+                            }
+                        }
+                        identities.insert(id);
+                        unresolved_identity = false;
+                    } else {
+                        identities.insert(id);
+                    }
+                }
+            }
+            let revision = artist_art_revision(&artist_key, &evidence.name, &evidence);
+            let Some(artist_id) = (identities.len() == 1 && !unresolved_identity)
+                .then(|| identities.iter().next().cloned())
+                .flatten()
+            else {
+                let outcome = if identities.is_empty() {
+                    "unidentified"
+                } else {
+                    ambiguous += 1;
+                    "ambiguous"
+                };
+                store_artist_artwork(
+                    registry.db(),
+                    &artist_key,
+                    &evidence.name,
+                    None,
+                    None,
+                    None,
+                    outcome,
+                    &revision,
+                )
+                .await?;
+                continue;
+            };
+            if let Some((stored_revision, outcome, stored_artist_id, Some(image_url))) =
+                current.as_ref()
+                && outcome == "ready"
+                && stored_artist_id.as_deref() == Some(&artist_id)
+                && artwork.remote_cache_complete(image_url)
+            {
+                if stored_revision != &revision {
+                    sqlx::query("UPDATE artist_artwork SET source_revision=? WHERE artist_key=?")
+                        .bind(&revision)
+                        .bind(&artist_key)
+                        .execute(registry.db())
+                        .await?;
+                }
+                continue;
+            }
+            let mut candidate = None;
+            let mut provider_ambiguous = false;
+            let mut provider_error = None;
+            if let Some((client_key, lease)) = fanart {
+                match self
+                    .fanart_artist(client_key, &artist_id, lease.clone())
+                    .await
+                {
+                    Ok(Some(mut answer))
+                        if crate::enrich::artist_key(&answer.name)
+                            == crate::enrich::artist_key(&evidence.name)
+                            && (answer.mbid_id.is_empty() || answer.mbid_id == artist_id) =>
+                    {
+                        if let Some(image) = answer.best_image() {
+                            candidate = Some(ArtistImageCandidate {
+                                id: image.id.clone(),
+                                url: image.url.clone(),
+                                source: ArtistImageSource::Fanart,
+                            });
+                        }
+                    }
+                    Ok(Some(_)) => provider_ambiguous = true,
+                    Ok(None) => {}
+                    Err(error) => {
+                        failed += 1;
+                        tracing::warn!(artist = %evidence.name, error = format!("{error:#}"),
+                            "Fanart.tv artist lookup failed; trying TheAudioDB");
+                        provider_error = Some(error);
+                    }
+                }
+            }
+
+            if let Some(image) = candidate.take() {
+                if !trusted_artist_image(&image.url) {
+                    failed += 1;
+                    tracing::warn!(artist = %evidence.name,
+                        "Fanart.tv returned an image URL outside its HTTPS origin");
+                    provider_error = Some(anyhow::anyhow!(
+                        "Fanart.tv returned an untrusted artist image URL"
+                    ));
+                } else {
+                    match artwork.prefetch_remote(&image.url).await {
+                        Ok(true) => {
+                            fanart
+                                .expect("Fanart candidate has a Fanart lease")
+                                .1
+                                .check()?;
+                            store_artist_artwork(
+                                registry.db(),
+                                &artist_key,
+                                &evidence.name,
+                                Some(&artist_id),
+                                Some(&image.id),
+                                Some(&image.url),
+                                "ready",
+                                &revision,
+                            )
+                            .await?;
+                            ready += 1;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            failed += 1;
+                            tracing::warn!(artist = %evidence.name, error = format!("{error:#}"),
+                                "Fanart.tv artist image prefetch failed; trying TheAudioDB");
+                            provider_error = Some(error);
+                        }
+                    }
+                }
+            }
+
+            match self
+                .theaudiodb_artist(
+                    theaudiodb_key,
+                    theaudiodb_premium,
+                    &artist_id,
+                    &evidence.name,
+                    theaudiodb_lease.clone(),
+                )
+                .await
+            {
+                Ok(TheAudioDbAnswer::Artist(answer)) => {
+                    if let Some((kind, url)) = answer.best_image() {
+                        candidate = Some(ArtistImageCandidate {
+                            id: format!("theaudiodb:{}:{kind}", answer.id_artist),
+                            url: url.to_string(),
+                            source: ArtistImageSource::TheAudioDb,
+                        });
+                    }
+                }
+                Ok(TheAudioDbAnswer::Ambiguous) => provider_ambiguous = true,
+                Ok(TheAudioDbAnswer::Missing) => {}
+                Err(error) => {
+                    failed += 1;
+                    tracing::warn!(artist = %evidence.name, error = format!("{error:#}"),
+                        "TheAudioDB artist lookup failed");
+                    provider_error = Some(error);
+                }
+            }
+
+            if let Some(image) = candidate {
+                if !trusted_artist_image(&image.url) {
+                    failed += 1;
+                    tracing::warn!(artist = %evidence.name,
+                        "TheAudioDB returned an image URL outside its HTTPS origin");
+                    provider_error = Some(anyhow::anyhow!(
+                        "TheAudioDB returned an untrusted artist image URL"
+                    ));
+                } else {
+                    match artwork.prefetch_remote(&image.url).await {
+                        Ok(true) => {
+                            match image.source {
+                                ArtistImageSource::Fanart => fanart
+                                    .expect("Fanart candidate has a Fanart lease")
+                                    .1
+                                    .check()?,
+                                ArtistImageSource::TheAudioDb => theaudiodb_lease.check()?,
+                            }
+                            store_artist_artwork(
+                                registry.db(),
+                                &artist_key,
+                                &evidence.name,
+                                Some(&artist_id),
+                                Some(&image.id),
+                                Some(&image.url),
+                                "ready",
+                                &revision,
+                            )
+                            .await?;
+                            ready += 1;
+                            continue;
+                        }
+                        Ok(false) => {}
+                        Err(error) => {
+                            failed += 1;
+                            tracing::warn!(artist = %evidence.name, error = format!("{error:#}"),
+                                "TheAudioDB artist image prefetch failed");
+                            provider_error = Some(error);
+                        }
+                    }
+                }
+            }
+
+            if let Some(error) = provider_error {
+                return Err(error);
+            }
+            let outcome = if provider_ambiguous {
+                ambiguous += 1;
+                "ambiguous"
+            } else {
+                missing += 1;
+                "missing"
+            };
+            store_artist_artwork(
+                registry.db(),
+                &artist_key,
+                &evidence.name,
+                Some(&artist_id),
+                None,
+                None,
+                outcome,
+                &revision,
+            )
+            .await?;
+            if (n + 1) % 100 == 0 {
+                tracing::info!(
+                    done = n + 1,
+                    ready,
+                    missing,
+                    ambiguous,
+                    failed,
+                    "artist artwork prefetch progress"
+                );
+            }
+        }
+        tracing::info!(
+            ready,
+            missing,
+            ambiguous,
+            failed,
+            "artist artwork prefetch complete"
+        );
+        Ok(())
     }
 
     /// Anime items needing the chain: unidentified ones, plus matched
@@ -2781,6 +3852,7 @@ impl Enricher {
                 original_language: media.original_language().map(str::to_string),
                 genres: Some(serde_json::to_string(&genres)?),
                 cast_json: None,
+                provider_artist_id: None,
             },
         )
         .await?;
@@ -3576,7 +4648,15 @@ impl Enricher {
         } else {
             format!("https://image.tmdb.org/t/p/w500{poster_path}")
         };
-        let resp = self.http.send(self.http.get(&url)).await?;
+        // Artist-art providers control these absolute URLs. Disable redirects
+        // as well as validating the original host, otherwise a trusted-looking
+        // asset URL could still bounce the hub into its own network.
+        let request = if trusted_artist_image(&url) {
+            self.http.get_no_redirect(&url)
+        } else {
+            self.http.get(&url)
+        };
+        let resp = self.http.send(request).await?;
         if matches!(
             resp.status(),
             reqwest::StatusCode::NOT_FOUND | reqwest::StatusCode::GONE
@@ -3623,6 +4703,356 @@ pub fn absolute_to_seasoned(seasons: &[(i64, i64)], absolute: i64) -> Option<(i6
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[test]
+    fn fanart_prefers_a_square_thumb_then_likes_and_stable_id() {
+        let mut answer: FanartArtist = serde_json::from_value(serde_json::json!({
+            "name": "Björk",
+            "mbid_id": "artist-id",
+            "artistthumb": [
+                {"id":"20", "url":"https://assets.fanart.tv/two.jpg", "likes":"7"},
+                {"id":"10", "url":"https://assets.fanart.tv/one.jpg", "likes":"7"},
+                {"id":"30", "url":"https://assets.fanart.tv/three.jpg", "likes":"2"}
+            ],
+            "artistbackground": [
+                {"id":"01", "url":"https://assets.fanart.tv/background.jpg", "likes":"99"}
+            ]
+        }))
+        .unwrap();
+        let chosen = answer.best_image().unwrap();
+        assert_eq!(chosen.id, "10");
+        assert_eq!(chosen.url, "https://assets.fanart.tv/one.jpg");
+    }
+
+    #[test]
+    fn fanart_background_is_used_when_no_square_thumb_exists() {
+        let mut answer: FanartArtist = serde_json::from_value(serde_json::json!({
+            "name": "Skinny Puppy",
+            "mbid_id": "artist-id",
+            "artistbackground": [
+                {"id":"20", "url":"https://assets.fanart.tv/two.jpg", "likes":"7"},
+                {"id":"10", "url":"https://assets.fanart.tv/one.jpg", "likes":"7"}
+            ]
+        }))
+        .unwrap();
+        let chosen = answer.best_image().unwrap();
+        assert_eq!(chosen.id, "10");
+    }
+
+    #[test]
+    fn artist_images_cannot_redirect_prefetch_to_another_origin() {
+        assert!(trusted_artist_image(
+            "https://assets.fanart.tv/fanart/music/portrait.jpg"
+        ));
+        assert!(trusted_artist_image(
+            "https://r2.theaudiodb.com/images/media/artist/thumb/example.jpg"
+        ));
+        assert!(!trusted_artist_image(
+            "http://assets.fanart.tv/fanart/music/portrait.jpg"
+        ));
+        assert!(!trusted_artist_image(
+            "https://assets.fanart.tv.example/internal"
+        ));
+        assert!(!trusted_artist_image("http://127.0.0.1:8420/admin"));
+    }
+
+    #[test]
+    fn fanart_personal_key_uses_the_documented_secret_header() {
+        let enricher = Enricher::new(tempfile::tempdir().unwrap().keep());
+        let (_, request) = enricher
+            .fanart_artist_request("personal-secret", "artist-id")
+            .build_split();
+        let request = request.unwrap();
+
+        assert_eq!(
+            request
+                .headers()
+                .get("client-key")
+                .and_then(|value| value.to_str().ok()),
+            Some("personal-secret"),
+        );
+        assert!(request.url().query().is_none());
+        assert!(!request.headers().contains_key("api-key"));
+    }
+
+    #[test]
+    fn theaudiodb_lookup_uses_mbid_and_encodes_the_key_as_one_path_segment() {
+        let enricher = Enricher::new(tempfile::tempdir().unwrap().keep());
+        let (_, request) = enricher
+            .theaudiodb_artist_request("premium/key", "artist-id")
+            .unwrap()
+            .build_split();
+        let request = request.unwrap();
+
+        assert_eq!(
+            request.url().as_str(),
+            "https://www.theaudiodb.com/api/v1/json/premium%2Fkey/artist-mb.php?i=artist-id"
+        );
+    }
+
+    #[test]
+    fn theaudiodb_answer_requires_exact_mbid_and_artist_name() {
+        let response = serde_json::from_value(serde_json::json!({
+            "artists": [{
+                "idArtist": "42",
+                "strArtist": "Björk",
+                "strMusicBrainzID": "artist-id",
+                "strArtistThumb": "https://r2.theaudiodb.com/portrait.jpg"
+            }]
+        }))
+        .unwrap();
+        let TheAudioDbAnswer::Artist(answer) =
+            exact_theaudiodb_artist(response, "artist-id", "Björk")
+        else {
+            panic!("exact answer rejected");
+        };
+        assert_eq!(
+            answer.best_image(),
+            Some(("thumb", "https://r2.theaudiodb.com/portrait.jpg"))
+        );
+
+        let mismatch = serde_json::from_value(serde_json::json!({
+            "artists": [{
+                "idArtist": "42",
+                "strArtist": "Bjork Tribute",
+                "strMusicBrainzID": "artist-id"
+            }]
+        }))
+        .unwrap();
+        assert!(matches!(
+            exact_theaudiodb_artist(mismatch, "artist-id", "Björk"),
+            TheAudioDbAnswer::Ambiguous
+        ));
+    }
+
+    #[test]
+    fn artist_art_revision_tracks_release_groups_even_after_identity_lands() {
+        let unresolved = ArtistEvidence {
+            name: "Artist".into(),
+            albums: vec![ArtistAlbumEvidence {
+                release_group_id: Some("release-a".into()),
+                artist_id: None,
+            }],
+        };
+        let before = artist_art_revision("artist-key", "Artist", &unresolved);
+        assert_eq!(
+            before,
+            artist_art_revision("artist-key", "Artist", &unresolved)
+        );
+        let resolved = ArtistEvidence {
+            name: "Artist".into(),
+            albums: vec![ArtistAlbumEvidence {
+                release_group_id: Some("release-a".into()),
+                artist_id: Some("mbid-a".into()),
+            }],
+        };
+        assert_ne!(
+            before,
+            artist_art_revision("artist-key", "Artist", &resolved)
+        );
+        let mut more_evidence = resolved;
+        more_evidence.albums.push(ArtistAlbumEvidence {
+            release_group_id: Some("release-b".into()),
+            artist_id: Some("mbid-a".into()),
+        });
+        assert_ne!(
+            artist_art_revision("artist-key", "Artist", &more_evidence),
+            artist_art_revision("artist-key", "Artist", &unresolved),
+            "new unresolved album evidence must invalidate a ready portrait"
+        );
+        more_evidence.albums[1].artist_id = None;
+        assert_ne!(
+            artist_art_revision("artist-key", "Artist", &more_evidence),
+            artist_art_revision(
+                "artist-key",
+                "Artist",
+                &ArtistEvidence {
+                    name: "Artist".into(),
+                    albums: vec![
+                        ArtistAlbumEvidence {
+                            release_group_id: Some("release-a".into()),
+                            artist_id: Some("mbid-a".into()),
+                        },
+                        ArtistAlbumEvidence {
+                            release_group_id: Some("release-b".into()),
+                            artist_id: Some("mbid-a".into()),
+                        },
+                    ],
+                }
+            ),
+            "a cleared per-release claim must invalidate the portrait"
+        );
+    }
+
+    #[test]
+    fn artist_identity_backfill_selects_every_distinct_unresolved_release_group() {
+        let evidence = ArtistEvidence {
+            name: "Artist".into(),
+            albums: vec![
+                ArtistAlbumEvidence {
+                    release_group_id: Some("known".into()),
+                    artist_id: Some("artist-id".into()),
+                },
+                ArtistAlbumEvidence {
+                    release_group_id: Some("unresolved-a".into()),
+                    artist_id: None,
+                },
+                ArtistAlbumEvidence {
+                    release_group_id: Some("unresolved-b".into()),
+                    artist_id: None,
+                },
+                ArtistAlbumEvidence {
+                    release_group_id: Some("unresolved-a".into()),
+                    artist_id: None,
+                },
+            ],
+        };
+
+        assert_eq!(
+            unresolved_artist_release_groups(&evidence),
+            BTreeSet::from(["unresolved-a".to_string(), "unresolved-b".to_string()])
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_identity_backfill_never_crosses_a_local_artist_group() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::query(
+            "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+             VALUES('fixture','mediahost','fixture','fp')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO collections(module_id,collection_id,media_type)
+             VALUES('fixture','music','music')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        for (item, key) in [
+            ("same-a", "artist-a"),
+            ("same-a-copy", "artist-a"),
+            ("same-b", "artist-b"),
+        ] {
+            sqlx::query(
+                "INSERT INTO items
+                    (id,kind,title,norm_title,artist_key,module_id,collection_id)
+                 VALUES(?,'album',?,lower(?),?,'fixture','music')",
+            )
+            .bind(item)
+            .bind(item)
+            .bind(item)
+            .bind(key)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO provider_metadata
+                    (item_id,provider,provider_id,confidence,updated_at)
+                 VALUES(?,'musicbrainz','shared-release','auto',unixepoch())",
+            )
+            .bind(item)
+            .execute(&db)
+            .await
+            .unwrap();
+        }
+
+        store_backfilled_artist_identity(&db, "artist-a", "shared-release", "credited-a")
+            .await
+            .unwrap();
+
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT item_id,provider_artist_id FROM provider_metadata ORDER BY item_id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("same-a".into(), Some("credited-a".into())),
+                ("same-a-copy".into(), Some("credited-a".into())),
+                ("same-b".into(), None),
+            ]
+        );
+
+        store_direct_artist_identity(&db, "artist-b", "direct-b")
+            .await
+            .unwrap();
+        let rows: Vec<(String, Option<String>)> = sqlx::query_as(
+            "SELECT item_id,provider_artist_id FROM provider_metadata ORDER BY item_id",
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            [
+                ("same-a".into(), Some("credited-a".into())),
+                ("same-a-copy".into(), Some("credited-a".into())),
+                ("same-b".into(), Some("direct-b".into())),
+            ],
+            "a direct artist answer must stay within its synthetic group"
+        );
+    }
+
+    #[test]
+    fn provider_artist_credit_uses_the_catalogues_strict_identity() {
+        let credits = serde_json::json!([
+            {"name":"1", "artist":{"id":"number", "name":"1"}},
+            {"name":"Pink", "artist":{"id":"plain", "name":"Pink"}},
+            {"name":"Beyonce", "artist":{"id":"accent", "name":"Beyonce"}}
+        ]);
+        let credits = credits.as_array().unwrap();
+
+        assert_eq!(exact_artist_credit_id(Some(credits), "One"), None);
+        assert_eq!(exact_artist_credit_id(Some(credits), "P!nk"), None);
+        assert_eq!(
+            exact_artist_credit_id(Some(credits), "Beyoncé").as_deref(),
+            Some("accent")
+        );
+    }
+
+    #[test]
+    fn direct_artist_search_requires_one_exact_catalogue_identity() {
+        let unique = serde_json::json!([
+            {"id":"wanted", "name":"Modeselektor"},
+            {"id":"tribute", "name":"Modeselektor Tribute"}
+        ]);
+        assert_eq!(
+            exact_artist_search_id(unique.as_array(), "MODESELEKTOR").as_deref(),
+            Some("wanted")
+        );
+
+        let same_named = serde_json::json!([
+            {"id":"one", "name":"Sefa"},
+            {"id":"two", "name":"SEFA"}
+        ]);
+        assert_eq!(exact_artist_search_id(same_named.as_array(), "Sefa"), None);
+    }
+
+    #[test]
+    fn established_artist_identities_do_not_wait_behind_lookup_work() {
+        let identified = ArtistEvidence {
+            name: "Known".into(),
+            albums: vec![ArtistAlbumEvidence {
+                release_group_id: Some("release".into()),
+                artist_id: Some("artist".into()),
+            }],
+        };
+        let unresolved = ArtistEvidence {
+            name: "Unknown".into(),
+            albums: vec![ArtistAlbumEvidence {
+                release_group_id: None,
+                artist_id: None,
+            }],
+        };
+
+        assert!(!artist_requires_identity_lookup(&identified));
+        assert!(artist_requires_identity_lookup(&unresolved));
+    }
 
     /// A v4 token is a JWT and goes in a header; a v3 key goes in the query.
     /// The value is stored as typed, so the test for which one it is has to
@@ -3683,6 +5113,56 @@ mod tests {
         assert!(
             replacement.check().is_err(),
             "a second TMDB replacement revived older work"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_provider_backoff_retry_waits_and_stays_artist_only() {
+        let registry = Arc::new(Registry::new(
+            crate::db::open_in_memory().await.unwrap(),
+            Default::default(),
+        ));
+        let enricher = Arc::new(Enricher::new(tempfile::tempdir().unwrap().keep()));
+        // Keep the shared scheduler from entering a real artist pass; this
+        // check is about when and which kind of request the timer produces.
+        enricher.running.store(true, Ordering::SeqCst);
+
+        enricher.schedule_artist_retry(registry.clone(), std::time::Duration::from_millis(40));
+        enricher.schedule_artist_retry(registry, std::time::Duration::from_millis(1));
+        tokio::time::sleep(std::time::Duration::from_millis(15)).await;
+        assert!(enricher.artist_retry_pending.load(Ordering::SeqCst));
+        assert!(!enricher.rerun_requested.load(Ordering::SeqCst));
+        assert!(!enricher.artist_run_requested.load(Ordering::SeqCst));
+
+        tokio::time::sleep(std::time::Duration::from_millis(40)).await;
+        assert!(!enricher.artist_retry_pending.load(Ordering::SeqCst));
+        assert!(
+            enricher.artist_run_requested.load(Ordering::SeqCst),
+            "the retry did not request artist artwork"
+        );
+        assert!(
+            !enricher.rerun_requested.load(Ordering::SeqCst),
+            "an artist retry incorrectly requested the full enrichment pipeline"
+        );
+    }
+
+    #[tokio::test]
+    async fn explicit_artist_request_does_not_schedule_full_enrichment() {
+        let registry = Arc::new(Registry::new(
+            crate::db::open_in_memory().await.unwrap(),
+            Default::default(),
+        ));
+        let enricher = Arc::new(Enricher::new(tempfile::tempdir().unwrap().keep()));
+        // Hold the runner so the flags remain observable.
+        enricher.running.store(true, Ordering::SeqCst);
+
+        enricher.request_artist_run(registry);
+        tokio::task::yield_now().await;
+
+        assert!(enricher.artist_run_requested.load(Ordering::SeqCst));
+        assert!(
+            !enricher.rerun_requested.load(Ordering::SeqCst),
+            "library composition scheduled the entire enrichment pipeline"
         );
     }
 
@@ -3932,7 +5412,12 @@ mod tests {
     /// rewriting the error as a string would quietly lose it.
     #[tokio::test]
     async fn a_refused_call_keeps_its_status_and_loses_its_url() {
-        for (code, line) in [(404, "404 Not Found"), (401, "401 Unauthorized")] {
+        for (code, line) in [
+            (404, "404 Not Found"),
+            (401, "401 Unauthorized"),
+            (403, "403 Forbidden"),
+            (500, "500 Internal Server Error"),
+        ] {
             let l = tokio::net::TcpListener::bind(("127.0.0.1", 0))
                 .await
                 .unwrap();
@@ -3954,6 +5439,17 @@ mod tests {
             let shown = format!("{e:#}");
             assert!(!shown.contains("SECRET-OPERATOR-KEY"), "{code}: {shown}");
             assert_eq!(is_http_404(&e), code == 404, "{code}: {shown}");
+            assert_eq!(
+                [
+                    reqwest::StatusCode::UNAUTHORIZED,
+                    reqwest::StatusCode::FORBIDDEN,
+                ]
+                .into_iter()
+                .any(|status| is_http_status(&e, status)),
+                matches!(code, 401 | 403),
+                "{code}: {shown}"
+            );
+            assert_eq!(is_http_transient(&e), code == 500, "{code}: {shown}");
         }
     }
 
@@ -4084,6 +5580,7 @@ impl Enricher {
             // request that also fills original_language (HUB-6).
             genres: None,
             cast_json: None,
+            provider_artist_id: None,
         };
         crate::providers::store_answer(db, item_id, provider, &provider_id, confidence, fields)
             .await
@@ -4619,6 +6116,7 @@ impl crate::providers::Provider for MusicbrainzProvider {
                 )),
                 premiered: rg.first_release_date.clone(),
                 genres: Some(serde_json::to_string(&rg.genres)?),
+                provider_artist_id: Some(rg.artist_id.clone()),
                 ..Default::default()
             },
         )

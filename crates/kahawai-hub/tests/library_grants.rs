@@ -261,6 +261,30 @@ async fn a_grant_bounds_browse_search_and_detail() {
     assert_eq!(status, StatusCode::OK);
     assert_eq!(titles(&v), ["Test Bravo"]);
 
+    // Artist portraits are media bytes, but their synthetic key does not name
+    // an item the common item middleware can authorize. The required library
+    // context must hide an ungranted library before the handler reveals even
+    // that this fixture is not a music library.
+    let (status, body) = call(
+        &h.api,
+        &h.kid,
+        "GET",
+        "/api/v1/artists/anything/artwork?library=L2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    assert_not_found(&body, "no such library");
+    let (status, _) = call(
+        &h.api,
+        &h.guest,
+        "GET",
+        "/api/v1/artists/anything/artwork?library=L2",
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+
     // Unscoped browse. The orphan in c3 belongs to no library, so no
     // grant reaches it — while an unrestricted account still sees it.
     let (_, v) = get(&h.api, &h.kid, "/api/v1/items").await;

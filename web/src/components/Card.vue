@@ -23,6 +23,7 @@
 /// No comment above the root elements below: a comment there is a node, which
 /// makes this component multi-root and changes what a parent's layout sees.
 import Art from './Art.vue'
+import CardFrame from './CardFrame.vue'
 import Icon from './Icon.vue'
 import { type Labelled, metaLine } from '../domain/label.ts'
 
@@ -78,16 +79,7 @@ function state(item: Row): string {
 </script>
 
 <template>
-  <div
-    v-if="!props.item"
-    class="card pointer-events-none opacity-50"
-    aria-hidden="true"
-    data-testid="pending-card"
-  >
-    <span class="ghost-art" />
-    <span class="card-title line-clamp-2 h-[2.7em]">&nbsp;</span>
-    <span class="card-meta">&nbsp;</span>
-  </div>
+  <CardFrame v-if="!props.item" pending />
   <div v-else class="group relative">
     <!-- Over the art rather than in the row: the row is the title and the meta
          line, and a button in it moved them on the cards that had one.
@@ -108,45 +100,9 @@ function state(item: Row): string {
     >
       <Icon name="search" />
     </button>
-    <button
-      class="card w-full cursor-pointer text-left"
-      type="button"
-      @click="emit('open', props.item)"
-    >
-      <Art :item="props.item" size="card" />
-      <span class="card-title line-clamp-2 h-[2.7em]">{{ props.item.title }}</span>
-      <span class="card-meta">{{ meta(props.item) }}</span>
+    <CardFrame :title="props.item.title" :meta="meta(props.item)" @open="emit('open', props.item)">
+      <template #art><Art :item="props.item" size="card" /></template>
       <span v-if="state(props.item)" class="sr-only">{{ state(props.item) }}</span>
-    </button>
+    </CardFrame>
   </div>
 </template>
-
-<style scoped>
-@reference '../theme.css';
-
-.card {
-  @apply flex w-full flex-col gap-1 rounded-md border border-line bg-surface p-2.5;
-}
-button.card:hover {
-  @apply border-teal-dim;
-}
-/* The clamp itself is in the class list rather than here: whether a title is
-   two lines or free to wrap is the difference between a grid that can reserve
-   its own height and one that cannot, and a scoped rule is invisible to a test
-   environment with no CSS in it. */
-.card-title {
-  @apply mt-1 text-[14px] leading-[1.35] font-semibold;
-}
-.card-meta {
-  @apply truncate text-[12px] text-dim;
-}
-/* The same shape the real art takes, read off the same property. A test can
-   see the class but not this rule — happy-dom drops an `aspect-ratio` whose
-   value is a `var()`, however it is written — so the height half of "the same
-   box" is checked by eye, and the clamp beside it is in the class list
-   precisely because that one did not have to be. */
-.ghost-art {
-  @apply block w-full rounded bg-line opacity-35;
-  aspect-ratio: var(--card-ratio, 2 / 3);
-}
-</style>

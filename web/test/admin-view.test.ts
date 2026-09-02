@@ -29,6 +29,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminDeleteSatellite: vi.fn(),
   adminDeleteUser: vi.fn(),
   adminDetachCollection: vi.fn(),
+  adminDisconnectProvider: vi.fn(),
   adminEndSession: vi.fn(),
   adminEnrichRun: vi.fn(),
   adminEnrichStatus: vi.fn(),
@@ -38,6 +39,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminSetAnidb: vi.fn(),
   adminSetChain: vi.fn(),
   adminSetDisabled: vi.fn(),
+  adminSetFanart: vi.fn(),
+  adminSetTheaudiodb: vi.fn(),
   adminSegmentsRun: vi.fn(),
   adminSegmentsStatus: vi.fn(),
   adminSetTmdb: vi.fn(),
@@ -140,6 +143,8 @@ beforeEach(() => {
     tmdb: { configured: false },
     tvdb: { configured: false },
     anidb: { configured: false },
+    fanart: { configured: false },
+    theaudiodb: { premium_key_configured: false },
     chains: {},
   } as never)
   vi.mocked(api.adminEnrichStatus).mockResolvedValue({
@@ -1219,6 +1224,39 @@ describe('providers', () => {
     expect(api.adminSetTmdb).toHaveBeenCalledWith({ api_key: ' secret ' })
     expect((wrapper.find('#tmdb-key').element as HTMLInputElement).value).toBe('')
     expect(notice.value).toContain('TMDB key saved')
+  })
+
+  test('saving a Fanart.tv key starts the artist artwork prefetch', async () => {
+    vi.mocked(api.adminSetFanart).mockResolvedValue({ saved: true } as never)
+    const wrapper = await open()
+    await tab(wrapper, 'Providers')
+    await wrapper.find('#fanart-key').setValue(' artist-key ')
+    await wrapper
+      .findAll('button')
+      .find((button) => button.element.previousElementSibling?.id === 'fanart-key')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.adminSetFanart).toHaveBeenCalledWith({ client_key: ' artist-key ' })
+    expect((wrapper.find('#fanart-key').element as HTMLInputElement).value).toBe('')
+    expect(notice.value).toContain('artist artwork prefetch started')
+  })
+
+  test('saving a TheAudioDB premium key leaves the free key as the default', async () => {
+    vi.mocked(api.adminSetTheaudiodb).mockResolvedValue({ saved: true } as never)
+    const wrapper = await open()
+    await tab(wrapper, 'Providers')
+    expect(wrapper.find('#theaudiodb-key').attributes('placeholder')).toContain(
+      'free key is active',
+    )
+    await wrapper.find('#theaudiodb-key').setValue(' premium-key ')
+    await wrapper
+      .findAll('button')
+      .find((button) => button.element.previousElementSibling?.id === 'theaudiodb-key')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.adminSetTheaudiodb).toHaveBeenCalledWith({ api_key: ' premium-key ' })
+    expect((wrapper.find('#theaudiodb-key').element as HTMLInputElement).value).toBe('')
+    expect(notice.value).toContain('premium key saved')
   })
 
   test('an AniDB account that saved but could not log in says both', async () => {

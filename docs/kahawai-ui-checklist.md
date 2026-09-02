@@ -40,9 +40,12 @@ followed, and those cases are listed too.
       chunks as the user scrolls; API paging is not exposed as a separate
       load-more interaction.
       Search shows matching artists beside albums and songs and also finds an
-      album by a matching child track. There is deliberately no artist entity
-      or invented portrait: that avoids a schema and enrichment/artwork path,
-      while accepting that renaming an Album Artist changes its route key.
+      album by a matching child track. The group is still synthetic rather
+      than an artist entity, so renaming an Album Artist changes its route key.
+      Its card now uses the album card's fixed title/metadata geometry with a
+      square, density-aware Fanart.tv portrait (square thumb preferred, wide
+      background cropped as fallback); the hub exposes a version only after
+      every size has been prefetched locally.
 
 - [ ] UI-2 **No per-track removal from the play queue.** The prototype offers
       a × on each queued track. The queue supports replacing, appending and

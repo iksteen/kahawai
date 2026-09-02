@@ -121,6 +121,7 @@ pub struct NetOptions {
         list_libraries,
         list_artists,
         artist_albums,
+        artist_artwork,
         list_items,
         up_next,
         item_detail,
@@ -164,6 +165,8 @@ pub struct NetOptions {
         admin_providers,
         admin_set_chain,
         admin_set_tmdb,
+        admin_set_fanart,
+        admin_set_theaudiodb,
         admin_set_tvdb,
         admin_set_anidb,
         admin_disconnect_provider,
@@ -407,6 +410,7 @@ pub fn router(
         ));
     let media = Router::new()
         .route("/api/v1/events", get(events))
+        .route("/api/v1/artists/{key}/artwork", get(artist_artwork))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_bearer_or_media,
@@ -459,6 +463,8 @@ pub fn router(
             post(admin_set_chain),
         )
         .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
+        .route("/admin/v1/providers/fanart", post(admin_set_fanart))
+        .route("/admin/v1/providers/theaudiodb", post(admin_set_theaudiodb))
         .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
         .route("/admin/v1/providers/anidb", post(admin_set_anidb))
         .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
@@ -663,6 +669,12 @@ struct ProviderConfiguration {
 }
 
 #[derive(Serialize, ToSchema)]
+struct TheAudioDbConfiguration {
+    /// The free public key is always active; this only reports an override.
+    premium_key_configured: bool,
+}
+
+#[derive(Serialize, ToSchema)]
 struct ProviderChain {
     order: Vec<String>,
     default: Vec<String>,
@@ -673,6 +685,8 @@ struct ProvidersResponse {
     tmdb: ProviderConfiguration,
     tvdb: ProviderConfiguration,
     anidb: ProviderConfiguration,
+    fanart: ProviderConfiguration,
+    theaudiodb: TheAudioDbConfiguration,
     chains: std::collections::BTreeMap<String, ProviderChain>,
 }
 
@@ -995,6 +1009,9 @@ struct ArtistSummary {
     /// Stored Album Artist spelling used for display.
     name: String,
     album_count: i64,
+    /// Changes when the selected portrait or its availability changes.
+    #[schema(required)]
+    art_version: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1486,9 +1503,8 @@ async fn admin_approve(
 
 /// Metadata provider configuration
 ///
-/// Admin only. Reports whether TMDB, TVDB and AniDB credentials are
-/// configured, plus the effective and default provider chain for each media
-/// type.
+/// Admin only. Reports credential state for metadata and artwork providers,
+/// plus the effective and default provider chain for each media type.
 #[utoipa::path(
     get, path = "/admin/v1/providers", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -1522,6 +1538,14 @@ async fn admin_providers(
         && anidb
             .get(crate::anidb::PASSWORD)
             .is_some_and(|value| !value.is_empty());
+    let fanart = crate::enrich::fanart_client_key(&state.registry)
+        .await
+        .map_err(internal)?
+        .is_some();
+    let theaudiodb = crate::enrich::theaudiodb_premium_key(&state.registry)
+        .await
+        .map_err(internal)?
+        .is_some();
     let db = state.registry.db();
     let mut chains = std::collections::BTreeMap::new();
     for media_type in crate::providers::MEDIA_TYPES {
@@ -1540,6 +1564,10 @@ async fn admin_providers(
         tmdb: ProviderConfiguration { configured: tmdb },
         tvdb: ProviderConfiguration { configured: tvdb },
         anidb: ProviderConfiguration { configured: anidb },
+        fanart: ProviderConfiguration { configured: fanart },
+        theaudiodb: TheAudioDbConfiguration {
+            premium_key_configured: theaudiodb,
+        },
         chains,
     }))
 }
@@ -2036,11 +2064,130 @@ async fn admin_set_tmdb(
     Ok(Json(SavedResponse { saved: true }))
 }
 
+#[derive(Deserialize, ToSchema)]
+struct SetFanart {
+    client_key: String,
+}
+
+/// Set Fanart.tv credentials
+///
+/// Admin only. Stores the personal API key and starts the Album Artist artwork
+/// prefetch in the background. Fanart.tv supplies artwork only and is not
+/// inserted into the music metadata chain.
+#[utoipa::path(
+    post, path = "/admin/v1/providers/fanart", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    request_body = SetFanart,
+    responses(
+        (status = 200, body = SavedResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_set_fanart(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<SetFanart>,
+) -> Result<Json<SavedResponse>, ApiError> {
+    let key = body.client_key.as_str();
+    if key.is_empty() {
+        return Err(ApiError::new(ErrorCode::BadRequest, "client_key required"));
+    }
+    let fields = BTreeMap::from([(crate::enrich::FANART_CLIENT_KEY, key)]);
+    let change = state.enricher.changing_credentials().await;
+    let changed = match state.registry.hub_credential(crate::enrich::FANART).await {
+        Ok(current) => !same_fields(&current, &fields),
+        Err(error) if error.is::<crate::secrets::UnreadableCredential>() => true,
+        Err(error) => return Err(internal(error)),
+    };
+    store(&state.registry)?
+        .set_provider(crate::secrets::HUB, crate::enrich::FANART, &fields)
+        .await
+        .map_err(internal)?;
+    if changed {
+        state.enricher.revoke_provider(crate::enrich::FANART);
+        // A replacement key can have a different visibility tier. Ready
+        // images are useful offline; only previous negative answers are owed.
+        sqlx::query("DELETE FROM artist_artwork WHERE outcome <> 'ready'")
+            .execute(state.registry.db())
+            .await
+            .map_err(internal)?;
+    }
+    drop(change);
+    state.enricher.request_artist_run(state.registry.clone());
+    Ok(Json(SavedResponse { saved: true }))
+}
+
+#[derive(Deserialize, ToSchema)]
+struct SetTheAudioDb {
+    api_key: String,
+}
+
+/// Set a premium TheAudioDB API key
+///
+/// Admin only. Overrides TheAudioDB's public free key and retries Album Artist
+/// artwork misses. Deleting this provider's credentials restores the free key.
+#[utoipa::path(
+    post, path = "/admin/v1/providers/theaudiodb", tag = "Admin providers",
+    security(("bearer_auth" = [])),
+    request_body = SetTheAudioDb,
+    responses(
+        (status = 200, body = SavedResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_set_theaudiodb(
+    State(state): State<AppState>,
+    ApiJson(body): ApiJson<SetTheAudioDb>,
+) -> Result<Json<SavedResponse>, ApiError> {
+    let key = body.api_key.as_str();
+    if key.is_empty() {
+        return Err(ApiError::new(ErrorCode::BadRequest, "api_key required"));
+    }
+    let fields = BTreeMap::from([(crate::enrich::THEAUDIODB_API_KEY, key)]);
+    let change = state.enricher.changing_credentials().await;
+    let changed = match state
+        .registry
+        .hub_credential(crate::enrich::THEAUDIODB)
+        .await
+    {
+        Ok(current) => !same_fields(&current, &fields),
+        Err(error) if error.is::<crate::secrets::UnreadableCredential>() => true,
+        Err(error) => return Err(internal(error)),
+    };
+    store(&state.registry)?
+        .set_provider(crate::secrets::HUB, crate::enrich::THEAUDIODB, &fields)
+        .await
+        .map_err(internal)?;
+    if changed {
+        state.enricher.revoke_provider(crate::enrich::THEAUDIODB);
+        // A premium account can expose images absent from the free result.
+        // Keep fully prefetched portraits; re-open only negative answers.
+        sqlx::query("DELETE FROM artist_artwork WHERE outcome <> 'ready'")
+            .execute(state.registry.db())
+            .await
+            .map_err(internal)?;
+    }
+    drop(change);
+    state.enricher.request_artist_run(state.registry.clone());
+    Ok(Json(SavedResponse { saved: true }))
+}
+
 /// Disconnect a provider
 ///
-/// Admin only. Deletes every credential stored for one provider; the hub then
-/// answers `configured: false` for it and stops contacting it. Metadata
-/// already merged from that provider stays.
+/// Admin only. Deletes every credential stored for one provider. TheAudioDB
+/// returns to its public free key; other providers become unconfigured.
+/// Metadata already merged from that provider stays.
 #[utoipa::path(
     delete, path = "/admin/v1/providers/{provider}/credentials", tag = "Admin providers",
     security(("bearer_auth" = [])),
@@ -2060,7 +2207,11 @@ async fn admin_disconnect_provider(
 ) -> Result<Json<OkResponse>, ApiError> {
     if !matches!(
         provider.as_str(),
-        crate::enrich::TMDB | crate::enrich::TVDB | crate::anidb::ANIDB
+        crate::enrich::TMDB
+            | crate::enrich::TVDB
+            | crate::anidb::ANIDB
+            | crate::enrich::FANART
+            | crate::enrich::THEAUDIODB
     ) {
         return Err(ApiError::new(ErrorCode::BadRequest, "unknown provider"));
     }
@@ -2073,11 +2224,21 @@ async fn admin_disconnect_provider(
     // client and a session on disk; revoke marks the client stale without
     // waiting on its UDP mutex, then the durable session is removed below.
     state.enricher.revoke_provider(&provider);
+    if provider == crate::enrich::THEAUDIODB {
+        sqlx::query("DELETE FROM artist_artwork WHERE outcome <> 'ready'")
+            .execute(state.registry.db())
+            .await
+            .map_err(internal)?;
+    }
     if provider == crate::anidb::ANIDB {
         let forgotten = crate::anidb::forget_session(state.enricher.data_dir());
         // Revocation above remains in force even if removing the persisted
         // session fails.
         forgotten.map_err(internal)?;
+    }
+    drop(_change);
+    if provider == crate::enrich::THEAUDIODB {
+        state.enricher.request_artist_run(state.registry.clone());
     }
     Ok(Json(OkResponse { ok: true }))
 }
@@ -2983,6 +3144,10 @@ async fn admin_attach_collection(
                 None => internal(e),
             }
         })?;
+    // Portrait eligibility follows library composition. Existing collection
+    // metadata is already present, so only re-evaluate artist artwork; a full
+    // enrichment pass would spend provider traffic on unrelated media.
+    state.enricher.request_artist_run(state.registry.clone());
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -4481,6 +4646,103 @@ struct ArtworkQuery {
     v: Option<String>,
 }
 
+#[derive(serde::Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ArtistArtworkQuery {
+    /// Music library providing both navigation and grant context.
+    library: String,
+    size: Option<String>,
+    /// Client cache-buster from `ArtistSummary.art_version`.
+    v: Option<String>,
+}
+
+/// Fetch Album Artist artwork
+///
+/// Serves a fully prefetched Fanart.tv artist thumb. The library parameter is
+/// required because an artist key is synthetic and can occur in more than one
+/// library. Accepts a bearer token or the media cookie.
+#[utoipa::path(
+    get, path = "/api/v1/artists/{key}/artwork", tag = "Item media",
+    security(("bearer_auth" = []), ("media_token" = [])),
+    params(("key" = String, Path), ArtistArtworkQuery),
+    responses(
+        (status = 200, content((Vec<u8> = "image/jpeg")), headers(("cache-control" = String))),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody, headers(("cache-control" = String))),
+        (status = 500, body = ApiErrorBody),
+        (status = 400, body = ApiErrorBody),
+        (status = 503, body = ApiErrorBody)
+    )
+)]
+async fn artist_artwork(
+    State(state): State<AppState>,
+    ApiPath(key): ApiPath<String>,
+    ApiQuery(q): ApiQuery<ArtistArtworkQuery>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Response, ApiError> {
+    music_library(state.registry.db(), &claims, &q.library).await?;
+    let belongs: i64 = sqlx::query_scalar(
+        "SELECT EXISTS(
+             SELECT 1 FROM items i JOIN library_collections lc
+               ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+              WHERE lc.library_id=? AND i.kind='album' AND i.artist_key=?)",
+    )
+    .bind(&q.library)
+    .bind(&key)
+    .fetch_one(state.registry.db())
+    .await
+    .map_err(internal)?;
+    if belongs == 0 {
+        return Err(hidden("artist"));
+    }
+    let url: Option<String> = sqlx::query_scalar(
+        "SELECT image_url FROM artist_artwork
+          WHERE artist_key=? AND outcome='ready' AND image_url IS NOT NULL",
+    )
+    .bind(&key)
+    .fetch_optional(state.registry.db())
+    .await
+    .map_err(internal)?
+    .flatten();
+    let found = match url {
+        Some(url) => match state
+            .artwork
+            .get_cached_remote_at(&url, q.size.as_deref())
+            .await
+        {
+            Ok(found) => found,
+            Err(error) => {
+                tracing::warn!(artist = %key, error = %error, "artist artwork could not be served");
+                return Err(ApiError::new(ErrorCode::Internal, "artwork unavailable"));
+            }
+        },
+        None => None,
+    };
+    match found {
+        Some((bytes, ctype)) => Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, ctype),
+                (axum::http::header::CACHE_CONTROL, "private, max-age=86400"),
+            ],
+            bytes,
+        )
+            .into_response()),
+        None => Ok((
+            StatusCode::NOT_FOUND,
+            [(
+                axum::http::header::CACHE_CONTROL,
+                if q.v.is_some() {
+                    "private, max-age=3600"
+                } else {
+                    "private, max-age=30"
+                },
+            )],
+            axum::Json(ApiErrorBody::new(ErrorCode::NotFound, "no artwork")),
+        )
+            .into_response()),
+    }
+}
+
 /// Fetch item artwork
 ///
 /// Serves the item's artwork, using the size query parameter or the original
@@ -4979,10 +5241,12 @@ async fn music_library(
     }
 }
 
-fn artist_group_sql(select: &str, descending: bool) -> String {
+fn artist_group_sql(descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     format!(
-        "SELECT {select} FROM (
+        "SELECT artists.key,artists.name,artists.album_count,
+                CASE WHEN aa.outcome='ready' THEN aa.updated_at END AS art_version
+           FROM (
            SELECT i.artist_key AS key,MIN(i.artist) AS name,COUNT(*) AS album_count
              FROM items i JOIN library_collections lc
                ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
@@ -4990,7 +5254,9 @@ fn artist_group_sql(select: &str, descending: bool) -> String {
               AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
               AND (?2='' OR i.norm_artist LIKE '%' || ?2 || '%')
             GROUP BY i.artist_key
-         ) artists ORDER BY name COLLATE NOCASE {direction},key {direction}"
+         ) artists
+           LEFT JOIN artist_artwork aa ON aa.artist_key=artists.key
+          ORDER BY name COLLATE NOCASE {direction},key {direction}"
     )
 }
 
@@ -5021,7 +5287,7 @@ async fn list_artists(
     let descending = q.sort.as_deref() == Some("-name");
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "{} LIMIT ?3 OFFSET ?4",
-        artist_group_sql("key,name,album_count", descending)
+        artist_group_sql(descending)
     )))
     .bind(&q.library)
     .bind(&needle)
@@ -5050,6 +5316,7 @@ async fn list_artists(
                 key: row.get("key"),
                 name: row.get("name"),
                 album_count: row.get("album_count"),
+                art_version: row.get("art_version"),
             })
             .collect(),
         total,
@@ -5097,10 +5364,12 @@ async fn artist_albums(
     let db = state.registry.db();
     music_library(db, &claims, &q.library).await?;
     let artist_row = sqlx::query(
-        "SELECT MIN(i.artist) AS name,COUNT(*) AS album_count
+        "SELECT MIN(i.artist) AS name,COUNT(*) AS album_count,
+                (SELECT updated_at FROM artist_artwork
+                  WHERE artist_key=?2 AND outcome='ready') AS art_version
            FROM items i JOIN library_collections lc
              ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
-          WHERE lc.library_id=? AND i.kind='album' AND i.artist_key=?
+          WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
          HAVING COUNT(*) > 0",
     )
     .bind(&q.library)
@@ -5113,6 +5382,7 @@ async fn artist_albums(
         key: key.clone(),
         name: artist_row.get("name"),
         album_count: artist_row.get("album_count"),
+        art_version: artist_row.get("art_version"),
     };
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
     let offset = q.offset.unwrap_or(0);
@@ -8026,6 +8296,7 @@ mod tests {
             ("get", "/api/v1/libraries"),
             ("get", "/api/v1/artists"),
             ("get", "/api/v1/artists/{key}/albums"),
+            ("get", "/api/v1/artists/{key}/artwork"),
             ("get", "/api/v1/items"),
             ("get", "/api/v1/up-next"),
             ("get", "/api/v1/items/{id}"),
@@ -8075,6 +8346,8 @@ mod tests {
             ("post", "/admin/v1/providers/tvdb"),
             ("post", "/admin/v1/providers/anidb"),
             ("post", "/admin/v1/providers/anidb/verify"),
+            ("post", "/admin/v1/providers/fanart"),
+            ("post", "/admin/v1/providers/theaudiodb"),
             ("delete", "/admin/v1/providers/{provider}/credentials"),
             ("get", "/admin/v1/enrich"),
             ("post", "/admin/v1/enrich"),

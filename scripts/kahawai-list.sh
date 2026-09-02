@@ -73,7 +73,8 @@ answer = json.load(sys.stdin)
 if mode == "artists":
     artists = answer["artists"]
     for artist in artists:
-        print("%s  %s  [%d albums]" % (artist["key"], artist["name"], artist["album_count"]))
+        art = "  [art]" if artist.get("art_version") is not None else ""
+        print("%s  %s  [%d albums]%s" % (artist["key"], artist["name"], artist["album_count"], art))
     print("-- %d/%d artists" % (len(artists), answer["total"]), file=sys.stderr)
     raise SystemExit
 items = answer["albums" if mode == "albums" else "items"]

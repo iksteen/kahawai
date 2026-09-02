@@ -601,6 +601,7 @@ async fn run_hub_inner(
         cfg.data_dir.join("artwork"),
         enricher.clone(),
     ));
+    enricher.attach_artwork(&artwork);
     // Protocol 4: the mediahost owns ordering and persistence of source facts.
     // This object remains the hub-side status/projection adapter; it no longer
     // runs the old hub-owned sweep.

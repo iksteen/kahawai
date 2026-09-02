@@ -41,6 +41,16 @@ pub struct Artwork {
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CacheWrite {
+    /// A viewer already has the original bytes. A failed cache write must not
+    /// turn a usable response into a 500.
+    BestEffort,
+    /// Background prefetch may advertise a portrait only after every public
+    /// derivative is actually durable.
+    Required,
+}
+
 /// The sizes a client may ask for, as `name → longest edge in pixels`.
 ///
 /// Add, rename or re-number freely: the next startup drops whatever no
@@ -61,6 +71,23 @@ pub const SIZES: &[(&str, u32)] = &[("thumb", 96), ("card1x", 320), ("card", 480
 /// invalidate anything.
 fn variant_dir(name: &str, px: u32) -> String {
     format!("size-{name}-{px}")
+}
+
+fn remote_cache_key(url: &str) -> String {
+    // Keep every existing provider poster at its historical key. Artist
+    // portraits are new and get an honest namespace from day one.
+    let host = reqwest::Url::parse(url)
+        .ok()
+        .and_then(|url| url.host_str().map(str::to_ascii_lowercase));
+    let prefix = match host.as_deref() {
+        Some(host) if host == "fanart.tv" || host.ends_with(".fanart.tv") => "fanart",
+        Some(host) if host == "theaudiodb.com" || host.ends_with(".theaudiodb.com") => "theaudiodb",
+        _ => "tmdb",
+    };
+    format!(
+        "{prefix}-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(url.as_bytes())
+    )
 }
 
 impl Artwork {
@@ -177,29 +204,99 @@ impl Artwork {
         let Some((bytes, ctype, key)) = self.original(registry, sessions, item_id).await? else {
             return Ok(None);
         };
+        self.at_from_original(bytes, ctype, key, size, CacheWrite::BestEffort)
+            .await
+            .map(Some)
+    }
+
+    async fn at_from_original(
+        &self,
+        bytes: Vec<u8>,
+        ctype: &'static str,
+        key: String,
+        size: Option<&str>,
+        cache_write: CacheWrite,
+    ) -> Result<(Vec<u8>, &'static str)> {
         let Some(name) = size else {
-            return Ok(Some((bytes, ctype)));
+            return Ok((bytes, ctype));
         };
         let Some((_, px)) = SIZES.iter().find(|(n, _)| *n == name) else {
             tracing::debug!(size = %name, "unknown artwork size; serving the original");
-            return Ok(Some((bytes, ctype)));
+            return Ok((bytes, ctype));
         };
-
         let dir = self.dir.join(variant_dir(name, *px));
         let path = dir.join(&key);
         if let Ok(small) = std::fs::read(&path) {
-            return Ok(Some((small, "image/jpeg")));
+            return Ok((small, "image/jpeg"));
         }
         // Decoding and re-encoding is CPU work on a runtime thread that
         // is otherwise serving requests, so it goes to the blocking pool.
         let px = *px;
         let small = tokio::task::spawn_blocking(move || resize_to(&bytes, px)).await??;
-        std::fs::create_dir_all(&dir)?;
-        // Written next to the read above, not atomically: two requests
-        // racing write identical bytes, and a torn file is re-made on the
-        // next miss.
-        let _ = Self::write_atomic(&path, &small);
-        Ok(Some((small, "image/jpeg")))
+        let persisted =
+            std::fs::create_dir_all(&dir).and_then(|()| Self::write_atomic(&path, &small));
+        if let Err(error) = persisted {
+            if cache_write == CacheWrite::Required {
+                return Err(error.into());
+            }
+            tracing::warn!(path = %path.display(), error = %error,
+                "resized artwork served but could not be cached");
+        }
+        Ok((small, "image/jpeg"))
+    }
+
+    /// Serve an Album Artist portrait strictly from the cache populated by
+    /// enrichment. Browsing must never turn into provider traffic.
+    pub(crate) async fn get_cached_remote_at(
+        &self,
+        url: &str,
+        size: Option<&str>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let key = remote_cache_key(url);
+        let path = size
+            .and_then(|name| {
+                SIZES
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(name, px)| self.dir.join(variant_dir(name, *px)).join(&key))
+            })
+            .unwrap_or_else(|| self.dir.join(&key));
+        Ok(std::fs::read(path).ok().map(|bytes| (bytes, "image/jpeg")))
+    }
+
+    /// Whether the durable promise behind a ready artist row still holds.
+    /// Atomic writes guarantee that a file created by this process is whole;
+    /// non-empty existence catches deletion, incomplete restores and manual
+    /// damage without decoding every portrait on every enrichment pass.
+    pub(crate) fn remote_cache_complete(&self, url: &str) -> bool {
+        let key = remote_cache_key(url);
+        let present = |path: &std::path::Path| {
+            std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        };
+        present(&self.dir.join(&key))
+            && SIZES
+                .iter()
+                .all(|(name, px)| present(&self.dir.join(variant_dir(name, *px)).join(&key)))
+    }
+
+    /// Fetch an artist portrait and materialise every public size before its
+    /// database row is made visible. An overview request is consequently a
+    /// local cache read, including on its first visit.
+    pub(crate) async fn prefetch_remote(&self, url: &str) -> Result<bool> {
+        let Some((bytes, ctype, key)) = self.remote_poster(url).await? else {
+            return Ok(false);
+        };
+        for (name, _) in SIZES {
+            self.at_from_original(
+                bytes.clone(),
+                ctype,
+                key.clone(),
+                Some(name),
+                CacheWrite::Required,
+            )
+            .await?;
+        }
+        Ok(true)
     }
 
     /// Image bytes + content type for the poster the provider chain
@@ -322,10 +419,7 @@ impl Artwork {
 
     /// A poster held by the provider itself, cached like local artwork.
     async fn remote_poster(&self, poster: &str) -> Result<Option<(Vec<u8>, &'static str, String)>> {
-        let cache_key = format!(
-            "tmdb-{:016x}",
-            xxhash_rust::xxh3::xxh3_64(poster.as_bytes())
-        );
+        let cache_key = remote_cache_key(poster);
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
@@ -463,5 +557,116 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
         if got < CHUNK {
             return Ok(out);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn artist_provider_caches_have_distinct_namespaces() {
+        assert!(remote_cache_key("https://assets.fanart.tv/a.jpg").starts_with("fanart-"));
+        assert!(remote_cache_key("https://r2.theaudiodb.com/a.jpg").starts_with("theaudiodb-"));
+    }
+
+    #[tokio::test]
+    async fn artist_portraits_are_served_only_from_prefetched_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enricher = Arc::new(crate::enrich::Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Artwork::new(tmp.path().to_path_buf(), enricher);
+        let url = "https://assets.fanart.tv/fanart/music/artist/portrait.jpg";
+        let key = remote_cache_key(url);
+
+        assert!(!artwork.remote_cache_complete(url));
+        assert!(
+            artwork
+                .get_cached_remote_at(url, Some("card"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+
+        let (name, px) = SIZES.iter().find(|(name, _)| *name == "card").unwrap();
+        let path = tmp.path().join(variant_dir(name, *px)).join(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, b"prefetched").unwrap();
+        assert!(
+            !artwork.remote_cache_complete(url),
+            "one derivative must not satisfy the durable portrait promise"
+        );
+
+        let (bytes, content_type) = artwork
+            .get_cached_remote_at(url, Some("card"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(bytes, b"prefetched");
+        assert_eq!(content_type, "image/jpeg");
+    }
+
+    #[test]
+    fn a_ready_portrait_requires_its_original_and_every_named_size() {
+        let tmp = tempfile::tempdir().unwrap();
+        let enricher = Arc::new(crate::enrich::Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Artwork::new(tmp.path().to_path_buf(), enricher);
+        let url = "https://assets.fanart.tv/fanart/music/artist/complete.jpg";
+        let key = remote_cache_key(url);
+        std::fs::write(tmp.path().join(&key), b"original").unwrap();
+        for (name, px) in SIZES {
+            let path = tmp.path().join(variant_dir(name, *px)).join(&key);
+            std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+            std::fs::write(path, b"derivative").unwrap();
+        }
+        assert!(artwork.remote_cache_complete(url));
+
+        std::fs::write(
+            tmp.path()
+                .join(variant_dir(SIZES[0].0, SIZES[0].1))
+                .join(&key),
+            [],
+        )
+        .unwrap();
+        assert!(!artwork.remote_cache_complete(url));
+    }
+
+    #[tokio::test]
+    async fn viewer_resize_survives_a_derivative_cache_write_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocked = tmp.path().join("cache-is-a-file");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+        let enricher = Arc::new(crate::enrich::Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Artwork::new(blocked, enricher);
+        let mut original = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::new_rgb8(2, 2)
+            .write_to(&mut original, image::ImageFormat::Png)
+            .unwrap();
+
+        let served = artwork
+            .at_from_original(
+                original.get_ref().clone(),
+                "image/png",
+                "key".into(),
+                Some("thumb"),
+                CacheWrite::BestEffort,
+            )
+            .await
+            .expect("a cache failure must not break viewer artwork");
+        assert_eq!(served.1, "image/jpeg");
+        assert!(!served.0.is_empty());
+
+        assert!(
+            artwork
+                .at_from_original(
+                    original.into_inner(),
+                    "image/png",
+                    "key".into(),
+                    Some("thumb"),
+                    CacheWrite::Required,
+                )
+                .await
+                .is_err(),
+            "prefetch must not publish a portrait whose derivative was not cached"
+        );
     }
 }

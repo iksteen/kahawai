@@ -12,6 +12,7 @@ import { useQuery } from '@tanstack/vue-query'
 
 import Btn from '../components/Btn.vue'
 import Card from '../components/Card.vue'
+import ArtistCard from '../components/ArtistCard.vue'
 import MatchDialog from '../components/MatchDialog.vue'
 import PagedGrid from '../components/PagedGrid.vue'
 import {
@@ -335,31 +336,22 @@ function retryPage() {
       }}
     </p>
 
-    <section v-if="music && (artists.total.value ?? 0) > 0">
+    <section v-if="music && (artists.total.value ?? 0) > 0" class="artist-grid">
       <h2 v-if="query" class="mb-3 text-[17px] font-[650]">Artists</h2>
-      <PagedGrid :total="artists.total.value" min-width="210px" @need="artists.need">
+      <PagedGrid :total="artists.total.value" min-width="150px" @need="artists.need">
         <template #default="{ at }">
-          <button
-            v-if="artists.loaded.value.get(at)"
-            type="button"
-            class="artist-tile w-full cursor-pointer rounded-lg border border-line bg-surface p-4 text-left hover:border-teal focus-visible:border-teal"
-            @click="openArtist(artists.loaded.value.get(at)!.key)"
-          >
-            <strong class="block truncate text-[15px]">
-              {{ artists.loaded.value.get(at)!.name }}
-            </strong>
-            <span class="mt-1 block font-mono text-[12px] text-dim">
-              {{ artists.loaded.value.get(at)!.album_count }}
-              {{ artists.loaded.value.get(at)!.album_count === 1 ? 'album' : 'albums' }}
-            </span>
-          </button>
-          <div
-            v-else
-            class="artist-tile w-full animate-pulse rounded-lg border border-line bg-surface"
-            aria-hidden="true"
+          <ArtistCard
+            :artist="artists.loaded.value.get(at)"
+            :library="library"
+            @open="(artist) => openArtist(artist.key)"
           />
         </template>
       </PagedGrid>
+      <p class="mt-4 text-[12px] text-dim">
+        Artist images from
+        <a class="text-teal hover:underline" href="https://fanart.tv/" rel="noreferrer">fanart.tv</a
+        >.
+      </p>
     </section>
 
     <h2 v-if="music && query && total !== 0" class="mt-7 mb-3 text-[17px] font-[650]">
@@ -419,7 +411,7 @@ function retryPage() {
   grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 140px), 1fr));
 }
 
-.artist-tile {
-  min-height: 76px;
+.artist-grid {
+  --card-ratio: 1;
 }
 </style>

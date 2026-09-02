@@ -208,6 +208,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             "tmdb": { "configured": false },
             "tvdb": { "configured": false },
             "anidb": { "configured": false },
+            "fanart": { "configured": false },
+            "theaudiodb": { "premium_key_configured": false },
             "chains": {
                 "movies": {
                     "order": ["tmdb", "tvdb"],
@@ -249,6 +251,29 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         "a username without a password is not a usable AniDB account"
     );
 
+    assert_eq!(
+        api.clone()
+            .oneshot(
+                Request::post("/admin/v1/providers/theaudiodb")
+                    .header("authorization", &admin_bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"api_key":"premium-key"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
+    let premium = body_json(
+        api.clone()
+            .oneshot(get("/admin/v1/providers", &admin_bearer))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(premium["theaudiodb"]["premium_key_configured"], true);
+
     // Disconnecting takes one provider's credentials and leaves the rest.
     // Stored through the store rather than the save routes because those
     // start an enrichment run that would reach for the network.
@@ -281,6 +306,14 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             .status(),
         StatusCode::OK
     );
+    assert_eq!(
+        api.clone()
+            .oneshot(disconnect("theaudiodb"))
+            .await
+            .unwrap()
+            .status(),
+        StatusCode::OK
+    );
     // A name the hub has no provider for is a 400, not a silent no-op that
     // answers ok.
     assert_eq!(
@@ -300,6 +333,10 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     .await;
     assert_eq!(v["tmdb"]["configured"], false, "disconnected");
     assert_eq!(v["tvdb"]["configured"], true, "not the one asked for");
+    assert_eq!(
+        v["theaudiodb"]["premium_key_configured"], false,
+        "the public key is not reported as a stored premium key"
+    );
 
     // What a deleted credential minted goes with it. AniDB's session survives
     // restarts and says nothing about whose it is, so left behind it would

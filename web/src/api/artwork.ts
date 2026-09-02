@@ -4,7 +4,7 @@
 /// generated bindings; the decisions ABOUT artwork — whose poster an episode
 /// shows, and which version pins it — are in the components that read them.
 
-import { getItemArtworkUrl } from './generated/kahawai.ts'
+import { getArtistArtworkUrl, getItemArtworkUrl } from './generated/kahawai.ts'
 
 export type ArtSize = 'thumb' | 'card1x' | 'card'
 
@@ -25,4 +25,21 @@ export function artworkUrl(id: string, version?: number | null, size?: ArtSize):
 /// one is unaffected.
 export function artworkSrcSet(id: string, version?: number | null): string {
   return `${artworkUrl(id, version, 'card1x')} 1x, ${artworkUrl(id, version, 'card')} 2x`
+}
+
+export function artistArtworkUrl(
+  key: string,
+  library: string,
+  version?: number | null,
+  size?: ArtSize,
+): string {
+  return getArtistArtworkUrl(key, {
+    library,
+    ...(size ? { size } : {}),
+    ...(version ? { v: String(version) } : {}),
+  })
+}
+
+export function artistArtworkSrcSet(key: string, library: string, version?: number | null): string {
+  return `${artistArtworkUrl(key, library, version, 'card1x')} 1x, ${artistArtworkUrl(key, library, version, 'card')} 2x`
 }

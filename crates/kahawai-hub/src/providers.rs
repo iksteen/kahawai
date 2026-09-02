@@ -865,8 +865,9 @@ pub async fn store_answer(
 const STORE_ANSWER: &str = "\
 INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
-            premiered, original_language, genres, cast_json, confidence, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()
+            premiered, original_language, genres, cast_json, provider_artist_id,
+            confidence, updated_at)
+         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()
           WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            provider_id = excluded.provider_id,
@@ -877,6 +878,7 @@ INSERT INTO provider_metadata
            premiered = excluded.premiered,
            original_language = excluded.original_language,
            genres = excluded.genres,
+           provider_artist_id = excluded.provider_artist_id,
            -- Cast arrives later than the match (one details request fills
            -- language, genres and cast at once), so a plain overwrite would
            -- erase it every time this row is re-answered. Keep it only
@@ -889,7 +891,7 @@ INSERT INTO provider_metadata
            confidence = excluded.confidence,
            updated_at = excluded.updated_at";
 
-/// The twelve binds [`STORE_ANSWER`] wants, in its order.
+/// The thirteen binds [`STORE_ANSWER`] wants, in its order.
 fn bind_answer<'a>(
     q: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     item_id: &'a str,
@@ -909,6 +911,7 @@ fn bind_answer<'a>(
         .bind(&fields.original_language)
         .bind(&fields.genres)
         .bind(&fields.cast_json)
+        .bind(&fields.provider_artist_id)
         .bind(confidence)
         .bind(item_id)
 }
@@ -1047,6 +1050,10 @@ pub struct Fields {
     pub genres: Option<String>,
     /// JSON array of {name, character}, billing order, as stored.
     pub cast_json: Option<String>,
+    /// This provider's identity for the credited Album Artist. Only music
+    /// answers currently supply it; keeping it beside the release-group
+    /// answer preserves the evidence needed to reject conflicting artists.
+    pub provider_artist_id: Option<String>,
 }
 
 /// Providers instantiated for one enrichment run (credentials resolved,

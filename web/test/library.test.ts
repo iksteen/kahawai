@@ -27,6 +27,10 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminApplyMatch: vi.fn(),
   adminReviewSearch: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
+  getArtistArtworkUrl: (key: string, params: { library: string; size?: string; v?: string }) =>
+    `/api/v1/artists/${key}/artwork?${new URLSearchParams(
+      Object.entries(params).filter((entry): entry is [string, string] => entry[1] !== undefined),
+    )}`,
 }))
 const admin = { value: false }
 vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
@@ -163,8 +167,8 @@ beforeEach(() => {
   })
   vi.mocked(listArtists).mockResolvedValue({
     artists: [
-      { key: 'bjork', name: 'Björk', album_count: 12 },
-      { key: 'various artists', name: 'Various Artists', album_count: 4 },
+      { key: 'bjork', name: 'Björk', album_count: 12, art_version: 77 },
+      { key: 'various artists', name: 'Various Artists', album_count: 4, art_version: null },
     ],
     total: 2,
     limit: 100,
@@ -214,7 +218,7 @@ describe('opening a library', () => {
 
   test('does not turn artist API paging into a load-more interaction', async () => {
     vi.mocked(listArtists).mockResolvedValue({
-      artists: [{ key: 'bjork', name: 'Björk', album_count: 12 }],
+      artists: [{ key: 'bjork', name: 'Björk', album_count: 12, art_version: null }],
       total: 101,
       limit: 100,
       offset: 0,
@@ -439,8 +443,15 @@ describe('once the page has been measured', () => {
     await flushPromises()
     expect(wrapper.text()).toContain('Björk')
     expect(wrapper.text()).toContain('12 albums')
+    const portrait = wrapper.find('.artist-grid img')
+    expect(wrapper.findAll('.artist-grid img')).toHaveLength(1)
+    expect(portrait.attributes('src')).toContain(
+      '/api/v1/artists/bjork/artwork?library=music&size=card&v=77',
+    )
+    expect(portrait.attributes('srcset')).toContain('size=card1x')
+    expect(portrait.attributes('srcset')).toContain('size=card')
     expect(listItems).not.toHaveBeenCalled()
-    await wrapper.findAll('.artist-tile')[0]!.trigger('click')
+    await wrapper.findAll('.artist-grid button')[0]!.trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.name).toBe('artist')
     expect(router.currentRoute.value.params.artist).toBe('bjork')

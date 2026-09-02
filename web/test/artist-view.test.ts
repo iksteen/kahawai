@@ -55,7 +55,12 @@ async function page() {
 
 beforeEach(() => {
   vi.mocked(artistAlbums).mockResolvedValue({
-    artist: { key: 'various artists', name: 'Various Artists', album_count: 2 },
+    artist: {
+      key: 'various artists',
+      name: 'Various Artists',
+      album_count: 2,
+      art_version: null,
+    },
     albums: [album('old', 'Old Record', 1971), album('new', 'New Record', 2024)],
     total: 2,
     limit: 100,
@@ -96,7 +101,12 @@ describe('an Album Artist', () => {
 
   test('does not turn API paging into a load-more interaction', async () => {
     vi.mocked(artistAlbums).mockResolvedValueOnce({
-      artist: { key: 'various artists', name: 'Various Artists', album_count: 101 },
+      artist: {
+        key: 'various artists',
+        name: 'Various Artists',
+        album_count: 101,
+        art_version: null,
+      },
       albums: [album('old', 'Old Record', 1971), album('new', 'New Record', 2024)],
       total: 101,
       limit: 100,

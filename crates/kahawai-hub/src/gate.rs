@@ -21,7 +21,7 @@ use std::future::Future;
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use tokio::sync::{Mutex, watch};
 use tokio::time::Instant;
 
@@ -39,6 +39,11 @@ const DEFAULT_PENALTY: Duration = Duration::from_secs(60);
 /// Never park a provider longer than this, whatever it asks for.
 const MAX_PENALTY: Duration = Duration::from_secs(3600);
 
+/// TheAudioDB documents 100 requests/minute for premium users. Leave a small
+/// margin rather than scheduling exactly on the boundary.
+/// Source: https://www.theaudiodb.com/free_music_api (read 2026-09-03).
+pub(crate) const THEAUDIODB_PREMIUM_SPACING: Duration = Duration::from_millis(650);
+
 #[derive(Clone)]
 pub(crate) struct CredentialLease {
     provider: &'static str,
@@ -49,6 +54,26 @@ pub(crate) struct CredentialLease {
 #[derive(Debug, thiserror::Error)]
 #[error("{0} credentials changed")]
 pub(crate) struct CredentialsChanged(&'static str);
+
+/// A provider response that makes further requests temporarily pointless.
+/// This deliberately does not call every 503 a client rate limit: MusicBrainz
+/// uses the same status for its per-client and global-capacity gates. Batch
+/// callers use the type to stop rather than waiting out the same park once per
+/// remaining item.
+#[derive(Debug, thiserror::Error)]
+#[error("{host} asked us to back off ({status}, {reason}); quiet for {secs}s")]
+pub(crate) struct ProviderBackoff {
+    host: String,
+    status: reqwest::StatusCode,
+    reason: &'static str,
+    secs: u64,
+}
+
+impl ProviderBackoff {
+    pub(crate) fn retry_after(&self) -> Duration {
+        Duration::from_secs(self.secs)
+    }
+}
 
 impl CredentialLease {
     pub(crate) fn new(provider: &'static str, mut current: watch::Receiver<u64>) -> Self {
@@ -85,8 +110,12 @@ impl CredentialLease {
 /// next person needs to know what to re-check.
 fn spacing(host: &str) -> Duration {
     let ms = match host {
-        // MusicBrainz: "on average 1 request per second" per source
-        // IP, enforced by rejecting everything above it with 503.
+        // MusicBrainz: "never make more than ONE call per second" per client.
+        // Its detailed rules put the current source-IP bucket at an average
+        // one request/second; the separately reported 50/second bucket applies
+        // only to listed User-Agents, and the global ceiling is 300/second.
+        // Source: https://musicbrainz.org/doc/MusicBrainz_API/Rate_Limiting
+        // (read 2026-09-03).
         // Cover Art Archive is the same project, same courtesy.
         "musicbrainz.org" | "coverartarchive.org" => 1100,
         // AniList: nominally 90/min, but the API has been in a
@@ -105,8 +134,21 @@ fn spacing(host: &str) -> Duration {
         "api.themoviedb.org" => 60,
         // TheTVDB publishes no number; be polite and heed the 429.
         "api4.thetvdb.com" => 200,
+        // Fanart.tv publishes no fixed interval: "Most keys have unlimited
+        // access"; configured limits return 429 with Retry-After. Keep the
+        // conservative unknown-provider pace as well as honouring that park.
+        // Source: https://api.fanart.tv/ (API v3.2, read 2026-09-03).
+        "webservice.fanart.tv" | "assets.fanart.tv" => 500,
+        // TheAudioDB's free tier is 30 requests/minute. Calls with a premium
+        // user key override this below with its documented 100/minute pace.
+        // Source: https://www.theaudiodb.com/free_music_api
+        // (read 2026-09-03).
+        "www.theaudiodb.com" => 2100,
         // Plain CDNs and static dumps: no per-client limit.
-        "image.tmdb.org" | "artworks.thetvdb.com" | "raw.githubusercontent.com" => 0,
+        "image.tmdb.org"
+        | "artworks.thetvdb.com"
+        | "raw.githubusercontent.com"
+        | "r2.theaudiodb.com" => 0,
         // An unpaced host is a provider nobody has read the terms of.
         _ => 500,
     };
@@ -124,17 +166,29 @@ fn queues() -> &'static Mutex<HashMap<String, Arc<Mutex<Instant>>>> {
 /// way out.
 pub struct Http {
     client: reqwest::Client,
+    no_redirect_client: reqwest::Client,
 }
 
 impl Http {
     pub fn new() -> Result<Self> {
         Ok(Self {
             client: reqwest::Client::builder().user_agent(UA).build()?,
+            no_redirect_client: reqwest::Client::builder()
+                .user_agent(UA)
+                .redirect(reqwest::redirect::Policy::none())
+                .build()?,
         })
     }
 
     pub fn get(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
         self.client.get(url)
+    }
+
+    /// Build a request whose origin validation cannot be bypassed by a
+    /// redirect. The builder carries its client through `build_split`, so it
+    /// still uses the same pacing and Retry-After handling in `send_inner`.
+    pub(crate) fn get_no_redirect(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
+        self.no_redirect_client.get(url)
     }
 
     pub fn post(&self, url: impl reqwest::IntoUrl) -> reqwest::RequestBuilder {
@@ -154,7 +208,7 @@ impl Http {
     /// next run — and silence for that provider until it says it will
     /// listen again.
     pub async fn send(&self, req: reqwest::RequestBuilder) -> Result<reqwest::Response> {
-        self.send_inner(req, None).await
+        self.send_inner(req, None, None).await
     }
 
     /// The same queue, but abandon a credentialed request if its lease changes
@@ -165,13 +219,25 @@ impl Http {
         req: reqwest::RequestBuilder,
         lease: CredentialLease,
     ) -> Result<reqwest::Response> {
-        self.send_inner(req, Some(lease)).await
+        self.send_inner(req, Some(lease), None).await
+    }
+
+    /// A credential tier may carry a provider-documented rate distinct from
+    /// the host default. It still shares the same host queue and backoff.
+    pub(crate) async fn send_current_at_spacing(
+        &self,
+        req: reqwest::RequestBuilder,
+        lease: CredentialLease,
+        spacing: Duration,
+    ) -> Result<reqwest::Response> {
+        self.send_inner(req, Some(lease), Some(spacing)).await
     }
 
     async fn send_inner(
         &self,
         req: reqwest::RequestBuilder,
         lease: Option<CredentialLease>,
+        spacing_override: Option<Duration>,
     ) -> Result<reqwest::Response> {
         let (client, req) = req.build_split();
         let req = req.context("building provider request")?;
@@ -204,7 +270,7 @@ impl Http {
             None => tokio::time::sleep_until(*next).await,
         }
         let resp = client.execute(req).await;
-        *next = Instant::now() + spacing(&host);
+        *next = Instant::now() + spacing_override.unwrap_or_else(|| spacing(&host));
         // A timeout or refused connection carries the URL it was reaching for,
         // and `providers::reschedule` writes that message into the database.
         // If the request's credentials changed during execution, cancellation
@@ -228,16 +294,30 @@ impl Http {
                 .unwrap_or(DEFAULT_PENALTY)
                 .min(MAX_PENALTY);
             *next = Instant::now() + penalty;
-            tracing::warn!(host, status = %resp.status(), secs = penalty.as_secs(),
-                "provider rate-limited us; going quiet");
-            bail!(
-                "{host} rate-limited us ({}); quiet for {}s",
-                resp.status(),
-                penalty.as_secs()
-            );
+            let zone = response_header(&resp, "x-ratelimit-zone");
+            let who = response_header(&resp, "x-ratelimit-who");
+            let reason = match resp.status().as_u16() {
+                429 => "rate limit",
+                503 if zone == Some("global") || who == Some("global") => "global capacity",
+                503 => "service unavailable",
+                _ => unreachable!(),
+            };
+            tracing::warn!(host, status = %resp.status(), reason, zone, who,
+                secs = penalty.as_secs(), "provider asked us to back off; going quiet");
+            return Err(ProviderBackoff {
+                host,
+                status: resp.status(),
+                reason,
+                secs: penalty.as_secs(),
+            }
+            .into());
         }
         Ok(resp)
     }
+}
+
+fn response_header<'a>(resp: &'a reqwest::Response, name: &str) -> Option<&'a str> {
+    resp.headers().get(name)?.to_str().ok()
 }
 
 /// `Retry-After` in seconds. The HTTP-date form falls back to the
@@ -256,6 +336,12 @@ fn retry_after(resp: &reqwest::Response) -> Option<Duration> {
 mod tests {
     use super::*;
     use tokio::io::AsyncWriteExt;
+
+    #[test]
+    fn theaudiodb_tiers_use_their_documented_rates_with_margin() {
+        assert_eq!(spacing("www.theaudiodb.com"), Duration::from_millis(2100));
+        assert_eq!(THEAUDIODB_PREMIUM_SPACING, Duration::from_millis(650));
+    }
 
     /// Answers every connection with one canned response. `ip` picks
     /// the loopback address, and so the queue this server lands in:
@@ -301,6 +387,18 @@ mod tests {
         let e = http.send(http.get(&url)).await.unwrap_err();
         let shown = format!("{e:#}");
         assert!(!shown.contains("SECRET-OPERATOR-KEY"), "{shown}");
+    }
+
+    #[tokio::test]
+    async fn a_no_redirect_request_never_follows_the_location() {
+        let url = server(
+            "127.0.0.8",
+            "HTTP/1.1 302 Found\r\nLocation: http://127.0.0.1:1/internal\r\nContent-Length: 0\r\n\r\n",
+        )
+        .await;
+        let http = Http::new().unwrap();
+        let response = http.send(http.get_no_redirect(url)).await.unwrap();
+        assert_eq!(response.status(), reqwest::StatusCode::FOUND);
     }
 
     #[tokio::test]
@@ -434,7 +532,8 @@ mod tests {
             "HTTP/1.1 429 Too Many Requests\r\nRetry-After: 90\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
-        assert!(http.send(http.get(&busy)).await.is_err());
+        let error = http.send(http.get(&busy)).await.unwrap_err();
+        assert!(error.is::<ProviderBackoff>(), "{error:#}");
         assert!(
             parked_for(&busy).await > Duration::from_secs(80),
             "Retry-After ignored"
@@ -446,10 +545,13 @@ mod tests {
         // penalty, not park for nothing and eat the next 503 too.
         let shrug = server(
             "127.0.0.3",
-            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nContent-Length: 0\r\n\r\n",
+            "HTTP/1.1 503 Service Unavailable\r\nRetry-After: 0\r\nX-RateLimit-Zone: global\r\nX-RateLimit-Who: global\r\nContent-Length: 0\r\n\r\n",
         )
         .await;
-        assert!(http.send(http.get(&shrug)).await.is_err());
+        let error = http.send(http.get(&shrug)).await.unwrap_err();
+        assert!(error.is::<ProviderBackoff>(), "{error:#}");
+        assert!(error.to_string().contains("global capacity"), "{error:#}");
+        assert!(!error.to_string().contains("rate-limited us"), "{error:#}");
         assert!(
             parked_for(&shrug).await > Duration::from_secs(30),
             "zero Retry-After must still park"
