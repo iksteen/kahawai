@@ -128,9 +128,12 @@ async fn public_ready(state: &Supervisor) -> bool {
 }
 
 fn benchmarks_settled(root: &Path) -> bool {
-    let cache = root.join("hub/benchmarks.json");
-    kahawai_media::bench::load(&cache)
-        .is_some_and(|measured| kahawai_media::bench::benchmark_jobs(Some(&measured)).is_empty())
+    // Availability and completion are different facts. A valid calibration
+    // can leave a capability unavailable (for example, hosted runners without
+    // a working GL tone-map path), in which case benchmark_jobs() correctly
+    // offers it again next boot. The fixture waits for the supervisor's exact
+    // completion signal instead of mistaking that retry policy for activity.
+    root.join("hub/benchmarks.complete").is_file()
 }
 
 async fn ready(State(state): State<Arc<Supervisor>>) -> impl IntoResponse {
@@ -261,7 +264,8 @@ async fn serve(args: ChildArgs) -> Result<()> {
         },
     ];
     cfg.all_in_one.transcoder = true;
-    kahawai::run_all_in_one(cfg, None, Some(args.web_dir)).await
+    let marker = args.root.join("hub/benchmarks.complete");
+    kahawai::run_all_in_one_with_benchmark_marker(cfg, None, Some(args.web_dir), marker).await
 }
 
 fn child_args(mut args: impl Iterator<Item = std::ffi::OsString>) -> Result<ChildArgs> {

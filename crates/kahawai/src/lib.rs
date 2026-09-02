@@ -265,7 +265,7 @@ pub async fn run_hub(
     config_path: Option<PathBuf>,
     web_dir: Option<PathBuf>,
 ) -> Result<()> {
-    run_hub_inner(cfg, None, false, config_path, web_dir).await
+    run_hub_inner(cfg, None, false, config_path, web_dir, None).await
 }
 
 /// AR-5 all-in-one: the hub plus an IN-PROCESS mediahost — module logic
@@ -286,6 +286,33 @@ pub async fn run_all_in_one(
         cfg.all_in_one.transcoder,
         config_path,
         web_dir,
+        None,
+    )
+    .await
+}
+
+/// Run the all-in-one while exposing completion of its one-time local
+/// capability calibration to an external test supervisor.
+///
+/// The marker is deliberately absent from the normal entry point. The product
+/// browser fixture owns a disposable data directory and restarts the child
+/// process inside one test journey; once calibration has completed for that
+/// directory, subsequent fixture restarts reuse the measured cache without
+/// scheduling the unavailable pieces again underneath playback.
+#[doc(hidden)]
+pub async fn run_all_in_one_with_benchmark_marker(
+    cfg: config::Config,
+    config_path: Option<PathBuf>,
+    web_dir: Option<PathBuf>,
+    benchmark_marker: PathBuf,
+) -> Result<()> {
+    run_hub_inner(
+        cfg.hub,
+        Some(cfg.mediahost),
+        cfg.all_in_one.transcoder,
+        config_path,
+        web_dir,
+        Some(benchmark_marker),
     )
     .await
 }
@@ -293,12 +320,23 @@ pub async fn run_all_in_one(
 /// HUB-36: measure this box's missing capabilities in the background and hand
 /// results to the registry, so all-in-one competes on the same measured footing
 /// as the fleet. The GStreamer-fingerprinted cache never re-runs successes.
-fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Registry>) {
+fn spawn_local_benchmark(
+    cache: PathBuf,
+    registry: Arc<kahawai_hub::registry::Registry>,
+    completion_marker: Option<PathBuf>,
+) {
     const SETTLE: Duration = Duration::from_secs(60);
     const BENCH_BUDGET: Duration = Duration::from_secs(300);
     let cached = kahawai_media::bench::load(&cache);
     if let Some(cached) = cached.as_ref() {
         registry.set_local_bench(cached.clone());
+    }
+    // A marker belongs only to the disposable product fixture. It means this
+    // exact temp directory already completed one calibration pass, including
+    // legitimate "unavailable" results that benchmark_jobs() would otherwise
+    // retry on every crash-style restart in the same browser journey.
+    if completion_marker.as_ref().is_some_and(|path| path.exists()) {
+        return;
     }
     tokio::spawn(async move {
         tokio::time::sleep(SETTLE).await;
@@ -345,6 +383,15 @@ fn spawn_local_benchmark(cache: PathBuf, registry: Arc<kahawai_hub::registry::Re
             }
             None => tracing::warn!("local benchmark child wrote no usable cache"),
         }
+        if let Some(marker) = completion_marker
+            && let Err(error) = std::fs::write(&marker, b"complete\n")
+        {
+            tracing::warn!(
+                path = %marker.display(),
+                %error,
+                "writing local benchmark completion marker failed"
+            );
+        }
     });
 }
 
@@ -356,6 +403,9 @@ async fn run_hub_inner(
     config_path: Option<PathBuf>,
     // `--web-dir`: serve /app/ from disk rather than the embedded bundle.
     web_dir: Option<PathBuf>,
+    // Product-fixture-only IPC. Normal processes persist capabilities in the
+    // benchmark cache and never create or consult a completion marker.
+    benchmark_marker: Option<PathBuf>,
 ) -> Result<()> {
     config::validate_hub_binds(&cfg)?;
     // Beside the bind check, and for the same reason: a flag that is wrong is
@@ -416,7 +466,11 @@ async fn run_hub_inner(
         // HUB-36: AIO's full local transcoder competes on the same measured
         // footing as satellites. Plain hub never enters this branch: its
         // local worker stops at remux and audio-only transcode.
-        spawn_local_benchmark(cfg.data_dir.join("benchmarks.json"), registry.clone());
+        spawn_local_benchmark(
+            cfg.data_dir.join("benchmarks.json"),
+            registry.clone(),
+            benchmark_marker,
+        );
     } else {
         tracing::info!("local video transcoder disabled; hub retains remux and audio transcode");
     }
