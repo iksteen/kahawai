@@ -86,7 +86,7 @@ async function openFixture(title: string, target = page) {
 }
 
 async function startPlayback(expected: 'DIRECT' | 'REMUX' | 'TRANSCODE', target = page) {
-  await target.getByRole('button', { name: /^▶ Play$/ }).click()
+  await target.getByRole('button', { name: /^▶ (?:Play|Resume)$/ }).click()
   const video = target.locator('video')
   // The first HLS session after a crash-style hub restart also starts the
   // supervised GStreamer worker; CI machines can spend well beyond the normal
@@ -304,6 +304,11 @@ test.describe.serial('real all-in-one product flows', () => {
     })
     await expect.poll(() => brightPixels(page, canvas)).toBeGreaterThan(0)
     await accessible('player')
+    // Tear the worker and its streaming fetch down while this test still owns
+    // the page. WebKit otherwise reports the fetch aborted by the next test's
+    // navigation as a late page error in that unrelated test.
+    await subtitles.selectOption('')
+    await expect(canvas).toBeHidden()
   })
 
   test('settings and all primary screens pass the automated accessibility gate', async () => {
@@ -317,10 +322,15 @@ test.describe.serial('real all-in-one product flows', () => {
     const native = await context.newPage()
     watch(native)
     await native.addInitScript(() => {
-      Object.defineProperty(globalThis, 'MediaSource', {
-        configurable: true,
-        value: undefined,
-      })
+      // hls.js can use all three names. Current Safari exposes
+      // ManagedMediaSource as well as MediaSource, so masking only the latter
+      // still exercises its blob/MSE path instead of native HLS.
+      for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
+        Object.defineProperty(globalThis, name, {
+          configurable: true,
+          value: undefined,
+        })
+      }
     })
     await openFixture('Remux Fixture', native)
     const video = await startPlayback('REMUX', native)

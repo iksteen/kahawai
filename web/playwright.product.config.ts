@@ -41,6 +41,10 @@ export default defineConfig({
   webServer: {
     command: 'cargo run --quiet --locked -p kahawai --example product_browser_fixture',
     cwd: '..',
+    // Product failures are usually a refusal inside the supervised Rust/media
+    // worker. Playwright pipes stderr by default but discards stdout, which is
+    // where tracing-subscriber writes the refusal chain and session id.
+    stdout: 'pipe',
     env: {
       KAHAWAI_E2E_PUBLIC: PUBLIC_ADDRESS,
       KAHAWAI_E2E_SETUP: SETUP_ADDRESS,
