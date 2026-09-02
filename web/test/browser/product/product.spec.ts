@@ -15,6 +15,18 @@ function watch(target: Page) {
   target.on('pageerror', (error) => pageErrors.push(error.message))
 }
 
+function disableMediaSource() {
+  // hls.js can use all three names. Current Safari exposes
+  // ManagedMediaSource as well as MediaSource, so masking only the latter
+  // still exercises its blob/MSE path instead of native HLS.
+  for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
+    Object.defineProperty(globalThis, name, {
+      configurable: true,
+      value: undefined,
+    })
+  }
+}
+
 async function brightPixels(target: Page, canvas: Locator): Promise<number> {
   const png = await canvas.screenshot()
   return target.evaluate(async (encoded) => {
@@ -111,6 +123,14 @@ test.describe.serial('real all-in-one product flows', () => {
       reducedMotion: 'reduce',
       viewport: { width: 1280, height: 800 },
     })
+    // Chromium owns the hls.js/MediaSource recovery gate. Playwright drives
+    // WebKit through Web Inspector, whose inspected MediaSource process can
+    // stop responding after a successful append on hosted macOS runners.
+    // Safari's production path is native HLS, so exercise every WebKit
+    // playback mode through that path from the first page load.
+    if (engine === 'webkit' && process.platform === 'darwin') {
+      await context.addInitScript(disableMediaSource)
+    }
     await context.route('**/*', async (route) => {
       const url = new URL(route.request().url())
       if (
@@ -257,8 +277,8 @@ test.describe.serial('real all-in-one product flows', () => {
     // WebKit implements route.abort() through Web Inspector. It does retry the
     // blocked segment, but its inspected MediaSource can remain wedged at time
     // zero after the successful retry. Chromium exercises the real hls.js
-    // transient-network recovery; WebKit still gates every playback mode and
-    // its separate native-HLS path below without the inspector artifact.
+    // transient-network recovery; WebKit gates every playback mode through
+    // native HLS and makes that source path explicit below.
     let failedSegment = false
     if (engine !== 'webkit') {
       await page.route('**/segment*.ts', async (route) => {
@@ -332,17 +352,6 @@ test.describe.serial('real all-in-one product flows', () => {
     test.skip(engine !== 'webkit' || process.platform !== 'darwin', 'native HLS is the macOS gate')
     const native = await context.newPage()
     watch(native)
-    await native.addInitScript(() => {
-      // hls.js can use all three names. Current Safari exposes
-      // ManagedMediaSource as well as MediaSource, so masking only the latter
-      // still exercises its blob/MSE path instead of native HLS.
-      for (const name of ['MediaSource', 'ManagedMediaSource', 'WebKitMediaSource']) {
-        Object.defineProperty(globalThis, name, {
-          configurable: true,
-          value: undefined,
-        })
-      }
-    })
     await openFixture('Remux Fixture', native)
     const video = await startPlayback('REMUX', native)
     expect(
