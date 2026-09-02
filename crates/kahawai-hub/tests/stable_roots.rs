@@ -230,6 +230,44 @@ async fn migration_and_single_root_adoption_preserve_durable_state() {
 }
 
 #[tokio::test]
+async fn artist_identity_is_backfilled_on_an_existing_catalogue() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = sqlx::sqlite::SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(dir.path().join("hub.db"))
+                .create_if_missing(true)
+                .foreign_keys(true),
+        )
+        .await
+        .unwrap();
+    MIGRATOR.run_to(74, &db).await.unwrap();
+    sqlx::raw_sql(
+        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+           VALUES('host','mediahost','host','cert');
+         INSERT INTO collections(module_id,collection_id,media_type)
+           VALUES('host','music','music');
+         INSERT INTO items(id,kind,title,norm_title,artist,norm_artist,module_id,collection_id)
+           VALUES('old-album','album','One','one','One','1','host','music')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    db.close().await;
+
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT artist_key FROM items WHERE id='old-album'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        "artist-b25l",
+        "the additive artist identity was not backfilled on an existing catalogue"
+    );
+}
+
+#[tokio::test]
 async fn single_root_announcement_adopts_legacy_state_without_rescan() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     let registry = Registry::new(db.clone(), Default::default());

@@ -2436,6 +2436,56 @@ impl Registry {
             .fetch_one(&mut *tx)
             .await
             .context("file record names an unknown collection root")?;
+            // Read the old identity before the upsert overwrites its hashes.
+            // Mapper corrections may reuse logical item ids and user state,
+            // but a different file appearing at the same path must not inherit
+            // either. Archive the displaced content first so it can still
+            // recover its state if those bytes return elsewhere later.
+            let previous_source: Option<(i64, Option<String>, i64, i64, i64)> = sqlx::query_as(
+                "SELECT f.id,
+                            (SELECT ps.item_id FROM playable_source_parts p
+                              JOIN playable_sources ps ON ps.id=p.playable_source_id
+                             WHERE p.file_id=f.id LIMIT 1),
+                            f.size,f.head_xxh3,f.tail_xxh3
+                       FROM files f
+                      WHERE f.module_id=? AND f.collection_id=?
+                        AND f.root_id=? AND f.path_rel=?",
+            )
+            .bind(module_id)
+            .bind(collection_id)
+            .bind(root_id)
+            .bind(&f.path_rel)
+            .fetch_optional(&mut *tx)
+            .await?;
+            let same_content = previous_source.as_ref().is_some_and(|old| {
+                old.2 == f.size as i64 && old.3 == f.head_xxh3 as i64 && old.4 == f.tail_xxh3 as i64
+            });
+            if let Some((old_file_id, _, _, _, _)) = previous_source.as_ref()
+                && !same_content
+            {
+                sqlx::query(
+                    "INSERT OR REPLACE INTO watch_state_archive
+                       (user_id,size,head_xxh3,tail_xxh3,
+                        position_ms,duration_ms,played,play_count)
+                     SELECT w.user_id,f.size,f.head_xxh3,f.tail_xxh3,
+                            w.position_ms,w.duration_ms,w.played,w.play_count
+                       FROM files f
+                       JOIN playable_source_parts p ON p.file_id=f.id
+                       JOIN playable_sources ps ON ps.id=p.playable_source_id
+                       JOIN watch_state w ON w.item_id=ps.item_id
+                      WHERE f.id=?",
+                )
+                .bind(old_file_id)
+                .execute(&mut *tx)
+                .await?;
+                let old_renditions: Vec<i64> = sqlx::query_scalar(
+                    "SELECT playable_source_id FROM playable_source_parts WHERE file_id=?",
+                )
+                .bind(old_file_id)
+                .fetch_all(&mut *tx)
+                .await?;
+                Self::archive_playable_sources(&mut tx, &old_renditions).await?;
+            }
             let source_id: i64 = sqlx::query_scalar(
                 "INSERT INTO files
                    (module_id,collection_id,root_id,path_rel,size,mtime_unix,
@@ -2473,6 +2523,9 @@ impl Registry {
             .bind(kahawai_core::segments::DETECTOR_GENERATION)
             .fetch_one(&mut *tx)
             .await?;
+            let previous_item = same_content
+                .then(|| previous_source.as_ref().and_then(|old| old.1.clone()))
+                .flatten();
 
             // Resolve to a playable item: movies map straight to a
             // movie item; series files map to an episode under a show.
@@ -2518,9 +2571,19 @@ impl Registry {
                 let tags = &media_info.tags;
                 let tag = |k: &str| tags.get(k).map(|s| s.trim()).filter(|s| !s.is_empty());
                 let parsed = names::parse_music(&f.path_rel);
-                let artist = tag("artist")
+                // Album and track artist are deliberately different facts.
+                // `items.artist` means the release credit on an album and the
+                // recording credit on a track. The directory is the safest
+                // fallback for a missing album-artist tag: a compilation is
+                // commonly laid out under "Various Artists", while each
+                // file's ordinary artist names its guest/performer.
+                let song_artist = tag("artist")
                     .map(str::to_string)
                     .or_else(|| parsed.as_ref().map(|g| g.artist.clone()));
+                let album_artist = tag("album_artist")
+                    .map(str::to_string)
+                    .or_else(|| parsed.as_ref().map(|g| g.artist.clone()))
+                    .or_else(|| song_artist.clone());
                 let album = tag("album")
                     .map(str::to_string)
                     .or_else(|| parsed.as_ref().map(|g| g.album.clone()));
@@ -2533,47 +2596,94 @@ impl Registry {
                     .or_else(|| parsed.as_ref().map(|g| g.title.clone()));
                 let disc: Option<u32> = tags.get("disc_number").and_then(|v| v.parse().ok());
                 let album_year = parsed.as_ref().and_then(|g| g.album_year);
-                match (artist, album, track_no, title) {
-                    (Some(artist), Some(album), Some(track), Some(title)) => {
+                match (album_artist, album, track_no, title) {
+                    (Some(album_artist), Some(album), Some(track), Some(title)) => {
                         let album_norm = names::normalize_title(&album);
+                        let album_artist_norm = crate::enrich::fold(&album_artist);
+                        let album_artist_key = crate::enrich::artist_key(&album_artist);
                         let existing: Option<String> = sqlx::query_scalar(
                             "SELECT id FROM items
                              WHERE module_id=? AND collection_id=? AND kind='album'
-                               AND norm_title=? AND LOWER(artist)=LOWER(?)",
+                               AND norm_title=? AND artist_key=?",
                         )
                         .bind(module_id)
                         .bind(collection_id)
                         .bind(&album_norm)
-                        .bind(&artist)
+                        .bind(&album_artist_key)
                         .fetch_optional(&mut *tx)
                         .await?;
                         let album_id = match existing {
                             Some(id) => id,
                             None => {
-                                let id = ulid::Ulid::generate().to_string();
-                                sqlx::query(
-                                    "INSERT INTO items
-                                       (id,kind,title,norm_title,year,artist,norm_artist,
+                                // Keep one existing identity when a mapper
+                                // upgrade merely corrects its release credit.
+                                // Besides stable track ids, this preserves the
+                                // album's provider answers and artwork. Other
+                                // former per-song albums rehome into it below.
+                                let prior_album: Option<(String, Option<String>)> = if let Some(
+                                    previous_item,
+                                ) =
+                                    previous_item.as_deref()
+                                {
+                                    sqlx::query_as(
+                                        "SELECT a.id,a.artist_key FROM items t JOIN items a ON a.id=t.parent_id
+                                              WHERE t.id=? AND t.kind='track' AND a.kind='album'
+                                                AND a.module_id=? AND a.collection_id=?
+                                                AND a.norm_title=?",
+                                    )
+                                    .bind(previous_item)
+                                    .bind(module_id)
+                                    .bind(collection_id)
+                                    .bind(&album_norm)
+                                    .fetch_optional(&mut *tx)
+                                    .await?
+                                } else {
+                                    None
+                                };
+                                if let Some((id, old_artist_key)) = prior_album {
+                                    if old_artist_key.as_deref() != Some(&album_artist_key) {
+                                        Self::invalidate_automatic_musicbrainz(&mut tx, &id)
+                                            .await?;
+                                    }
+                                    sqlx::query(
+                                        "UPDATE items SET artist=?,norm_artist=?,artist_key=? WHERE id=?",
+                                    )
+                                    .bind(&album_artist)
+                                    .bind(&album_artist_norm)
+                                    .bind(&album_artist_key)
+                                    .bind(&id)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                    id
+                                } else {
+                                    let id = ulid::Ulid::generate().to_string();
+                                    sqlx::query(
+                                        "INSERT INTO items
+                                       (id,kind,title,norm_title,year,artist,norm_artist,artist_key,
                                         module_id,collection_id)
-                                     VALUES (?,'album',?,?,?,?,?,?,?)",
-                                )
-                                .bind(&id)
-                                .bind(&album)
-                                .bind(&album_norm)
-                                .bind(album_year)
-                                .bind(&artist)
-                                // Folded like the search needle is, or an
-                                // accented artist can never be found.
-                                .bind(crate::enrich::fold(&artist))
-                                .bind(module_id)
-                                .bind(collection_id)
-                                .execute(&mut *tx)
-                                .await?;
-                                id
+                                     VALUES (?,'album',?,?,?,?,?,?,?,?)",
+                                    )
+                                    .bind(&id)
+                                    .bind(&album)
+                                    .bind(&album_norm)
+                                    .bind(album_year)
+                                    .bind(&album_artist)
+                                    // Folded like the search needle is, or an
+                                    // accented artist can never be found.
+                                    .bind(&album_artist_norm)
+                                    .bind(&album_artist_key)
+                                    .bind(module_id)
+                                    .bind(collection_id)
+                                    .execute(&mut *tx)
+                                    .await?;
+                                    id
+                                }
                             }
                         };
-                        // Album artist for dedup is normalized lowercase;
-                        // display keeps the first-seen casing.
+                        // A mapper-only correction keeps this physical
+                        // recording's item id. Only a genuine slot collision
+                        // (same disc/track already exists in the target album)
+                        // needs the merge path below.
                         let existing_track: Option<String> = sqlx::query_scalar(
                             "SELECT id FROM items
                              WHERE kind = 'track' AND parent_id = ?
@@ -2584,8 +2694,49 @@ impl Registry {
                         .bind(track)
                         .fetch_optional(&mut *tx)
                         .await?;
+                        let previous_track: Option<(String, Option<String>)> =
+                            if let Some(previous_item) = previous_item.as_deref() {
+                                sqlx::query_as(
+                                    "SELECT id,parent_id FROM items WHERE id=? AND kind='track'
+                                   AND module_id=? AND collection_id=?",
+                                )
+                                .bind(previous_item)
+                                .bind(module_id)
+                                .bind(collection_id)
+                                .fetch_optional(&mut *tx)
+                                .await?
+                            } else {
+                                None
+                            };
+                        if let Some((_, Some(previous_album))) = previous_track.as_ref()
+                            && previous_album != &album_id
+                        {
+                            Self::preserve_manual_album_match(&mut tx, previous_album, &album_id)
+                                .await?;
+                        }
                         Some(match existing_track {
                             Some(id) => id,
+                            None if previous_track.is_some() => {
+                                let id = previous_track.expect("guarded above").0;
+                                let display_artist =
+                                    song_artist.as_deref().unwrap_or(&album_artist);
+                                sqlx::query(
+                                    "UPDATE items SET title=?,norm_title=?,parent_id=?,season=?,episode=?,
+                                                      artist=?,norm_artist=?
+                                      WHERE id=?",
+                                )
+                                .bind(&title)
+                                .bind(names::normalize_title(&title))
+                                .bind(&album_id)
+                                .bind(disc)
+                                .bind(track)
+                                .bind(display_artist)
+                                .bind(crate::enrich::fold(display_artist))
+                                .bind(&id)
+                                .execute(&mut *tx)
+                                .await?;
+                                id
+                            }
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
@@ -2600,8 +2751,10 @@ impl Registry {
                                 .bind(&album_id)
                                 .bind(disc)
                                 .bind(track)
-                                .bind(&artist)
-                                .bind(crate::enrich::fold(&artist))
+                                .bind(song_artist.as_deref().unwrap_or(&album_artist))
+                                .bind(crate::enrich::fold(
+                                    song_artist.as_deref().unwrap_or(&album_artist),
+                                ))
                                 .bind(module_id)
                                 .bind(collection_id)
                                 .execute(&mut *tx)
@@ -2777,6 +2930,11 @@ impl Registry {
             };
 
             if let Some(item_id) = resolved_item {
+                if let Some(previous_item) = previous_item.as_deref()
+                    && previous_item != item_id
+                {
+                    Self::merge_watch_state(&mut tx, previous_item, &item_id).await?;
+                }
                 Self::bind_playable_source(
                     &mut tx,
                     module_id,
@@ -2937,6 +3095,146 @@ impl Registry {
               WHERE NOT EXISTS(SELECT 1 FROM playable_source_parts p
                                 WHERE p.playable_source_id=playable_sources.id)",
         )
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// A changed automatic Album Artist is a different MusicBrainz question.
+    /// Drop the old automatic answer as well as its question history; keeping
+    /// either would make `enrich_music` believe the corrected album is already
+    /// settled. A human pin is an explicit identity decision and survives
+    /// local tag corrections unchanged.
+    async fn invalidate_automatic_musicbrainz(
+        tx: &mut sqlx::SqliteConnection,
+        item_id: &str,
+    ) -> Result<()> {
+        let pinned: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM manual_match
+                            WHERE item_id=? AND provider='musicbrainz')",
+        )
+        .bind(item_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if pinned {
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM provider_metadata WHERE item_id=? AND provider='musicbrainz'")
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query("DELETE FROM provider_queries WHERE item_id=? AND provider='musicbrainz'")
+            .bind(item_id)
+            .execute(&mut *tx)
+            .await?;
+        Ok(())
+    }
+
+    /// Carry an explicit album match when duplicate pre-Album-Artist albums
+    /// converge. Automatic answers are deliberately not copied: they answered
+    /// the old recording-artist question. Two different human pins cannot
+    /// both describe the one surviving album, so retain its existing pin and
+    /// make the conflict visible instead of silently replacing it.
+    async fn preserve_manual_album_match(
+        tx: &mut sqlx::SqliteConnection,
+        from_item: &str,
+        to_item: &str,
+    ) -> Result<()> {
+        let from: Option<(String, String)> =
+            sqlx::query_as("SELECT provider,provider_id FROM manual_match WHERE item_id=?")
+                .bind(from_item)
+                .fetch_optional(&mut *tx)
+                .await?;
+        let Some((provider, provider_id)) = from else {
+            return Ok(());
+        };
+        let to: Option<(String, String)> =
+            sqlx::query_as("SELECT provider,provider_id FROM manual_match WHERE item_id=?")
+                .bind(to_item)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if let Some(to) = to {
+            if to != (provider.clone(), provider_id.clone()) {
+                tracing::warn!(from_item, to_item,
+                    from_provider = %provider, from_provider_id = %provider_id,
+                    to_provider = %to.0, to_provider_id = %to.1,
+                    "conflicting manual album matches converged; retaining survivor's pin");
+            }
+            return Ok(());
+        }
+        let has_answer: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM provider_metadata
+                            WHERE item_id=? AND provider=? AND provider_id=?)",
+        )
+        .bind(from_item)
+        .bind(&provider)
+        .bind(&provider_id)
+        .fetch_one(&mut *tx)
+        .await?;
+        if !has_answer {
+            tracing::warn!(from_item, to_item, %provider, %provider_id,
+                "manual album match has no backing answer; not transferring it");
+            return Ok(());
+        }
+        sqlx::query("DELETE FROM provider_metadata WHERE item_id=? AND provider=?")
+            .bind(to_item)
+            .bind(&provider)
+            .execute(&mut *tx)
+            .await?;
+        sqlx::query(
+            "INSERT INTO provider_metadata
+               (item_id,provider,provider_id,title,overview,poster_path,rating,premiered,
+                original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json)
+             SELECT ?1,provider,provider_id,title,overview,poster_path,rating,premiered,
+                    original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json
+               FROM provider_metadata
+              WHERE item_id=?2 AND provider=?3 AND provider_id=?4",
+        )
+        .bind(to_item)
+        .bind(from_item)
+        .bind(&provider)
+        .bind(&provider_id)
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
+            "INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+             SELECT ?1,provider,provider_id,pinned_at FROM manual_match WHERE item_id=?2",
+        )
+        .bind(to_item)
+        .bind(from_item)
+        .execute(&mut *tx)
+        .await?;
+        Ok(())
+    }
+
+    /// Carry durable user state across automatic identity correction.
+    ///
+    /// Album-artist discovery can merge tracks that were formerly resolved
+    /// beneath per-song artists. Position/played follow the newest write;
+    /// play_count is monotonic and takes the larger value rather than adding
+    /// two rows that may describe the same physical recording.
+    async fn merge_watch_state(
+        tx: &mut sqlx::SqliteConnection,
+        from_item: &str,
+        to_item: &str,
+    ) -> Result<()> {
+        sqlx::query(
+            "INSERT INTO watch_state
+               (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
+             SELECT user_id,?2,position_ms,duration_ms,played,play_count,updated_at
+               FROM watch_state WHERE item_id=?1
+             ON CONFLICT(user_id,item_id) DO UPDATE SET
+               position_ms=CASE WHEN excluded.updated_at >= watch_state.updated_at
+                                THEN excluded.position_ms ELSE watch_state.position_ms END,
+               duration_ms=CASE WHEN excluded.updated_at >= watch_state.updated_at
+                                THEN excluded.duration_ms ELSE watch_state.duration_ms END,
+               played=CASE WHEN excluded.updated_at >= watch_state.updated_at
+                           THEN excluded.played ELSE watch_state.played END,
+               play_count=MAX(watch_state.play_count,excluded.play_count),
+               updated_at=MAX(watch_state.updated_at,excluded.updated_at)",
+        )
+        .bind(from_item)
+        .bind(to_item)
         .execute(&mut *tx)
         .await?;
         Ok(())

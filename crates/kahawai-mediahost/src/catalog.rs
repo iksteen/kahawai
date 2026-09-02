@@ -27,6 +27,12 @@
 //! `completed_generation` distinguishes a fresh/aborted first scan from a
 //! catalogue with a complete prior manifest. Only the former delays offers;
 //! ordinary process restarts can reconnect from SQLite while rescanning.
+//! `catalog_files.music_tag_generation` is local probe bookkeeping, not a
+//! source revision. A newer tag mapper re-probes only stale music rows and
+//! leaves byte-derived records attached to the unchanged source. Advancing it
+//! nevertheless publishes one ordinary file update: the hub's music mapper
+//! may have changed even when discovery produces byte-for-byte identical JSON,
+//! and it must get another opportunity to map that stored evidence.
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
@@ -72,6 +78,7 @@ pub struct KnownFile {
     pub size: u64,
     pub mtime_unix: i64,
     pub streams_json: String,
+    pub music_tag_generation: i64,
 }
 
 #[derive(sqlx::FromRow)]
@@ -84,6 +91,7 @@ struct StoredFileRevision {
     streams_json: String,
     error: String,
     version: i64,
+    music_tag_generation: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -367,7 +375,7 @@ impl Catalog {
         collection: &str,
     ) -> Result<HashMap<(String, String), KnownFile>> {
         let rows = sqlx::query(
-            "SELECT root_token,path_rel,size,mtime_unix,streams_json
+            "SELECT root_token,path_rel,size,mtime_unix,streams_json,music_tag_generation
                FROM catalog_files WHERE collection_id=? AND error=''",
         )
         .bind(collection)
@@ -382,6 +390,7 @@ impl Catalog {
                         size: row.get::<i64, _>("size") as u64,
                         mtime_unix: row.get("mtime_unix"),
                         streams_json: row.get("streams_json"),
+                        music_tag_generation: row.get("music_tag_generation"),
                     },
                 )
             })
@@ -565,12 +574,24 @@ impl Catalog {
         file: &FileRecord,
         generation: i64,
     ) -> Result<Option<u64>> {
+        self.upsert_file_with_music_tag_generation(collection, file, generation, 0)
+            .await
+    }
+
+    pub async fn upsert_file_with_music_tag_generation(
+        &self,
+        collection: &str,
+        file: &FileRecord,
+        generation: i64,
+        music_tag_generation: i64,
+    ) -> Result<Option<u64>> {
         let source = file
             .source
             .as_ref()
             .context("catalogue file missing source")?;
         let previous: Option<StoredFileRevision> = sqlx::query_as(
-            "SELECT size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,error,version
+            "SELECT size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,error,version,
+                    music_tag_generation
                FROM catalog_files
               WHERE collection_id=? AND root_token=? AND path_rel=?",
         )
@@ -579,6 +600,9 @@ impl Catalog {
         .bind(&source.path_rel)
         .fetch_optional(&self.db)
         .await?;
+        let mapper_refresh = previous
+            .as_ref()
+            .is_some_and(|stored| music_tag_generation > stored.music_tag_generation);
         let unchanged = previous.as_ref().is_some_and(|stored| {
             stored.error.is_empty()
                 && stored.size == file.size as i64
@@ -587,10 +611,26 @@ impl Catalog {
                 && stored.tail_xxh3 == file.tail_xxh3 as i64
                 && stored.oshash == file.oshash as i64
                 && stored.streams_json == file.streams_json
-        });
+        }) && !mapper_refresh;
         if unchanged {
-            self.mark_seen(collection, &source.root_token, &source.path_rel, generation)
-                .await?;
+            sqlx::query(
+                "UPDATE catalog_files
+                    SET seen_generation=?,music_tag_generation=?
+                  WHERE collection_id=? AND root_token=? AND path_rel=?",
+            )
+            .bind(generation)
+            .bind(
+                music_tag_generation.max(
+                    previous
+                        .as_ref()
+                        .map_or(0, |stored| stored.music_tag_generation),
+                ),
+            )
+            .bind(collection)
+            .bind(&source.root_token)
+            .bind(&source.path_rel)
+            .execute(&self.db)
+            .await?;
             return Ok(None);
         }
         let revision_changed = previous.as_ref().is_none_or(|stored| {
@@ -606,13 +646,15 @@ impl Catalog {
         sqlx::query(
             "INSERT INTO catalog_files
                (collection_id,root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,
-                oshash,streams_json,seen_generation,version,error)
-             VALUES(?,?,?,?,?,?,?,?,?,?,?,'')
+                oshash,streams_json,seen_generation,version,error,music_tag_generation)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?,'',?)
              ON CONFLICT(collection_id,root_token,path_rel) DO UPDATE SET
                size=excluded.size,mtime_unix=excluded.mtime_unix,
                head_xxh3=excluded.head_xxh3,tail_xxh3=excluded.tail_xxh3,
                oshash=excluded.oshash,streams_json=excluded.streams_json,
-               seen_generation=excluded.seen_generation,version=excluded.version,error=''",
+               seen_generation=excluded.seen_generation,version=excluded.version,error='',
+               music_tag_generation=MAX(catalog_files.music_tag_generation,
+                                        excluded.music_tag_generation)",
         )
         .bind(collection)
         .bind(&source.root_token)
@@ -625,6 +667,7 @@ impl Catalog {
         .bind(&file.streams_json)
         .bind(generation)
         .bind(version as i64)
+        .bind(music_tag_generation)
         .execute(&mut *tx)
         .await?;
         let payload = kahawai_proto::v1::FileUpsert {
@@ -1799,6 +1842,63 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn mapper_generation_republishes_unchanged_metadata_for_the_hub() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = collection(root.path());
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        let source = SourcePath {
+            root_token: kahawai_core::media::root_token(root.path()),
+            path_rel: "Track.flac".into(),
+        };
+        let file = FileRecord {
+            source: Some(source.clone()),
+            size: 123,
+            mtime_unix: 7,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json: serde_json::to_string(&media_info(true)).unwrap(),
+        };
+        let first = catalog
+            .upsert_file("movies", &file, generation)
+            .await
+            .unwrap()
+            .expect("new file publishes a catalogue version");
+        let refresh = catalog
+            .upsert_file_with_music_tag_generation("movies", &file, generation, 1)
+            .await
+            .unwrap()
+            .expect("a mapper generation must give the hub another mapping pass");
+        assert!(refresh > first);
+        let known = catalog.known_files("movies").await.unwrap();
+        assert_eq!(
+            known[&(source.root_token.clone(), source.path_rel.clone())].music_tag_generation,
+            1
+        );
+        let current: i64 =
+            sqlx::query_scalar("SELECT current_version FROM catalog_collections WHERE id='movies'")
+                .fetch_one(&catalog.db)
+                .await
+                .unwrap();
+        assert_eq!(current as u64, refresh);
+
+        catalog
+            .upsert_file("movies", &file, generation)
+            .await
+            .unwrap();
+        let known = catalog.known_files("movies").await.unwrap();
+        assert_eq!(
+            known[&(source.root_token, source.path_rel)].music_tag_generation,
+            1,
+            "an older caller cannot downgrade a completed mapper generation"
+        );
     }
 
     #[tokio::test]

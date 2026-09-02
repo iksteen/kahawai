@@ -12,6 +12,7 @@ import { notify } from './composables/notices.ts'
 
 const Home = () => import('./views/Home.vue')
 const Library = () => import('./views/Library.vue')
+const Artist = () => import('./views/Artist.vue')
 const Detail = () => import('./views/Detail.vue')
 const Season = () => import('./views/Season.vue')
 const Settings = () => import('./views/Settings.vue')
@@ -26,6 +27,12 @@ export const router = createRouter({
     { path: '/admin', name: 'admin', component: Admin },
     { path: '/settings', name: 'settings', component: Settings },
     { path: '/library/:library', name: 'library', component: Library },
+    { path: '/library/:library/artist/:artist', name: 'artist', component: Artist },
+    {
+      path: '/library/:library/artist/:artist/item/:id',
+      name: 'artist-album',
+      component: Detail,
+    },
     {
       path: '/library/:library/item/:id',
       name: 'detail',

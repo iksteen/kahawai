@@ -32,28 +32,17 @@ followed, and those cases are listed too.
 
 ## Narrower than the prototype
 
-- [ ] UI-1 **No artist screen.** The prototype browses a music library by
-      artist — artist cards, then an artist page listing that artist's albums
-      with per-album Play and Queue. The built UI shows albums, as before
-      (owner decision during planning).
-
-      What exists: `items.norm_artist`, which album search already folds.
-      What does not: any artist entity, any id to route to, and any source of
-      artwork for the round avatars. Three ways out, cheapest first:
-
-      1. Group by `norm_artist` client-side within a page. Cheap, and wrong
-         across page boundaries — an artist whose albums straddle a page break
-         appears twice.
-      2. A folded-artist mode on the existing browse endpoint: group and count
-         server-side, return synthetic rows keyed by `norm_artist`. No schema
-         change, no artwork, and the id is a name — so a rename splits the
-         artist.
-      3. A first-class artist entity, with somewhere for MusicBrainz artist art
-         to land. The only option that survives a rename and can carry an
-         image, and the only one that is a migration plus an enrichment path.
-
-      This is the one place the ported UI is knowingly less capable than the
-      design it was ported from.
+- [x] UI-1 **Music starts at Album Artists.** The chosen cost point is the
+      server-side synthetic group: albums are grouped by strict `artist_key`
+      before paging (separate from fuzzy `norm_artist` search), and an artist
+      page lists the group's albums by their resolved
+      release year. Both grids reserve their full height and fetch visible
+      chunks as the user scrolls; API paging is not exposed as a separate
+      load-more interaction.
+      Search shows matching artists beside albums and songs and also finds an
+      album by a matching child track. There is deliberately no artist entity
+      or invented portrait: that avoids a schema and enrichment/artwork path,
+      while accepting that renaming an Album Artist changes its route key.
 
 - [ ] UI-2 **No per-track removal from the play queue.** The prototype offers
       a × on each queued track. The queue supports replacing, appending and

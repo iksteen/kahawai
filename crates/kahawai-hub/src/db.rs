@@ -82,6 +82,7 @@ pub async fn open(data_dir: &Path) -> Result<Database> {
         .await?;
     install_derived(&database).await?;
     backfill_norm_artist(&database).await?;
+    backfill_artist_key(&database).await?;
     backfill_revision(&database).await?;
     backfill_playable_source_families(&database).await?;
     repair_release_tag_titles(&database).await?;
@@ -112,6 +113,32 @@ async fn backfill_norm_artist(pool: &Database) -> Result<()> {
     }
     tx.commit().await?;
     tracing::info!(rows = missing.len(), "norm_artist backfilled");
+    Ok(())
+}
+
+/// Fill the strict album-artist identity introduced by 0075. Tracks are not
+/// artist browse groups, so touching every song would buy nothing and turn a
+/// bounded album backfill into the largest write of the upgrade.
+async fn backfill_artist_key(pool: &Database) -> Result<()> {
+    let missing: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id, artist FROM items
+          WHERE kind='album' AND artist IS NOT NULL AND artist_key IS NULL",
+    )
+    .fetch_all(pool)
+    .await?;
+    if missing.is_empty() {
+        return Ok(());
+    }
+    let mut tx = pool.begin().await?;
+    for (id, artist) in &missing {
+        sqlx::query("UPDATE items SET artist_key = ? WHERE id = ?")
+            .bind(crate::enrich::artist_key(artist))
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    tracing::info!(rows = missing.len(), "artist identity backfilled");
     Ok(())
 }
 

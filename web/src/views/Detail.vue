@@ -90,9 +90,19 @@ const up = computed(() => {
   if (kind === 'episode' && item.value?.parent_id) {
     return { label: `← ${item.value.show_title ?? 'Series'}`, id: item.value.parent_id }
   }
+  if (kind === 'album' && typeof route.params.artist === 'string') {
+    return { label: `← ${item.value?.artist ?? 'Artist'}`, id: null, artist: route.params.artist }
+  }
   return { label: '← Library', id: null }
 })
 function goUp() {
+  if ('artist' in up.value && up.value.artist) {
+    void router.push({
+      name: 'artist',
+      params: { library: library.value, artist: up.value.artist },
+    })
+    return
+  }
   if (up.value.id) {
     void router.push({ name: 'detail', params: { library: library.value, id: up.value.id } })
   } else {

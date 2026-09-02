@@ -31,6 +31,13 @@ use kahawai_core::media::{
     AudioStream, Chapter, MediaInfo, SubtitleStream, VideoGeometry, VideoStream,
 };
 
+/// Version of the music identity tags emitted by discovery.
+///
+/// The mediahost stores this beside each successful music probe. Bumping it
+/// makes unchanged music files pass through discovery once more without
+/// invalidating byte-derived work such as hashes or subtitle extraction.
+pub const MUSIC_TAG_GENERATION: i64 = 1;
+
 pub fn init() -> Result<()> {
     static INIT: OnceLock<Result<(), String>> = OnceLock::new();
     INIT.get_or_init(|| {
@@ -435,6 +442,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
         for (name, tag_name) in [
             ("title", gst::tags::Title::TAG_NAME),
             ("artist", gst::tags::Artist::TAG_NAME),
+            ("album_artist", gst::tags::AlbumArtist::TAG_NAME),
             ("album", gst::tags::Album::TAG_NAME),
         ] {
             if let Some(v) = tags.generic(tag_name).and_then(|v| v.get::<String>().ok()) {
@@ -832,6 +840,52 @@ mod tests {
                 .expect("discover")
                 .replay_gain,
             None
+        );
+    }
+
+    #[test]
+    fn album_artist_is_distinct_from_the_recording_artist() {
+        init().unwrap();
+        if !crate::testutil::require_elements(&["audiotestsrc", "taginject", "flacenc"]) {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("compilation.flac");
+        let pipeline = gstreamer::parse::launch(&format!(
+            "audiotestsrc num-buffers=20 ! audioconvert ! \
+             flacenc ! flactag name=tags ! filesink location={}",
+            path.display()
+        ))
+        .expect("pipeline");
+        let tagger = pipeline
+            .downcast_ref::<gstreamer::Pipeline>()
+            .unwrap()
+            .by_name("tags")
+            .unwrap()
+            .dynamic_cast::<gstreamer::TagSetter>()
+            .unwrap();
+        tagger.add_tag::<gstreamer::tags::Artist>(&"Guest", gstreamer::TagMergeMode::Replace);
+        tagger.add_tag::<gstreamer::tags::AlbumArtist>(
+            &"Various Artists",
+            gstreamer::TagMergeMode::Replace,
+        );
+        tagger.add_tag::<gstreamer::tags::Album>(&"Sampler", gstreamer::TagMergeMode::Replace);
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(30),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            )
+            .expect("muxing timed out");
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+
+        let tags = discover(&path, Duration::from_secs(30)).unwrap().tags;
+        assert_eq!(tags.get("artist").map(String::as_str), Some("Guest"));
+        assert_eq!(
+            tags.get("album_artist").map(String::as_str),
+            Some("Various Artists")
         );
     }
 }

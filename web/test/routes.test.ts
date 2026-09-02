@@ -18,6 +18,8 @@ import {
 const EVERY: RouteName[] = [
   'libraries',
   'library',
+  'artist',
+  'artist-album',
   'admin',
   'settings',
   'detail',
@@ -70,7 +72,7 @@ describe('what the search box means', () => {
   test('no box at all where nothing is searchable', () => {
     // A box that silently does nothing is worse than no box.
     const withBox = EVERY.filter((name) => hasSearchBox(name))
-    expect(withBox).toEqual(['libraries', 'library'])
+    expect(withBox).toEqual(['libraries', 'library', 'artist'])
   })
 
   test('and nothing has a panel without a box to open it from', () => {

@@ -119,6 +119,8 @@ pub struct NetOptions {
         events,
         list_collections,
         list_libraries,
+        list_artists,
+        artist_albums,
         list_items,
         up_next,
         item_detail,
@@ -382,6 +384,8 @@ pub fn router(
     let bearer = Router::new()
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
+        .route("/api/v1/artists", get(list_artists))
+        .route("/api/v1/artists/{key}/albums", get(artist_albums))
         .route("/api/v1/items", get(list_items))
         .route("/api/v1/up-next", get(up_next))
         .route("/api/v1/auth/logout", post(logout))
@@ -979,6 +983,32 @@ struct LibrariesResponse {
 #[derive(Serialize, ToSchema)]
 struct ItemsResponse {
     items: Vec<ItemRow<i64>>,
+    total: i64,
+    limit: u32,
+    offset: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ArtistSummary {
+    /// Opaque, URL-safe synthetic identity used by artist navigation.
+    key: String,
+    /// Stored Album Artist spelling used for display.
+    name: String,
+    album_count: i64,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ArtistsResponse {
+    artists: Vec<ArtistSummary>,
+    total: i64,
+    limit: u32,
+    offset: u32,
+}
+
+#[derive(Serialize, ToSchema)]
+struct ArtistAlbumsResponse {
+    artist: ArtistSummary,
+    albums: Vec<ItemRow<i64>>,
     total: i64,
     limit: u32,
     offset: u32,
@@ -4894,6 +4924,255 @@ async fn list_libraries(
 
 #[derive(Deserialize, ToSchema, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
+struct ArtistsQuery {
+    /// Music library whose Album Artists are being browsed.
+    library: String,
+    /// Folded substring of the Album Artist display name.
+    q: Option<String>,
+    /// `name` (default) or `-name`.
+    sort: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct ArtistAlbumsQuery {
+    /// Music library providing navigation and access context.
+    library: String,
+    /// Album or child-track title substring.
+    q: Option<String>,
+    /// `year` (default), `-year`, `title`, `-title`, `added`, or `-added`.
+    sort: Option<String>,
+    limit: Option<u32>,
+    offset: Option<u32>,
+}
+
+async fn music_library(
+    db: &kahawai_sqlite::Database,
+    claims: &crate::auth::Claims,
+    library: &str,
+) -> Result<(), ApiError> {
+    let restricted = crate::grants::restricted(db, claims)
+        .await
+        .map_err(internal)?;
+    if restricted
+        && !crate::grants::can_see_library(db, claims, library)
+            .await
+            .map_err(internal)?
+    {
+        return Err(hidden("library"));
+    }
+    let media_type: Option<String> =
+        sqlx::query_scalar("SELECT media_type FROM libraries WHERE id=?")
+            .bind(library)
+            .fetch_optional(db)
+            .await
+            .map_err(internal)?;
+    match media_type.as_deref() {
+        None => Err(hidden("library")),
+        Some("music") => Ok(()),
+        Some(_) => Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "artists belong to a music library",
+        )),
+    }
+}
+
+fn artist_group_sql(select: &str, descending: bool) -> String {
+    let direction = if descending { "DESC" } else { "ASC" };
+    format!(
+        "SELECT {select} FROM (
+           SELECT i.artist_key AS key,MIN(i.artist) AS name,COUNT(*) AS album_count
+             FROM items i JOIN library_collections lc
+               ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+            WHERE lc.library_id=?1 AND i.kind='album'
+              AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
+              AND (?2='' OR i.norm_artist LIKE '%' || ?2 || '%')
+            GROUP BY i.artist_key
+         ) artists ORDER BY name COLLATE NOCASE {direction},key {direction}"
+    )
+}
+
+/// Browse the Album Artists in a music library
+#[utoipa::path(
+    get, path = "/api/v1/artists", tag = "Browse",
+    security(("bearer_auth" = [])),
+    params(ArtistsQuery),
+    responses(
+        (status = 200, body = ArtistsResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, body = ApiErrorBody)
+    )
+)]
+async fn list_artists(
+    State(state): State<AppState>,
+    ApiQuery(q): ApiQuery<ArtistsQuery>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<ArtistsResponse>, ApiError> {
+    let db = state.registry.db();
+    music_library(db, &claims, &q.library).await?;
+    let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    let needle = q.q.as_deref().map(crate::enrich::fold).unwrap_or_default();
+    let descending = q.sort.as_deref() == Some("-name");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "{} LIMIT ?3 OFFSET ?4",
+        artist_group_sql("key,name,album_count", descending)
+    )))
+    .bind(&q.library)
+    .bind(&needle)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await
+    .map_err(internal)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(DISTINCT i.artist_key)
+           FROM items i JOIN library_collections lc
+             ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE lc.library_id=?1 AND i.kind='album'
+            AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
+            AND (?2='' OR i.norm_artist LIKE '%' || ?2 || '%')",
+    )
+    .bind(&q.library)
+    .bind(&needle)
+    .fetch_one(db)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ArtistsResponse {
+        artists: rows
+            .into_iter()
+            .map(|row| ArtistSummary {
+                key: row.get("key"),
+                name: row.get("name"),
+                album_count: row.get("album_count"),
+            })
+            .collect(),
+        total,
+        limit,
+        offset,
+    }))
+}
+
+fn artist_album_order(sort: Option<&str>, alias: &str, metadata: &str) -> String {
+    // An album's release year can come from an embedded tag (`items.year`) or
+    // from MusicBrainz (`resolved_metadata.premiered`). The card has always
+    // displayed that resolved value; ordering on only the former made an
+    // enriched catalogue look alphabetic under "Oldest first".
+    let year = format!("COALESCE({alias}.year,CAST(substr({metadata}.premiered,1,4) AS INTEGER))");
+    match sort.unwrap_or("year") {
+        "-year" => format!("{year} IS NULL,{year} DESC,{alias}.sort_title,{alias}.id"),
+        "title" => format!("{alias}.sort_title,{year},{alias}.id"),
+        "-title" => format!("{alias}.sort_title DESC,{year} DESC,{alias}.id DESC"),
+        "added" => format!("{alias}.id,{alias}.sort_title"),
+        "-added" => format!("{alias}.id DESC,{alias}.sort_title"),
+        _ => format!("{year} IS NULL,{year},{alias}.sort_title,{alias}.id"),
+    }
+}
+
+/// Browse one Album Artist's records
+#[utoipa::path(
+    get, path = "/api/v1/artists/{key}/albums", tag = "Browse",
+    security(("bearer_auth" = [])),
+    params(("key" = String, Path, description = "Opaque URL-safe key returned by the artist index"), ArtistAlbumsQuery),
+    responses(
+        (status = 200, body = ArtistAlbumsResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 503, body = ApiErrorBody)
+    )
+)]
+async fn artist_albums(
+    State(state): State<AppState>,
+    ApiPath(key): ApiPath<String>,
+    ApiQuery(q): ApiQuery<ArtistAlbumsQuery>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<ArtistAlbumsResponse>, ApiError> {
+    let db = state.registry.db();
+    music_library(db, &claims, &q.library).await?;
+    let artist_row = sqlx::query(
+        "SELECT MIN(i.artist) AS name,COUNT(*) AS album_count
+           FROM items i JOIN library_collections lc
+             ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+          WHERE lc.library_id=? AND i.kind='album' AND i.artist_key=?
+         HAVING COUNT(*) > 0",
+    )
+    .bind(&q.library)
+    .bind(&key)
+    .fetch_optional(db)
+    .await
+    .map_err(internal)?
+    .ok_or_else(|| hidden("artist"))?;
+    let artist = ArtistSummary {
+        key: key.clone(),
+        name: artist_row.get("name"),
+        album_count: artist_row.get("album_count"),
+    };
+    let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
+    let offset = q.offset.unwrap_or(0);
+    let needle = q.q.as_deref().map(crate::enrich::fold).unwrap_or_default();
+    let order_in = artist_album_order(q.sort.as_deref(), "c", "candidate_md");
+    let order_out = artist_album_order(q.sort.as_deref(), "i", "md");
+    let inner = format!(
+        "SELECT c.id AS item_id FROM items c JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
+          LEFT JOIN resolved_metadata candidate_md ON candidate_md.item_id=c.id
+          WHERE lc.library_id=?2 AND c.kind='album' AND c.artist_key=?3
+            AND (?4='' OR c.norm_title LIKE '%' || ?4 || '%'
+                 OR c.sort_title LIKE '%' || ?4 || '%'
+                 OR EXISTS(SELECT 1 FROM items t WHERE t.parent_id=c.id
+                            AND (t.norm_title LIKE '%' || ?4 || '%'
+                                 OR t.sort_title LIKE '%' || ?4 || '%')))
+          ORDER BY {order_in} LIMIT ?5 OFFSET ?6"
+    );
+    let rows = sqlx::query(sqlx::AssertSqlSafe(item_page_sql(
+        &inner, &order_out, false, true,
+    )))
+    .bind(&claims.sub)
+    .bind(&q.library)
+    .bind(&key)
+    .bind(&needle)
+    .bind(limit)
+    .bind(offset)
+    .fetch_all(db)
+    .await
+    .map_err(internal)?;
+    let total: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM items c JOIN library_collections lc
+           ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
+          WHERE lc.library_id=?1 AND c.kind='album' AND c.artist_key=?2
+            AND (?3='' OR c.norm_title LIKE '%' || ?3 || '%'
+                 OR c.sort_title LIKE '%' || ?3 || '%'
+                 OR EXISTS(SELECT 1 FROM items t WHERE t.parent_id=c.id
+                            AND (t.norm_title LIKE '%' || ?3 || '%'
+                                 OR t.sort_title LIKE '%' || ?3 || '%')))",
+    )
+    .bind(&q.library)
+    .bind(&key)
+    .bind(&needle)
+    .fetch_one(db)
+    .await
+    .map_err(internal)?;
+    Ok(Json(ArtistAlbumsResponse {
+        artist,
+        albums: rows
+            .iter()
+            .map(|row| item_row(row, row.get::<i64, _>("sources")))
+            .collect(),
+        total,
+        limit,
+        offset,
+    }))
+}
+
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
 struct ItemsQuery {
     library: Option<String>,
     /// Search: a substring of the title, folded the same way titles are
@@ -5662,6 +5941,7 @@ struct ItemRow<S> {
     id: String,
     kind: String,
     title: String,
+    /// Album Artist for albums; recording Artist for tracks; absent elsewhere.
     #[schema(required)]
     artist: Option<String>,
     #[schema(required)]
@@ -7744,6 +8024,8 @@ mod tests {
             ("get", "/api/v1/events"),
             ("get", "/api/v1/collections"),
             ("get", "/api/v1/libraries"),
+            ("get", "/api/v1/artists"),
+            ("get", "/api/v1/artists/{key}/albums"),
             ("get", "/api/v1/items"),
             ("get", "/api/v1/up-next"),
             ("get", "/api/v1/items/{id}"),

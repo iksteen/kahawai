@@ -24,6 +24,8 @@ export type Screen = RouteName | Exclude<Phase, 'app'> | 'failed'
 const SCREENS: Record<Screen, string> = {
   libraries: 'Home',
   library: 'Library',
+  artist: '',
+  'artist-album': '',
   detail: '',
   season: '',
   settings: 'Settings',
@@ -44,7 +46,14 @@ const SCREENS: Record<Screen, string> = {
 /// see `useDocumentTitle`. `library` is here despite having a placeholder: the
 /// placeholder is for the tab strip, and announcing "Library" when the answer
 /// to "where am I" is "Films" wastes the one announcement a screen gets.
-const AWAITS: ReadonlySet<Screen> = new Set<Screen>(['library', 'detail', 'season', 'player'])
+const AWAITS: ReadonlySet<Screen> = new Set<Screen>([
+  'library',
+  'artist',
+  'artist-album',
+  'detail',
+  'season',
+  'player',
+])
 
 export function awaitsName(screen: Screen): boolean {
   return AWAITS.has(screen)

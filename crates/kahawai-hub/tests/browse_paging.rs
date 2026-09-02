@@ -458,6 +458,174 @@ async fn search_finds_artists_and_episode_titles() {
     assert_eq!(hits[0]["parent_title"], "Ace of Spades");
 }
 
+#[tokio::test]
+async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
+    let (api, token, db, _registry) = harness().await;
+    sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES('M','Music','music')")
+        .execute(&db)
+        .await
+        .unwrap();
+    for (module, collection) in [("m1", "c1"), ("m2", "c2")] {
+        sqlx::query(
+            "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint,enrolled_at,disabled)
+             VALUES(?,'mediahost',?,'',unixepoch(),0)",
+        )
+        .bind(module)
+        .bind(module)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO collections(module_id,collection_id,media_type,roots_json,sync_version)
+             VALUES(?,?,'music','[]',1)",
+        )
+        .bind(module)
+        .bind(collection)
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO library_collections(library_id,module_id,collection_id)
+             VALUES('M',?,?)",
+        )
+        .bind(module)
+        .bind(collection)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    for (id, title, year, artist, norm, artist_key, module, collection) in [
+        (
+            "a1",
+            "Enriched Earlier",
+            2005,
+            "Various Artists",
+            "various artists",
+            "artist-dmFyaW91cyBhcnRpc3Rz",
+            "m1",
+            "c1",
+        ),
+        (
+            "a2",
+            "Tagged Later",
+            1999,
+            "Various Artists",
+            "various artists",
+            "artist-dmFyaW91cyBhcnRpc3Rz",
+            "m2",
+            "c2",
+        ),
+        (
+            "a3",
+            "Solo",
+            2001,
+            "Björk",
+            "bjork",
+            "artist-Ympvcms",
+            "m1",
+            "c1",
+        ),
+    ] {
+        sqlx::query(
+            "INSERT INTO items
+               (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
+             VALUES(?,'album',?,?,?,?,?,?,?,?,?)",
+        )
+        .bind(id)
+        .bind(title)
+        .bind(title.to_ascii_lowercase())
+        .bind(title.to_ascii_lowercase())
+        .bind(year)
+        .bind(artist)
+        .bind(norm)
+        .bind(artist_key)
+        .bind(module)
+        .bind(collection)
+        .execute(&db)
+        .await
+        .unwrap();
+    }
+    sqlx::query(
+        "INSERT INTO items
+           (id,kind,title,norm_title,sort_title,parent_id,episode,artist,norm_artist,module_id,collection_id)
+         VALUES('t','track','Hidden Gem','hidden gem','hidden gem','a1',1,'Guest','guest','m1','c1')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // The filename/tag supplied no usable date for a1. MusicBrainz did, and
+    // the list must order by the same resolved year its card displays. Leaving
+    // this as a raw-year fixture let the broken query pass unnoticed.
+    sqlx::query("UPDATE items SET year=NULL WHERE id='a1'")
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata
+           (item_id,provider,provider_id,premiered,confidence,updated_at)
+         VALUES('a1','musicbrainz','rg-a1','1990-01-01','auto',unixepoch())",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let first = page(&api, &token, "/api/v1/artists?library=M&limit=1").await;
+    assert_eq!(first["total"], 2, "the group count must precede paging");
+    assert_eq!(first["artists"][0]["name"], "Björk");
+    let second = page(&api, &token, "/api/v1/artists?library=M&limit=1&offset=1").await;
+    assert_eq!(second["artists"][0]["name"], "Various Artists");
+    assert_eq!(second["artists"][0]["album_count"], 2);
+
+    let albums = page(
+        &api,
+        &token,
+        "/api/v1/artists/artist-dmFyaW91cyBhcnRpc3Rz/albums?library=M",
+    )
+    .await;
+    let titles: Vec<&str> = albums["albums"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|album| album["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(titles, ["Enriched Earlier", "Tagged Later"]);
+
+    let found = page(
+        &api,
+        &token,
+        "/api/v1/artists/artist-dmFyaW91cyBhcnRpc3Rz/albums?library=M&q=hidden",
+    )
+    .await;
+    assert_eq!(found["total"], 1);
+    assert_eq!(found["albums"][0]["id"], "a1");
+
+    // Search folding intentionally considers number spellings equivalent,
+    // but artist identity must not. Punctuation-only credits also need a
+    // non-empty route key.
+    sqlx::query(
+        "INSERT INTO items
+           (id,kind,title,norm_title,sort_title,artist,norm_artist,artist_key,module_id,collection_id)
+         VALUES('word','album','Word','word','word','One','1','artist-b25l','m1','c1'),
+               ('digit','album','Digit','digit','digit','1','1','artist-MQ','m1','c1'),
+               ('punct','album','Punctuation','punctuation','punctuation','!!!','','artist-ISEh','m1','c1')",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    let numeric = page(&api, &token, "/api/v1/artists?library=M&q=one").await;
+    assert_eq!(numeric["total"], 2, "fuzzy search merged artist identities");
+    let keys: std::collections::BTreeSet<&str> = numeric["artists"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|artist| artist["key"].as_str())
+        .collect();
+    assert_eq!(keys, ["artist-MQ", "artist-b25l"].into_iter().collect());
+    let punctuation = page(&api, &token, "/api/v1/artists/artist-ISEh/albums?library=M").await;
+    assert_eq!(punctuation["albums"][0]["id"], "punct");
+}
+
 /// Unification: capability never filters the list — it changes each
 /// track's computed delivery. A no-overlay client still sees the PGS
 /// track; with no burn-capable host it reads `delivery: none`.

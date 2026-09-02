@@ -303,3 +303,359 @@ async fn resolves_music_into_albums_and_tracks() {
         .unwrap();
     assert_eq!(n, 1, "childless album should be swept");
 }
+
+#[tokio::test]
+async fn album_artist_groups_compilations_and_preserves_existing_identity_and_state() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
+    registry
+        .announce_collection("01HOST", "music", "music", &[TEST_ROOT.into()])
+        .await
+        .unwrap();
+
+    let tagged = |path: &str, size: u64, artist: &str, track: u32, album_artist: Option<&str>| {
+        let mut tags = serde_json::json!({
+            "artist": artist,
+            "album": "Creme de la Core",
+            "title": format!("Song {track}"),
+            "track_number": track.to_string(),
+        });
+        if let Some(album_artist) = album_artist {
+            tags["album_artist"] = album_artist.into();
+        }
+        FileUpsertRecord {
+            streams_json: serde_json::json!({"tags": tags}).to_string(),
+            ..rec(path, size)
+        }
+    };
+
+    // This is how an already indexed loose file looked before Album Artist
+    // extraction: without a usable directory fallback, its song artist owned
+    // the album.
+    registry
+        .upsert_files(
+            "01HOST",
+            "music",
+            vec![
+                tagged("loose-one.flac", 20, "Guest One", 1, None),
+                tagged("loose-two.flac", 21, "Guest Two", 2, None),
+            ],
+        )
+        .await
+        .unwrap();
+    let old_tracks: Vec<(String, String)> =
+        sqlx::query_as("SELECT id,artist FROM items WHERE kind='track' ORDER BY episode")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    let retained_album: String = sqlx::query_scalar("SELECT parent_id FROM items WHERE id=?")
+        .bind(&old_tracks[0].0)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    let pinned_album: String = sqlx::query_scalar("SELECT parent_id FROM items WHERE id=?")
+        .bind(&old_tracks[1].0)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata
+           (item_id,provider,provider_id,title,poster_path,confidence,updated_at)
+         VALUES(?,'musicbrainz','wrong-release','Wrong release','wrong.jpg','auto',1);
+         INSERT INTO provider_queries(item_id,provider,query_type,query,rev,asked_at)
+         VALUES(?,'musicbrainz','title','guest 1|creme de la core',1,1);
+         INSERT INTO provider_metadata
+           (item_id,provider,provider_id,title,poster_path,confidence,updated_at)
+         VALUES(?,'musicbrainz','human-release','Human release','human.jpg','manual',1);
+         INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+         VALUES(?,'musicbrainz','human-release',1)",
+    )
+    .bind(&retained_album)
+    .bind(&retained_album)
+    .bind(&pinned_album)
+    .bind(&pinned_album)
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query(
+        "INSERT INTO users(id,username,password_hash) VALUES('listener','listener','x');
+         INSERT INTO watch_state
+           (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
+         VALUES('listener',?,42000,180000,0,3,123),
+               ('listener',?,84000,180000,0,2,124)",
+    )
+    .bind(&old_tracks[0].0)
+    .bind(&old_tracks[1].0)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    // The refreshed source moves under the compilation. A second recording
+    // has a different song artist but the same release credit.
+    registry
+        .upsert_files(
+            "01HOST",
+            "music",
+            vec![
+                tagged(
+                    "loose-one.flac",
+                    20,
+                    "Guest One",
+                    1,
+                    Some("Various Artists"),
+                ),
+                tagged(
+                    "loose-two.flac",
+                    21,
+                    "Guest Two",
+                    2,
+                    Some("Various Artists"),
+                ),
+            ],
+        )
+        .await
+        .unwrap();
+
+    let albums: Vec<(String, String)> =
+        sqlx::query_as("SELECT title,artist FROM items WHERE kind='album'")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(
+        albums,
+        [("Creme de la Core".into(), "Various Artists".into())]
+    );
+    let tracks: Vec<(i64, String)> =
+        sqlx::query_as("SELECT episode,artist FROM items WHERE kind='track' ORDER BY episode")
+            .fetch_all(&db)
+            .await
+            .unwrap();
+    assert_eq!(tracks, [(1, "Guest One".into()), (2, "Guest Two".into())]);
+    let state: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
+        "SELECT i.episode,w.position_ms,w.play_count,w.updated_at FROM watch_state w
+          JOIN items i ON i.id=w.item_id WHERE i.kind='track' ORDER BY i.episode",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert_eq!(
+        state,
+        [(1, 42_000, 3, 123), (2, 84_000, 2, 124)],
+        "identity correction lost state"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE id=?")
+            .bind(&old_tracks[0].0)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1,
+        "the first track identity should survive the correction"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE id=?")
+            .bind(&old_tracks[1].0)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1,
+        "a free target slot should reparent rather than replace the second track"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT id FROM items WHERE kind='album'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        retained_album,
+        "correcting the release credit replaced the album identity"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT provider_id FROM provider_metadata
+              WHERE item_id=? AND provider='musicbrainz'",
+        )
+        .bind(&retained_album)
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        "human-release",
+        "the old automatic answer survived or the converging human pin was lost"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM provider_queries
+              WHERE item_id=? AND provider='musicbrainz'",
+        )
+        .bind(&retained_album)
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        0,
+        "an old question can also suppress a future correction back to that artist"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT provider_id FROM manual_match WHERE item_id=?",)
+            .bind(&retained_album)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        "human-release",
+        "the explicit match on the merged-away album was not preserved"
+    );
+}
+
+#[tokio::test]
+async fn album_artist_correction_preserves_a_human_musicbrainz_pin() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
+    registry
+        .announce_collection("01HOST", "music", "music", &[TEST_ROOT.into()])
+        .await
+        .unwrap();
+    let tagged = |album_artist: Option<&str>| {
+        let mut tags = serde_json::json!({
+            "artist": "Guest", "album": "A Compilation",
+            "title": "A Song", "track_number": "1"
+        });
+        if let Some(album_artist) = album_artist {
+            tags["album_artist"] = album_artist.into();
+        }
+        FileUpsertRecord {
+            streams_json: serde_json::json!({"tags": tags}).to_string(),
+            ..rec("loose.flac", 30)
+        }
+    };
+    registry
+        .upsert_files("01HOST", "music", vec![tagged(None)])
+        .await
+        .unwrap();
+    let album: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='album'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO provider_metadata
+           (item_id,provider,provider_id,title,confidence,updated_at)
+         VALUES(?,'musicbrainz','human-release','Human choice','manual',1);
+         INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
+         VALUES(?,'musicbrainz','human-release',1);
+         INSERT INTO provider_queries(item_id,provider,query_type,query,rev,asked_at)
+         VALUES(?,'musicbrainz','title','guest|a compilation',1,1)",
+    )
+    .bind(&album)
+    .bind(&album)
+    .bind(&album)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    registry
+        .upsert_files("01HOST", "music", vec![tagged(Some("Various Artists"))])
+        .await
+        .unwrap();
+
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT provider_id FROM provider_metadata
+              WHERE item_id=? AND provider='musicbrainz'",
+        )
+        .bind(&album)
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        "human-release"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM manual_match WHERE item_id=?")
+            .bind(&album)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn replacement_at_the_same_path_does_not_inherit_item_or_watch_state() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default());
+    registry
+        .record_satellite("01HOST", "mediahost", "nas", "fp")
+        .await
+        .unwrap();
+    registry
+        .announce_collection("01HOST", "music", "music", &[TEST_ROOT.into()])
+        .await
+        .unwrap();
+    let tagged = |size: u64, artist: &str, album: &str| FileUpsertRecord {
+        streams_json: serde_json::json!({"tags": {
+            "artist": artist, "album": album, "title": "Track", "track_number": "1"
+        }})
+        .to_string(),
+        ..rec("mutable.flac", size)
+    };
+    registry
+        .upsert_files(
+            "01HOST",
+            "music",
+            vec![tagged(40, "Old Artist", "Old Album")],
+        )
+        .await
+        .unwrap();
+    let old_track: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='track'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO users(id,username,password_hash) VALUES('listener','listener','x');
+         INSERT INTO watch_state
+           (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
+         VALUES('listener',?,42000,180000,0,3,123)",
+    )
+    .bind(&old_track)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    registry
+        .upsert_files(
+            "01HOST",
+            "music",
+            vec![tagged(41, "New Artist", "New Album")],
+        )
+        .await
+        .unwrap();
+    let new_track: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='track'")
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_ne!(new_track, old_track);
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM watch_state WHERE item_id=?")
+            .bind(&new_track)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "different bytes inherited the displaced recording's state"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM watch_state_archive
+              WHERE size=40 AND head_xxh3=40 AND tail_xxh3=41",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        1,
+        "the displaced content's state was not retained for a future return"
+    );
+}

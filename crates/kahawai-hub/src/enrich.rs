@@ -594,6 +594,42 @@ pub(crate) fn fold(s: &str) -> String {
         .join(" ")
 }
 
+/// Stable identity for an artist credit, not a fuzzy search key.
+///
+/// Case, accents and whitespace are typographic differences in tags. Keep
+/// punctuation and number spelling, however: `P!nk`, `Pink`, `One` and `1`
+/// are all names the catalogue must be able to keep apart. In particular, a
+/// punctuation-only artist must remain a usable, non-empty API route key.
+pub(crate) fn artist_key(s: &str) -> String {
+    use data_encoding::BASE64URL_NOPAD;
+    use unicode_normalization::UnicodeNormalization;
+    let folded: String = s
+        .nfd()
+        .filter(|c| !unicode_normalization::char::is_combining_mark(*c))
+        .flat_map(char::to_lowercase)
+        .collect();
+    let identity = folded.split_whitespace().collect::<Vec<_>>().join(" ");
+    format!("artist-{}", BASE64URL_NOPAD.encode(identity.as_bytes()))
+}
+
+#[cfg(test)]
+mod artist_key_tests {
+    use super::artist_key;
+
+    #[test]
+    fn artist_identity_ignores_typography_without_becoming_fuzzy() {
+        assert_eq!(artist_key("Beyoncé"), artist_key("  BEYONCE  "));
+        assert_ne!(artist_key("One"), artist_key("1"));
+        assert_ne!(artist_key("P!nk"), artist_key("Pink"));
+        assert_eq!(artist_key("!!!"), "artist-ISEh");
+        assert!(
+            artist_key("AC/DC")
+                .bytes()
+                .all(|byte| { byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_') })
+        );
+    }
+}
+
 /// Which TMDB credential style this is: the v3 "API Key" rides the `api_key`
 /// query parameter, the v4 "API Read Access Token" is a JWT and rides a Bearer
 /// header.

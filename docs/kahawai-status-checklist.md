@@ -93,12 +93,15 @@ How something works and why it was built that way belong in
       progress reports every 500 files. Files and failures commit to the local
       SQLite catalogue before any hub observes them
 - [x] MH-3 GStreamer discovery for technical metadata, including exact PAR,
-      normalized display orientation and resulting display dimensions. Legacy
-      rows use a bounded local exact-source scheduler tier rather than
-      scans/reconciliation; results and terminal failures are source-owned and
-      catalogue-revision-guarded, scan
-      generations remain unchanged, and changed source JSON retries only that
-      physical revision
+      normalized display orientation and resulting display dimensions, and
+      distinct recording Artist and Album Artist tags. Existing music rows
+      advance through a durable local mapper generation during ordinary scans;
+      a generation advance republishes even identical discovery JSON so the
+      hub reruns its mapper, while a failed re-probe retains the playable old
+      row at the old generation for retry.
+      Other legacy technical rows use bounded local exact-source scheduler
+      worklists; results and terminal failures are source-owned and
+      catalogue-revision-guarded
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
       at scan via a sparse EBML walk; missing records are retried by one local
@@ -161,7 +164,13 @@ How something works and why it was built that way belong in
       live in the explicit source tables. Direct level-52→59 migration and
       conflict-detecting migration-56 replay are runnable and real-catalogue
       proven.
-- [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions, music layout)
+- [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions,
+      music layout). Music albums group on Album Artist while tracks retain
+      their recording Artist; missing Album Artist falls back to path artist,
+      then recording Artist. Mapper-only correction reparents stable track
+      identities (merging state only on a real slot collision), invalidates an
+      obsolete automatic MusicBrainz answer while preserving a human pin, and
+      never transfers state across different content at the same path
 - [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
       composite, MusicBrainz + CAA). Which record an item IS is derived
@@ -408,6 +417,16 @@ How something works and why it was built that way belong in
       and paging, item detail with stream info, artwork at named sizes,
       playback and admin endpoints. Client behaviour and the API shape
       are in implementation §4.4/§4.7.
+      Music libraries additionally expose a paged Album Artist index and a
+      paged, chronological artist-album route. Both web grids virtualise those
+      pages and fetch visible chunks without a load-more control. Grouping
+      happens before paging, and chronology uses the same embedded-or-enriched
+      release year the album card displays;
+      search returns matching artists alongside albums and songs and matches
+      track titles within an artist's albums. A strict synthetic `artist_key`
+      keeps fuzzy-search equivalents such as “One” and “1” distinct while
+      avoiding an artist entity/enrichment path; a rename changes the route
+      key (`kahawai-list.sh -r/-A`).
       `in_progress=true` narrows the same endpoint to what is meaningfully
       started and unfinished, most recently watched first — the
       continue-watching row (`kahawai-list.sh -p`). Meaningful means both one

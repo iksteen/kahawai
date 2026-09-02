@@ -23,6 +23,7 @@ import { defineComponent, h } from 'vue'
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(),
   listLibraries: vi.fn(),
+  listArtists: vi.fn(),
   adminApplyMatch: vi.fn(),
   adminReviewSearch: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
@@ -30,7 +31,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
 const admin = { value: false }
 vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
 
-const { adminApplyMatch, adminReviewSearch, listItems, listLibraries } =
+const { adminApplyMatch, adminReviewSearch, listArtists, listItems, listLibraries } =
   await import('../src/api/generated/kahawai.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
@@ -107,6 +108,11 @@ function routerFor() {
     routes: [
       { path: '/', name: 'libraries', component: { template: '<div />' } },
       { path: '/library/:library', name: 'library', component: Library },
+      {
+        path: '/library/:library/artist/:artist',
+        name: 'artist',
+        component: { template: '<div />' },
+      },
       { path: '/library/:library/item/:id', name: 'detail', component: { template: '<div />' } },
     ],
   })
@@ -155,6 +161,15 @@ beforeEach(() => {
       { id: 'music', name: 'Music', media_type: 'music' },
     ],
   })
+  vi.mocked(listArtists).mockResolvedValue({
+    artists: [
+      { key: 'bjork', name: 'Björk', album_count: 12 },
+      { key: 'various artists', name: 'Various Artists', album_count: 4 },
+    ],
+    total: 2,
+    limit: 100,
+    offset: 0,
+  })
   clearNotices()
 })
 afterEach(() => {
@@ -196,9 +211,39 @@ describe('opening a library', () => {
     await flushPromises()
     expect(router.currentRoute.value.path).toBe('/library/films/item/i0')
   })
+
+  test('does not turn artist API paging into a load-more interaction', async () => {
+    vi.mocked(listArtists).mockResolvedValue({
+      artists: [{ key: 'bjork', name: 'Björk', album_count: 12 }],
+      total: 101,
+      limit: 100,
+      offset: 0,
+    })
+    const { wrapper } = await grid('/library/music')
+    expect(wrapper.text()).not.toContain('More artists')
+  })
+
+  test('does not render an empty Artists section for item-only search results', async () => {
+    vi.mocked(listArtists).mockResolvedValue({
+      artists: [],
+      total: 0,
+      limit: 100,
+      offset: 0,
+    })
+    const { wrapper } = await filtered('heat', '/library/music')
+    expect(wrapper.findAll('h2').map((heading) => heading.text())).toEqual(['Albums and songs'])
+  })
 })
 
 describe('when something will not load', () => {
+  test('an unknown library reaches the canonical item-route refusal', async () => {
+    vi.mocked(listItems).mockRejectedValue(new ApiError(404, 'library not found'))
+    const { wrapper } = await grid('/library/gone')
+
+    expect(listItems).toHaveBeenCalledWith(expect.objectContaining({ library: 'gone' }))
+    expect(wrapper.text()).toContain('library not found')
+  })
+
   test('the grid says so and offers to ask again', async () => {
     hub(250, { failing: [0] })
     const { wrapper } = await grid()
@@ -389,14 +434,16 @@ describe('once the page has been measured', () => {
     expect(asked).toContain(100)
   })
 
-  test('a music library lays its cards out square', async () => {
-    // The media type arrives a round trip after the first cards, and the row
-    // pitch is measured off a cell — a library that kept the poster ratio
-    // reserved a poster's height for every sleeve.
-    laidOut()
-    const { wrapper } = await grid('/library/music')
+  test('a music library starts at Album Artists instead of the album grid', async () => {
+    const { wrapper, router } = await grid('/library/music')
     await flushPromises()
-    expect(wrapper.find('ul').attributes('style')).toContain('--card-ratio: 1')
+    expect(wrapper.text()).toContain('Björk')
+    expect(wrapper.text()).toContain('12 albums')
+    expect(listItems).not.toHaveBeenCalled()
+    await wrapper.findAll('.artist-tile')[0]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('artist')
+    expect(router.currentRoute.value.params.artist).toBe('bjork')
   })
 })
 

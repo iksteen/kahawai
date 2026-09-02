@@ -105,6 +105,16 @@ function pages(at: string) {
     history: createMemoryHistory(),
     routes: [
       { path: '/library/:library', name: 'library', component: { template: '<div />' } },
+      {
+        path: '/library/:library/artist/:artist',
+        name: 'artist',
+        component: { template: '<div />' },
+      },
+      {
+        path: '/library/:library/artist/:artist/item/:id',
+        name: 'artist-album',
+        component: Detail,
+      },
       { path: '/library/:library/item/:id', name: 'detail', component: Detail },
       { path: '/library/:library/item/:id/season/:season', name: 'season', component: Season },
       {
@@ -576,6 +586,17 @@ describe('going back up', () => {
     await wrapper.findAll('button')[0]!.trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.path).toBe('/library/films')
+  })
+
+  test('an album opened under an Album Artist returns to that artist', async () => {
+    vi.mocked(itemQuery).mockResolvedValue(
+      film({ kind: 'album', id: 'album', title: 'Hot Space', artist: 'Queen' }) as never,
+    )
+    const { router, wrapper } = await open(Detail, '/library/music/artist/queen/item/album')
+    expect(wrapper.findAll('button')[0]!.text()).toContain('Queen')
+    await wrapper.findAll('button')[0]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/library/music/artist/queen')
   })
 })
 

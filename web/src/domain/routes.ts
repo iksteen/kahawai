@@ -13,6 +13,8 @@
 export type RouteName =
   | 'libraries'
   | 'library'
+  | 'artist'
+  | 'artist-album'
   | 'admin'
   | 'settings'
   | 'detail'
@@ -70,7 +72,7 @@ export function hasSearchPanel(name: RouteName): boolean {
 /// On the player, admin and settings there is nothing for it to search, and a
 /// box that silently does nothing is worse than no box.
 export function hasSearchBox(name: RouteName): boolean {
-  return name === 'libraries' || name === 'library'
+  return name === 'libraries' || name === 'library' || name === 'artist'
 }
 
 /// A season segment. `all` rather than an empty one: a null season is ABSOLUTE

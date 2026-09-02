@@ -14,7 +14,12 @@ import { CHUNK } from '../domain/virtual.ts'
 import { listItems } from '../api/generated/kahawai.ts'
 import { sentence } from '../domain/refusal.ts'
 
-export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: Ref<string>) {
+export function useLibraryItems(
+  library: Ref<string>,
+  query: Ref<string>,
+  sort: Ref<string>,
+  enabled?: Ref<boolean>,
+) {
   /// Sparse, keyed by item index. A `Map` rather than an array: the grid holds
   /// the whole library's height from the first answer, and most of it has
   /// never been fetched.
@@ -54,6 +59,7 @@ export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: 
   }
 
   async function load(chunk: number) {
+    if (enabled && !enabled.value) return
     if (asked.has(chunk)) return
     asked.add(chunk)
     const mine = generation
@@ -101,6 +107,7 @@ export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: 
   /// new one had never fetched — a re-sort re-fetched offset 0 and left
   /// ninety cells as permanent placeholders, because nothing re-asks.
   function need(chunks: number[]) {
+    if (enabled && !enabled.value) return
     for (const chunk of chunks) void load(chunk)
   }
 
@@ -136,9 +143,14 @@ export function useLibraryItems(library: Ref<string>, query: Ref<string>, sort: 
   // NOT cleared — arriving from a search on the home screen has to land with
   // that search still applied.
   watch(
-    [library, query, sort],
+    [library, query, sort, () => enabled?.value ?? true],
     () => {
       reset()
+      if (enabled && !enabled.value) {
+        total.value = null
+        loaded.value = new Map()
+        return
+      }
       void load(0)
     },
     { immediate: true },

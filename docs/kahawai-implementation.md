@@ -183,6 +183,24 @@ Runs per file-upsert batch, incrementally:
 3. **Dedup within that collection only**: another physical copy may bind to the same item and is ranked by resolution/bitrate/codec modernity. The same work in another collection is a different item with independent provider and watch state (HUB-3).
 4. **Enrich** the collection item via its media-type provider chain (below).
 
+For music, the album identity uses the embedded Album Artist, then the parsed
+path artist, then the recording Artist. Tracks keep the recording Artist. That
+distinction is what makes compilations one “Various Artists” album instead of
+one album per guest performer. A mapper-only correction reparents the existing
+track identity when its target slot is free; only a real slot collision merges
+watch state onto the surviving track. Reusing an album after its automatic
+Album Artist changes clears the obsolete MusicBrainz answer and question so
+the new credit is looked up, while a human pin remains authoritative. A file
+with different content at the same path gets a new identity and cannot inherit
+the displaced item’s state; that state is archived by the old content hashes.
+The mediahost records a monotonic music-tag mapper generation beside
+each local file, so pre-existing rows are refreshed once and resume after a
+restart; if re-probing unchanged bytes fails, their old playable catalogue row
+stays live and its old generation makes the next scan retry it. Advancing the
+generation publishes one file update even when the discovered JSON is
+byte-for-byte unchanged: a hub-side mapper change such as the path-artist
+fallback still needs to re-evaluate that evidence.
+
 **Which record an item IS** (`item_match`) is derived, never assigned. The pick orders every candidate answer by: the owner's pin first, then match strength (a strong match beats a weak one whatever the ranking says), then `local` (HUB-9), then the media type's chain order, then provider name for determinism. Refused records are not candidates, and no candidate means NO ROW — absence is the only representation of "unmatched", covering "never asked", "only misses" and "everything refused" alike.
 
 Because it is recomputed from scratch on every input write, a more preferred provider that later gains information replaces an automatic match by itself, a chain reorder re-decides ownership of a whole media type without contacting anyone, and a pin whose backing answer is withdrawn stops winning rather than stranding a match nothing supports. Top-level items only: episodes and tracks carry no assignment and render through their parent's.
@@ -411,9 +429,31 @@ ENG-6 work.
 
 *This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
 
-**Every browse page is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one.
+**The general item browse is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one. The narrower artist-album exception and its cost boundary are below.
 
 **Browse and search are one endpoint** (HUB-12). Omitting `library` searches every library, which is what makes cross-library search a parameter rather than a second route; `q` matches the folded filename and the resolved title, so an item is found by what it is called now as well as by what it is called on disk. `sort` is a name (`title`, `-title`, `year`, `-year`, `added`, `-added`) mapped to a fixed ORDER BY — never interpolated from the request — and each name resolves to `items.sort_title`/`items.year` only, both carried by one index, so a page is a range scan. `added` needs no column: item ids are ULIDs and sort by mint time. The response carries `total`, `limit` and `offset` so a client can size the whole result set before fetching it.
+
+Music adds two library-scoped views over those same item rows. `GET
+/api/v1/artists` groups albums by a strict `artist_key` before paging and
+returns that opaque URL-safe, stable-within-the-current-name key, display name
+and album count. The separate `norm_artist` stays the fuzzy search value: using it
+as identity would merge real names such as “One” and “1”, and punctuation-only
+names would have no route key.
+`GET /api/v1/artists/{key}/albums` returns that group's albums, oldest first by
+default, and a search also matches their child tracks. Chronology resolves an
+album's embedded year against its provider premiere date before paging, so the
+order is the same one the card displays. This is deliberately paid across one
+artist's candidate albums rather than every album in the library; persisting a
+second copy would add write amplification and another derived value to keep
+correct. The artist index and album grid reserve their full result height,
+render only nearby rows, and fetch 100-row chunks as those rows approach the
+viewport—there is no separate load-more interaction. This deliberately costs
+no artist table or artwork/enrichment pipeline. The additive identity column
+costs one bounded backfill over album rows, avoiding a permanent
+artist entity and its lifecycle. Its trade-off is explicit: an Album Artist
+rename changes the synthetic key. The web music library starts at
+this artist index, searches artists alongside albums and songs, and keeps the
+artist in the URL while an album is open so Back returns to the right level.
 
 **Artwork sizes.** `?size=` names one of a fixed list in code (`thumb` 96 px, `card` 480 px, longest edge), resized on first request and cached thereafter. Names rather than free-form `w=`/`h=`: a client that can ask for any width can mint unbounded cache entries. An unknown name serves the original rather than failing, so retiring a size cannot break a page already open.
 
@@ -560,7 +600,7 @@ manual keyboard, focus, zoom and screen-reader review.
 
 **Video playback.** Direct play binds the range endpoint straight to `<video src>` (browsers do range requests natively); remux/transcode plans load the session's `master.m3u8` via `hls.js` (MSE) with native HLS fallback on Safari. Seek beyond the transcoded window and ladder switches go through the session endpoints from §4.6. Text subtitles attach as WebVTT `<track>` elements (hub converts on demand); ASS/SSA streams render client-side via JASSUB (libass compiled to WASM) on a canvas overlay, loading the item's served font set; PGS/VobSub arrive as the server-decoded bitmap track (§4.3b) composited on the same canvas — the player accordingly declares both `ass_render: true` and `graphics_overlay: true` in its capability profile; burned-in subtitles arrive inside the video and the UI marks them as such from the negotiation verdict, which is also surfaced in a "playback info" overlay (direct/remux/transcode + per-stream reasons). Progress posts every 10 s and on pause/unload.
 
-**Browsing.** One search box in the header, whose meaning follows the screen: on the home screen it queries every library at once and shows at most five hits each, listing only libraries that have any; clicking a library's name follows those results into it with the query still standing, where the same box becomes that library's filter. The box is rendered only on those two screens — on the player or admin pages it would silently do nothing.
+**Browsing.** One search box in the header, whose meaning follows the screen: on the home screen it queries every library at once and shows at most five hits each, listing only libraries that have any; clicking a library's name follows those results into it with the query still standing, where the same box becomes that library's filter. On an Album Artist screen it filters that artist's albums and tracks. The box is absent on screens where it would silently do nothing, including the player and admin pages.
 
 A library grid reserves the full height of the result set from the first response and fetches 100-item chunks as rows scroll into view, so only the visible rows exist in the DOM (25–44 cells for a library of 881) and the scrollbar never moves under the thumb — the property that separates this from infinite scroll, where the page grows as you go. Row height and column count are measured from the DOM rather than copied from the CSS, because the card art is `aspect-ratio: 1` on a fluid grid track and both are therefore functions of window width. Cards are a fixed height (titles clamped to two lines) since an exact reservation is impossible over variable rows, and the placeholder for a row that has not arrived is structurally identical to a loaded card so nothing shifts when a chunk lands.
 

@@ -13,6 +13,7 @@ import { useQuery } from '@tanstack/vue-query'
 import Btn from '../components/Btn.vue'
 import Card from '../components/Card.vue'
 import MatchDialog from '../components/MatchDialog.vue'
+import PagedGrid from '../components/PagedGrid.vue'
 import {
   cellsIn,
   changed,
@@ -31,6 +32,7 @@ import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'
 import { useLibraryItems } from '../composables/library.ts'
+import { useArtists } from '../composables/music.ts'
 import { useScreenName } from '../composables/title.ts'
 import { useSearchBox, useSearchQuery } from '../composables/search.ts'
 import { whoAmI } from '../api/session.ts'
@@ -42,12 +44,38 @@ const library = computed(() => String(route.params.library ?? ''))
 /// The header's box filters this library in place — see `useSearch`.
 const query = useSearchQuery()
 const sort = ref('title')
+const artistSort = ref('name')
+
+/// Resolve the media type before choosing the browse shape. Music starts at
+/// artists; every other library retains the virtual item grid.
+const details = useQuery({
+  queryKey: ['libraries'],
+  queryFn: () => listLibraries(),
+  select: (r) => r.libraries,
+})
+watch(
+  () => details.isError.value,
+  (failed) =>
+    failed && notify(`Could not load the library details: ${sentence(details.error.value)}`),
+)
+const self = computed(() => details.data.value?.find((l) => l.id === library.value))
+const music = computed(() => self.value?.media_type === 'music')
+const name = computed(() => self.value?.name ?? 'Library')
+useScreenName(computed(() => self.value?.name ?? (details.isError.value ? name.value : null)))
+
+const itemsEnabled = computed(
+  () =>
+    details.isError.value ||
+    (details.data.value !== undefined && (!self.value || !music.value || query.value !== '')),
+)
 
 const { loaded, total, libraryTotal, failure, need, refresh, retry } = useLibraryItems(
   library,
   query,
   sort,
+  itemsEnabled,
 )
+const artists = useArtists(library, query, artistSort, music)
 
 /// HUB-8 hand-matching, from the grid: an operator finds a wrong cover by
 /// LOOKING at the covers, so the affordance belongs where they are looking.
@@ -65,30 +93,6 @@ const search = useSearchBox()
 function clearFilter() {
   search?.clear()
 }
-
-/// The library's name and media type. A second request, and a failure here is
-/// a notice rather than the screen: this failing alone leaves a perfectly good
-/// grid underneath it. Silence read as a library called "Library" holding
-/// cards of the wrong shape — the media type is what decides whether a sleeve
-/// is square.
-const details = useQuery({
-  queryKey: ['libraries'],
-  queryFn: () => listLibraries(),
-  select: (r) => r.libraries,
-})
-watch(
-  () => details.isError.value,
-  (failed) =>
-    failed && notify(`Could not load the library details: ${sentence(details.error.value)}`),
-)
-const self = computed(() => details.data.value?.find((l) => l.id === library.value))
-const name = computed(() => self.value?.name ?? 'Library')
-/// UI-17. The real name, not `name`: its fallback is the placeholder the title
-/// falls back to anyway, and announcing "Library" is spending this screen's one
-/// announcement on the word the announcement exists to replace. But a details
-/// request that FAILED is never going to produce one, and a screen you are
-/// standing on has to answer "where am I" — so the placeholder, then.
-useScreenName(computed(() => self.value?.name ?? (details.isError.value ? name.value : null)))
 
 /// Measured, never assumed: the card art's aspect ratio is applied to a fluid
 /// grid column, so a row's height is a function of the window width.
@@ -169,7 +173,6 @@ watch([total, () => loaded.value.size > 0, () => self.value?.media_type], () =>
   }),
 )
 watch([metric, total], recompute)
-
 /// Fetch whatever the visible rows need and do not have.
 watch(
   [rows, metric, total],
@@ -188,7 +191,7 @@ watch(
 // event, and a re-sort changes neither the total nor the metric, so every
 // other path that would have recomputed was watching something that had not
 // moved.
-watch([library, query, sort], () => {
+watch([library, query, sort, artistSort], () => {
   rows.value = { start: 0, end: 0 }
   window.scrollTo({ top: 0 })
   void nextTick(recompute)
@@ -214,6 +217,40 @@ function open(item: Parameters<typeof targetOf>[0]) {
     name: 'detail',
     params: { library: library.value, id: targetOf(item) },
   })
+}
+
+function openArtist(key: string) {
+  void router.push({
+    name: 'artist',
+    params: { library: library.value, artist: key },
+  })
+}
+
+const count = computed(() => {
+  if (!music.value) return countLine(total.value, libraryTotal.value, query.value !== '')
+  const artistCount = artists.total.value
+  if (!query.value) return artistCount === null ? '' : `${artistCount} artists`
+  const itemCount = total.value
+  return [
+    artistCount === null ? '' : `${artistCount} artists`,
+    itemCount === null ? '' : `${itemCount} albums and songs`,
+  ]
+    .filter(Boolean)
+    .join(' · ')
+})
+
+const pageFailure = computed(() => {
+  if (!music.value) return failure.value
+  return [artists.failure.value, query.value ? failure.value : ''].filter(Boolean).join(' ')
+})
+
+function retryPage() {
+  if (music.value) {
+    if (artists.failure.value) artists.retry()
+    if (query.value && failure.value) retry()
+  } else {
+    retry()
+  }
 }
 </script>
 
@@ -245,6 +282,16 @@ function open(item: Parameters<typeof targetOf>[0]) {
         <template v-else>{{ name }}</template>
       </h1>
       <select
+        v-if="music && query === ''"
+        v-model="artistSort"
+        class="ml-auto rounded-md border border-line bg-surface px-2 py-1 text-[13px]"
+        aria-label="Sort"
+      >
+        <option value="name">Artist A–Z</option>
+        <option value="-name">Artist Z–A</option>
+      </select>
+      <select
+        v-else
         v-model="sort"
         class="ml-auto rounded-md border border-line bg-surface px-2 py-1 text-[13px]"
         aria-label="Sort"
@@ -259,8 +306,8 @@ function open(item: Parameters<typeof targetOf>[0]) {
       <!-- The only feedback somebody who cannot see the grid gets that a
            filter or a sort did anything. -->
       <span class="font-mono text-dim" role="status">
-        {{ countLine(total, libraryTotal, query !== '') }}
-        <span class="sr-only">items</span>
+        {{ count }}
+        <span v-if="!music" class="sr-only">items</span>
       </span>
     </div>
 
@@ -270,11 +317,17 @@ function open(item: Parameters<typeof targetOf>[0]) {
          polite news — and the button is outside the region, or its label is
          read as part of the message every time the message changes. -->
     <div class="mb-3 flex items-center gap-3">
-      <p class="m-0 text-warn" role="alert">{{ failure }}</p>
-      <Btn v-if="failure" ghost small @click="retry">Try again</Btn>
+      <p class="m-0 text-warn" role="alert">{{ pageFailure }}</p>
+      <Btn v-if="pageFailure" ghost small @click="retryPage">Try again</Btn>
     </div>
 
-    <p v-if="total === 0" class="text-dim">
+    <p v-if="music && !query && artists.total.value === 0" class="text-dim">
+      Nothing here yet. Attach a collection to this library and its scan will fill this page.
+    </p>
+    <p v-else-if="music && query && artists.total.value === 0 && total === 0" class="text-dim">
+      Nothing matches “{{ query }}”.
+    </p>
+    <p v-else-if="!music && total === 0" class="text-dim">
       {{
         query
           ? `Nothing matches “${query}”.`
@@ -282,11 +335,47 @@ function open(item: Parameters<typeof targetOf>[0]) {
       }}
     </p>
 
+    <section v-if="music && (artists.total.value ?? 0) > 0">
+      <h2 v-if="query" class="mb-3 text-[17px] font-[650]">Artists</h2>
+      <PagedGrid :total="artists.total.value" min-width="210px" @need="artists.need">
+        <template #default="{ at }">
+          <button
+            v-if="artists.loaded.value.get(at)"
+            type="button"
+            class="artist-tile w-full cursor-pointer rounded-lg border border-line bg-surface p-4 text-left hover:border-teal focus-visible:border-teal"
+            @click="openArtist(artists.loaded.value.get(at)!.key)"
+          >
+            <strong class="block truncate text-[15px]">
+              {{ artists.loaded.value.get(at)!.name }}
+            </strong>
+            <span class="mt-1 block font-mono text-[12px] text-dim">
+              {{ artists.loaded.value.get(at)!.album_count }}
+              {{ artists.loaded.value.get(at)!.album_count === 1 ? 'album' : 'albums' }}
+            </span>
+          </button>
+          <div
+            v-else
+            class="artist-tile w-full animate-pulse rounded-lg border border-line bg-surface"
+            aria-hidden="true"
+          />
+        </template>
+      </PagedGrid>
+    </section>
+
+    <h2 v-if="music && query && total !== 0" class="mt-7 mb-3 text-[17px] font-[650]">
+      Albums and songs
+    </h2>
+
     <!-- The whole library's height, reserved before a single card past the
          fold has been fetched. That is the difference from infinite scroll,
          where the page grows as you go and the scrollbar jumps under the thumb
          every time it does. -->
-    <div ref="wrap" class="relative" :style="height !== undefined ? { height: `${height}px` } : {}">
+    <div
+      v-if="!music || query"
+      ref="wrap"
+      class="relative"
+      :style="height !== undefined ? { height: `${height}px` } : {}"
+    >
       <!-- `role="list"`, because the reset that comes with Tailwind strips
            list semantics in Safari. `aria-setsize` because this list is
            virtualised: without it a 2242-item library announces as the ninety
@@ -328,5 +417,9 @@ function open(item: Parameters<typeof targetOf>[0]) {
 .grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 140px), 1fr));
+}
+
+.artist-tile {
+  min-height: 76px;
 }
 </style>

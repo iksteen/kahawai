@@ -80,6 +80,7 @@ pub(crate) async fn scan_local_collection(
     let known = std::sync::Arc::new(catalog.known_files(&cfg.name).await?);
     let force_dirs = std::sync::Arc::new(force_dirs);
     let include_audio = cfg.media_type == "music";
+    let music = cfg.media_type == "music";
     let mut unavailable_roots = std::collections::HashSet::new();
     let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
 
@@ -118,7 +119,7 @@ pub(crate) async fn scan_local_collection(
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .into_owned();
-                        let unchanged = !path
+                        let physically_unchanged = !path
                             .parent()
                             .is_some_and(|parent| force_dirs.contains(parent))
                             && known
@@ -138,13 +139,26 @@ pub(crate) async fn scan_local_collection(
                                                 == stored_sidecar_sig(&old.streams_json)
                                     })
                                 });
-                        Ok((root_local, path, rel, unchanged))
+                        let music_tags_stale = physically_unchanged
+                            && music
+                            && known
+                                .get(&(batch_root_token.clone(), rel.clone()))
+                                .is_some_and(|old| {
+                                    old.music_tag_generation < kahawai_media::MUSIC_TAG_GENERATION
+                                });
+                        Ok((
+                            root_local,
+                            path,
+                            rel,
+                            physically_unchanged && !music_tags_stale,
+                            music_tags_stale,
+                        ))
                     })
                     .collect::<Result<Vec<_>>>()
             })
             .await??;
             let mut seen_batch = Vec::new();
-            for (root_local, path, rel, unchanged) in verdicts {
+            for (root_local, path, rel, unchanged, music_tags_stale) in verdicts {
                 if unchanged {
                     skipped += 1;
                     seen_batch.push((root_token.clone(), rel));
@@ -155,7 +169,7 @@ pub(crate) async fn scan_local_collection(
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
                         scanned += 1;
                         catalog
-                            .upsert_file(
+                            .upsert_file_with_music_tag_generation(
                                 &cfg.name,
                                 &FileRecord {
                                     source: Some(kahawai_proto::v1::SourcePath {
@@ -170,11 +184,28 @@ pub(crate) async fn scan_local_collection(
                                     streams_json: serde_json::to_string(&info)?,
                                 },
                                 generation,
+                                if music {
+                                    kahawai_media::MUSIC_TAG_GENERATION
+                                } else {
+                                    0
+                                },
                             )
                             .await?;
                     }
                     Err(error) => {
                         failed += 1;
+                        if music_tags_stale {
+                            // A mapper upgrade failed against bytes whose
+                            // stat, identity and sidecars are unchanged. The
+                            // old probe remains usable; keep it visible and
+                            // leave its generation stale so a later scan tries
+                            // again instead of turning an optional metadata
+                            // refresh into media loss.
+                            tracing::warn!(path = %path.display(), error = format!("{error:#}"),
+                                "music metadata refresh failed; retaining previous source");
+                            seen_batch.push((root_token.clone(), rel));
+                            continue;
+                        }
                         tracing::warn!(path = %path.display(), error = format!("{error:#}"),
                             "scan failed");
                         catalog
@@ -944,6 +975,86 @@ id: nl, index: 1
         std::fs::write(&b, b"other content, different name").unwrap();
         let hb2 = identity_hashes(&b, 29).unwrap();
         assert_ne!(ha, hb2);
+    }
+
+    #[tokio::test]
+    async fn failed_music_mapper_refresh_keeps_the_playable_source_retryable() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Unprobeable.flac");
+        std::fs::write(&path, b"not really a flac file").unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        let size = metadata.len();
+        let mtime_unix = metadata
+            .modified()
+            .unwrap()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs() as i64;
+        let (head_xxh3, tail_xxh3, oshash) = identity_hashes(&path, size).unwrap();
+        let cfg = CollectionConfig {
+            name: "music".into(),
+            media_type: "music".into(),
+            roots: vec![root.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        let generation = catalog.begin_scan("music").await.unwrap();
+        let source = kahawai_proto::v1::SourcePath {
+            root_token: kahawai_core::media::root_token(root.path()),
+            path_rel: "Unprobeable.flac".into(),
+        };
+        let original_version = catalog
+            .upsert_file(
+                "music",
+                &FileRecord {
+                    source: Some(source.clone()),
+                    size,
+                    mtime_unix,
+                    head_xxh3,
+                    tail_xxh3,
+                    oshash,
+                    streams_json: serde_json::to_string(&kahawai_core::media::MediaInfo::default())
+                        .unwrap(),
+                },
+                generation,
+            )
+            .await
+            .unwrap()
+            .unwrap();
+        catalog
+            .finish_scan("music", generation, &Default::default())
+            .await
+            .unwrap();
+
+        let scheduler =
+            crate::scheduler::Scheduler::new(std::slice::from_ref(&cfg), &Default::default())
+                .unwrap();
+        let permit = scheduler
+            .acquire(
+                crate::scheduler::Priority::CatalogFreshness,
+                scheduler.resources([source.root_token.as_str()], true),
+                None,
+                "music tag refresh test",
+            )
+            .await
+            .unwrap();
+        let current = scan_local_collection(cfg, catalog.clone(), Default::default(), permit)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            current, original_version,
+            "failure published no replacement"
+        );
+        let known = catalog.known_files("music").await.unwrap();
+        let kept = &known[&(source.root_token, source.path_rel)];
+        assert_eq!(kept.music_tag_generation, 0, "the next scan must retry");
+        assert_eq!(
+            kept.streams_json,
+            serde_json::to_string(&kahawai_core::media::MediaInfo::default()).unwrap()
+        );
     }
 
     #[test]
