@@ -247,7 +247,11 @@ test.describe.serial('real all-in-one product flows', () => {
     expect(await video.evaluate((element) => (element as HTMLVideoElement).currentSrc)).not.toMatch(
       /^blob:/,
     )
-    await video.click()
+    // This fixture is intentionally tiny. On a slower runner it can finish
+    // between startPlayback's assertions and this cleanup, restoring the play
+    // veil and making a pointer click on the video impossible. Pause the media
+    // element directly; navigation below still owns session teardown.
+    await video.evaluate((element) => (element as HTMLVideoElement).pause())
     await page.getByRole('button', { name: '← Back' }).click()
 
     // WebKit implements route.abort() through Web Inspector. It does retry the

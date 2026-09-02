@@ -1229,6 +1229,7 @@ async fn query_projects_only_client_safe_media_facts() {
         bearer,
         id,
         db,
+        _dir,
         ..
     } = fixture().await;
     let mut private = info(&[]);
@@ -1270,8 +1271,9 @@ async fn query_projects_only_client_safe_media_facts() {
         ))
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
+    let status = response.status();
     let body = json_of(response).await;
+    assert_eq!(status, 200, "QUERY failed: {body}");
     let text = body.to_string();
     for private in [
         "credential-secret",
