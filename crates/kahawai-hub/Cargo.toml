@@ -58,11 +58,11 @@ jsonwebtoken = { version = "10.4.0", default-features = false, features = ["rust
 url = { workspace = true }
 utoipa = { workspace = true }
 utoipa-swagger-ui = { workspace = true }
+tempfile = { workspace = true }
 
 [dev-dependencies]
 tracing-subscriber = { workspace = true }
 kahawai-transcoder = { workspace = true }
-tempfile = { workspace = true }
 libc = { workspace = true }
 tower = { workspace = true, features = ["util"] }
 kahawai-mediahost = { workspace = true }

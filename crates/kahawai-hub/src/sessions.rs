@@ -132,13 +132,24 @@ impl std::fmt::Display for NoSuchTrack {
 
 impl std::error::Error for NoSuchTrack {}
 
+fn short_worker_socket_dir() -> Result<tempfile::TempDir> {
+    tempfile::Builder::new()
+        .prefix("kahawai-")
+        .tempdir_in("/tmp")
+        .context("creating short worker socket directory")
+}
+
 /// How a remux/transcode pipeline runs. The hub always spawns the
 /// supervised worker (§1.1: a GStreamer crash kills one session, not the
 /// process — observed twice on a real library via hlssink3 panics).
 /// ponytail: in-process kept for tests, which have no worker binary.
 pub enum RemuxRunner {
     InProcess(Arc<kahawai_media::remux::RemuxJob>),
-    Worker(Mutex<tokio::process::Child>),
+    Worker {
+        child: Mutex<tokio::process::Child>,
+        /// Owns the short Unix-socket directory until the worker is gone.
+        _socket_dir: tempfile::TempDir,
+    },
     /// Placeholder while a seek-restart swaps runners.
     Stopped,
 }
@@ -147,7 +158,7 @@ impl RemuxRunner {
     fn stop(&self) {
         match self {
             RemuxRunner::InProcess(job) => job.stop(),
-            RemuxRunner::Worker(child) => {
+            RemuxRunner::Worker { child, .. } => {
                 let _ = child.lock().unwrap().start_kill();
             }
             RemuxRunner::Stopped => {}
@@ -159,7 +170,7 @@ impl RemuxRunner {
     /// it corrupts the new run.
     async fn stop_and_wait(&self) {
         self.stop();
-        if let RemuxRunner::Worker(child) = self {
+        if let RemuxRunner::Worker { child, .. } = self {
             let deadline = std::time::Instant::now() + Duration::from_secs(3);
             loop {
                 if matches!(child.lock().unwrap().try_wait(), Ok(Some(_)) | Err(_)) {
@@ -2754,10 +2765,12 @@ impl Sessions {
 
         let runner = match &self.worker_exe {
             Some(exe) => {
-                // ponytail: SUN_LEN caps unix socket paths at ~108
-                // bytes — a pathologically deep data_dir breaks remux
-                // here. Bind under a short tmp dir if it ever bites a
-                // real deployment.
+                // SUN_LEN caps Unix socket paths at roughly 108 bytes. macOS's
+                // ordinary temp root already consumes most of that before the
+                // session ULID and socket name are added, so keep only these
+                // private transport sockets under the short /tmp spelling.
+                // Output and diagnostics remain in the configured data dir.
+                let socket_dir = short_worker_socket_dir()?;
                 // One socket per part: the worker joins them with concat
                 // into a single pipeline, so a CD1->CD2 boundary is not a
                 // restart. Part one keeps the historical name and the
@@ -2765,9 +2778,9 @@ impl Sessions {
                 let mut socks = Vec::with_capacity(parts.len());
                 for (n, (lease, size)) in parts.iter().enumerate() {
                     let sock = if n == 0 {
-                        dir.join("worker.sock")
+                        socket_dir.path().join("worker.sock")
                     } else {
-                        dir.join(format!("worker{n}.sock"))
+                        socket_dir.path().join(format!("worker{n}.sock"))
                     };
                     let listener = tokio::net::UnixListener::bind(&sock)
                         .with_context(|| format!("binding {}", sock.display()))?;
@@ -2877,7 +2890,10 @@ impl Sessions {
                     pid = child.id(),
                     "pipeline worker spawned"
                 );
-                RemuxRunner::Worker(Mutex::new(child))
+                RemuxRunner::Worker {
+                    child: Mutex::new(child),
+                    _socket_dir: socket_dir,
+                }
             }
             None => {
                 // In-process (tests): the pipeline pulls (and seeks —
@@ -2934,7 +2950,7 @@ impl Sessions {
                         bail!("remux failed to start: {e}");
                     }
                 }
-                RemuxRunner::Worker(child) => {
+                RemuxRunner::Worker { child, .. } => {
                     if let Some(status) = child.lock().unwrap().try_wait()? {
                         // A CLEAN exit is a pipeline that FINISHED: an
                         // all-copy remux of short content completes in
@@ -4271,6 +4287,20 @@ mod reads_from_tests {
         let parts = [part("A")];
         assert!(reads_from("A", &parts, "A"));
         assert!(!reads_from("A", &parts, "B"));
+    }
+}
+
+#[cfg(test)]
+mod worker_socket_tests {
+    use std::os::unix::ffi::OsStrExt;
+
+    use super::short_worker_socket_dir;
+
+    #[test]
+    fn worker_socket_directory_leaves_sun_len_headroom() {
+        let dir = short_worker_socket_dir().unwrap();
+        let socket = dir.path().join("worker999.sock");
+        assert!(socket.as_os_str().as_bytes().len() <= 64, "{socket:?}");
     }
 }
 
