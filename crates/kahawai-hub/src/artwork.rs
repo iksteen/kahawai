@@ -17,6 +17,14 @@
 //! appear, and the resize itself is one decode plus one encode of a file
 //! already on local disk.
 //!
+//! Album Artist collages follow the same rule but are built by background
+//! enrichment before their version is exposed. Their `.collage` manifest is
+//! the durable readiness claim and records the exact newest-four album set;
+//! the generated JPEG is keyed by both library and artist so a shared artist
+//! cannot expose a cover across a library grant boundary. Rebuilding costs at
+//! most four cached cover reads plus one composition and the named resizes;
+//! required-time latency stays one local cache read.
+//!
 //! The one thing that IS evicted, at startup, is a derivative whose size
 //! no longer exists — see [`Artwork::sweep_stale_sizes`]. That is not a
 //! janitor and not a quota: nothing is removed because the cache grew,
@@ -29,6 +37,8 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use image::GenericImageView;
+use serde::{Deserialize, Serialize};
 use sqlx::Row;
 
 use crate::registry::Registry;
@@ -39,7 +49,28 @@ pub struct Artwork {
     enricher: Arc<crate::enrich::Enricher>,
     /// Per-key locks so concurrent requests fetch once.
     inflight: std::sync::Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
+    /// Ready generated Album Artist collages, including remembered misses.
+    /// The library is part of the identity: one synthetic artist can occur in
+    /// libraries with different grants and must not borrow a hidden cover.
+    collages: std::sync::Mutex<HashMap<(String, String), Option<i64>>>,
 }
+
+#[derive(Deserialize, Serialize)]
+struct ArtistCollageManifest {
+    library: String,
+    artist_key: String,
+    revision: String,
+    albums: Vec<String>,
+}
+
+struct ArtistCollageAlbum {
+    id: String,
+    art_version: Option<i64>,
+    poster: String,
+}
+
+const ARTIST_COLLAGE_SCHEMA: &str = "artist-collage-v1";
+const ARTIST_COLLAGE_EDGE: u32 = 480;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum CacheWrite {
@@ -96,6 +127,7 @@ impl Artwork {
             dir,
             enricher,
             inflight: Default::default(),
+            collages: Default::default(),
         };
         art.sweep_stale_sizes();
         art
@@ -264,19 +296,245 @@ impl Artwork {
         Ok(std::fs::read(path).ok().map(|bytes| (bytes, "image/jpeg")))
     }
 
+    /// The version of a complete, library-scoped Album Artist collage.
+    ///
+    /// Manifests make readiness durable across a restart without copying a
+    /// cache projection into SQLite. A miss is memoised too: listing a page of
+    /// coverless artists must not turn into one filesystem probe per render.
+    pub(crate) fn artist_collage_version(&self, library: &str, artist_key: &str) -> Option<i64> {
+        let identity = (library.to_string(), artist_key.to_string());
+        if let Some(version) = self.collages.lock().unwrap().get(&identity) {
+            return *version;
+        }
+        let manifest = self.read_artist_collage_manifest(library, artist_key);
+        let version = manifest
+            .as_ref()
+            .map(|manifest| artist_collage_version(&manifest.revision));
+        self.collages.lock().unwrap().insert(identity, version);
+        version
+    }
+
+    /// Serve a generated artist fallback strictly from the durable cache.
+    ///
+    /// The manifest is also the authorization provenance: every album whose
+    /// cover was composited must still belong to this artist in this library.
+    /// Library composition can change through admin actions, satellite
+    /// deletion, or catalogue reconciliation, so validating here is the one
+    /// place that covers every mutation path without putting cache eviction
+    /// policy into the registry.
+    pub(crate) async fn get_cached_artist_collage_at(
+        &self,
+        registry: &Registry,
+        library: &str,
+        artist_key: &str,
+        size: Option<&str>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let Some(manifest) = self.read_artist_collage_manifest(library, artist_key) else {
+            return Ok(None);
+        };
+        if !(1..=4).contains(&manifest.albums.len()) {
+            return Ok(None);
+        }
+        let mut albums = manifest.albums.iter().map(String::as_str);
+        let visible: i64 = sqlx::query_scalar(
+            "SELECT COUNT(DISTINCT i.id) FROM items i
+               JOIN library_collections lc
+                 ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+              WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
+                AND i.id IN (?3,?4,?5,?6)",
+        )
+        .bind(library)
+        .bind(artist_key)
+        .bind(albums.next())
+        .bind(albums.next())
+        .bind(albums.next())
+        .bind(albums.next())
+        .fetch_one(registry.db())
+        .await?;
+        if visible as usize != manifest.albums.len() {
+            return Ok(None);
+        }
+        let key = artist_collage_cache_key(library, artist_key);
+        let path = size
+            .and_then(|name| {
+                SIZES
+                    .iter()
+                    .find(|(candidate, _)| *candidate == name)
+                    .map(|(name, px)| self.dir.join(variant_dir(name, *px)).join(&key))
+            })
+            .unwrap_or_else(|| self.dir.join(&key));
+        Ok(std::fs::read(path).ok().map(|bytes| (bytes, "image/jpeg")))
+    }
+
+    /// Build the Album Artist fallback from the newest four albums with
+    /// usable artwork in each library. This is background work: the public
+    /// endpoint only reads the files materialised here.
+    pub(crate) async fn prefetch_artist_collages(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+    ) -> Result<()> {
+        let rows = sqlx::query(
+            "SELECT lc.library_id,i.artist_key,i.id,md.poster_path,md.updated_at,
+                    COALESCE(i.year,CAST(substr(md.premiered,1,4) AS INTEGER)) AS release_year
+               FROM items i
+               JOIN library_collections lc
+                 ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+               LEFT JOIN resolved_metadata md ON md.item_id=i.id
+               LEFT JOIN artist_artwork aa ON aa.artist_key=i.artist_key
+              WHERE i.kind='album' AND i.artist_key IS NOT NULL
+                AND (aa.outcome IS NULL OR aa.outcome<>'ready')
+              ORDER BY lc.library_id,i.artist_key,
+                       release_year IS NULL,release_year DESC,
+                       COALESCE(i.sort_title,i.title) COLLATE NOCASE,i.id",
+        )
+        .fetch_all(registry.db())
+        .await?;
+        let mut artists: std::collections::BTreeMap<(String, String), Vec<ArtistCollageAlbum>> =
+            std::collections::BTreeMap::new();
+        for row in rows {
+            let identity = (row.get("library_id"), row.get("artist_key"));
+            let albums = artists.entry(identity).or_default();
+            if let Some(poster) = row.get("poster_path") {
+                albums.push(ArtistCollageAlbum {
+                    id: row.get("id"),
+                    art_version: row.get("updated_at"),
+                    poster,
+                });
+            }
+        }
+
+        tracing::info!(artists = artists.len(), "artist collage prefetch starting");
+        let mut ready = 0usize;
+        let mut unchanged = 0usize;
+        let mut unavailable = 0usize;
+        for ((library, artist_key), albums) in artists {
+            let mut selected = Vec::new();
+            let mut covers = Vec::new();
+            for album in albums {
+                match self
+                    .get_at(registry, sessions, &album.id, Some("card"))
+                    .await
+                {
+                    Ok(Some((bytes, _))) => {
+                        selected.push(album);
+                        covers.push(bytes);
+                        if covers.len() == 4 {
+                            break;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => tracing::warn!(
+                        library,
+                        artist = %artist_key,
+                        album = %album.id,
+                        error = format!("{error:#}"),
+                        "album cover unavailable for artist collage"
+                    ),
+                }
+            }
+            let identity = (library.clone(), artist_key.clone());
+            if covers.is_empty() {
+                // The generated JPEG is a cache and remains retained, but its
+                // durable readiness claim must not survive a restart after the
+                // last source cover disappeared.
+                let _ = std::fs::remove_file(artist_collage_manifest_path(
+                    &self.dir,
+                    &library,
+                    &artist_key,
+                ));
+                self.collages.lock().unwrap().insert(identity, None);
+                unavailable += 1;
+                continue;
+            }
+            let revision = artist_collage_revision(&library, &artist_key, &selected);
+            if self
+                .read_artist_collage_manifest(&library, &artist_key)
+                .is_some_and(|manifest| manifest.revision == revision)
+            {
+                self.collages
+                    .lock()
+                    .unwrap()
+                    .insert(identity, Some(artist_collage_version(&revision)));
+                unchanged += 1;
+                continue;
+            }
+
+            let key = artist_collage_cache_key(&library, &artist_key);
+            let cover =
+                tokio::task::spawn_blocking(move || compose_artist_collage(&covers)).await??;
+            std::fs::create_dir_all(&self.dir)?;
+            Self::write_atomic(&self.dir.join(&key), &cover)?;
+            for (name, _) in SIZES {
+                self.at_from_original(
+                    cover.clone(),
+                    "image/jpeg",
+                    key.clone(),
+                    Some(name),
+                    CacheWrite::Required,
+                )
+                .await?;
+            }
+            let manifest = ArtistCollageManifest {
+                library: library.clone(),
+                artist_key: artist_key.clone(),
+                revision: revision.clone(),
+                albums: selected.into_iter().map(|album| album.id).collect(),
+            };
+            Self::write_atomic(
+                &artist_collage_manifest_path(&self.dir, &library, &artist_key),
+                &serde_json::to_vec(&manifest)?,
+            )?;
+            self.collages
+                .lock()
+                .unwrap()
+                .insert(identity, Some(artist_collage_version(&revision)));
+            ready += 1;
+        }
+        tracing::info!(
+            ready,
+            unchanged,
+            unavailable,
+            "artist collage prefetch complete"
+        );
+        Ok(())
+    }
+
+    fn read_artist_collage_manifest(
+        &self,
+        library: &str,
+        artist_key: &str,
+    ) -> Option<ArtistCollageManifest> {
+        let manifest: ArtistCollageManifest = serde_json::from_slice(
+            &std::fs::read(artist_collage_manifest_path(&self.dir, library, artist_key)).ok()?,
+        )
+        .ok()?;
+        if manifest.library != library
+            || manifest.artist_key != artist_key
+            || !self.cache_key_complete(&artist_collage_cache_key(library, artist_key))
+        {
+            return None;
+        }
+        Some(manifest)
+    }
+
+    fn cache_key_complete(&self, key: &str) -> bool {
+        let present = |path: &std::path::Path| {
+            std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
+        };
+        present(&self.dir.join(key))
+            && SIZES
+                .iter()
+                .all(|(name, px)| present(&self.dir.join(variant_dir(name, *px)).join(key)))
+    }
+
     /// Whether the durable promise behind a ready artist row still holds.
     /// Atomic writes guarantee that a file created by this process is whole;
     /// non-empty existence catches deletion, incomplete restores and manual
     /// damage without decoding every portrait on every enrichment pass.
     pub(crate) fn remote_cache_complete(&self, url: &str) -> bool {
         let key = remote_cache_key(url);
-        let present = |path: &std::path::Path| {
-            std::fs::metadata(path).is_ok_and(|meta| meta.is_file() && meta.len() > 0)
-        };
-        present(&self.dir.join(&key))
-            && SIZES
-                .iter()
-                .all(|(name, px)| present(&self.dir.join(variant_dir(name, *px)).join(&key)))
+        self.cache_key_complete(&key)
     }
 
     /// Fetch an artist portrait and materialise every public size before its
@@ -464,6 +722,108 @@ impl Artwork {
     }
 }
 
+fn artist_collage_cache_key(library: &str, artist_key: &str) -> String {
+    format!(
+        "artist-collage-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(format!("{library}\n{artist_key}").as_bytes())
+    )
+}
+
+fn artist_collage_manifest_path(dir: &std::path::Path, library: &str, artist_key: &str) -> PathBuf {
+    dir.join(format!(
+        "{}.collage",
+        artist_collage_cache_key(library, artist_key)
+    ))
+}
+
+fn artist_collage_revision(
+    library: &str,
+    artist_key: &str,
+    albums: &[ArtistCollageAlbum],
+) -> String {
+    let mut material = format!("{ARTIST_COLLAGE_SCHEMA}\n{library}\n{artist_key}");
+    for album in albums {
+        material.push_str(&format!(
+            "\n{}\n{}\n{}",
+            album.id,
+            album.art_version.unwrap_or_default(),
+            album.poster
+        ));
+    }
+    format!(
+        "{ARTIST_COLLAGE_SCHEMA}-{:016x}",
+        xxhash_rust::xxh3::xxh3_64(material.as_bytes())
+    )
+}
+
+fn artist_collage_version(revision: &str) -> i64 {
+    // Zero is omitted by the web URL helper, so keep every valid cache-buster
+    // positive and inside JavaScript's exactly representable integer range.
+    const JAVASCRIPT_SAFE_INTEGER_MAX: u64 = (1_u64 << 53) - 1;
+    ((xxhash_rust::xxh3::xxh3_64(revision.as_bytes()) & JAVASCRIPT_SAFE_INTEGER_MAX) as i64).max(1)
+}
+
+fn compose_artist_collage(covers: &[Vec<u8>]) -> Result<Vec<u8>> {
+    anyhow::ensure!(!covers.is_empty(), "an artist collage needs an album cover");
+    let images = covers
+        .iter()
+        .take(4)
+        .map(|cover| image::load_from_memory(cover).context("decoding album cover"))
+        .collect::<Result<Vec<_>>>()?;
+    let mut collage = image::RgbImage::new(ARTIST_COLLAGE_EDGE, ARTIST_COLLAGE_EDGE);
+    let half = ARTIST_COLLAGE_EDGE / 2;
+    let rectangles = match images.len() {
+        1 => vec![(0, 0, ARTIST_COLLAGE_EDGE, ARTIST_COLLAGE_EDGE)],
+        2 => vec![
+            (0, 0, half, ARTIST_COLLAGE_EDGE),
+            (half, 0, half, ARTIST_COLLAGE_EDGE),
+        ],
+        3 => vec![
+            (0, 0, half, ARTIST_COLLAGE_EDGE),
+            (half, 0, half, half),
+            (half, half, half, half),
+        ],
+        _ => vec![
+            (0, 0, half, half),
+            (half, 0, half, half),
+            (0, half, half, half),
+            (half, half, half, half),
+        ],
+    };
+    for (image, (x, y, width, height)) in images.iter().zip(rectangles) {
+        let tile = crop_fill(image, width, height);
+        image::imageops::replace(&mut collage, &tile, i64::from(x), i64::from(y));
+    }
+    let mut out = std::io::Cursor::new(Vec::new());
+    collage
+        .write_to(&mut out, image::ImageFormat::Jpeg)
+        .context("encoding artist collage")?;
+    Ok(out.into_inner())
+}
+
+fn crop_fill(image: &image::DynamicImage, width: u32, height: u32) -> image::RgbImage {
+    let (source_width, source_height) = image.dimensions();
+    let scale = f64::max(
+        f64::from(width) / f64::from(source_width),
+        f64::from(height) / f64::from(source_height),
+    );
+    let resized_width = (f64::from(source_width) * scale).ceil() as u32;
+    let resized_height = (f64::from(source_height) * scale).ceil() as u32;
+    let resized = image.resize_exact(
+        resized_width,
+        resized_height,
+        image::imageops::FilterType::Lanczos3,
+    );
+    resized
+        .crop_imm(
+            (resized_width - width) / 2,
+            (resized_height - height) / 2,
+            width,
+            height,
+        )
+        .to_rgb8()
+}
+
 /// Fit an image inside `px` on its longest edge, as JPEG.
 ///
 /// Always JPEG, whatever went in: these are small, lossy is invisible at
@@ -563,6 +923,238 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn solid_png(color: [u8; 3]) -> Vec<u8> {
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(16, 16, image::Rgb(color))
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    fn assert_near(pixel: image::Rgb<u8>, expected: [u8; 3]) {
+        for (actual, expected) in pixel.0.into_iter().zip(expected) {
+            assert!(actual.abs_diff(expected) < 10, "{pixel:?} != {expected:?}");
+        }
+    }
+
+    #[test]
+    fn artist_collage_layouts_are_stable() {
+        let red = solid_png([240, 0, 0]);
+        let green = solid_png([0, 240, 0]);
+        let blue = solid_png([0, 0, 240]);
+        let yellow = solid_png([240, 240, 0]);
+        let cases = [
+            (vec![red.clone()], vec![((240, 240), [240, 0, 0])]),
+            (
+                vec![red.clone(), green.clone()],
+                vec![((120, 240), [240, 0, 0]), ((360, 240), [0, 240, 0])],
+            ),
+            (
+                vec![red.clone(), green.clone(), blue.clone()],
+                vec![
+                    ((120, 240), [240, 0, 0]),
+                    ((360, 120), [0, 240, 0]),
+                    ((360, 360), [0, 0, 240]),
+                ],
+            ),
+            (
+                vec![red, green, blue, yellow],
+                vec![
+                    ((120, 120), [240, 0, 0]),
+                    ((360, 120), [0, 240, 0]),
+                    ((120, 360), [0, 0, 240]),
+                    ((360, 360), [240, 240, 0]),
+                ],
+            ),
+        ];
+        for (covers, samples) in cases {
+            let image = image::load_from_memory(&compose_artist_collage(&covers).unwrap())
+                .unwrap()
+                .to_rgb8();
+            assert_eq!(image.dimensions(), (480, 480));
+            for ((x, y), expected) in samples {
+                assert_near(*image.get_pixel(x, y), expected);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn artist_collage_uses_the_newest_four_covered_albums_inside_one_library() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::open(tmp.path()).await.unwrap();
+        let registry = Registry::new(db.clone(), Default::default());
+        sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music')")
+            .execute(&db)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint,enrolled_at,disabled)
+             VALUES('host','mediahost','Host','',unixepoch(),0)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO collections(module_id,collection_id,media_type,roots_json,sync_version)
+             VALUES('host','albums','music','[]',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO library_collections(library_id,module_id,collection_id)
+             VALUES('music','host','albums')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO libraries(id,name,media_type) VALUES('private','Private','music')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO collections(module_id,collection_id,media_type,roots_json,sync_version)
+             VALUES('host','private-albums','music','[]',1)",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO library_collections(library_id,module_id,collection_id)
+             VALUES('private','host','private-albums')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+
+        let cache = tmp.path().join("artwork");
+        std::fs::create_dir_all(&cache).unwrap();
+        let colors = [
+            [120, 120, 120],
+            [240, 240, 0],
+            [0, 0, 240],
+            [0, 240, 0],
+            [240, 0, 0],
+        ];
+        for (index, color) in colors.into_iter().enumerate() {
+            let number = index + 1;
+            let id = format!("album-{number}");
+            let poster = format!("https://covers.example/{number}.jpg");
+            sqlx::query(
+                "INSERT INTO items
+                   (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
+                 VALUES(?,'album',?,?,?,?,'Artist','artist','artist-key','host','albums')",
+            )
+            .bind(&id)
+            .bind(format!("Album {number}"))
+            .bind(format!("album {number}"))
+            .bind(format!("album {number}"))
+            .bind(2000 + number as i64)
+            .execute(&db)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO provider_metadata
+                   (item_id,provider,provider_id,poster_path,confidence,updated_at)
+                 VALUES(?,'musicbrainz',?,?, 'auto',?)",
+            )
+            .bind(&id)
+            .bind(format!("release-{number}"))
+            .bind(&poster)
+            .bind(2000 + number as i64)
+            .execute(&db)
+            .await
+            .unwrap();
+            std::fs::write(cache.join(remote_cache_key(&poster)), solid_png(color)).unwrap();
+        }
+        let private_poster = "https://covers.example/private.jpg";
+        sqlx::query(
+            "INSERT INTO items
+               (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
+             VALUES('private-album','album','Private','private','private',2099,
+                    'Artist','artist','artist-key','host','private-albums')",
+        )
+        .execute(&db)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO provider_metadata
+               (item_id,provider,provider_id,poster_path,confidence,updated_at)
+             VALUES('private-album','musicbrainz','private-release',?,'auto',2099)",
+        )
+        .bind(private_poster)
+        .execute(&db)
+        .await
+        .unwrap();
+        std::fs::write(
+            cache.join(remote_cache_key(private_poster)),
+            solid_png([0, 240, 240]),
+        )
+        .unwrap();
+
+        let enricher = Arc::new(crate::enrich::Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Artwork::new(cache.clone(), enricher);
+        let sessions = Sessions::new(tmp.path().join("sessions"));
+        artwork
+            .prefetch_artist_collages(&registry, &sessions)
+            .await
+            .unwrap();
+
+        let manifest = artwork
+            .read_artist_collage_manifest("music", "artist-key")
+            .unwrap();
+        assert_eq!(
+            manifest.albums,
+            ["album-5", "album-4", "album-3", "album-2"]
+        );
+        assert_eq!(
+            artwork
+                .read_artist_collage_manifest("private", "artist-key")
+                .unwrap()
+                .albums,
+            ["private-album"]
+        );
+        assert_ne!(
+            artist_collage_cache_key("music", "artist-key"),
+            artist_collage_cache_key("private", "artist-key")
+        );
+        assert!(
+            artwork
+                .artist_collage_version("music", "artist-key")
+                .is_some()
+        );
+        for (name, px) in SIZES {
+            assert!(
+                cache
+                    .join(variant_dir(name, *px))
+                    .join(artist_collage_cache_key("music", "artist-key"))
+                    .is_file()
+            );
+        }
+
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", "artist-key", Some("card"),)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        registry
+            .detach_collection("music", "host", "albums")
+            .await
+            .unwrap();
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", "artist-key", Some("card"),)
+                .await
+                .unwrap()
+                .is_none(),
+            "a cached cover from a detached collection crossed the library boundary"
+        );
+    }
 
     #[test]
     fn artist_provider_caches_have_distinct_namespaces() {

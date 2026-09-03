@@ -43,9 +43,10 @@ followed, and those cases are listed too.
       album by a matching child track. The group is still synthetic rather
       than an artist entity, so renaming an Album Artist changes its route key.
       Its card now uses the album card's fixed title/metadata geometry with a
-      square, density-aware Fanart.tv portrait (square thumb preferred, wide
-      background cropped as fallback); the hub exposes a version only after
-      every size has been prefetched locally.
+      square, density-aware provider portrait (Fanart.tv, then TheAudioDB).
+      When neither source has one, it uses a cached collage of the newest four
+      covered albums in that library; the hub exposes a version only after
+      every size has been materialised locally.
 
 - [ ] UI-2 **No per-track removal from the play queue.** The prototype offers
       a × on each queued track. The queue supports replacing, appending and

@@ -1674,7 +1674,7 @@ impl Enricher {
             kind: "enrich",
             running: true,
         });
-        let result = async {
+        let portrait_result = async {
             let fanart = Self::usable(
                 FANART,
                 self.credential_snapshot(registry, FANART)
@@ -1696,6 +1696,10 @@ impl Enricher {
             Ok(())
         }
         .await;
+        // A provider failure must not withhold the entirely local fallback.
+        // Conversely, a collage failure must not erase a portrait result.
+        let collage_result = self.prefetch_artist_collages(registry).await;
+        let result = portrait_result.and(collage_result);
         self.running.store(false, Ordering::SeqCst);
         registry.emit(crate::registry::RegistryEvent::EnrichRunning {
             kind: "enrich",
@@ -2028,20 +2032,25 @@ impl Enricher {
         if let Err(e) = self.enrich_music(registry, &providers).await {
             tracing::warn!(error = format!("{e:#}"), "music enrichment failed");
         }
-        if let Some((theaudiodb_key, premium, theaudiodb_lease)) = theaudiodb_credential.as_ref() {
-            let result = self
-                .prefetch_artist_artwork(
-                    registry,
-                    fanart_credential
-                        .as_ref()
-                        .map(|(key, lease)| (key.as_str(), lease)),
-                    theaudiodb_key,
-                    *premium,
-                    theaudiodb_lease,
-                )
-                .await;
-            self.observe_artist_result(registry, &result);
-        }
+        let portrait_result = if let Some((theaudiodb_key, premium, theaudiodb_lease)) =
+            theaudiodb_credential.as_ref()
+        {
+            self.prefetch_artist_artwork(
+                registry,
+                fanart_credential
+                    .as_ref()
+                    .map(|(key, lease)| (key.as_str(), lease)),
+                theaudiodb_key,
+                *premium,
+                theaudiodb_lease,
+            )
+            .await
+        } else {
+            Ok(())
+        };
+        let collage_result = self.prefetch_artist_collages(registry).await;
+        let artist_result = portrait_result.and(collage_result);
+        self.observe_artist_result(registry, &artist_result);
         providers.finish().await;
         tracing::info!(matched = m, weak = w, missed = x, "enrichment run complete");
         registry.emit(crate::registry::RegistryEvent::EnrichRunning {
@@ -2755,6 +2764,16 @@ impl Enricher {
             "artist artwork prefetch complete"
         );
         Ok(())
+    }
+
+    async fn prefetch_artist_collages(&self, registry: &Registry) -> Result<()> {
+        let Some(artwork) = self.artwork.get().and_then(std::sync::Weak::upgrade) else {
+            return Ok(());
+        };
+        let Some(sessions) = self.sessions.get() else {
+            return Ok(());
+        };
+        artwork.prefetch_artist_collages(registry, sessions).await
     }
 
     /// Anime items needing the chain: unidentified ones, plus matched

@@ -464,7 +464,15 @@ and id. When Fanart has no usable image, TheAudioDB is queried by the already
 verified MusicBrainz artist ID; its returned MBID and strict artist name must
 both still agree before its thumb (or fanart image) is accepted. The original
 and every named size are materialised before publishing a version to the browse
-API. The administrator supplies a personal Fanart key, sent in the provider's
+API. If no provider portrait is ready, background enrichment composes the
+newest four albums with resolved artwork: one cover fills the square, two split
+it vertically, three give the newest album the left half and stack the others,
+and four form a 2×2 grid. Selection uses resolved release year followed by
+title and item ID, so it is deterministic and changes only with the selected
+album evidence. The cache and its manifest are library-scoped as well as
+artist-scoped; a shared Album Artist must never reveal a cover from a library
+the caller cannot see. The administrator supplies a personal Fanart key, sent
+in the provider's
 documented `client-key` header so transport-error URLs cannot disclose it
 (project `api-key` is a different credential). TheAudioDB uses its documented
 public `123` key at 30 requests/minute by default; an administrator can store a
@@ -501,7 +509,16 @@ has no usable portrait, plus the selected image download; direct identity
 recovery adds at most one
 paced MusicBrainz request per otherwise-unidentified artist. Therefore
 enrichment eagerly prefetches every Album Artist and retains
-the originals and derivatives permanently, consistent with OPS-6. Terminal
+the originals and derivatives permanently, consistent with OPS-6. A generated
+collage costs at most four normal album-artwork cache fills or reads, one
+compose and the named resizes; doing that in the background keeps required-time
+latency to one indexed membership check over at most four album IDs plus one
+cache read. That check is deliberately paid when the fallback is served: it
+prevents a cached cover crossing a grant boundary after collection membership
+changes through any admin, satellite-deletion, or catalogue-reconciliation
+path. Its fixed cache key is overwritten only when the
+selected album IDs, poster answers, or artwork versions change, avoiding both
+periodic rebuilds and stale-file accumulation. Terminal
 missing/unidentified/ambiguous answers are versioned by their current album
 evidence; transient provider failures are not persisted and retry on the next
 run. Portraits whose identity is already established run before identity
@@ -511,7 +528,7 @@ derivative remain non-empty on disk; an incomplete cache is rebuilt in the
 background and publishes a new version. `GET
 /api/v1/artists/{key}/artwork?library=...` checks that the caller may
 see the music library and that the artist belongs to it, then serves only the
-local cache. The web uses the same fixed-height card shell and density-aware
+local portrait or collage cache. The web uses the same fixed-height card shell and density-aware
 sizes for artist and album grids, searches artists alongside albums and songs,
 and keeps the artist in the URL while an album is open so Back returns to the
 right level.

@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "cf8d1629e98b5cd8680fa75ca85bb355d41539708571a7903064e7365aac759b",
+  "x-kahawai-source-sha256": "4dab3bdfde23cae1e6454e4b097e87a570ce4abc32fa7d516fc628f630ec11eb",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -6009,7 +6009,7 @@
           "Item media"
         ],
         "summary": "Fetch Album Artist artwork",
-        "description": "Serves a fully prefetched Fanart.tv artist thumb. The library parameter is\nrequired because an artist key is synthetic and can occur in more than one\nlibrary. Accepts a bearer token or the media cookie.",
+        "description": "Serves a fully prefetched provider portrait, falling back to a generated\ncollage of the newest four covered albums. The library parameter provides\nboth grant context and the collage boundary: an artist can occur in several\nlibraries whose covers must remain separate. Accepts a bearer token or the\nmedia cookie.",
         "operationId": "artist_artwork",
         "parameters": [
           {
@@ -11042,7 +11042,7 @@
               "null"
             ],
             "format": "int64",
-            "description": "Changes when the selected portrait or its availability changes."
+            "description": "Changes when the selected portrait or generated album collage changes."
           },
           "key": {
             "type": "string",

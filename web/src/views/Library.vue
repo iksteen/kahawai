@@ -348,9 +348,14 @@ function retryPage() {
         </template>
       </PagedGrid>
       <p class="mt-4 text-[12px] text-dim">
-        Artist images from
-        <a class="text-teal hover:underline" href="https://fanart.tv/" rel="noreferrer">fanart.tv</a
-        >.
+        Artist portraits from
+        <a class="text-teal hover:underline" href="https://fanart.tv/" rel="noreferrer"
+          >fanart.tv</a
+        >
+        and
+        <a class="text-teal hover:underline" href="https://www.theaudiodb.com/" rel="noreferrer"
+          >TheAudioDB</a
+        >; album-cover collages come from your library.
       </p>
     </section>
 

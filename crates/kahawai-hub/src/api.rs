@@ -1009,7 +1009,7 @@ struct ArtistSummary {
     /// Stored Album Artist spelling used for display.
     name: String,
     album_count: i64,
-    /// Changes when the selected portrait or its availability changes.
+    /// Changes when the selected portrait or generated album collage changes.
     #[schema(required)]
     art_version: Option<i64>,
 }
@@ -4658,9 +4658,11 @@ struct ArtistArtworkQuery {
 
 /// Fetch Album Artist artwork
 ///
-/// Serves a fully prefetched Fanart.tv artist thumb. The library parameter is
-/// required because an artist key is synthetic and can occur in more than one
-/// library. Accepts a bearer token or the media cookie.
+/// Serves a fully prefetched provider portrait, falling back to a generated
+/// collage of the newest four covered albums. The library parameter provides
+/// both grant context and the collage boundary: an artist can occur in several
+/// libraries whose covers must remain separate. Accepts a bearer token or the
+/// media cookie.
 #[utoipa::path(
     get, path = "/api/v1/artists/{key}/artwork", tag = "Item media",
     security(("bearer_auth" = []), ("media_token" = [])),
@@ -4704,7 +4706,7 @@ async fn artist_artwork(
     .await
     .map_err(internal)?
     .flatten();
-    let found = match url {
+    let portrait = match url {
         Some(url) => match state
             .artwork
             .get_cached_remote_at(&url, q.size.as_deref())
@@ -4717,6 +4719,14 @@ async fn artist_artwork(
             }
         },
         None => None,
+    };
+    let found = match portrait {
+        Some(portrait) => Some(portrait),
+        None => state
+            .artwork
+            .get_cached_artist_collage_at(&state.registry, &q.library, &key, q.size.as_deref())
+            .await
+            .map_err(internal)?,
     };
     match found {
         Some((bytes, ctype)) => Ok((
@@ -5245,7 +5255,7 @@ fn artist_group_sql(descending: bool) -> String {
     let direction = if descending { "DESC" } else { "ASC" };
     format!(
         "SELECT artists.key,artists.name,artists.album_count,
-                CASE WHEN aa.outcome='ready' THEN aa.updated_at END AS art_version
+                CASE WHEN aa.outcome='ready' THEN aa.updated_at END AS portrait_version
            FROM (
            SELECT i.artist_key AS key,MIN(i.artist) AS name,COUNT(*) AS album_count
              FROM items i JOIN library_collections lc
@@ -5312,11 +5322,16 @@ async fn list_artists(
     Ok(Json(ArtistsResponse {
         artists: rows
             .into_iter()
-            .map(|row| ArtistSummary {
-                key: row.get("key"),
-                name: row.get("name"),
-                album_count: row.get("album_count"),
-                art_version: row.get("art_version"),
+            .map(|row| {
+                let key: String = row.get("key");
+                ArtistSummary {
+                    art_version: row
+                        .get::<Option<i64>, _>("portrait_version")
+                        .or_else(|| state.artwork.artist_collage_version(&q.library, &key)),
+                    key,
+                    name: row.get("name"),
+                    album_count: row.get("album_count"),
+                }
             })
             .collect(),
         total,
@@ -5366,7 +5381,7 @@ async fn artist_albums(
     let artist_row = sqlx::query(
         "SELECT MIN(i.artist) AS name,COUNT(*) AS album_count,
                 (SELECT updated_at FROM artist_artwork
-                  WHERE artist_key=?2 AND outcome='ready') AS art_version
+                  WHERE artist_key=?2 AND outcome='ready') AS portrait_version
            FROM items i JOIN library_collections lc
              ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
           WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
@@ -5382,7 +5397,9 @@ async fn artist_albums(
         key: key.clone(),
         name: artist_row.get("name"),
         album_count: artist_row.get("album_count"),
-        art_version: artist_row.get("art_version"),
+        art_version: artist_row
+            .get::<Option<i64>, _>("portrait_version")
+            .or_else(|| state.artwork.artist_collage_version(&q.library, &key)),
     };
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
     let offset = q.offset.unwrap_or(0);

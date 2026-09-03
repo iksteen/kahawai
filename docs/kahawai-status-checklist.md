@@ -434,7 +434,11 @@ How something works and why it was built that way belong in
       changes the route key. A durable artwork projection requires exactly one
       credited-artist MusicBrainz identity, tries Fanart.tv before TheAudioDB,
       prefetches the selected portrait and every named size before exposing its
-      cache version, and serves it through a
+      cache version, and otherwise generates the same sizes from a stable
+      collage of the newest four covered albums. Collages are scoped to the
+      requested library, and the serving path revalidates every contributing
+      album against current library membership so a cached cover cannot cross
+      a grant boundary after any composition change. Both are served through a
       library-grant-checked endpoint (`kahawai-list.sh -r/-A`).
       Legacy MusicBrainz rows are resolved per distinct release group and
       synthetic artist until every identity agrees or a conflict makes the
