@@ -753,6 +753,44 @@ describe('a record', () => {
     ).toBe(false)
   })
 
+  test('a multi-disc release can play or append either disc on its own', async () => {
+    const { wrapper } = await record([
+      episode(1, { kind: 'track', season: 1, title: 'Disc one, track one' }),
+      episode(2, { kind: 'track', season: 1, title: 'Disc one, track two' }),
+      episode(1, { id: 'd2t1', kind: 'track', season: 2, title: 'Disc two, track one' }),
+    ])
+
+    expect(wrapper.text()).toContain('Disc 1')
+    expect(wrapper.text()).toContain('Disc 2')
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Add disc 2 to queue')!
+      .trigger('click')
+    expect(queue.queue.value.entries.map((entry) => entry.track.title)).toEqual([
+      'Disc two, track one',
+    ])
+
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === '▶ Play disc 1')!
+      .trigger('click')
+    expect(queue.queue.value.entries.map((entry) => entry.track.title)).toEqual([
+      'Disc one, track one',
+      'Disc one, track two',
+    ])
+  })
+
+  test('a single-disc release keeps the ordinary uncluttered track list', async () => {
+    const { wrapper } = await record([
+      episode(1, { kind: 'track', season: null, title: 'Unnumbered disc' }),
+      episode(2, { kind: 'track', season: 1, title: 'Explicit disc one' }),
+    ])
+    expect(wrapper.findAll('button').some((button) => button.text().includes('Play disc'))).toBe(
+      false,
+    )
+    expect(wrapper.text()).not.toContain('Disc 1')
+  })
+
   test('and its two actions are the queue’s, which are different questions', async () => {
     // Play replaces what is playing; Add does not disturb it.
     const { wrapper } = await record()

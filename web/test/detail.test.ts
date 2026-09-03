@@ -5,7 +5,14 @@
 
 import { describe, expect, test } from 'vitest'
 
-import { artShape, childCount, continueAt, ordered, seasonsIn } from '../src/domain/detail.ts'
+import {
+  artShape,
+  childCount,
+  continueAt,
+  discsIn,
+  ordered,
+  seasonsIn,
+} from '../src/domain/detail.ts'
 
 const ep = (
   over: Partial<Parameters<typeof continueAt>[0] extends (infer T)[] | null ? T : never>,
@@ -93,6 +100,22 @@ describe('the seasons a series falls into', () => {
     const eps = [ep({ season: null, proj_season: 1 }), ep({ season: null, proj_season: 2 })]
     expect(seasonsIn(eps, true)).toEqual([1, 2])
     expect(seasonsIn(eps, false)).toEqual([null])
+  })
+})
+
+describe('the discs an album falls into', () => {
+  test('retain track order and their positions in the whole record', () => {
+    const tracks = [ep({ season: 1 }), ep({ season: 1 }), ep({ season: 2 })]
+    const discs = discsIn(tracks)
+    expect(discs.map((disc) => disc.number)).toEqual([1, 2])
+    expect(discs.map((disc) => disc.entries.map((entry) => entry.albumIndex))).toEqual([
+      [0, 1],
+      [2],
+    ])
+  })
+
+  test('an absent disc number is disc one, not a separate phantom disc', () => {
+    expect(discsIn([ep({ season: null }), ep({ season: 1 })])).toHaveLength(1)
   })
 })
 

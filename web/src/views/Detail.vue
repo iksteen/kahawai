@@ -19,7 +19,7 @@ import SubtitlePanel from '../components/SubtitlePanel.vue'
 import DetailHead from '../components/DetailHead.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
-import { childCount, continueAt, ordered, seasonsIn } from '../domain/detail.ts'
+import { childCount, continueAt, discsIn, ordered, seasonsIn } from '../domain/detail.ts'
 import {
   deliveryPlan,
   groupSources,
@@ -180,6 +180,8 @@ const me = whoAmI()
 /// the other.
 const queue = useQueue()
 const tracks = computed(() => children.data.value ?? [])
+const discs = computed(() => discsIn(tracks.value))
+const isMultiDisc = computed(() => discs.value.length > 1)
 /// Which track of THIS record is playing, so the list can mark it. By id: the
 /// queue may hold another record entirely.
 const nowPlaying = computed(() => queue.playing.value?.track.id ?? null)
@@ -478,41 +480,62 @@ function markSeason(season: number | null, played: boolean) {
       <p v-if="!children.isError.value && children.data.value?.length === 0" class="text-dim">
         No tracks in this record.
       </p>
-      <ul v-else class="flex flex-col">
-        <li
-          v-for="(track, at) in tracks"
-          :key="track.id"
-          class="flex items-center gap-3 border-b border-hairline last:border-0"
-          :class="track.id === nowPlaying && 'text-teal'"
-        >
-          <button
-            class="flex flex-1 cursor-pointer items-center gap-3 py-1.5 text-left hover:text-teal"
-            type="button"
-            :aria-current="track.id === nowPlaying ? 'true' : undefined"
-            :title="`Play this record from ${track.title}`"
-            @click="queue.playAlbum(tracks, at)"
-          >
-            <!-- The playing row is marked rather than numbered: which one it is
-                 matters more than where it sits. -->
-            <span class="w-8 shrink-0 text-right font-mono text-[12px] text-dim">
-              {{ track.id === nowPlaying ? '▶' : (track.episode ?? at + 1) }}
-            </span>
-            <span class="flex-1 truncate">{{ track.title }}</span>
-          </button>
-          <span v-if="track.played" class="flex text-teal" title="played">
-            <Icon name="check" :size="13" />
-          </span>
-          <button
-            class="cursor-pointer px-2 py-1.5 font-mono text-[11px] text-dim hover:text-teal"
-            type="button"
-            :aria-label="`Add ${track.title} to the queue`"
-            title="Add to the queue"
-            @click="queue.appendTrack(track)"
-          >
-            +
-          </button>
-        </li>
-      </ul>
+      <div v-else class="flex flex-col gap-5">
+        <section v-for="disc in discs" :key="disc.number">
+          <!-- Whole-record controls remain in the header. Per-disc controls
+               appear only when they describe a real choice. -->
+          <div v-if="isMultiDisc" class="mb-1 flex flex-wrap items-center gap-2">
+            <h3 class="mr-auto text-[13px] font-[650] tracking-[0.06em] text-dim uppercase">
+              Disc {{ disc.number }}
+            </h3>
+            <Btn ghost small @click="queue.playAlbum(disc.entries.map((entry) => entry.track))">
+              ▶ Play disc {{ disc.number }}
+            </Btn>
+            <Btn ghost small @click="queue.appendAlbum(disc.entries.map((entry) => entry.track))">
+              Add disc {{ disc.number }} to queue
+            </Btn>
+          </div>
+          <ul class="flex flex-col">
+            <li
+              v-for="entry in disc.entries"
+              :key="entry.track.id"
+              class="flex items-center gap-3 border-b border-hairline last:border-0"
+              :class="entry.track.id === nowPlaying && 'text-teal'"
+            >
+              <button
+                class="flex flex-1 cursor-pointer items-center gap-3 py-1.5 text-left hover:text-teal"
+                type="button"
+                :aria-current="entry.track.id === nowPlaying ? 'true' : undefined"
+                :title="`Play this record from ${entry.track.title}`"
+                @click="queue.playAlbum(tracks, entry.albumIndex)"
+              >
+                <!-- The playing row is marked rather than numbered: which one
+                     it is matters more than where it sits. -->
+                <span class="w-8 shrink-0 text-right font-mono text-[12px] text-dim">
+                  {{
+                    entry.track.id === nowPlaying
+                      ? '▶'
+                      : (entry.track.episode ?? entry.albumIndex + 1)
+                  }}
+                </span>
+                <span class="flex-1 truncate">{{ entry.track.title }}</span>
+              </button>
+              <span v-if="entry.track.played" class="flex text-teal" title="played">
+                <Icon name="check" :size="13" />
+              </span>
+              <button
+                class="cursor-pointer px-2 py-1.5 font-mono text-[11px] text-dim hover:text-teal"
+                type="button"
+                :aria-label="`Add ${entry.track.title} to the queue`"
+                title="Add to the queue"
+                @click="queue.appendTrack(entry.track)"
+              >
+                +
+              </button>
+            </li>
+          </ul>
+        </section>
+      </div>
     </template>
 
     <!-- A film or an episode -->

@@ -16,6 +16,26 @@ type Episode = {
   played: boolean
 }
 
+export type Disc<T> = {
+  number: number
+  entries: { track: T; albumIndex: number }[]
+}
+
+/// Split an album's already-ordered child rows into physical discs. A missing
+/// DISCNUMBER is the ordinary single-disc shape, so it belongs to disc 1; this
+/// also keeps a partly tagged release's unnumbered first disc together with
+/// tracks explicitly stamped `1`.
+export function discsIn<T extends { season: number | null }>(tracks: T[]): Disc<T>[] {
+  const groups = new Map<number, Disc<T>>()
+  tracks.forEach((track, albumIndex) => {
+    const number = track.season ?? 1
+    const disc = groups.get(number) ?? { number, entries: [] }
+    disc.entries.push({ track, albumIndex })
+    groups.set(number, disc)
+  })
+  return [...groups.values()]
+}
+
 /// Artwork follows what the artwork IS, not what the page is about: a track's
 /// is its album's square sleeve, an episode's is a 16:9 still, and everything
 /// else has a poster.

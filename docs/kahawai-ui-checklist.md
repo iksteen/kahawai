@@ -48,6 +48,9 @@ followed, and those cases are listed too.
       covered albums in that library; the hub exposes a version only after
       every size has been materialised locally. Album pages expose record and
       queue actions only; video-only subtitle management is not mounted there.
+      A multi-disc release groups its tracks under disc headings and offers
+      the same replace-or-append queue actions for each individual disc,
+      without adding controls to an ordinary single-disc record.
 
 - [ ] UI-2 **No per-track removal from the play queue.** The prototype offers
       a × on each queued track. The queue supports replacing, appending and

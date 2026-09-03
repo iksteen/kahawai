@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "4dab3bdfde23cae1e6454e4b097e87a570ce4abc32fa7d516fc628f630ec11eb",
+  "x-kahawai-source-sha256": "1520cc28e78254e2b53abcd600cffffe1bed247e969feb41374f06fe181ba409",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -12581,7 +12581,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Season number for episodes; tagged physical disc number for tracks."
           },
           "sources": {
             "type": "array",
@@ -12835,7 +12836,8 @@
               "integer",
               "null"
             ],
-            "format": "int64"
+            "format": "int64",
+            "description": "Season number for episodes; tagged physical disc number for tracks."
           },
           "sources": {
             "type": "integer",

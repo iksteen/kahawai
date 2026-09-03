@@ -6245,6 +6245,7 @@ struct ItemRow<S> {
     matched_title: Option<String>,
     #[schema(required)]
     year: Option<i64>,
+    /// Season number for episodes; tagged physical disc number for tracks.
     #[schema(required)]
     season: Option<i64>,
     #[schema(required)]
