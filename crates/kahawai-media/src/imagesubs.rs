@@ -273,6 +273,28 @@ pub fn vobsub_size(codec_private: &str) -> Option<(u32, u32)> {
     })
 }
 
+/// Convert the Y'CrCb CLUT carried by DVD navigation and MP4 `mp4s`
+/// events into the RGB palette consumed by [`vobsub_decode`]. Each value is
+/// packed as `0x00YYCrCb`; DVD video uses limited-range BT.601.
+pub fn vobsub_dvd_clut(clut: &[u32]) -> Vec<[u8; 3]> {
+    clut.iter()
+        .map(|value| {
+            let y = ((value >> 16) & 0xff) as f32;
+            let cr = ((value >> 8) & 0xff) as f32;
+            let cb = (value & 0xff) as f32;
+            let yl = 1.164 * (y - 16.0);
+            let r = yl + 1.596 * (cr - 128.0);
+            let g = yl - 0.392 * (cb - 128.0) - 0.813 * (cr - 128.0);
+            let b = yl + 2.017 * (cb - 128.0);
+            [
+                r.clamp(0.0, 255.0).round() as u8,
+                g.clamp(0.0, 255.0).round() as u8,
+                b.clamp(0.0, 255.0).round() as u8,
+            ]
+        })
+        .collect()
+}
+
 /// Decode one VobSub SPU (post-demux Matroska block payload) into a
 /// positioned bitmap. Returns None for empty/unshowable units.
 pub fn vobsub_decode(spu: &[u8], palette16: &[[u8; 3]]) -> Result<Option<ImageObject>> {
@@ -502,6 +524,16 @@ mod tests {
         let p = vobsub_palette(idx);
         assert_eq!(p.len(), 4);
         assert_eq!(p[1], [255, 0, 0]);
+    }
+
+    #[test]
+    fn dvd_clut_is_limited_range_bt601() {
+        // Values emitted by qtdemux for black, white and the source RGB
+        // colour cb0032. The latter catches both Cr/Cb order and matrix.
+        let palette = super::vobsub_dvd_clut(&[0x0010_8080, 0x00e9_8181, 0x0048_d779]);
+        assert_eq!(palette[0], [0, 0, 0]);
+        assert!(palette[1].iter().all(|channel| *channel >= 250));
+        assert_eq!(palette[2], [204, 0, 51]);
     }
 
     #[test]

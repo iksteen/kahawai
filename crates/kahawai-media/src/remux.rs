@@ -1141,6 +1141,7 @@ fn plumb_parsed_pad(
     audio_seen: &Arc<std::sync::atomic::AtomicUsize>,
     video_seen: &Arc<std::sync::atomic::AtomicUsize>,
     subs_seen: &Arc<std::sync::atomic::AtomicUsize>,
+    video_canvas: &Arc<Mutex<Option<(u32, u32)>>>,
     subs_dir: &std::path::Path,
     burn: &Option<std::sync::Arc<crate::burnin::Timeline>>,
     // HUB-32a: Some when this session burns ASS — the chosen track's pad
@@ -1168,6 +1169,19 @@ fn plumb_parsed_pad(
     queue.sync_state_with_parent().unwrap();
     pad.link(&queue.static_pad("sink").unwrap()).unwrap();
     let qsrc = queue.static_pad("src").unwrap();
+    // `GstStream::caps()` at pad-added time often names only the codec;
+    // width/height land in the later CAPS event. Observe that event for every
+    // video stream, including streams we can route immediately, so an MP4
+    // VobSub tap can use the real canvas instead of racing pad discovery.
+    let event_video_canvas = video_canvas.clone();
+    qsrc.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data
+            && let gst::EventView::Caps(caps) = event.view()
+        {
+            remember_video_canvas(caps.caps(), &event_video_canvas);
+        }
+        gst::PadProbeReturn::Ok
+    });
 
     let advertised = pad
         .stream()
@@ -1178,6 +1192,13 @@ fn plumb_parsed_pad(
         .structure(0)
         .map(|s| s.name().to_string())
         .unwrap_or_default();
+    remember_video_canvas(&advertised, video_canvas);
+    // `GstStream::caps()` is intentionally preferred above for routing, but
+    // parsebin's already-negotiated current caps are where qtdemux puts the
+    // video dimensions. A generic stream caps value otherwise masks them.
+    if let Some(current) = pad.current_caps() {
+        remember_video_canvas(&current, video_canvas);
+    }
     // Track selection: only the plan's audio track proceeds (demux order
     // matches discovery order — the assumption subtitle extraction
     // already relies on). Streams whose advertised caps hide their
@@ -1213,7 +1234,7 @@ fn plumb_parsed_pad(
             return;
         }
         if name.starts_with("subpicture/") {
-            tap_image_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
+            tap_image_track(pipe, &qsrc, &advertised, subs_dir, idx, &name, video_canvas);
         } else {
             tap_text_track(pipe, &qsrc, &advertised, subs_dir, idx, &name);
         }
@@ -1284,6 +1305,65 @@ fn plumb_parsed_pad(
         }
         gst::PadProbeReturn::Ok
     });
+}
+
+fn remember_video_canvas(caps: &gst::CapsRef, canvas: &Arc<Mutex<Option<(u32, u32)>>>) {
+    let Some(structure) = caps.structure(0) else {
+        return;
+    };
+    if !structure.name().starts_with("video/") {
+        return;
+    }
+    let Ok(width) = structure.get::<i32>("width") else {
+        return;
+    };
+    let Ok(height) = structure.get::<i32>("height") else {
+        return;
+    };
+    if width > 0 && height > 0 {
+        *canvas.lock().unwrap_or_else(|e| e.into_inner()) = Some((width as u32, height as u32));
+    }
+}
+
+fn vobsub_palette_event(event: &gst::EventRef) -> Option<Vec<[u8; 3]>> {
+    if !matches!(event.view(), gst::EventView::CustomDownstream(_)) {
+        return None;
+    }
+    let structure = event.structure()?;
+    if structure.name() != "application/x-gst-dvd"
+        || structure.get::<String>("event").ok()? != "dvd-spu-clut-change"
+    {
+        return None;
+    }
+    let clut: Option<Vec<u32>> = (0..16)
+        .map(|i| {
+            structure
+                .get::<i32>(&format!("clut{i:02}"))
+                .ok()
+                .map(|value| value as u32)
+        })
+        .collect();
+    Some(crate::imagesubs::vobsub_dvd_clut(&clut?))
+}
+
+fn vobsub_canvas(
+    declared: Option<(u32, u32)>,
+    video: Option<(u32, u32)>,
+    object: &crate::imagesubs::ImageObject,
+) -> (u32, u32) {
+    if let Some(canvas) = declared {
+        return canvas;
+    }
+    // Ordinary VobSub is authored in a 720-wide DVD canvas. Some MP4
+    // muxers instead rewrite SPU coordinates into the video's HD canvas but
+    // carry no size at all. Crossing either DVD bound proves this is the HD
+    // form; use the video caps qtdemux already supplied instead of scaling it
+    // once more from 720 (Men.In.Black.1997.mp4: 1920-wide coordinates were
+    // rendered 2.67x too large).
+    if object.x.saturating_add(object.w) > 720 || object.y.saturating_add(object.h) > 576 {
+        return video.unwrap_or((object.x + object.w, object.y + object.h));
+    }
+    (720, 576)
 }
 
 /// Tee a text subtitle stream into the session dir as it is demuxed:
@@ -1385,6 +1465,7 @@ fn tap_image_track(
     dir: &std::path::Path,
     idx: usize,
     caps_name: &str,
+    video_canvas: &Arc<Mutex<Option<(u32, u32)>>>,
 ) {
     use base64::Engine;
     let path = dir.join(format!("subs-e{idx}.jsonl"));
@@ -1418,7 +1499,17 @@ fn tap_image_track(
             })
         })
         .unwrap_or_default();
-    let vob_size = vob_size.unwrap_or((720, 576));
+    let vob_palette = Arc::new(Mutex::new(vob_palette));
+    let event_palette = vob_palette.clone();
+    from.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, info| {
+        if let Some(gst::PadProbeData::Event(event)) = &info.data
+            && let Some(palette) = vobsub_palette_event(event)
+        {
+            *event_palette.lock().unwrap_or_else(|e| e.into_inner()) = palette;
+        }
+        gst::PadProbeReturn::Ok
+    });
+    let video_canvas = video_canvas.clone();
 
     let write_set = move |file: &std::sync::Mutex<std::fs::File>,
                           ms: u64,
@@ -1477,21 +1568,21 @@ fn tap_image_track(
                     } else if let Some(obj) = {
                         let mut decoded = None;
                         guard(&mut || {
-                            decoded = crate::imagesubs::vobsub_decode(map.as_slice(), &vob_palette)
+                            let palette = vob_palette.lock().unwrap_or_else(|e| e.into_inner());
+                            decoded = crate::imagesubs::vobsub_decode(map.as_slice(), &palette)
                                 .ok()
-                                .flatten()
+                                .flatten();
                         });
                         decoded
                     } {
                         let end = ms + buffer.duration().map(|d| d.mseconds()).unwrap_or(5000);
-                        write_set(
-                            &file,
-                            ms,
-                            vob_size.0,
-                            vob_size.1,
-                            std::slice::from_ref(&obj),
+                        let canvas = vobsub_canvas(
+                            vob_size,
+                            *video_canvas.lock().unwrap_or_else(|e| e.into_inner()),
+                            &obj,
                         );
-                        write_set(&file, end, vob_size.0, vob_size.1, &[]);
+                        write_set(&file, ms, canvas.0, canvas.1, std::slice::from_ref(&obj));
+                        write_set(&file, end, canvas.0, canvas.1, &[]);
                     }
                 }
                 Ok(gst::FlowSuccess::Ok)
@@ -4460,6 +4551,7 @@ pub fn start_parts(
         let audio_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let video_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let subs_seen = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let video_canvas = Arc::new(Mutex::new(None));
         let subs_dir = subs_dir.clone();
         let burn_tl = burn_timeline.clone();
         let ass_link = ass_link.clone();
@@ -4473,6 +4565,7 @@ pub fn start_parts(
                 &audio_seen,
                 &video_seen,
                 &subs_seen,
+                &video_canvas,
                 &subs_dir,
                 &burn_tl,
                 &ass_link,
@@ -5593,6 +5686,71 @@ mod concat_spike {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn mp4_vobsub_clut_event_becomes_rgb_palette() {
+        crate::init().unwrap();
+        let values = [
+            0x0010_8080u32,
+            0x00e9_8181,
+            0x00bf_8080,
+            0x0093_8080,
+            0x0048_d779,
+            0x0029_cb7a,
+            0x0060_6dd7,
+            0x003e_70cb,
+            0x00b6_3e32,
+            0x0087_473d,
+            0x00da_2a88,
+            0x00a6_3687,
+            0x006c_c3cf,
+            0x0048_bac4,
+            0x00c2_942a,
+            0x0092_9136,
+        ];
+        let mut structure = gst::Structure::new_empty("application/x-gst-dvd");
+        structure.set("event", "dvd-spu-clut-change");
+        for (i, value) in values.into_iter().enumerate() {
+            structure.set(format!("clut{i:02}"), value as i32);
+        }
+        let event = gst::event::CustomDownstream::new(structure);
+        let palette = super::vobsub_palette_event(&event).expect("DVD CLUT event");
+        assert_eq!(palette.len(), 16);
+        assert_eq!(palette[0], [0, 0, 0]);
+        assert_eq!(palette[4], [204, 0, 51]);
+    }
+
+    #[test]
+    fn hd_authored_vobsub_uses_video_canvas_without_overriding_idx_size() {
+        let hd = crate::imagesubs::ImageObject {
+            x: 752,
+            y: 971,
+            w: 417,
+            h: 64,
+            rgba: Vec::new(),
+        };
+        assert_eq!(
+            super::vobsub_canvas(None, Some((1920, 1036)), &hd),
+            (1920, 1036)
+        );
+        assert_eq!(
+            super::vobsub_canvas(Some((720, 480)), Some((1920, 1036)), &hd),
+            (720, 480),
+            "an explicit idx canvas always wins"
+        );
+        let dvd = crate::imagesubs::ImageObject {
+            x: 150,
+            y: 420,
+            w: 420,
+            h: 48,
+            rgba: Vec::new(),
+        };
+        assert_eq!(
+            super::vobsub_canvas(None, Some((1920, 1080)), &dvd),
+            (720, 576),
+            "DVD-coordinate subtitles keep their DVD scale"
+        );
+    }
+
     /// A gfx1200 radeonsi HEVC encoder advertises width >= 384. The old
     /// universal 320x240 probe therefore rejected working hardware before a
     /// session could use it. Probe dimensions come from the encoder's own caps:
