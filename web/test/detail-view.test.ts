@@ -745,6 +745,14 @@ describe('a record', () => {
     expect(wrapper.text()).toContain('1 track')
   })
 
+  test('does not offer video subtitle management', async () => {
+    const { wrapper } = await record()
+    expect(wrapper.findAll('h2').some((heading) => heading.text() === 'Subtitles')).toBe(false)
+    expect(
+      wrapper.findAll('button').some((button) => button.text().startsWith('Find subtitles')),
+    ).toBe(false)
+  })
+
   test('and its two actions are the queue’s, which are different questions', async () => {
     // Play replaces what is playing; Add does not disturb it.
     const { wrapper } = await record()

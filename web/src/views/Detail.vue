@@ -722,7 +722,11 @@ function markSeason(season: number | null, played: boolean) {
       </section>
     </template>
 
+    <!-- Subtitle management belongs to playable video titles. Albums and
+         tracks are audio-only; showing an online subtitle search below a
+         record's track list is an unrelated action, not an empty state. -->
     <SubtitlePanel
+      v-if="item.kind !== 'album' && item.kind !== 'track'"
       :item="item"
       :subs="item.negotiated?.subtitles ?? []"
       :languages="subLanguages"
