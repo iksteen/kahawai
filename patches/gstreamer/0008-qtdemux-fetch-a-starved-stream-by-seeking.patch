@@ -1,57 +1,5 @@
-From 4cf737d9c1516497cdeca82cd9d4092cf7eb410a Mon Sep 17 00:00:00 2001
-From: Ingmar Steen <iksteen@gmail.com>
-Date: Thu, 6 Aug 2026 22:20:42 +0200
-Subject: [PATCH] qtdemux: fetch a starved stream by seeking instead of reading
- up to it
-MIME-Version: 1.0
-Content-Type: text/plain; charset=UTF-8
-Content-Transfer-Encoding: 8bit
-
-Pushed, samples are served in byte order. That is right for a file whose
-streams are interleaved and wrong for one whose streams are not: an MP4
-written as all video and then all audio delivers nothing from its second
-stream until the first is exhausted, because the first sample of that
-stream sits at the far end of the file. Anything downstream that muxes
-waits that entire time. On a 1.8 GB title that is the difference between
-starting and appearing to hang; pulled, the same file starts at once,
-because each stream is read where it lives.
-
-When upstream can seek, pushed can do the same. Track how far each
-stream has fallen behind in decode time, and when one falls further
-behind than any sane interleave — and its data is far enough away that
-the jump pays for itself — seek to it rather than read everything in
-between.
-
-Three parts:
-
-  - qtdemux_push_starved_stream() finds the stream that is furthest
-    behind and says where its data is, or says no, which is the answer
-    for every interleaved file.
-
-  - next_entry_size() passes over a stream whose next sample lies behind
-    the read position rather than selecting it and finding no entry at
-    the current offset, which ended the file early. Only when a seek can
-    fetch it back, so a non-seekable upstream is unaffected.
-
-  - The segment that answers such a seek must not be read as "start
-    again from here": that path repositions every stream to the new byte
-    offset and marks as EOS any stream with no samples there, which is
-    precisely the stream just seeked away from. The seqnum of the seek
-    identifies its own segment.
-
-Measured on a 27.5 MB file whose audio starts at 97.9% (videotestsrc +
-audiotestsrc through mp4mux with interleaving disabled): starting both
-streams read 100% of the file before, 27% after, against 0.06% pulled.
-The remainder is the lag threshold, so the cost no longer grows with the
-file: the 1.8 GB title that prompted this went from producing nothing in
-120 s to 3057 segments carrying both streams.
----
- .../gst-plugins-good/gst/isomp4/qtdemux.c     | 140 ++++++++++++++++++
- .../gst-plugins-good/gst/isomp4/qtdemux.h     |   6 +
- 2 files changed, 146 insertions(+)
-
 diff --git a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
-index 4ad4745e3d9..3536c7621e3 100644
+index 4ad4745e3d..3dcb692c74 100644
 --- a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
 +++ b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.c
 @@ -374,6 +374,7 @@ static GstCaps *qtdemux_generic_caps (GstQTDemux * qtdemux,
@@ -96,7 +44,43 @@ index 4ad4745e3d9..3536c7621e3 100644
        /* we only expect a BYTE segment, e.g. following a seek */
        if (segment.format == GST_FORMAT_BYTES) {
          if (GST_CLOCK_TIME_IS_VALID (segment.start)) {
-@@ -7791,6 +7812,84 @@ has_next_entry (GstQTDemux * demux)
+@@ -2369,10 +2390,34 @@ gst_qtdemux_handle_sink_event (GstPad * sinkpad, GstObject * parent,
+     case GST_EVENT_FLUSH_STOP:
+     {
+       guint64 dur;
++      GstSegment before;
++      gboolean ours, needed;
++
++      /* A seek sent to fetch a starved stream moves the READ POSITION and
++       * nothing else: the streams keep playing the run they were in, and
++       * the flush it carries is dropped before it reaches downstream (see
++       * offset_seek_seqnum below). The reset here is written for the
++       * header-hunting seek, which happens before a timeline exists, so
++       * it keeps only the duration — on a run that has already been
++       * seeked, that discards the segment start and republishes every
++       * stream at zero. Running time then becomes absolute media time,
++       * and every clock derived from it — the muxer's output timestamps,
++       * a player's position, its subtitles — jumps forward by exactly the
++       * offset the run resumed at. Keep the whole segment for our own
++       * seek; there is no new timeline to describe. */
++      before = demux->segment;
++      needed = demux->need_segment;
++      ours = demux->interleave_seek_seqnum != GST_SEQNUM_INVALID
++          && gst_event_get_seqnum (event) == demux->interleave_seek_seqnum;
+ 
+       dur = demux->segment.duration;
+       gst_qtdemux_reset (demux, FALSE);
+-      demux->segment.duration = dur;
++      if (ours) {
++        demux->segment = before;
++        demux->need_segment = needed;
++      } else {
++        demux->segment.duration = dur;
++      }
+ 
+       if (gst_event_get_seqnum (event) == demux->offset_seek_seqnum) {
+         gst_event_unref (event);
+@@ -7791,6 +7836,84 @@ has_next_entry (GstQTDemux * demux)
    return FALSE;
  }
  
@@ -181,7 +165,7 @@ index 4ad4745e3d9..3536c7621e3 100644
  /*
   * next_entry_size
   *
-@@ -7821,6 +7920,21 @@ next_entry_size (GstQTDemux * demux)
+@@ -7821,6 +7944,21 @@ next_entry_size (GstQTDemux * demux)
        continue;
      }
  
@@ -203,7 +187,7 @@ index 4ad4745e3d9..3536c7621e3 100644
      if (!qtdemux_parse_samples (demux, stream, stream->sample_index)) {
        GST_LOG_OBJECT (demux, "Parsing of index %u from stbl atom failed!",
            stream->sample_index);
-@@ -7886,6 +8000,11 @@ qtdemux_seek_offset (GstQTDemux * demux, guint64 offset)
+@@ -7886,6 +8024,11 @@ qtdemux_seek_offset (GstQTDemux * demux, guint64 offset)
  
    /* store seqnum to drop flush events, they don't need to reach downstream */
    demux->offset_seek_seqnum = gst_event_get_seqnum (event);
@@ -215,7 +199,7 @@ index 4ad4745e3d9..3536c7621e3 100644
    res = gst_pad_push_event (demux->sinkpad, event);
    demux->offset_seek_seqnum = GST_SEQNUM_INVALID;
  
-@@ -8674,11 +8793,32 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
+@@ -8674,11 +8817,32 @@ gst_qtdemux_process_adapter (GstQTDemux * demux, gboolean force)
          guint64 dts, pts, duration;
          gboolean round_up_duration = FALSE;
          gboolean keyframe;
@@ -249,7 +233,7 @@ index 4ad4745e3d9..3536c7621e3 100644
            GST_DEBUG_OBJECT (demux, "mdat remaining %" G_GUINT64_FORMAT,
                demux->mdatleft);
 diff --git a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
-index 51a2a875805..56a44bc36fb 100644
+index 51a2a87580..56a44bc36f 100644
 --- a/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
 +++ b/subprojects/gst-plugins-good/gst/isomp4/qtdemux.h
 @@ -287,6 +287,12 @@ struct _GstQTDemux {
@@ -265,6 +249,3 @@ index 51a2a875805..56a44bc36fb 100644
    /* UPSTREAM BYTE: Size of upstream content.
     * Note : This is only computed once ! If upstream grows in the meantime
     * it will not be updated */
--- 
-2.55.0
-

@@ -108,6 +108,46 @@ way as every other reproducer here. It used to be the other way round,
 alone among the nine, which made a checker that ran them all report this
 patch as missing precisely when it was working.
 
+## Amendment 2026-09-04: the flush wiped a seeked run's timeline
+
+The fetch seek carries `GST_SEEK_FLAG_FLUSH`, and qtdemux's `FLUSH_STOP`
+handler answers any flush with `gst_qtdemux_reset (demux, FALSE)`, which
+re-inits `demux->segment` and keeps only its duration. That is written
+for the header-hunting seek, which happens before a timeline exists.
+
+Sent mid-playback on a run that was STARTED at an offset, it discards the
+segment start. The branch above then recognises the answering segment as
+our own and deliberately declines to publish a new one — so nothing ever
+restores what the flush erased, and the next pending-segment check
+republishes every stream at zero. Buffer timestamps do not change, only
+the segment converting them to running time, so running time silently
+becomes absolute media time and every clock derived from it moves by
+exactly the offset the run resumed at.
+
+Measured against a hub session resumed 18 minutes into a 98-minute MP4
+with an embedded VobSub track — sparse enough to make the fetch seek fire
+repeatedly. The produced HLS timeline stepped by 1082 s, the resume
+offset, eleven segments in; a client's position, its subtitles and the
+progress it saved were all that far ahead, with no visible skip in the
+picture because the content itself stayed continuous.
+
+The fix keeps the whole segment across the reset when the flush answers
+our own fetch seek, rather than only the duration. There is no new
+timeline to describe: the seek moved the read position, and its flush is
+already dropped before it reaches downstream, so downstream's segment is
+still the right one.
+
+    before: 13 segments, PTS 3600.000s -> 4693.134s (step +1082.123s)
+    after: 388 segments, PTS 3600.000s -> 3987.387s, continuous
+
+An earlier attempt at this, `0010-qtdemux-preserve-timeline-across-
+unmapped-byte-segments`, has been dropped. It guarded the byte-to-time
+mapping further down the same handler, which is a real weakness — a byte
+offset that maps to an early sample, or to none, still re-bases the
+timeline there — but instrumentation showed that path is never reached
+for these seeks, because the branch above exits first. It fixed its own
+synthetic reproducer and did nothing for the case that prompted it.
+
 ## Also seen, not diagnosed
 
 `filesrc ! queue ! qtdemux ! two fakesinks` hangs on this layout — with
