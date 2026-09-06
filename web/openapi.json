@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "76cb3208bbdff9ea2c37ad0bd9ea9edb690a95416875afac7b7378e516212d45",
+  "x-kahawai-source-sha256": "3038ac23dda805c69db6949717e5df31740b3924fa29dcc3316f57f7ac84e52e",
   "paths": {
     "/admin/v1/collections": {
       "get": {
@@ -6733,6 +6733,105 @@
             }
           }
         }
+      }
+    },
+    "/api/v1/candidate-artwork": {
+      "get": {
+        "tags": [
+          "Admin enrichment"
+        ],
+        "operationId": "candidate_artwork",
+        "parameters": [
+          {
+            "name": "ticket",
+            "in": "query",
+            "description": "Short-lived poster capability returned by an administrator's search.",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "image/jpeg": {
+                "schema": {
+                  "type": "array",
+                  "items": {
+                    "type": "integer",
+                    "format": "int32",
+                    "minimum": 0
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "candidate_artwork_ticket": []
+          }
+        ]
       }
     },
     "/api/v1/collections": {
@@ -14922,6 +15021,11 @@
         "type": "http",
         "scheme": "bearer",
         "bearerFormat": "JWT"
+      },
+      "candidate_artwork_ticket": {
+        "type": "apiKey",
+        "in": "query",
+        "name": "ticket"
       },
       "media_token": {
         "type": "apiKey",

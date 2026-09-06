@@ -176,6 +176,7 @@ pub struct NetOptions {
         admin_refresh_library,
         admin_review_list,
         admin_review_search,
+        candidate_artwork,
         admin_apply_match,
         admin_sessions,
         admin_end_session,
@@ -216,6 +217,10 @@ impl Modify for BearerSecurity {
         components.add_security_scheme(
             "media_token",
             SecurityScheme::ApiKey(ApiKey::Query(ApiKeyValue::new("token"))),
+        );
+        components.add_security_scheme(
+            "candidate_artwork_ticket",
+            SecurityScheme::ApiKey(ApiKey::Query(ApiKeyValue::new("ticket"))),
         );
         components.add_security_scheme(
             "metrics_token",
@@ -513,6 +518,7 @@ pub fn router(
         // nothing else — a load balancer or uptime check must be able to
         // ask without holding a credential, and there is nothing here
         // that a failed login does not already reveal.
+        .route("/api/v1/candidate-artwork", get(candidate_artwork))
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .route("/api/v1/bootstrap", get(bootstrap))
@@ -2447,7 +2453,7 @@ async fn admin_review_search(
     State(state): State<AppState>,
     ApiJson(body): ApiJson<ReviewSearch>,
 ) -> Result<Json<ReviewCandidatesResponse>, ApiError> {
-    let candidates = state
+    let mut candidates = state
         .enricher
         .search_candidates(
             &state.registry,
@@ -2458,7 +2464,56 @@ async fn admin_review_search(
         )
         .await
         .map_err(internal)?;
+    for candidate in &mut candidates {
+        let poster = match candidate {
+            crate::enrich::ProviderCandidate::Catalog(c) => &mut c.poster_url,
+            crate::enrich::ProviderCandidate::Anilist(c) => &mut c.poster_url,
+        };
+        if let Some(url) = poster {
+            let ticket = state.auth.candidate_artwork_ticket(url).map_err(internal)?;
+            *url = format!("/api/v1/candidate-artwork?ticket={ticket}");
+        }
+    }
     Ok(Json(ReviewCandidatesResponse { candidates }))
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct CandidateArtworkQuery {
+    /// Short-lived poster capability returned by an administrator's search.
+    ticket: String,
+}
+
+#[utoipa::path(
+    get, path = "/api/v1/candidate-artwork", tag = "Admin enrichment",
+    security(("candidate_artwork_ticket" = [])),
+    params(CandidateArtworkQuery),
+    responses((status = 200, body = Vec<u8>, content_type = "image/jpeg"),
+        (status = 400, body = ApiErrorBody), (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody))
+)]
+async fn candidate_artwork(
+    State(state): State<AppState>,
+    ApiQuery(q): ApiQuery<CandidateArtworkQuery>,
+) -> Result<Response, ApiError> {
+    let url = state
+        .auth
+        .candidate_artwork_url(&q.ticket)
+        .map_err(|_| hidden("artwork"))?;
+    let (bytes, content_type) = state
+        .artwork
+        .candidate_poster(&url)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| hidden("artwork"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, content_type),
+            (axum::http::header::CACHE_CONTROL, "private, max-age=900"),
+        ],
+        bytes,
+    )
+        .into_response())
 }
 
 #[derive(Deserialize, ToSchema)]
@@ -8088,6 +8143,75 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn candidate_artwork_serves_cached_bytes_only_with_a_valid_ticket() {
+        use super::{Arc, Auth, NetOptions, Registry, StatusCode, router};
+        use axum::{body::Body, http::Request};
+        use tower::ServiceExt;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+        let auth = Arc::new(Auth::new(db, dir.path()).await.unwrap());
+        let enricher = Arc::new(crate::enrich::Enricher::new(dir.path().into()));
+        let artwork_dir = dir.path().join("artwork");
+        std::fs::create_dir_all(&artwork_dir).unwrap();
+        let remote = "https://image.tmdb.org/t/p/w154/test.jpg";
+        let bytes = b"cached provider image";
+        std::fs::write(
+            artwork_dir.join(format!(
+                "tmdb-{:016x}",
+                xxhash_rust::xxh3::xxh3_64(remote.as_bytes())
+            )),
+            bytes,
+        )
+        .unwrap();
+        let ticket = auth.candidate_artwork_ticket(remote).unwrap();
+        let ca = Arc::new(crate::pki::HubCa::load_or_create(dir.path()).unwrap());
+        let enrollments = Arc::new(crate::enrollment_service::EnrollmentService::new(
+            ca,
+            registry.clone(),
+            std::time::Duration::from_secs(900),
+            90,
+        ));
+        let app = router(
+            registry,
+            auth,
+            Arc::new(crate::sessions::Sessions::new(dir.path().join("scratch"))),
+            enrollments,
+            Arc::new(crate::subtitles::Subtitles::new(dir.path().join("subs"))),
+            Arc::new(crate::artwork::Artwork::new(artwork_dir, enricher.clone())),
+            enricher,
+            Arc::new(crate::segments::Detector::new()),
+            NetOptions::default(),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::get(format!("/api/v1/candidate-artwork?ticket={ticket}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 1024)
+                .await
+                .unwrap()
+                .as_ref(),
+            bytes
+        );
+        let response = app
+            .oneshot(
+                Request::get(format!("/api/v1/candidate-artwork?ticket={ticket}x"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
     #[test]
     fn credential_fields_change_only_when_the_plaintext_set_differs() {
         let current = BTreeMap::from([
@@ -8305,6 +8429,7 @@ mod tests {
             ("get", "/health"),
             ("get", "/metrics"),
             ("get", "/api/v1/bootstrap"),
+            ("get", "/api/v1/candidate-artwork"),
             ("post", "/api/v1/setup"),
             ("post", "/api/v1/auth/token"),
             ("post", "/api/v1/auth/refresh"),
@@ -8605,6 +8730,11 @@ mod tests {
             );
             if public {
                 assert!(operation.get("security").is_none(), "{method} {path}");
+            } else if path == "/api/v1/candidate-artwork" {
+                assert_eq!(
+                    operation["security"][0]["candidate_artwork_ticket"],
+                    serde_json::json!([])
+                );
             } else if path == "/metrics" {
                 assert_eq!(
                     operation["security"][0]["metrics_token"],

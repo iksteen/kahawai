@@ -212,7 +212,9 @@ How something works and why it was built that way belong in
       TMDB, TheTVDB and AniDB plaintext snapshots carry revocable runtime
       leases: replacement wakes queued/paced work before its next send,
       creates no retry debt, and coalesces one fresh follow-up pass.
-- [x] HUB-8 Ambiguous matches flagged for manual review (card-based review UI,
+- [x] HUB-8 Candidate box art uses signed hub URLs and the existing artwork
+      cache, so the match selector works under the self-only image policy.
+      Ambiguous matches flagged for manual review (card-based review UI,
       per-item re-match/search dialog)
 - [x] HUB-9 Local metadata as authoritative provider — unranked and
       asked before the chain (requirement amended 2026-07-26). Sidecars

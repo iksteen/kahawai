@@ -663,6 +663,18 @@ impl Artwork {
 }
 
 impl Artwork {
+    /// Match candidates use the same provider gate, deduplication and durable
+    /// artwork cache as assigned posters; browsers only request hub URLs.
+    pub(crate) async fn candidate_poster(
+        &self,
+        url: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        Ok(self
+            .remote_poster(url)
+            .await?
+            .map(|(bytes, content_type, _)| (bytes, content_type)))
+    }
+
     /// `remote_poster` for the integration test that counts provider requests.
     /// The real caller reaches it through `original`, which needs a registry, a
     /// mediahost and a resolved item — none of which say anything about whether

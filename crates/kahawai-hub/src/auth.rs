@@ -716,6 +716,31 @@ impl Auth {
         })
     }
 
+    /// A short-lived capability for exactly the poster returned by a provider.
+    /// Its separate audience prevents using it as an account credential or
+    /// turning the artwork endpoint into a caller-controlled URL fetcher.
+    pub(crate) fn candidate_artwork_ticket(&self, url: &str) -> Result<String> {
+        Ok(jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({"url":url,"exp":now_unix()+ACCESS_TTL_SECS,
+                "iss":ACCESS_TOKEN_ISSUER,"aud":"kahawai-candidate-artwork"}),
+            &self.enc,
+        )?)
+    }
+
+    pub(crate) fn candidate_artwork_url(&self, ticket: &str) -> Result<String> {
+        let mut validation = Validation::new(Algorithm::HS256);
+        validation.set_required_spec_claims(&["exp", "iss", "aud"]);
+        validation.set_issuer(&[ACCESS_TOKEN_ISSUER]);
+        validation.set_audience(&["kahawai-candidate-artwork"]);
+        let claims =
+            jsonwebtoken::decode::<serde_json::Value>(ticket, &self.dec, &validation)?.claims;
+        Ok(claims["url"]
+            .as_str()
+            .context("missing poster URL")?
+            .to_string())
+    }
+
     fn issue_access_token(
         &self,
         user_id: &str,
@@ -837,6 +862,28 @@ pub async fn reset_password(db: &Database, username: &str, new_password: &str) -
 mod tests {
     use super::*;
     use std::os::unix::fs::PermissionsExt;
+
+    #[tokio::test]
+    async fn candidate_artwork_tickets_are_bound_to_the_url_and_purpose() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let auth = Auth::new(db, dir.path()).await.unwrap();
+        let url = "https://image.tmdb.org/t/p/w154/poster.jpg";
+        let ticket = auth.candidate_artwork_ticket(url).unwrap();
+        assert_eq!(auth.candidate_artwork_url(&ticket).unwrap(), url);
+        assert!(auth.candidate_artwork_url(&format!("{ticket}x")).is_err());
+        assert!(auth.authenticate(&ticket).await.is_err());
+        let access = auth.issue_access_token("u", "viewer", true, 0).unwrap();
+        assert!(auth.candidate_artwork_url(&access).is_err());
+        let expired = jsonwebtoken::encode(
+            &Header::new(Algorithm::HS256),
+            &serde_json::json!({"url":url,"exp":now_unix()-3600,
+                "iss":ACCESS_TOKEN_ISSUER,"aud":"kahawai-candidate-artwork"}),
+            &auth.enc,
+        )
+        .unwrap();
+        assert!(auth.candidate_artwork_url(&expired).is_err());
+    }
 
     #[tokio::test]
     async fn loading_an_existing_jwt_secret_restricts_its_mode() {

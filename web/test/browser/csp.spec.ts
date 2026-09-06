@@ -282,3 +282,70 @@ test('the minimal permissions policy is delivered and understood by Chromium', a
     geolocation: false,
   })
 })
+
+test('the match selector renders hub-served candidate box art under CSP', async ({ page }) => {
+  await recordViolations(page)
+  const png = Buffer.from(
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jRZkAAAAASUVORK5CYII=',
+    'base64',
+  )
+  const access = `e30.${Buffer.from(JSON.stringify({ sub: 'admin', username: 'admin', admin: true, exp: Math.floor(Date.now() / 1000) + 900 })).toString('base64url')}.fixture`
+  const item = {
+    id: 'copy',
+    kind: 'movie',
+    title: 'X-Men',
+    year: 2000,
+    file_title: 'X-Men',
+    file_year: 2000,
+    match_confidence: 'auto',
+    sources: 1,
+    play_count: 0,
+    played: false,
+    library_id: 'movies',
+  }
+  await page.route('**/api/v1/**', async (route) => {
+    const path = new URL(route.request().url()).pathname
+    if (path.endsWith('/artwork') || path === '/api/v1/candidate-artwork') {
+      await route.fulfill({ contentType: 'image/png', body: png })
+      return
+    }
+    const answer =
+      path === '/api/v1/auth/refresh'
+        ? { access_token: access, expires_in: 900 }
+        : path === '/api/v1/bootstrap'
+          ? { setup_required: false, setup_available: false, setup_url: null }
+          : path === '/api/v1/libraries'
+            ? { libraries: [{ id: 'movies', name: 'Movies', media_type: 'movies' }] }
+            : path === '/api/v1/items'
+              ? { items: [item], total: 1, offset: 0, limit: 100 }
+              : {}
+    await route.fulfill({ json: answer })
+  })
+  await page.route('**/admin/v1/enrich/search', (route) =>
+    route.fulfill({
+      json: {
+        candidates: [
+          {
+            id: 1,
+            provider: 'tmdb',
+            title: 'X-Men',
+            release_date: '2000-07-14',
+            format: 'Movie',
+            poster_path: '/poster.jpg',
+            poster_url: '/api/v1/candidate-artwork?ticket=fixture',
+          },
+        ],
+      },
+    }),
+  )
+  await page.goto('/app/library/movies')
+  await page.getByRole('button', { name: 'Re-match metadata: X-Men' }).click({ force: true })
+  const poster = page.getByRole('dialog').locator('img')
+  await expect(poster).toBeVisible()
+  await expect
+    .poll(() =>
+      poster.evaluate((image: HTMLImageElement) => image.complete && image.naturalWidth > 0),
+    )
+    .toBe(true)
+  expect(await violations(page)).toEqual([])
+})
