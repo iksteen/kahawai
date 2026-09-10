@@ -179,6 +179,25 @@ describe('opening the player', () => {
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 0 }))
   })
 
+  test.each([
+    ['', true],
+    ['&start=0', true],
+    ['&start=0&chapter=1', false],
+  ])(
+    'uses the chosen source and preserves item/chapter positioning (%s)',
+    async (position, resume) => {
+      vi.mocked(api.itemQuery).mockResolvedValue(
+        film({ negotiated: { source: { source_id: 2 } } }) as never,
+      )
+      const { router } = await open(`/library/films/item/heat/play?source=2${position}`)
+      expect(api.itemQuery).toHaveBeenCalledWith('heat', expect.objectContaining({ source_id: 2 }))
+      expect(api.startSession).toHaveBeenCalledWith(
+        expect.objectContaining({ source_id: 2, resume }),
+      )
+      expect(router.currentRoute.value.query).toEqual({})
+    },
+  )
+
   test('a chapter position starts there, and is spent on arrival', async () => {
     vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     const { router } = await open('/library/films/item/heat/play?start=470512')

@@ -295,6 +295,122 @@ describe('what the hub says it would do with the file', () => {
   })
 })
 
+describe('choosing a playback source', () => {
+  const rendition = (selected = 2) => {
+    const base = film().sources[0]!
+    return film({
+      sources: [
+        { ...base, source_id: 1, parts: 2, path_rel: 'Heat CD1.avi' },
+        { ...base, source_id: 1, parts: 2, part: 2, path_rel: 'Heat CD2.avi' },
+        { ...base, source_id: 2, path_rel: 'Heat 1080p.mkv' },
+        { ...base, source_id: 3, available: false, path_rel: 'Offline.mkv' },
+        { ...base, source_id: 4, parts: 2, path_rel: 'Incomplete CD1.avi' },
+      ],
+      negotiated: {
+        source: { source_id: selected },
+        cost: selected === 1 ? 'video_encode' : 'copy',
+        streams: { video: selected === 1 ? 'encode' : 'copy', audio: 'copy' },
+        subtitles: [],
+      },
+      chapters: [{ start_ms: selected === 1 ? 45_000 : 60_000, title: 'The heist' }],
+      resume_position_ms: 90_000,
+      resume_duration_ms: 600_000,
+    })
+  }
+  const playButton = (wrapper: Awaited<ReturnType<typeof open>>['wrapper']) =>
+    wrapper.findAll('button').find((button) => button.text() === '▶ Resume')!
+
+  beforeEach(() => {
+    vi.mocked(itemQuery).mockImplementation(
+      async (_id, body) => rendition(body?.source_id ?? 2) as never,
+    )
+  })
+
+  test('defaults to the hub choice and groups CDs into one selectable copy', async () => {
+    const { wrapper, router } = await open(Detail, '/library/films/item/heat')
+    const options = wrapper.find('#playback-source').findAll('option')
+    expect(options).toHaveLength(5)
+    expect(options[0]!.text()).toContain('Automatic · c · Heat 1080p.mkv')
+    expect((options[0]!.element as HTMLOptionElement).selected).toBe(true)
+    expect(options[1]!.text()).toContain('Heat CD1.avi + Heat CD2.avi')
+    expect(options[3]!.attributes('disabled')).toBeDefined()
+    expect(options[4]!.attributes('disabled')).toBeDefined()
+    await playButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query.source).toBeUndefined()
+  })
+
+  test.each(['resume', 'start', 'chapter'] as const)(
+    'uses the override for %s and updates the preview',
+    async (action) => {
+      const { wrapper, router } = await open(Detail, '/library/films/item/heat')
+      await wrapper.find('#playback-source').setValue('1')
+      await flushPromises()
+      expect(itemQuery).toHaveBeenLastCalledWith('heat', expect.objectContaining({ source_id: 1 }))
+      expect(wrapper.text()).toContain('TRANSCODE')
+      expect(wrapper.text()).not.toContain('REMUX')
+      const button =
+        action === 'resume'
+          ? playButton(wrapper)
+          : wrapper
+              .findAll('button')
+              .find((b) =>
+                action === 'start'
+                  ? b.text() === 'Play from start'
+                  : b.text().includes('The heist'),
+              )!
+      await button.trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.query.source).toBe('1')
+      expect(router.currentRoute.value.query.start).toBe(
+        action === 'resume' ? undefined : action === 'start' ? '0' : '45000',
+      )
+      expect(router.currentRoute.value.query.chapter).toBe(action === 'chapter' ? '1' : undefined)
+    },
+  )
+
+  test('a pending or failed source check keeps the page and allows returning to automatic', async () => {
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    let fail!: (error: Error) => void
+    vi.mocked(itemQuery).mockImplementationOnce(
+      () =>
+        new Promise((_resolve, reject) => {
+          fail = reject
+        }),
+    )
+    await wrapper.find('#playback-source').setValue('1')
+    await flushPromises()
+    expect(wrapper.text()).toContain('Checking this source')
+    expect(playButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).not.toContain('Playback plan')
+    fail(new Error('hub unavailable'))
+    await flushPromises()
+    expect(wrapper.find('h1').text()).toContain('Heat')
+    expect(wrapper.text()).toContain('Could not check this source')
+    expect(playButton(wrapper).attributes('disabled')).toBeDefined()
+    await wrapper.find('#playback-source').setValue('Automatic · c · Heat 1080p.mkv · 8.0 GB')
+    await flushPromises()
+    expect(wrapper.text()).not.toContain('Could not check this source')
+    expect(playButton(wrapper).attributes('disabled')).toBeUndefined()
+  })
+
+  test('changing items resets the override without writing preferences', async () => {
+    const { wrapper, router } = await open(Detail, '/library/films/item/heat')
+    await wrapper.find('#playback-source').setValue('1')
+    await flushPromises()
+    await router.push('/library/films/item/another')
+    await flushPromises()
+    expect(itemQuery).toHaveBeenLastCalledWith(
+      'another',
+      expect.not.objectContaining({ source_id: 1 }),
+    )
+    expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
+      true,
+    )
+    expect((await import('../src/api/generated/kahawai.ts')).putPref).not.toHaveBeenCalled()
+  })
+})
+
 describe('the files it is made of', () => {
   test('a magnifier targets its source copy and keeps its CDs together', async () => {
     admin.value = true

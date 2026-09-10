@@ -252,7 +252,10 @@ async function start() {
       startMs: at,
       audioTrack,
       prefs: prefs.value,
-      resume: asked === null || (asked === 0 && source === undefined),
+      ...(source === undefined ? {} : { sourceId: source }),
+      // Starting an episode from zero is item-relative even with a chosen
+      // source; a chapter explicitly names a position within the source.
+      resume: asked === null || (asked === 0 && route.query.chapter !== '1'),
     })
     if (mine !== attempt.value || left) {
       void release(fresh.session_id)
@@ -266,7 +269,7 @@ async function start() {
     // the ask, or Try again after a transient 503 silently resumed mid-film
     // instead of at the chapter that was pressed. replace(), so Back does
     // not walk through the parameter either.
-    if (asked !== null) {
+    if (asked !== null || source !== undefined) {
       void router.replace({ query: {} })
     }
   } catch (cause) {

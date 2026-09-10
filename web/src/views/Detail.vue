@@ -42,9 +42,9 @@ import {
   watchedPct,
 } from '../domain/label.ts'
 import { chapterTitle } from '../domain/chapters.ts'
-import { adminItemLog, listLibraries } from '../api/generated/kahawai.ts'
+import { adminItemLog, itemQuery, listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
-import { loadMask } from '../api/capabilities.ts'
+import { buildProfile, loadMask } from '../api/capabilities.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
 import { saveAs } from '../api/download.ts'
@@ -66,10 +66,42 @@ const matching = ref<string | null>(null)
 async function matched(ids: string[]) {
   if (ids[0] && ids[0] !== id.value)
     await router.replace({ name: 'detail', params: { library: library.value, id: ids[0] } })
-  else await query.refetch()
+  else await refreshItem()
 }
 const query = useItem(id)
-const item = computed(() => query.data.value)
+// A source choice belongs to this visit, never to the user's preferences.
+const sourceOverride = ref<number>()
+watch(id, () => (sourceOverride.value = undefined), { flush: 'sync' })
+const sourceQuery = useQuery({
+  queryKey: computed(() => ['item', id.value, { source: sourceOverride.value }]),
+  enabled: computed(() => sourceOverride.value !== undefined),
+  queryFn: () => itemQuery(id.value, { profile: buildProfile(), source_id: sourceOverride.value! }),
+})
+// Keep the item and source choices on screen if checking an override fails.
+const item = computed(() =>
+  sourceOverride.value === undefined
+    ? query.data.value
+    : (sourceQuery.data.value ?? query.data.value),
+)
+const sourceFailure = computed(() =>
+  sourceOverride.value === undefined
+    ? ''
+    : sourceQuery.isError.value
+      ? sentence(sourceQuery.error.value)
+      : (sourceQuery.data.value?.unavailable?.message ?? ''),
+)
+const sourceReady = computed(
+  () =>
+    sourceOverride.value === undefined ||
+    (sourceQuery.data.value?.negotiated?.source?.source_id === sourceOverride.value &&
+      !sourceFailure.value),
+)
+async function refreshItem() {
+  await Promise.all([
+    query.refetch(),
+    ...(sourceOverride.value === undefined ? [] : [sourceQuery.refetch()]),
+  ])
+}
 /// UI-17: this screen is titled by the thing on it, and nothing above it knows
 /// what that is until the query lands. When it does not land, the failure panel
 /// IS the screen — left waiting for a name that is never coming, the tab strip
@@ -119,10 +151,36 @@ function goUp() {
   }
 }
 
-/// What playback would pick: the hub orders the list that way, so the first
-/// work in it is the one Play uses.
 const works = computed(() => groupSources(item.value?.sources ?? []))
-const best = computed(() => works.value[0]?.parts[0])
+const automaticSource = computed(
+  () => query.data.value?.negotiated?.source?.source_id ?? works.value[0]?.id,
+)
+const selectedSource = computed(() => sourceOverride.value ?? automaticSource.value)
+const selectedWork = computed(() => works.value.find((work) => work.id === selectedSource.value))
+const best = computed(() => selectedWork.value?.parts[0])
+const canPlay = computed(
+  () =>
+    sourceReady.value &&
+    selectedWork.value?.whole &&
+    selectedWork.value.parts.every((part) => part.available),
+)
+function sourceLabel(work: (typeof works.value)[number]) {
+  const first = work.parts[0]!
+  const video = first.streams?.video?.[0]
+  return [
+    first.collection_id,
+    work.parts.map((part) => part.path_rel.split('/').at(-1)).join(' + '),
+    video ? [video.height ? `${video.height}p` : '', video.codec].filter(Boolean).join(' ') : '',
+    size(work.parts.reduce((total, part) => total + part.size, 0)),
+    !work.whole ? 'incomplete' : work.parts.some((part) => !part.available) ? 'offline' : '',
+  ]
+    .filter(Boolean)
+    .join(' · ')
+}
+const automaticLabel = computed(() => {
+  const work = works.value.find((work) => work.id === automaticSource.value)
+  return work ? `Automatic · ${sourceLabel(work)}` : 'Automatic'
+})
 
 /// HUB-24, and the two preferences the panel has to know about: the media
 /// type's subtitle wishlist, and this TITLE's own standing choice — which
@@ -157,7 +215,7 @@ const fileFps = computed(() => {
 
 /// A download, a removal or a cleared override all change what this page shows.
 async function subtitlesChanged() {
-  await Promise.all([query.refetch(), prefs.query.refetch()])
+  await Promise.all([refreshItem(), prefs.query.refetch()])
 }
 
 /// What the stored capability mask changes, if anything.
@@ -173,7 +231,7 @@ const showCaps = ref(false)
 /// the ASS rung and the reasons all move.
 async function maskChanged() {
   mask.value = loadMask()
-  await query.refetch()
+  await refreshItem()
 }
 
 /// OPS-10: the LAST session for this item, whoever played it.
@@ -244,19 +302,16 @@ const subline = computed(() => {
 /// "play from start", which is the same statement — the player reads a
 /// number, so a chapter is one too rather than a second kind of link.
 function play(at?: number, chapter = false) {
+  if (!canPlay.value) return
+  const source = chapter ? selectedSource.value : sourceOverride.value
   void router.push({
     name: 'player',
     params: { library: library.value, id: id.value },
-    ...(at === undefined
-      ? {}
-      : {
-          query: {
-            start: String(Math.round(at)),
-            ...(chapter && item.value?.negotiated?.source?.source_id
-              ? { source: String(item.value.negotiated.source.source_id) }
-              : {}),
-          },
-        }),
+    query: {
+      ...(at === undefined ? {} : { start: String(Math.round(at)) }),
+      ...(source === undefined ? {} : { source: String(source) }),
+      ...(chapter ? { chapter: '1' } : {}),
+    },
   })
 }
 
@@ -349,14 +404,43 @@ function markSeason(season: number | null, played: boolean) {
       </template>
 
       <template v-else>
+        <div v-if="works.length > 1" class="basis-full">
+          <label for="playback-source" class="mb-1 block text-[13px] text-dim">Source</label>
+          <select
+            id="playback-source"
+            v-model="sourceOverride"
+            class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
+          >
+            <option :value="undefined">{{ automaticLabel }}</option>
+            <option
+              v-for="work in works"
+              :key="work.id"
+              :value="work.id"
+              :disabled="!work.whole || work.parts.some((part) => !part.available)"
+            >
+              {{ sourceLabel(work) }}
+            </option>
+          </select>
+          <p
+            v-if="sourceOverride !== undefined && sourceQuery.isPending.value"
+            class="mt-1 text-dim"
+            role="status"
+          >
+            Checking this source…
+          </p>
+          <div v-if="sourceFailure" class="mt-1">
+            <p class="text-warn" role="alert">Could not check this source: {{ sourceFailure }}</p>
+            <Btn ghost small @click="sourceQuery.refetch()">Try again</Btn>
+          </div>
+        </div>
         <Btn
-          :disabled="!best?.available"
+          :disabled="!canPlay"
           :title="best?.available ? undefined : 'The machine holding this file is not answering'"
           @click="play()"
         >
           ▶ {{ resumeAt ? 'Resume' : 'Play' }}
         </Btn>
-        <Btn v-if="resumeAt > 0" ghost @click="play(0)">Play from start</Btn>
+        <Btn v-if="resumeAt > 0" ghost :disabled="!canPlay" @click="play(0)">Play from start</Btn>
         <Btn
           ghost
           small
@@ -583,7 +667,7 @@ function markSeason(season: number | null, played: boolean) {
       <!-- What the hub says it would do with this file, for this client. Never
            re-derived here: the point of asking the item what it would serve is
            that the answer comes from the code that will serve it. -->
-      <section v-if="item.negotiated" class="mt-8">
+      <section v-if="sourceReady && item.negotiated" class="mt-8">
         <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">
           Playback plan
         </h2>
@@ -652,7 +736,7 @@ function markSeason(season: number | null, played: boolean) {
            the useful thing about a chapter is that you can be in it a second
            later, and a viewer who wants "the bit after the recap" should not
            have to start at the beginning and scrub. -->
-      <section v-if="item.chapters?.length" class="mt-8 max-w-[46rem]">
+      <section v-if="sourceReady && item.chapters?.length" class="mt-8 max-w-[46rem]">
         <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Chapters</h2>
         <ul class="grid grid-cols-[repeat(auto-fill,minmax(15rem,1fr))] gap-x-6">
           <li
@@ -663,7 +747,7 @@ function markSeason(season: number | null, played: boolean) {
             <button
               class="flex w-full cursor-pointer items-baseline gap-3 border-0 bg-transparent px-0 py-1.5 text-left text-text hover:text-teal disabled:cursor-default disabled:text-dim"
               type="button"
-              :disabled="!best?.available"
+              :disabled="!canPlay"
               :title="
                 best?.available ? undefined : 'The machine holding this file is not answering'
               "
@@ -688,7 +772,8 @@ function markSeason(season: number | null, played: boolean) {
           <li
             v-for="work in works"
             :key="work.id"
-            class="rounded-md border border-line bg-surface p-2"
+            class="rounded-md border bg-surface p-2"
+            :class="work.id === selectedSource ? 'border-teal' : 'border-line'"
           >
             <div class="flex items-start gap-3">
               <div class="min-w-0 flex-1">
@@ -789,7 +874,7 @@ function markSeason(season: number | null, played: boolean) {
          tracks are audio-only; showing an online subtitle search below a
          record's track list is an unrelated action, not an empty state. -->
     <SubtitlePanel
-      v-if="item.kind !== 'album' && item.kind !== 'song'"
+      v-if="sourceReady && item.kind !== 'album' && item.kind !== 'song'"
       :item="item"
       :subs="item.negotiated?.subtitles ?? []"
       :source-id="item.negotiated?.source?.source_id"

@@ -168,6 +168,9 @@ How something works and why it was built that way belong in
       Source-specific subtitles, fonts and resume use the selected rendition.
       Text/ASS serving and extraction retain the selected track's physical file;
       an empty session subtitle list cannot reuse another source's preview.
+      The item page offers a source selector before playback, defaults to the
+      automatic choice, and keeps CDs together. Overrides update the playback
+      preview and apply to Play, Resume and chapters without saving a preference.
       Runnable regression and upgrade audit: `scripts/kahawai-library.sh`.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions,
       music layout). Music albums group on Album Artist while tracks retain
