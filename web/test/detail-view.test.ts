@@ -326,7 +326,7 @@ describe('when something goes wrong', () => {
   test('the episodes failing is a line, not the screen', async () => {
     // The head is real and already on screen: the title, the poster and the
     // way back are all in hand.
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'show', id: 'show' }) as never)
+    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
     vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'no'))
     const { wrapper } = await open(Detail, '/library/films/item/show')
     expect(wrapper.find('h1').text()).toContain('Heat')
@@ -350,7 +350,7 @@ describe('when something goes wrong', () => {
 })
 
 describe('a series', () => {
-  const show = () => film({ kind: 'show', id: 'show', title: 'Fringe', duration_ms: null })
+  const show = () => film({ kind: 'series', id: 'show', title: 'Fringe', duration_ms: null })
 
   test('counts its episodes, and says where to carry on', async () => {
     vi.mocked(itemQuery).mockResolvedValue(show() as never)
@@ -435,7 +435,7 @@ describe('a series', () => {
 })
 
 describe('a season', () => {
-  const show = () => film({ kind: 'show', id: 'show', title: 'Fringe', duration_ms: null })
+  const show = () => film({ kind: 'series', id: 'show', title: 'Fringe', duration_ms: null })
 
   test('shows its episodes as stills', async () => {
     vi.mocked(itemQuery).mockResolvedValue(show() as never)
@@ -472,7 +472,7 @@ describe('a season', () => {
 
 describe('a mark, and what it costs', () => {
   test('asks for the item and its children again, so no tick can lie', async () => {
-    const show = film({ kind: 'show', id: 'show' })
+    const show = film({ kind: 'series', id: 'show' })
     vi.mocked(itemQuery).mockResolvedValue(show as never)
     vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
@@ -529,7 +529,7 @@ describe('a mark, and what it costs', () => {
 })
 
 describe('what a series page says about an episode', () => {
-  const show = () => film({ kind: 'show', id: 'show', duration_ms: null })
+  const show = () => film({ kind: 'series', id: 'show', duration_ms: null })
 
   test('how far into it you are', async () => {
     vi.mocked(itemQuery).mockResolvedValue(show() as never)
@@ -731,7 +731,7 @@ describe('what this item is connected to', () => {
 })
 
 describe('a record', () => {
-  const record = async (tracks = [episode(1, { kind: 'track', title: 'Staying Power' })]) => {
+  const record = async (tracks = [episode(1, { kind: 'song', title: 'Staying Power' })]) => {
     vi.mocked(itemQuery).mockResolvedValue(
       film({ kind: 'album', id: 'album', title: 'Hot Space', artist: 'Queen' }) as never,
     )
@@ -755,9 +755,9 @@ describe('a record', () => {
 
   test('a multi-disc release can play or append either disc on its own', async () => {
     const { wrapper } = await record([
-      episode(1, { kind: 'track', season: 1, title: 'Disc one, track one' }),
-      episode(2, { kind: 'track', season: 1, title: 'Disc one, track two' }),
-      episode(1, { id: 'd2t1', kind: 'track', season: 2, title: 'Disc two, track one' }),
+      episode(1, { kind: 'song', season: 1, title: 'Disc one, track one' }),
+      episode(2, { kind: 'song', season: 1, title: 'Disc one, track two' }),
+      episode(1, { id: 'd2t1', kind: 'song', season: 2, title: 'Disc two, track one' }),
     ])
 
     expect(wrapper.text()).toContain('Disc 1')
@@ -782,8 +782,8 @@ describe('a record', () => {
 
   test('a single-disc release keeps the ordinary uncluttered track list', async () => {
     const { wrapper } = await record([
-      episode(1, { kind: 'track', season: null, title: 'Unnumbered disc' }),
-      episode(2, { kind: 'track', season: 1, title: 'Explicit disc one' }),
+      episode(1, { kind: 'song', season: null, title: 'Unnumbered disc' }),
+      episode(2, { kind: 'song', season: 1, title: 'Explicit disc one' }),
     ])
     expect(wrapper.findAll('button').some((button) => button.text().includes('Play disc'))).toBe(
       false,
@@ -860,8 +860,8 @@ describe('a record', () => {
     // The numbered list is the record, and somebody pressing track 4 of nine
     // means "start here" — not "play this one and stop".
     const { wrapper } = await record([
-      episode(1, { kind: 'track', title: 'Staying Power' }),
-      episode(2, { kind: 'track', title: 'Dancer' }),
+      episode(1, { kind: 'song', title: 'Staying Power' }),
+      episode(2, { kind: 'song', title: 'Dancer' }),
     ])
     await wrapper
       .findAll('button')
@@ -884,8 +884,8 @@ describe('a record', () => {
     // reading its index into THIS record's list marks a track nobody is
     // playing.
     const { wrapper } = await record([
-      episode(1, { kind: 'track', title: 'Staying Power' }),
-      episode(2, { kind: 'track', title: 'Dancer' }),
+      episode(1, { kind: 'song', title: 'Staying Power' }),
+      episode(2, { kind: 'song', title: 'Dancer' }),
     ])
     queue.playAlbum([{ id: 'other', title: 'Another Record' } as never])
     await flushPromises()
@@ -894,8 +894,8 @@ describe('a record', () => {
 
   test('and the track playing is marked, wherever the queue got it', async () => {
     const { wrapper } = await record([
-      episode(1, { kind: 'track', title: 'Staying Power' }),
-      episode(2, { kind: 'track', title: 'Dancer' }),
+      episode(1, { kind: 'song', title: 'Staying Power' }),
+      episode(2, { kind: 'song', title: 'Dancer' }),
     ])
     await wrapper
       .findAll('button')
@@ -917,7 +917,7 @@ describe('a record', () => {
 })
 
 describe('the season page, in more detail', () => {
-  const show = () => film({ kind: 'show', id: 'show', title: 'Fringe', duration_ms: null })
+  const show = () => film({ kind: 'series', id: 'show', title: 'Fringe', duration_ms: null })
 
   test('opens on the first thing you have not finished', async () => {
     // The reason you came. Landing on nothing means finding your place twice.
@@ -1063,7 +1063,7 @@ describe('what an item page does not ask for', () => {
 
 describe('un-ticking', () => {
   test('an episode that has been watched offers to unmark it', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'show', id: 'show' }) as never)
+    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
     vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1, { played: true })] } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
     await wrapper.find('[aria-label^="Mark as unwatched"]').trigger('click')
@@ -1076,7 +1076,7 @@ describe('a season still loading', () => {
   test('does not say it is empty', async () => {
     // An empty array meant either "loading" or "this show has no episodes",
     // so the explanation was suppressed for the case it was written for.
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'show', id: 'show' }) as never)
+    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
     vi.mocked(itemChildren).mockReturnValue(new Promise(() => {}) as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).not.toContain('No episodes in')
@@ -1089,7 +1089,7 @@ describe('a still whose episode will not open', () => {
     // a no-op because the selection had not changed.
     vi.mocked(itemQuery).mockImplementation(async (id) =>
       id === 'show'
-        ? (film({ kind: 'show', id: 'show' }) as never)
+        ? (film({ kind: 'series', id: 'show' }) as never)
         : Promise.reject(new ApiError(500, 'no')),
     )
     vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
@@ -1250,7 +1250,10 @@ describe('the subtitles section (HUB-24)', () => {
       .find((b) => b.text().startsWith('Find subtitles'))!
       .trigger('click')
     await flushPromises()
-    expect(subtitleSearch).toHaveBeenCalledWith('heat', { languages: ['eng', 'fra'] })
+    expect(subtitleSearch).toHaveBeenCalledWith('heat', {
+      languages: ['eng', 'fra'],
+      source_id: null,
+    })
   })
 
   test('and a standing choice for this title is shown, scoped to the series', async () => {

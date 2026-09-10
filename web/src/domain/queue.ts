@@ -99,3 +99,7 @@ export function current(queue: Queue): QueueEntry | undefined {
 export function upNext(queue: Queue): QueueEntry | undefined {
   return queue.entries[queue.at + 1]
 }
+
+/// One album position can share its song with another position.
+export const trackKey = (track: ItemRowI64): string =>
+  track.album_track_id == null ? track.id : `album-track:${track.album_track_id}`

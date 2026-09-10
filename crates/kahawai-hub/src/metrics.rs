@@ -160,7 +160,7 @@ pub async fn gather(
     Ok(Snapshot {
         modules,
         sessions_active: sessions.list().len(),
-        items: one("SELECT COUNT(*) FROM items").await,
+        items: one("SELECT COUNT(*) FROM collection_items").await,
         files: one("SELECT COUNT(*) FROM files").await,
         file_bytes: one("SELECT COALESCE(SUM(size), 0) FROM files").await,
         subtitle_files: one(
@@ -170,7 +170,7 @@ pub async fn gather(
         enrichment_due: one("SELECT COUNT(*) FROM enrichment_queue WHERE due_at <= unixepoch()")
             .await,
         // The number worth alerting on: items nothing has identified.
-        unmatched_items: one("SELECT COUNT(*) FROM items i
+        unmatched_items: one("SELECT COUNT(*) FROM collection_items i
               WHERE i.kind IN ('movie', 'show', 'album')
                 AND NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)")
         .await,

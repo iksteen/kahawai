@@ -25,6 +25,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   listLibraries: vi.fn(),
   listArtists: vi.fn(),
   adminApplyMatch: vi.fn(),
+  itemDetail: vi.fn(),
   adminReviewSearch: vi.fn(),
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
   getArtistArtworkUrl: (key: string, params: { library: string; size?: string; v?: string }) =>
@@ -35,7 +36,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
 const admin = { value: false }
 vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
 
-const { adminApplyMatch, adminReviewSearch, listArtists, listItems, listLibraries } =
+const { itemDetail, adminApplyMatch, adminReviewSearch, listArtists, listItems, listLibraries } =
   await import('../src/api/generated/kahawai.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
@@ -535,8 +536,22 @@ describe('scrolling it', () => {
 describe('hand-matching from the grid (HUB-8)', () => {
   beforeEach(() => {
     admin.value = true
+    vi.mocked(itemDetail).mockImplementation(
+      async (id) =>
+        ({
+          copies: [
+            {
+              id,
+              title: 'Heat',
+              year: 1995,
+              paths: [],
+              assignment: { revision: 4, library_item_ids: [id] },
+            },
+          ],
+        }) as never,
+    )
     vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
-    vi.mocked(adminApplyMatch).mockResolvedValue({ ok: true } as never)
+    vi.mocked(adminApplyMatch).mockResolvedValue({ library_item_ids: ['i1'], revision: 5 } as never)
   })
   afterEach(() => (admin.value = false))
 
@@ -546,11 +561,11 @@ describe('hand-matching from the grid (HUB-8)', () => {
     expect(wrapper.findAll('[aria-label*="match"]')).toHaveLength(0)
   })
 
-  test('nor on an episode, which has no identity of its own', async () => {
+  test('also offers matching an episode copy', async () => {
     // An episode inherits its show's match; the show is where you would fix it.
     hub(1, { kind: 'episode' })
     const { wrapper } = await grid()
-    expect(wrapper.findAll('[aria-label*="match"]')).toHaveLength(0)
+    expect(wrapper.findAll('[aria-label*="match"]')).toHaveLength(1)
   })
 
   test('and opens a dialog anchored on the file', async () => {

@@ -17,7 +17,7 @@ use tower::ServiceExt;
 async fn harness() -> (
     axum::Router,
     String,
-    kahawai_sqlite::Database,
+    kahawai_hub::library::Database,
     Arc<kahawai_hub::registry::Registry>,
     std::path::PathBuf,
 ) {
@@ -103,9 +103,9 @@ struct CompositionState {
     generation: i64,
 }
 
-async fn composition_state(db: &kahawai_sqlite::Database) -> CompositionState {
+async fn composition_state(db: &kahawai_hub::library::Database) -> CompositionState {
     CompositionState {
-        item_count: sqlx::query_scalar("SELECT count(*) FROM items WHERE id='composed-item'")
+        item_count: sqlx::query_scalar("SELECT count(*) FROM collection_items WHERE id='composed-item'")
             .fetch_one(db)
             .await
             .unwrap(),
@@ -126,7 +126,7 @@ async fn composition_state(db: &kahawai_sqlite::Database) -> CompositionState {
         .await
         .unwrap(),
         watch: sqlx::query_as(
-            "SELECT position_ms,play_count FROM watch_state WHERE item_id='composed-item'",
+            "SELECT position_ms,play_count FROM user_item_state WHERE item_id='composed-item'",
         )
         .fetch_one(db)
         .await
@@ -160,7 +160,7 @@ async fn attach_and_detach_change_only_visibility() {
            VALUES('compose-host','mediahost','compose-host','fp');
          INSERT INTO collections(module_id,collection_id,media_type,sync_version)
            VALUES('compose-host','films','movies',91);
-         INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+         INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
            VALUES('composed-item','movie','Composed','composed','compose-host','films');
          INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
@@ -182,7 +182,7 @@ async fn attach_and_detach_change_only_visibility() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO watch_state(user_id,item_id,position_ms,play_count)
+        "INSERT INTO user_item_state(user_id,item_id,position_ms,play_count)
          VALUES(?,'composed-item',1234,3)",
     )
     .bind(user_id)
@@ -294,8 +294,8 @@ async fn pages_partition_a_library_even_across_ties() {
     for n in 0..11 {
         let id = format!("i{n:02}");
         sqlx::query(
-            "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
-             VALUES(?,'movie','Same','same',2020,'m','c')",
+            "INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
+             VALUES(?,'movie','Same','same',NULL,'m','c')",
         )
         .bind(&id)
         .execute(&db)
@@ -376,7 +376,7 @@ async fn search_finds_artists_and_episode_titles() {
     // An album by an accented artist. norm_artist is what the write
     // sites store; here it is set the way the registry would.
     q(
-        "INSERT INTO items(id,kind,title,norm_title,artist,norm_artist,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,artist,norm_artist,module_id,collection_id)
        VALUES('alb','album','Ace of Spades','ace of spades','Motörhead','motorhead','m','c')",
     )
     .await;
@@ -384,12 +384,12 @@ async fn search_finds_artists_and_episode_titles() {
     // A show whose episode has a projected title that is NOT in the
     // filename — the 19% case.
     q(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
        VALUES('sh','show','A Show','a show','m','c')",
     )
     .await;
     q(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
        VALUES('ep','episode','S03E14','s03e14','sh',3,14,'m','c')",
     )
     .await;
@@ -438,7 +438,7 @@ async fn search_finds_artists_and_episode_titles() {
     // Tracks match by TITLE, never by artist: "motorhead" must not bury
     // the album under a row per song, but the song itself is findable.
     q(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,artist,norm_artist,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,artist,norm_artist,module_id,collection_id)
        VALUES('trk','track','Overkill','overkill','alb','Motörhead','motorhead','m','c')",
     )
     .await;
@@ -529,7 +529,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
         ),
     ] {
         sqlx::query(
-            "INSERT INTO items
+            "INSERT INTO collection_items
                (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
              VALUES(?,'album',?,?,?,?,?,?,?,?,?)",
         )
@@ -548,7 +548,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
         .unwrap();
     }
     sqlx::query(
-        "INSERT INTO items
+        "INSERT INTO collection_items
            (id,kind,title,norm_title,sort_title,parent_id,episode,artist,norm_artist,module_id,collection_id)
          VALUES('t','track','Hidden Gem','hidden gem','hidden gem','a1',1,'Guest','guest','m1','c1')",
     )
@@ -559,7 +559,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
     // The filename/tag supplied no usable date for a1. MusicBrainz did, and
     // the list must order by the same resolved year its card displays. Leaving
     // this as a raw-year fixture let the broken query pass unnoticed.
-    sqlx::query("UPDATE items SET year=NULL WHERE id='a1'")
+    sqlx::query("UPDATE collection_items SET year=NULL WHERE id='a1'")
         .execute(&db)
         .await
         .unwrap();
@@ -642,13 +642,19 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
     )
     .await;
     assert_eq!(found["total"], 1);
-    assert_eq!(found["albums"][0]["id"], "a1");
+    let a1: String = sqlx::query_scalar(
+        "SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='a1'",
+    )
+    .fetch_one(&db)
+    .await
+    .unwrap();
+    assert_eq!(found["albums"][0]["id"], a1);
 
     // Search folding intentionally considers number spellings equivalent,
     // but artist identity must not. Punctuation-only credits also need a
     // non-empty route key.
     sqlx::query(
-        "INSERT INTO items
+        "INSERT INTO collection_items
            (id,kind,title,norm_title,sort_title,artist,norm_artist,artist_key,module_id,collection_id)
          VALUES('word','album','Word','word','word','One','1','artist-b25l','m1','c1'),
                ('digit','album','Digit','digit','digit','1','1','artist-MQ','m1','c1'),
@@ -694,7 +700,7 @@ async fn capability_changes_delivery_not_existence() {
     )
     .await;
     q(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
        VALUES('subs-item','movie','Subbed','subbed','m2','c2')",
     )
     .await;
@@ -717,13 +723,11 @@ async fn capability_changes_delivery_not_existence() {
     .fetch_one(&db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(
-        &mut db.acquire().await.unwrap(),
-        source_id,
-        "subs-item",
-    )
-    .await
-    .unwrap();
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source_id, "subs-item")
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
     // What a scan would materialize (tests seed by SQL, so no
     // sync_source_tracks ran).
     q(
@@ -807,7 +811,7 @@ async fn scan_sync_preserves_track_ids() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('it','movie','M','m','sync','c')",
     )
     .execute(&db)
@@ -821,9 +825,11 @@ async fn scan_sync_preserves_track_ids() {
     .fetch_one(&db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "it")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source_id, "it")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let info: kahawai_core::media::MediaInfo = serde_json::from_str(
         r#"{"subtitles":[{"format":"srt","language":"en"},{"format":"pgs","language":"nl"}],
             "external_subtitles":[{"path_rel":"m.idx","format":"vobsub","language":"en","track":0}]}"#,

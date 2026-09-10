@@ -7,7 +7,7 @@
 //! have cached them.
 
 use kahawai_hub::enrich::Enricher;
-use kahawai_sqlite::Database as SqlitePool;
+use kahawai_hub::library::Database as SqlitePool;
 
 const AID: u32 = 1234;
 
@@ -30,7 +30,7 @@ async fn harness() -> (Enricher, SqlitePool, tempfile::TempDir) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('show','show','X','x','m','c')",
     )
     .execute(&db)
@@ -50,7 +50,7 @@ async fn episode(
     epno: &str,
 ) {
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
          VALUES(?,'episode',?,?,'show',?,?,'m','c')",
     )
     .bind(id)
@@ -71,9 +71,11 @@ async fn episode(
     .fetch_one(db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, id)
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, id)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     sqlx::query(
         "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
          VALUES ('hash-' || ?, ?, 9, ?, 7, 'Grp', unixepoch())",
@@ -88,7 +90,7 @@ async fn episode(
 
 async fn slot_of(db: &SqlitePool, path: &str) -> (Option<i64>, i64, String) {
     sqlx::query_as::<_, (Option<i64>, i64, String)>(
-        "SELECT i.season,i.episode,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
+        "SELECT i.season,i.episode,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items i ON i.id=fb.item_id
           WHERE f.path_rel=?",
     )
     .bind(path)
@@ -113,7 +115,7 @@ async fn bare_files_bind_to_what_their_hash_names() {
         }
     };
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('show', 1234)").await;
-    q("INSERT INTO items(id,kind,title,norm_title,module_id,collection_id) VALUES('film','movie','A Film','a film','m','c')")
+    q("INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id) VALUES('film','movie','A Film','a film','m','c')")
         .await;
     q("INSERT INTO anime_ids (item_id, anidb_id) VALUES ('film', 9999)").await;
 
@@ -205,7 +207,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     xml(800, "OVA", 4, "Serial OVA", "2005-01-01");
     // The adoptable twin: same normalized title and year, no anime_ids.
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
          VALUES('twin','movie','Adopted Film','adopted film',2001,'m','c')",
     )
     .execute(&db)
@@ -246,7 +248,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
         "movie, adoption and single-episode OVA bind; stray episode and serial OVA do not"
     );
     let lone: Option<String> = sqlx::query_scalar(
-        "SELECT i.title FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id WHERE f.path_rel='lone-ova.mkv'",
+        "SELECT i.title FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items i ON i.id=fb.item_id WHERE f.path_rel='lone-ova.mkv'",
     )
     .fetch_optional(&db)
     .await
@@ -264,7 +266,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     assert!(serial.is_none(), "multi-episode OVA stays bare");
 
     let akira: (String, Option<i64>, String) = sqlx::query_as(
-        "SELECT i.title,i.year,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
+        "SELECT i.title,i.year,i.id FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items i ON i.id=fb.item_id
           WHERE f.path_rel='akira.mkv'",
     )
     .fetch_one(&db)
@@ -301,7 +303,7 @@ async fn ownerless_movies_are_minted_or_adopted_from_the_hash() {
     assert_eq!(stray, 0, "a series-type aid must not scaffold a show");
     // And no phantom show was created for it.
     let shows: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind IN ('show','movie')")
+        sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE kind IN ('show','movie')")
             .fetch_one(&db)
             .await
             .unwrap();
@@ -342,7 +344,7 @@ async fn the_hash_wins_over_the_filename() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
          VALUES ('u','e6',120000,1200000,1,1,unixepoch())",
     )
     .execute(&db)
@@ -361,15 +363,16 @@ async fn the_hash_wins_over_the_filename() {
     assert_eq!(slot_of(&db, "e6.mkv").await, (None, 5, "e5".into()));
     // The misnumbered item is a ghost and is gone; the watch state moved
     // with the content.
-    let ghost: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE id='e6'")
+    let ghost: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE id='e6'")
         .fetch_one(&db)
         .await
         .unwrap();
     assert_eq!(ghost, 0, "a sourceless misnumbered episode must not linger");
-    let watched: String = sqlx::query_scalar("SELECT item_id FROM watch_state WHERE user_id='u'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let watched: String =
+        sqlx::query_scalar("SELECT item_id FROM user_item_state WHERE user_id='u'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(watched, "e5");
 
     // Idempotent: nothing left to move.
@@ -419,7 +422,7 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
 
     // The created season-0 item carried the file's own title.
     let title: String = sqlx::query_scalar(
-        "SELECT title FROM items WHERE parent_id='show' AND season=0 AND episode=2",
+        "SELECT title FROM collection_items WHERE parent_id='show' AND season=0 AND episode=2",
     )
     .fetch_one(&db)
     .await
@@ -447,7 +450,7 @@ async fn selection_follows_the_question_not_the_miss() {
     // Membership in an anime collection (the harness show has no source
     // yet — give it one, unhashed so the hash branch stays quiet).
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id) VALUES('ep','episode','e','e','show','m','c')",
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,module_id,collection_id) VALUES('ep','episode','e','e','show','m','c')",
     )
     .execute(&db)
     .await
@@ -458,9 +461,11 @@ async fn selection_follows_the_question_not_the_miss() {
     .fetch_one(&db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "ep")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, "ep")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
 
     // Never asked: the name question is owed.
     assert!(
@@ -491,7 +496,7 @@ async fn selection_follows_the_question_not_the_miss() {
     );
 
     // A rename changes the question: due again, exactly once.
-    sqlx::query("UPDATE items SET title='Y', norm_title='y' WHERE id='show'")
+    sqlx::query("UPDATE collection_items SET title='Y', norm_title='y' WHERE id='show'")
         .execute(&db)
         .await
         .unwrap();
@@ -510,7 +515,7 @@ async fn selection_follows_the_question_not_the_miss() {
     assert!(!selected(&registry, &enricher).await);
 
     // A real answer is terminal for the name branch, whatever the log.
-    sqlx::query("UPDATE items SET title='Z', norm_title='z' WHERE id='show'")
+    sqlx::query("UPDATE collection_items SET title='Z', norm_title='z' WHERE id='show'")
         .execute(&db)
         .await
         .unwrap();
@@ -572,9 +577,11 @@ async fn extra_source(
     .fetch_one(db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, item_id)
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, item_id)
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     sqlx::query(
         "INSERT OR REPLACE INTO ed2k_aid (ed2k, aid, eid, epno, gid, group_name, updated_at)
          VALUES ('hash-' || ?, ?, ?, ?, 7, 'Grp', unixepoch())",

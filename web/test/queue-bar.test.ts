@@ -53,10 +53,11 @@ class FakeContext {
 }
 
 const track = (id: string, over: Record<string, unknown> = {}) =>
-  ({ id, title: id.toUpperCase(), artist: 'Someone', kind: 'track', ...over }) as ItemRowI64
+  ({ id, title: id.toUpperCase(), artist: 'Someone', kind: 'song', ...over }) as ItemRowI64
 
 const session = (id: string) => ({
   session_id: `s-${id}`,
+  source_fingerprint: `file-${id}`,
   stream_url: `/stream/${id}`,
   content_type: 'audio/flac',
   mode: 'direct',
@@ -385,6 +386,25 @@ describe('a session the hub has forgotten', () => {
     expect(element.currentTime).toBe(42)
   })
 
+  test('discards the recovered offset when the physical copy changed', async () => {
+    vi.useFakeTimers()
+    const { wrapper } = await playing()
+    const element = audio(wrapper)[0]!.element as HTMLMediaElement
+    Object.defineProperty(element, 'duration', { value: 180, configurable: true })
+    element.currentTime = 42
+    await element.play()
+    vi.mocked(api.startSession).mockResolvedValue({
+      ...session('a'),
+      source_fingerprint: 'different-copy',
+    } as never)
+    vi.mocked(api.postProgress).mockRejectedValue(new ApiError(404, 'no such session'))
+    await vi.advanceTimersByTimeAsync(PING_MS + 100)
+    await flushPromises()
+    element.currentTime = 0
+    element.dispatchEvent(new Event('loadedmetadata'))
+    expect(element.currentTime).toBe(0)
+  })
+
   test('and only onto the track the position was measured on', async () => {
     // A bare number outlived the track it belonged to: recover at 0:42, jump to
     // another track before the new session arrives, and the jumped-to track
@@ -602,6 +622,10 @@ describe('ReplayGain (HUB-19)', () => {
     // positive.
     const queue = useQueue()
     queue.playAlbum([levelled('a', -6)])
+    vi.mocked(api.startSession).mockResolvedValue({
+      ...session('a'),
+      replay_gain: { album_gain_db: -6, album_peak: 0.5 },
+    } as never)
     const wrapper = mount(QueueBar, { attachTo: document.body })
     await flushPromises()
     expect(gain.value).toBeCloseTo(10 ** (-6 / 20), 4)

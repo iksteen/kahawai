@@ -28,10 +28,10 @@
 //! every account unrestricted, which is what it had a moment earlier.
 //!
 //! Grants attach to libraries, never directly to collections (0008): a
-//! collection owns catalogue identities, while a library is the composition a
-//! person is given. `library_collections` therefore decides visibility. Child
-//! items carry the same collection as their parent, so episodes and tracks
-//! inherit visibility naturally without an item-level membership projection.
+//! collection owns physical copies, while a library is the composition a
+//! person is given. Catalogue entries are visible through accessible assigned
+//! copies. Children require their own accessible copy; album associations also
+//! require an accessible supporting copy on that specific album.
 //!
 //! An item in no library at all is invisible to a restricted account.
 //! There is nothing to grant that would reach it; attach its collection
@@ -65,8 +65,8 @@
 //! row on the two scan-shaped browses: the cost class of the in-library
 //! search predicate that has always been there.
 
+use crate::library::Database as SqlitePool;
 use anyhow::Result;
-use kahawai_sqlite::Database as SqlitePool;
 use serde::Serialize;
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -99,12 +99,13 @@ pub async fn can_see(db: &SqlitePool, claims: &Claims, item_id: &str) -> Result<
     if claims.admin {
         return Ok(true);
     }
+    let item_id = crate::library::resolve_id(db, item_id).await?;
     let ok: i64 = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND all_libraries=1)
-             OR EXISTS(SELECT 1 FROM items i JOIN library_collections lc
+             OR EXISTS(SELECT 1 FROM collection_item_library_items a JOIN collection_items i ON i.id=a.collection_item_id JOIN library_collections lc
                   ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
                   JOIN user_libraries ul ON ul.library_id=lc.library_id AND ul.user_id=?1
-                 WHERE i.id=?2)",
+                 WHERE a.library_item_id=?2)",
     )
     .bind(&claims.sub)
     .bind(item_id)
@@ -140,11 +141,7 @@ pub async fn can_see_library(db: &SqlitePool, claims: &Claims, library_id: &str)
 /// interpolated when [`restricted`] said so: it carries no
 /// `all_libraries` check of its own, which is what keeps it a single
 /// indexed probe instead of a per-row lookup in `users`.
-pub const VISIBLE_C: &str = "\
-AND EXISTS (SELECT 1 FROM library_collections lc
-              JOIN user_libraries ul
-                ON ul.library_id=lc.library_id AND ul.user_id=?1
-             WHERE (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))";
+pub const VISIBLE_C: &str = "AND EXISTS(SELECT 1 FROM library_membership lc JOIN user_libraries ul ON ul.library_id=lc.library_id AND ul.user_id=?1 WHERE lc.item_id=c.id)";
 
 /// The same restriction, for the navigation library a browse row carries.
 ///

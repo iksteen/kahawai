@@ -7,15 +7,15 @@
 
 use sqlx::Row;
 
-async fn library() -> (tempfile::TempDir, kahawai_sqlite::Database) {
+async fn library() -> (tempfile::TempDir, kahawai_hub::library::Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     sqlx::raw_sql(
         "INSERT INTO collections(module_id,collection_id,media_type)
            VALUES('host','series','series');
-         INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+         INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
            VALUES('show','show','Show','show','show','host','series');
-         INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
+         INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
            VALUES('e1','episode','One','one','one','host','series','show',1,1),
                  ('e2','episode','Two','two','two','host','series','show',1,2);
          INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
@@ -38,7 +38,7 @@ async fn library() -> (tempfile::TempDir, kahawai_sqlite::Database) {
 }
 
 /// Record a finished scan the way `analyze_season` does.
-async fn scanned(db: &kahawai_sqlite::Database, item: &str, mtime: Option<i64>) {
+async fn scanned(db: &kahawai_hub::library::Database, item: &str, mtime: Option<i64>) {
     sqlx::query(
         "INSERT INTO media_segment_scans(item_id,scanned_at,detector,mtime_unix)
          VALUES(?, unixepoch(), ?, ?)
@@ -52,7 +52,7 @@ async fn scanned(db: &kahawai_sqlite::Database, item: &str, mtime: Option<i64>) 
     .unwrap();
 }
 
-async fn pending(db: &kahawai_sqlite::Database) -> i64 {
+async fn pending(db: &kahawai_hub::library::Database) -> i64 {
     kahawai_hub::segments::pending_seasons(db)
         .await
         .unwrap()
@@ -109,7 +109,7 @@ async fn an_episode_with_no_running_time_keeps_its_season_pending() {
     // ever.
     let (_dir, db) = library().await;
     sqlx::raw_sql(
-        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
+        "INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
            VALUES('e3','episode','Three','three','three','host','series','show',1,3);
          INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
@@ -130,7 +130,7 @@ async fn an_episode_with_no_running_time_keeps_its_season_pending() {
 
 #[tokio::test]
 async fn a_second_viewer_does_not_double_the_season() {
-    // `watch_state` is keyed on (user, item). Joined rather than subselected,
+    // `user_item_state` is keyed on (user, item). Joined rather than subselected,
     // it counted an episode once per person who had touched it — and both the
     // episode count and the PENDING count were counts of that fan-out. Three
     // users on the real hub was enough to invent three episodes.
@@ -142,7 +142,7 @@ async fn a_second_viewer_does_not_double_the_season() {
     sqlx::raw_sql(
         "INSERT INTO users(id,username,password_hash,created_at)
            VALUES('u1','one','x',1),('u2','two','x',1);
-         INSERT INTO watch_state(user_id,item_id,position_ms,played,updated_at)
+         INSERT INTO state_imports(user_id,item_id,position_ms,played,updated_at)
            VALUES('u1','e1',60000,1,100),('u2','e1',30000,0,200);",
     )
     .execute(&db)
@@ -167,9 +167,9 @@ async fn the_season_someone_is_watching_comes_first() {
     // FIRST episode was just watched could sort by another episode's zero.
     let (_dir, db) = library().await;
     sqlx::raw_sql(
-        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
            VALUES('ztouched','show','Ztouched','ztouched','ztouched','host','series');
-         INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
+         INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,parent_id,season,episode)
            VALUES('z1','episode','One','one','one','host','series','ztouched',1,1),
                  ('z2','episode','Two','two','two','host','series','ztouched',1,2);
          INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
@@ -190,7 +190,7 @@ async fn the_season_someone_is_watching_comes_first() {
          -- outer MAX() — the fixture has to put the signal where the
          -- arbitrary pick is not looking. The base library's e1-watch below
          -- covers the first-episode case at a lower rank.
-         INSERT INTO watch_state(user_id,item_id,position_ms,played,updated_at)
+         INSERT INTO state_imports(user_id,item_id,position_ms,played,updated_at)
            VALUES('u','z2',60000,0,9999),
                  ('u','e1',60000,0,5000);",
     )

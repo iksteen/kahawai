@@ -51,6 +51,8 @@ export type CarriedTracks = {
   /// viewer who turned subtitles off mid-film must not get them back because
   /// the wishlist would have picked some.
   subKey: string
+  embeddedSub?: number
+  sourceFingerprint?: string
 }
 
 export type TrackEvent =

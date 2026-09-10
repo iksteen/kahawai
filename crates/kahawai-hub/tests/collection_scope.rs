@@ -8,7 +8,7 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
            VALUES('m','mediahost','m','fp');
          INSERT INTO collections(module_id,collection_id,media_type) VALUES
            ('m','a','movies'),('m','b','movies');
-         INSERT INTO items(id,kind,title,norm_title,module_id,collection_id) VALUES
+         INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id) VALUES
            ('a1','movie','A1','a1','m','a'),
            ('a2','movie','A2','a2','m','a'),
            ('b1','movie','B1','b1','m','b');
@@ -20,9 +20,9 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
     .unwrap();
 
     for sql in [
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('bad','movie','Bad','bad','m','missing')",
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,module_id,collection_id)
          VALUES('child','episode','Child','child','b1','m','a')",
         "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                            head_xxh3,tail_xxh3,oshash,streams_json)
@@ -47,9 +47,11 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
     .await
     .unwrap();
 
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "a1")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source_id, "a1")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
 
     // Exactly one direct owner: physical tracks name only the source and
     // independently acquired tracks name only the item.
@@ -95,9 +97,11 @@ async fn cross_collection_references_are_rejected_and_source_tracks_follow_the_s
 
     // Rebinding the physical source changes its catalogue context without
     // rewriting the source-owned track.
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "a2")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source_id, "a2")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     assert!(
         kahawai_hub::tracks::get_for_item(&db, "a1", track_id)
             .await

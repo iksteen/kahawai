@@ -98,7 +98,7 @@ describe('what is drawn over it', () => {
     ).toBe(true)
     // A show says "series", because that is the word the interface uses.
     expect(
-      mount(Art, { props: { item: item({ kind: 'show' }), size: 'card' } })
+      mount(Art, { props: { item: item({ kind: 'series' }), size: 'card' } })
         .find('[title="series"]')
         .exists(),
     ).toBe(true)

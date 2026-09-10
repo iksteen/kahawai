@@ -267,11 +267,17 @@ async fn writer_task(
     }
 }
 
+/// An optional application derivation, run inside every transaction before commit.
+/// Errors roll back the entire source write. The callback must use the supplied
+/// connection and must not request another writer lease.
+pub type BeforeCommit = for<'c> fn(&'c mut SqliteConnection) -> BoxFuture<'c, Result<()>>;
+
 /// A database with a query-only reader pool and one serialized writer.
 #[derive(Clone, Debug)]
 pub struct Database {
     readers: SqlitePool,
     writer: Writer,
+    before_commit: Arc<Mutex<Option<BeforeCommit>>>,
 }
 
 impl Database {
@@ -292,7 +298,14 @@ impl Database {
         Ok(Self {
             readers,
             writer: Writer::spawn(writer),
+            before_commit: Arc::new(Mutex::new(None)),
         })
+    }
+
+    /// Install after schema initialization, before exposing the database to callers.
+    /// Single-statement writes then use the same atomic transaction path as batches.
+    pub fn set_before_commit(&self, callback: BeforeCommit) {
+        *self.before_commit.lock().unwrap() = Some(callback);
     }
 
     pub fn read_pool(&self) -> &SqlitePool {
@@ -383,7 +396,10 @@ impl Database {
             lease.rollback = false;
             return Err(error);
         }
-        Ok(WriterTransaction { lease })
+        Ok(WriterTransaction {
+            lease,
+            before_commit: *self.before_commit.lock().unwrap(),
+        })
     }
 
     pub async fn close(self) {
@@ -404,10 +420,16 @@ impl Deref for Database {
 #[derive(Debug)]
 pub struct WriterTransaction {
     lease: WriterLease,
+    before_commit: Option<BeforeCommit>,
 }
 
 impl WriterTransaction {
     pub async fn commit(mut self) -> Result<(), sqlx::Error> {
+        if let Some(callback) = self.before_commit {
+            callback(&mut self.lease)
+                .await
+                .map_err(|error| sqlx::Error::Protocol(format!("before commit: {error:#}")))?;
+        }
         sqlx::query("COMMIT").execute(&mut *self.lease).await?;
         self.lease.rollback = false;
         Ok(())
@@ -517,6 +539,11 @@ impl<'database> Executor<'database> for &'database Database {
                 while let Some(row) = rows.try_next().await? {
                     yield row;
                 }
+            } else if database.before_commit.lock().unwrap().is_some() {
+                let mut transaction = database.begin_with_label(writer_label(sql.as_str())).await?;
+                let rows: Vec<_> = (&mut *transaction).fetch_many((sql, arguments)).try_collect().await?;
+                transaction.commit().await?;
+                for row in rows { yield row; }
             } else {
                 let mut connection = database.writer.lease(writer_label(sql.as_str())).await
                     .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
@@ -548,6 +575,13 @@ impl<'database> Executor<'database> for &'database Database {
                     .await?
                     .fetch_optional((sql, arguments))
                     .await
+            } else if database.before_commit.lock().unwrap().is_some() {
+                let mut transaction = database
+                    .begin_with_label(writer_label(sql.as_str()))
+                    .await?;
+                let row = (&mut *transaction).fetch_optional((sql, arguments)).await?;
+                transaction.commit().await?;
+                Ok(row)
             } else {
                 let mut connection = database
                     .writer
@@ -906,5 +940,74 @@ mod tests {
                     .await
                     .unwrap();
             });
+    }
+}
+
+#[cfg(test)]
+mod derivation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn before_commit_keeps_returning_rows_and_derived_rows_atomic() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("derivations.db");
+        let db = Database::connect_with(
+            SqliteConnectOptions::new()
+                .filename(&path)
+                .create_if_missing(true),
+            SqliteConnectOptions::new().filename(&path),
+            1,
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE values_to_commit(id INTEGER PRIMARY KEY,value TEXT)")
+            .execute(&db)
+            .await
+            .unwrap();
+        db.set_before_commit(|c| {
+            Box::pin(async move {
+                let rejected: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM values_to_commit WHERE value='reject')",
+                )
+                .fetch_one(&mut *c)
+                .await?;
+                anyhow::ensure!(!rejected, "derivation rejected this source change");
+                sqlx::query("INSERT INTO values_to_commit VALUES(100,'derived')")
+                    .execute(&mut *c)
+                    .await?;
+                Ok(())
+            })
+        });
+        assert!(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO values_to_commit VALUES(1,'reject') RETURNING id"
+            )
+            .fetch_one(&db)
+            .await
+            .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM values_to_commit")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "INSERT INTO values_to_commit VALUES(2,'accepted') RETURNING id"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            2
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM values_to_commit")
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            2
+        );
     }
 }

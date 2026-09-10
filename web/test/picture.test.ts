@@ -94,20 +94,26 @@ const { forgetIntrodb } = await import('../src/domain/introdb-cache.ts')
 const { resetIntrodb } = await import('../src/api/introdb.ts')
 const Picture = (await import('../src/components/Picture.vue')).default
 
-const film = (over: Record<string, unknown> = {}) => ({
-  id: 'heat',
-  kind: 'movie',
-  title: 'Heat',
-  parent_id: null,
-  resume_position_ms: null,
-  metadata: null,
-  negotiated: null,
-  sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
-  ...over,
-})
+const film = (over: Record<string, unknown> = {}) => {
+  const item = {
+    id: 'heat',
+    kind: 'movie',
+    title: 'Heat',
+    parent_id: null,
+    resume_position_ms: null,
+    metadata: null,
+    negotiated: null,
+    sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
+    ...over,
+  }
+  return { ...item, sources: item.sources.map((source) => ({ source_id: 1, ...source })) }
+}
 
 const session = (id = 's1', over: Record<string, unknown> = {}) => ({
   session_id: id,
+  source_id: 1,
+  source_fingerprint: 'physical-version-1',
+  effective_start_ms: 0,
   stream_url: `/stream/${id}/index.m3u8`,
   content_type: 'application/vnd.apple.mpegurl',
   mode: 'remux',
@@ -1037,7 +1043,7 @@ describe('choosing a track', () => {
     const movie = await switching()
     await pick(movie.wrapper, '1')
     expect(api.putPref).toHaveBeenCalledWith({
-      scope: 'heat',
+      scope: 'source:1',
       key: 'audio.track',
       value: '#1',
     })
@@ -1282,7 +1288,7 @@ describe('choosing subtitles', () => {
     const { wrapper } = await withSubs([listing()])
     await choose(wrapper, '7')
     expect(api.putPref).toHaveBeenCalledWith({ scope: 'heat', key: 'subs', value: 'eng' })
-    expect(api.putPref).toHaveBeenCalledWith({ scope: 'heat', key: 'subs.track', value: '7' })
+    expect(api.putPref).toHaveBeenCalledWith({ scope: 'source:1', key: 'subs.track', value: '7' })
   })
 
   test('and turning them off is a choice, not an absence of one', async () => {
@@ -1349,7 +1355,7 @@ describe('choosing subtitles', () => {
     const queued = held<{ part_base_ms: number }>({ part_base_ms: 0 })
     void queued
     const { wrapper } = await withSubs([listing({ id: 9, delivery: 'burn' })], {
-      prefs: [{ scope: 'heat', key: 'subs.track', value: '9' }] as never,
+      prefs: [{ scope: 'source:1', key: 'subs.track', value: '9' }] as never,
     })
     void wrapper
     // The burn was wanted the moment the tracks resolved, and the pipeline was
@@ -1795,4 +1801,31 @@ describe('subtitles and the control bar', () => {
     await wrapper.find('.videobox').trigger('mouseleave')
     expect(wrapper.find('.videobox').classes()).not.toContain('bar-up')
   })
+})
+
+test('an empty session subtitle list never borrows tracks from the item preview', async () => {
+  const oldTrack = {
+    id: 7,
+    item_id: 'heat',
+    origin: 'embedded',
+    stream_index: 0,
+    format: 'text',
+    language: 'eng',
+    label: 'Another release',
+    machine: false,
+    derived_from: null,
+    delivery: 'text',
+    note: '',
+    deletable: false,
+  }
+  const { wrapper } = await watching({
+    item: film({ negotiated: { subtitles: [oldTrack] } }),
+    session: session('s1', { subtitle_listing: [] }),
+    prefs: [{ scope: 'heat', key: 'subs', value: 'eng' }],
+  })
+  expect(wrapper.find('track').exists()).toBe(false)
+  expect(
+    wrapper.findAll('[aria-label="Subtitles"] option').some((o) => o.attributes('value') === '7'),
+  ).toBe(false)
+  wrapper.unmount()
 })

@@ -68,7 +68,7 @@ async fn files_and_items_survive_restart() {
     assert!(!cols[0].available, "no mediahost connected after restart");
 
     let titles: Vec<(String, Option<i64>, i64)> = sqlx::query_as(
-        "SELECT i.title, i.year, COUNT(fb.file_id) FROM items i
+        "SELECT i.title, i.year, COUNT(fb.file_id) FROM collection_items i
          JOIN file_bindings fb ON fb.item_id = i.id
          GROUP BY i.id ORDER BY i.title",
     )
@@ -170,15 +170,17 @@ async fn reconcile_drops_files_missing_from_scan() {
         .execute(&db)
         .await
         .unwrap();
-    let ronin: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Ronin'")
+    let ronin: String = sqlx::query_scalar("SELECT id FROM collection_items WHERE title = 'Ronin'")
         .fetch_one(&db)
         .await
         .unwrap();
-    sqlx::query("INSERT INTO watch_state (user_id, item_id, position_ms) VALUES ('u1', ?, 1234)")
-        .bind(&ronin)
-        .execute(&db)
-        .await
-        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_item_state (user_id, item_id, position_ms) VALUES ('u1', ?, 1234)",
+    )
+    .bind(&ronin)
+    .execute(&db)
+    .await
+    .unwrap();
     let source: i64 =
         sqlx::query_scalar("SELECT fb.file_id FROM file_bindings fb WHERE fb.item_id=?")
             .bind(&ronin)
@@ -234,17 +236,17 @@ async fn reconcile_drops_files_missing_from_scan() {
         .fetch_one(&db)
         .await
         .unwrap();
-    let items: Vec<String> = sqlx::query_scalar("SELECT title FROM items")
+    let items: Vec<String> = sqlx::query_scalar("SELECT title FROM collection_items")
         .fetch_all(&db)
         .await
         .unwrap();
-    let watch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+    let watch: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state")
         .fetch_one(&db)
         .await
         .unwrap();
     assert_eq!(files, 1);
     assert_eq!(items, vec!["Heat".to_string()]);
-    assert_eq!(watch, 0, "watch state cascades with the removed item");
+    assert_eq!(watch, 1, "catalogue history survives the last removed copy");
     assert_eq!(subtitles.clean_orphaned_payloads(&reg).await.unwrap(), 2);
     assert!(
         std::fs::read_dir(payload_dir.path())
@@ -465,7 +467,7 @@ async fn catalog_cursor_and_projection_survive_reconnect() {
         n, 1,
         "a cursor-only reconnect must preserve the projected file"
     );
-    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -539,7 +541,7 @@ async fn multipart_movies_group_into_one_item() {
         .unwrap();
 
     let items: Vec<String> =
-        sqlx::query_scalar("SELECT title FROM items WHERE kind='movie' ORDER BY title")
+        sqlx::query_scalar("SELECT title FROM collection_items WHERE kind='movie' ORDER BY title")
             .fetch_all(&db)
             .await
             .unwrap();
@@ -547,7 +549,7 @@ async fn multipart_movies_group_into_one_item() {
 
     let parts: Vec<(String, Option<i64>)> = sqlx::query(
         "SELECT f.path_rel AS source_path,fb.part FROM files f
-         JOIN file_bindings fb ON fb.file_id=f.id JOIN items i ON i.id=fb.item_id
+         JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items i ON i.id=fb.item_id
          WHERE i.title='12 Monkeys' ORDER BY fb.part",
     )
     .fetch_all(&db)
@@ -567,7 +569,7 @@ async fn multipart_movies_group_into_one_item() {
         "SELECT CASE WHEN s.expected_parts=1 THEN NULL ELSE fb.part END
            FROM files f JOIN file_bindings fb ON fb.file_id=f.id
            JOIN playable_sources s ON s.id=fb.playable_source_id
-           JOIN items i ON i.id=fb.item_id WHERE i.title='Heat'",
+           JOIN collection_items i ON i.id=fb.item_id WHERE i.title='Heat'",
     )
     .fetch_one(&db)
     .await

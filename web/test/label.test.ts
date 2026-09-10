@@ -78,7 +78,7 @@ describe('the line under a card', () => {
   })
 
   test('a track names its artist and its album', () => {
-    expect(metaLine(row({ kind: 'track', artist: 'Queen', parent_title: 'Hot Space' }))).toBe(
+    expect(metaLine(row({ kind: 'song', artist: 'Queen', parent_title: 'Hot Space' }))).toBe(
       'Queen · Hot Space',
     )
   })
@@ -91,12 +91,12 @@ describe('the line under a card', () => {
 
 describe('where a card leads', () => {
   test('a track opens its album, because a track has no page', () => {
-    expect(targetOf(row({ kind: 'track', id: 't1', parent_id: 'a1' }))).toBe('a1')
+    expect(targetOf(row({ kind: 'song', id: 't1', parent_id: 'a1' }))).toBe('a1')
   })
 
   test('a track with no album still opens something', () => {
     // Nothing else to offer, and a dead card is worse than a thin page.
-    expect(targetOf(row({ kind: 'track', id: 't1', parent_id: null }))).toBe('t1')
+    expect(targetOf(row({ kind: 'song', id: 't1', parent_id: null }))).toBe('t1')
   })
 
   test('everything else opens itself', () => {

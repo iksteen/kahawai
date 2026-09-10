@@ -296,8 +296,8 @@ export function useSubtitleRenderers(p: {
     void (async () => {
       let fonts: string[] = []
       try {
-        const answer = await itemFonts(p.itemId.value)
-        fonts = answer.fonts.map((_, at) => fontUrl(p.itemId.value, at))
+        const answer = await itemFonts(p.itemId.value, { source_id: p.session.value.source_id })
+        fonts = answer.fonts.map((_, at) => fontUrl(p.itemId.value, at, p.session.value.source_id))
       } catch {
         // No fonts: libass falls back.
       }

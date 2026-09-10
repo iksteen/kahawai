@@ -20,7 +20,7 @@ use tower::ServiceExt;
 async fn harness() -> (
     axum::Router,
     Arc<kahawai_hub::auth::Auth>,
-    kahawai_sqlite::Database,
+    kahawai_hub::library::Database,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
@@ -98,7 +98,7 @@ fn titles(page: &serde_json::Value) -> Vec<String> {
 /// `(position_ms, duration_ms, played, watched_at)`. `watched_at` is an
 /// offset in seconds from now — bigger is older.
 async fn seed(
-    db: &kahawai_sqlite::Database,
+    db: &kahawai_hub::library::Database,
     id: &str,
     kind: &str,
     title: &str,
@@ -133,7 +133,7 @@ async fn seed(
         .unwrap();
     }
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                  VALUES(?,?,?,?,?,'fixture',?)",
     )
     .bind(id)
@@ -147,7 +147,7 @@ async fn seed(
     .unwrap();
     if let Some((position_ms, duration_ms, played, age_secs)) = watch {
         sqlx::query(
-            "INSERT INTO watch_state
+            "INSERT INTO user_item_state
                     (user_id, item_id, position_ms, duration_ms, played, updated_at)
              SELECT id, ?, ?, ?, ?, unixepoch() - ? FROM users WHERE username = 'owner'",
         )
@@ -350,7 +350,7 @@ async fn continue_watching_respects_library_grants() {
         .unwrap();
     for (item, age) in [("a1", 20), ("b1", 10)] {
         sqlx::query(
-            "INSERT INTO watch_state
+            "INSERT INTO user_item_state
                     (user_id, item_id, position_ms, duration_ms, played, updated_at)
              VALUES (?, ?, 60000, 1200000, 0, unixepoch() - ?)",
         )

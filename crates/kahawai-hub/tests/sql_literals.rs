@@ -73,7 +73,7 @@ fn is_sql(s: &str) -> bool {
         "INSERT" => next == "INTO" || next == "OR",
         "DELETE" => next == "FROM",
         "UPDATE" => upper.contains(" SET "),
-        "SELECT" | "WITH" | "REPLACE" => true,
+        "SELECT" | "WITH" | "REPLACE" => !next.is_empty(),
         _ => false,
     }
 }
@@ -86,13 +86,18 @@ async fn every_sql_literal_parses_against_the_schema() {
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut checked = 0;
     let mut broken = Vec::new();
-    let mut files: Vec<_> = std::fs::read_dir(&src)
-        .unwrap()
-        .filter_map(|e| {
-            let p = e.unwrap().path();
-            (p.extension()? == "rs").then_some(p)
-        })
-        .collect();
+    fn sources(dir: &std::path::Path, files: &mut Vec<std::path::PathBuf>) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                sources(&path, files);
+            } else if path.extension().is_some_and(|ext| ext == "rs") {
+                files.push(path);
+            }
+        }
+    }
+    let mut files = Vec::new();
+    sources(&src, &mut files);
     files.sort();
 
     for path in files {

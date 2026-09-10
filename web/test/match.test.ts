@@ -12,6 +12,8 @@ import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminApplyMatch: vi.fn(),
+  itemDetail: vi.fn(),
+  listItems: vi.fn(),
   adminReviewSearch: vi.fn(),
   // The card reaches for artwork, and a partial mock of a generated module is
   // a missing-export error rather than a passthrough.
@@ -59,14 +61,41 @@ function held<T>(value: T) {
 }
 
 const open = async (over: Record<string, unknown> = {}) => {
+  const source = item(over)
+  vi.mocked(api.itemDetail).mockResolvedValue({
+    copies: [
+      {
+        id: 'i1',
+        title: source.file_title ?? source.title,
+        year: source.file_year,
+        paths: [],
+        assignment: { revision: 4, library_item_ids: ['i1'] },
+      },
+    ],
+  } as never)
   const wrapper = mount(MatchDialog, { attachTo: document.body, props: { item: item(over) } })
   await flushPromises()
   return wrapper
 }
 
 beforeEach(() => {
+  vi.mocked(api.listItems).mockResolvedValue({ items: [] } as never)
+  vi.mocked(api.itemDetail).mockResolvedValue({
+    copies: [
+      {
+        id: 'i1',
+        title: 'Heat',
+        year: 1995,
+        paths: [],
+        assignment: { revision: 4, library_item_ids: ['i1'] },
+      },
+    ],
+  } as never)
   vi.mocked(api.adminReviewSearch).mockResolvedValue({ candidates: [candidate()] } as never)
-  vi.mocked(api.adminApplyMatch).mockResolvedValue({ ok: true } as never)
+  vi.mocked(api.adminApplyMatch).mockResolvedValue({
+    library_item_ids: ['i1'],
+    revision: 5,
+  } as never)
 })
 afterEach(() => vi.resetAllMocks())
 
@@ -86,7 +115,7 @@ describe('the dialog', () => {
   test('and says which of the two titles it is anchored on', async () => {
     const wrapper = await open()
     expect(wrapper.text()).toContain('Match “Heat” (1995)')
-    expect(wrapper.text()).toContain('anchored on the file identity')
+    expect(wrapper.text()).toContain('selected copy and all its file parts')
   })
 
   test('a file with no parsed title falls back to the displayed one', async () => {
@@ -104,6 +133,9 @@ describe('the dialog', () => {
     await wrapper.find('ul button').trigger('click')
     await flushPromises()
     expect(api.adminApplyMatch).toHaveBeenCalledWith('i1', {
+      expected_revision: 4,
+      library_item_ids: null,
+      new_item: null,
       action: 'pick',
       provider: 'tmdb',
       candidate: candidate(),
@@ -144,6 +176,7 @@ describe('the dialog', () => {
       .mockReturnValueOnce(first.promise as never)
       .mockReturnValueOnce(second.promise as never)
     const wrapper = mount(MatchDialog, { attachTo: document.body, props: { item: item() } })
+    await flushPromises()
     await wrapper.find('#match-query').setValue('newer')
     await wrapper.find('form').trigger('submit')
 
@@ -162,6 +195,7 @@ describe('the dialog', () => {
     const slow = held<{ candidates: unknown[] }>({ candidates: [] })
     vi.mocked(api.adminReviewSearch).mockReturnValue(slow.promise as never)
     const wrapper = mount(MatchDialog, { attachTo: document.body, props: { item: item() } })
+    await flushPromises()
     await wrapper.find('form').trigger('submit')
     await wrapper.find('form').trigger('submit')
     expect(vi.mocked(api.adminReviewSearch).mock.calls).toHaveLength(1)
@@ -173,6 +207,7 @@ describe('the dialog', () => {
     const slow = held<{ candidates: unknown[] }>({ candidates: [] })
     vi.mocked(api.adminReviewSearch).mockReturnValue(slow.promise as never)
     const wrapper = mount(MatchDialog, { attachTo: document.body, props: { item: item() } })
+    await flushPromises()
     await wrapper.find('#match-query').setValue('something else')
     await wrapper.find('form').trigger('submit')
     expect(vi.mocked(api.adminReviewSearch).mock.calls).toHaveLength(2)
@@ -211,6 +246,9 @@ describe('an uncertain match', () => {
       .trigger('click')
     await flushPromises()
     expect(api.adminApplyMatch).toHaveBeenCalledWith('i1', {
+      expected_revision: 4,
+      library_item_ids: null,
+      new_item: null,
       action: 'confirm',
       provider: null,
       candidate: null,

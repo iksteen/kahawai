@@ -157,11 +157,21 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         .with_context(|| format!("creating {}", dest.display()))?;
     let db_out = dest.join("hub.db");
     let taken_at = now_unix();
-    sqlx::query("VACUUM INTO ?")
-        .bind(db_out.to_str().context("snapshot path is not utf-8")?)
-        .execute(&pool)
-        .await
-        .context("VACUUM INTO — is the destination on a writable filesystem?")?;
+    let snapshot_path = db_out
+        .to_str()
+        .context("snapshot path is not utf-8")?
+        .to_string();
+    pool.write("snapshot database", |connection| {
+        Box::pin(async move {
+            sqlx::query("VACUUM INTO ?")
+                .bind(snapshot_path)
+                .execute(connection)
+                .await?;
+            Ok(())
+        })
+    })
+    .await
+    .context("VACUUM INTO — is the destination on a writable filesystem?")?;
     pool.close().await;
     // SQLite gives the new file 0666 & ~umask — 0644 under the usual one —
     // and there is no pragma for it. The directory above already hides it;

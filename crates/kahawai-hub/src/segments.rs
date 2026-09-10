@@ -420,7 +420,7 @@ async fn pending_episode_ids(
     season: i64,
 ) -> Result<Vec<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT i.id FROM items i
+        "SELECT i.id FROM collection_items i
           WHERE i.parent_id = ? AND i.season = ? AND i.kind = 'episode'
             AND NOT EXISTS (
                 SELECT 1 FROM media_segment_scans s
@@ -943,7 +943,7 @@ impl Detector {
                     (SELECT c.media_type FROM collections c
                       WHERE c.module_id = i.module_id
                         AND c.collection_id = i.collection_id) AS media_type
-               FROM items i
+               FROM collection_items i
               WHERE i.parent_id = ? AND i.season = ? AND i.kind = 'episode'
                 AND EXISTS (SELECT 1 FROM playable_sources ps WHERE ps.item_id = i.id)
               ORDER BY i.episode, i.id",
@@ -1386,7 +1386,7 @@ impl Detector {
             // every sibling's result with it; the vanished episode's bytes
             // will be re-read under whatever id they carry now.
             let exists: bool =
-                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM items WHERE id = ?)")
+                sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM collection_items WHERE id = ?)")
                     .bind(item_id)
                     .fetch_one(&mut *tx)
                     .await?;
@@ -1823,10 +1823,10 @@ pub async fn pending_seasons(db: &sqlx::SqlitePool) -> Result<Vec<PendingSeason>
                 -- SQLite's documented behaviour, verified here — which made
                 -- the season somebody was mid-way through sort with the
                 -- never-opened ones. The outer MAX makes it the season's.
-                MAX(COALESCE((SELECT MAX(w.updated_at) FROM watch_state w
+                MAX(COALESCE((SELECT MAX(w.updated_at) FROM collection_watch_state w
                                WHERE w.item_id = i.id), 0)) AS watched_at
-           FROM items i
-           JOIN items p ON p.id = i.parent_id
+           FROM collection_items i
+           JOIN collection_items p ON p.id = i.parent_id
            LEFT JOIN media_segment_scans s
                   ON s.item_id = i.id AND s.detector = ?
                  AND (s.mtime_unix IS NULL OR s.mtime_unix IN (
@@ -1906,9 +1906,9 @@ mod tests {
               VALUES('m','c','series');
             INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
               VALUES('m','c','r','/series');
-            INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+            INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
               VALUES('show','show','Show','show','show','m','c');
-            INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+            INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,
                               parent_id,season,episode)
               VALUES('e1','episode','One','one','one','m','c','show',1,1),
                     ('e2','episode','Two','two','two','m','c','show',1,2);
@@ -1922,7 +1922,7 @@ mod tests {
             INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
                                          family_key,expected_parts)
               SELECT 'm','c',id,NULL,'file:' || id,1
-                FROM items WHERE kind='episode';
+                FROM collection_items WHERE kind='episode';
             INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
                                               ordinal,file_id)
               SELECT ps.id,'m','c',1,f.id
@@ -2025,7 +2025,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');",
         )
         .execute(&db)
@@ -2085,7 +2085,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');",
         )
         .execute(&db)
@@ -2135,7 +2135,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');",
         )
         .execute(&db)
@@ -2200,7 +2200,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');",
         )
         .execute(&db)
@@ -2358,7 +2358,7 @@ mod tests {
                VALUES('m','c','series');
              INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
                VALUES('m','c','r','/series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');
              INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,
                                head_xxh3,tail_xxh3,oshash,streams_json)
@@ -2452,6 +2452,8 @@ mod tests {
     fn season_source_selection_uses_one_common_home() {
         let candidate = |module: &str, path: &str| SegmentCandidate {
             part: crate::sessions::PartSource {
+                head_xxh3: 0,
+                tail_xxh3: 0,
                 file_id: 0,
                 module_id: module.into(),
                 collection_id: "shows".into(),
@@ -2512,9 +2514,9 @@ mod tests {
                VALUES('m','c','series');
              INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
                VALUES('m','c','r','/series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('show','show','Show','show','show','m','c');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,
                                parent_id,season,episode)
                VALUES('e1','episode','One','one','one','m','c','show',1,1),
                      ('e2','episode','Two','two','two','m','c','show',1,2);
@@ -2525,7 +2527,7 @@ mod tests {
                SELECT 'm','c',id,'e2.mkv',10,1,0,0,0,'{}' FROM collection_roots;
              INSERT INTO playable_sources(module_id,collection_id,item_id,root_id,
                                           family_key,expected_parts)
-               SELECT 'm','c',id,NULL,'file:' || id,1 FROM items WHERE kind='episode';
+               SELECT 'm','c',id,NULL,'file:' || id,1 FROM collection_items WHERE kind='episode';
              INSERT INTO playable_source_parts(playable_source_id,module_id,collection_id,
                                                ordinal,file_id)
                SELECT ps.id,'m','c',1,f.id FROM playable_sources ps
@@ -2688,6 +2690,8 @@ mod tests {
         );
 
         let part = |path_rel: &str, size: u64| crate::sessions::PartSource {
+            head_xxh3: 0,
+            tail_xxh3: 0,
             file_id: 0,
             module_id: "m".into(),
             collection_id: "c".into(),
@@ -2893,7 +2897,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');",
         )
         .execute(&db)
@@ -2953,7 +2957,7 @@ mod tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');
              INSERT INTO media_segments(item_id,kind,start_ms,end_ms,source)
                VALUES('e1','intro',1000,2000,'chromaprint');

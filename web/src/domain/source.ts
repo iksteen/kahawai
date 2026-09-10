@@ -151,3 +151,11 @@ export function groupSources<T extends { source_id: number; part: number; parts:
     whole: parts.length === (parts[0]?.parts ?? 0),
   }))
 }
+
+/// Streams belong to the physical source that QUERY/session selected.
+export function sourceStreams<T extends { source_id: number; streams?: unknown }>(
+  sources: T[],
+  sourceId: number | undefined,
+): T['streams'] | undefined {
+  return sources.find((source) => source.source_id === sourceId)?.streams
+}

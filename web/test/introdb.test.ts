@@ -277,7 +277,7 @@ describe('what spends quota', () => {
     expect(
       await introdbSegments(film({ kind: 'episode', season: 1, episode: 1, episode_end: 2 }), DUR),
     ).toEqual([])
-    expect(await introdbSegments(film({ kind: 'track' }), DUR)).toEqual([])
+    expect(await introdbSegments(film({ kind: 'song' }), DUR)).toEqual([])
     expect(wire).not.toHaveBeenCalled()
   })
 })

@@ -3,8 +3,8 @@
 //! precedence can be re-decided locally — these tests are what keeps
 //! that property true.
 
+use kahawai_hub::library::Database as SqlitePool;
 use kahawai_hub::providers::{Fields, chain_in_force, media_type_of_item, set_chain, store_answer};
-use kahawai_sqlite::Database as SqlitePool;
 use sqlx::Row;
 
 async fn item(db: &SqlitePool, id: &str) {
@@ -23,7 +23,7 @@ async fn item(db: &SqlitePool, id: &str) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES(?,'movie',?,?,'fixture','default')",
     )
     .bind(id)
@@ -235,7 +235,7 @@ async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query("UPDATE items SET module_id='mh',collection_id='c1' WHERE id='i1'")
+    sqlx::query("UPDATE collection_items SET module_id='mh',collection_id='c1' WHERE id='i1'")
         .execute(&db)
         .await
         .unwrap();
@@ -271,7 +271,7 @@ async fn the_anime_composites_answer_ranks_as_the_chain_entry() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query("UPDATE items SET module_id='mh',collection_id='c1' WHERE id='i1'")
+    sqlx::query("UPDATE collection_items SET module_id='mh',collection_id='c1' WHERE id='i1'")
         .execute(&db)
         .await
         .unwrap();
@@ -363,7 +363,7 @@ async fn provider_completion_for_a_retired_item_is_a_no_op() {
     use kahawai_hub::providers::{record_question, reschedule};
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
     item(&db, "gone").await;
-    sqlx::query("DELETE FROM items WHERE id = 'gone'")
+    sqlx::query("DELETE FROM collection_items WHERE id = 'gone'")
         .execute(&db)
         .await
         .unwrap();
@@ -429,7 +429,7 @@ async fn episodes_are_never_left_queued() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "show1").await;
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('ep','episode','e','e','fixture','default')",
     )
     .execute(&db)
@@ -448,7 +448,7 @@ async fn episodes_are_never_left_queued() {
     // the way the schema does, so a future backfill cannot reintroduce it.
     sqlx::query(
         "DELETE FROM enrichment_queue
-         WHERE item_id IN (SELECT id FROM items WHERE kind NOT IN ('movie','show','album'))",
+         WHERE item_id IN (SELECT id FROM collection_items WHERE kind NOT IN ('movie','show','album'))",
     )
     .execute(&db)
     .await
@@ -920,7 +920,7 @@ async fn episodes_are_never_assigned() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "ep").await;
-    sqlx::query("UPDATE items SET kind='episode' WHERE id='ep'")
+    sqlx::query("UPDATE collection_items SET kind='episode' WHERE id='ep'")
         .execute(&db)
         .await
         .unwrap();
@@ -1169,9 +1169,9 @@ async fn the_view_resolves_an_episode_through_its_show() {
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "show1").await;
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
          SELECT 'ep1','episode','e','e','show1',1,1,module_id,collection_id
-           FROM items WHERE id='show1'",
+           FROM collection_items WHERE id='show1'",
     )
     .execute(&db)
     .await
@@ -1239,7 +1239,7 @@ async fn the_view_stays_flattenable() {
     item(&db, "i1").await;
     let plan: Vec<String> = sqlx::query(
         "EXPLAIN QUERY PLAN
-         SELECT i.id, v.title FROM items i
+         SELECT i.id, v.title FROM collection_items i
          LEFT JOIN resolved_metadata v ON v.item_id = i.id
           WHERE i.parent_id = 'i1'",
     )
@@ -1481,7 +1481,7 @@ impl kahawai_hub::providers::Provider for DecliningProvider {
     }
     async fn enrich(
         &self,
-        _db: &kahawai_sqlite::Database,
+        _db: &kahawai_hub::library::Database,
         _item: &kahawai_hub::providers::ItemRef,
     ) -> anyhow::Result<kahawai_hub::providers::Outcome> {
         Ok(kahawai_hub::providers::Outcome::Declined)
@@ -1718,9 +1718,11 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
     .fetch_one(&db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "i1")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, "i1")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
 
     let rows = sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
         .bind(kahawai_hub::providers::QUERY_REV)

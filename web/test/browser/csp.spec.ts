@@ -318,7 +318,21 @@ test('the match selector renders hub-served candidate box art under CSP', async 
             ? { libraries: [{ id: 'movies', name: 'Movies', media_type: 'movies' }] }
             : path === '/api/v1/items'
               ? { items: [item], total: 1, offset: 0, limit: 100 }
-              : {}
+              : path === '/api/v1/items/copy'
+                ? {
+                    ...item,
+                    sources: [],
+                    copies: [
+                      {
+                        id: 'copy',
+                        title: 'X-Men',
+                        year: 2000,
+                        paths: ['X-Men.mkv'],
+                        assignment: { revision: 1, mode: 'automatic', library_item_ids: ['copy'] },
+                      },
+                    ],
+                  }
+                : {}
     await route.fulfill({ json: answer })
   })
   await page.route('**/admin/v1/enrich/search', (route) =>

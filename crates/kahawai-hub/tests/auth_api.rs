@@ -521,7 +521,7 @@ fn test_router_with_net(
 
 async fn auth_harness() -> (
     tempfile::TempDir,
-    kahawai_sqlite::Database,
+    kahawai_hub::library::Database,
     Arc<Auth>,
     axum::Router,
     kahawai_hub::auth::TokenPair,
@@ -2158,13 +2158,13 @@ async fn admin_deletes_users() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('i1','movie','M','m','fixture','default')",
     )
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO watch_state (user_id, item_id, position_ms) VALUES (?, 'i1', 5)")
+    sqlx::query("INSERT INTO user_item_state (user_id, item_id, position_ms) VALUES (?, 'i1', 5)")
         .bind(&victim)
         .execute(&db)
         .await
@@ -2293,7 +2293,7 @@ async fn admin_deletes_users() {
         0
     );
     assert_eq!(
-        count("SELECT COUNT(*) FROM watch_state WHERE user_id = ?").await,
+        count("SELECT COUNT(*) FROM user_item_state WHERE user_id = ?").await,
         0
     );
     assert_eq!(

@@ -83,7 +83,7 @@ const artists = useArtists(library, query, artistSort, music)
 /// Only for a work — an episode inherits its show's identity — and only for an
 /// admin, who is the only one the endpoint answers.
 const me = whoAmI()
-const matchable = (item: ItemRowI64) => me.admin && (item.kind === 'movie' || item.kind === 'show')
+const matchable = (_item: ItemRowI64) => me.admin
 
 const matching = ref<{ item: ItemRowI64; at: number } | null>(null)
 

@@ -1,7 +1,7 @@
 //! Marking an item watched without playing it (HUB-10).
 //!
 //! `POST /playback/sessions/{id}/progress` was the only writer of
-//! `watch_state`, and it needs a live session — so nothing could tick off
+//! `user_item_state`, and it needs a live session — so nothing could tick off
 //! something watched elsewhere, or undo a mistaken tick.
 //!
 //! The assertions read the table rather than a response body: the response
@@ -18,7 +18,7 @@ use axum::body::Body;
 use axum::http::{Request, StatusCode};
 use tower::ServiceExt;
 
-async fn harness() -> (axum::Router, String, kahawai_sqlite::Database) {
+async fn harness() -> (axum::Router, String, kahawai_hub::library::Database) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     sqlx::query(
@@ -142,7 +142,7 @@ fn only(body: &serde_json::Value) -> &serde_json::Value {
 async fn state(db: &sqlx::SqlitePool, id: &str) -> (i64, Option<i64>, i64, i64) {
     sqlx::query_as(
         "SELECT position_ms, duration_ms, played, play_count
-           FROM watch_state WHERE item_id = ?",
+           FROM user_item_state WHERE item_id = ?",
     )
     .bind(id)
     .fetch_one(db)
@@ -154,7 +154,7 @@ async fn state(db: &sqlx::SqlitePool, id: &str) -> (i64, Option<i64>, i64, i64) 
 async fn marking_watched_clears_resume_and_never_loses_the_count() {
     let (api, token, db) = harness().await;
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('i1','movie','Heat','heat','fixture','default')",
     )
     .execute(&db)
@@ -163,7 +163,7 @@ async fn marking_watched_clears_resume_and_never_loses_the_count() {
 
     // Half-watched, the way progress would have left it.
     sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count)
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, duration_ms, played, play_count)
          SELECT id, 'i1', 50000, 100000, 0, 0 FROM users",
     )
     .execute(&db)
@@ -209,7 +209,7 @@ async fn an_unknown_item_is_404_not_a_foreign_key_500() {
     // own existence check this reaches the item_id foreign key.
     let (status, _) = mark(&api, &token, "01NOPE", true).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -229,7 +229,7 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
         ("oth1", "episode", Some("other")),
     ] {
         sqlx::query(
-            "INSERT INTO items(id,kind,title,norm_title,parent_id,module_id,collection_id)
+            "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,module_id,collection_id)
              VALUES(?,?,?,?,?,'fixture','default')",
         )
         .bind(id)
@@ -271,14 +271,15 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
     let (_, _, played, count) = state(&db, "s1e2").await;
     assert_eq!((played, count), (1, 1));
     // The other show's episode was silently skipped, not marked.
-    let leaked: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state WHERE item_id = 'oth1'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let leaked: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state WHERE item_id = 'oth1'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(leaked, 0, "a batch cannot reach outside the item it is on");
     // And the season it did not name is untouched.
     let untouched: i64 =
-        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state WHERE item_id = 's2e1'")
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state WHERE item_id = 's2e1'")
             .fetch_one(&db)
             .await
             .unwrap();
@@ -289,7 +290,7 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
 async fn a_batch_that_matches_nothing_is_404_and_writes_nothing() {
     let (api, token, db) = harness().await;
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('m','movie','M','m','fixture','default')",
     )
     .execute(&db)
@@ -297,7 +298,7 @@ async fn a_batch_that_matches_nothing_is_404_and_writes_nothing() {
     .unwrap();
     let (status, _) = mark_many(&api, &token, "m", true, Some(&["nope", "also-nope"])).await;
     assert_eq!(status, StatusCode::NOT_FOUND);
-    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state")
         .fetch_one(&db)
         .await
         .unwrap();

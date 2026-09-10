@@ -50,7 +50,7 @@ export function useItem(id: Ref<string>) {
 export function useChildren(item: Ref<{ id: string; kind: string } | undefined>) {
   return useQuery({
     queryKey: computed(() => ['children', item.value?.id ?? '']),
-    enabled: computed(() => item.value?.kind === 'show' || item.value?.kind === 'album'),
+    enabled: computed(() => item.value?.kind === 'series' || item.value?.kind === 'album'),
     queryFn: () => itemChildren(item.value!.id),
     select: (answer) => answer.children,
   })

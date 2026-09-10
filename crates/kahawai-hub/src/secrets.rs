@@ -20,8 +20,8 @@
 //! another user or field fails to open rather than decrypting into the wrong
 //! account.
 
+use crate::library::Database;
 use anyhow::{Context, Result, anyhow, bail};
-use kahawai_sqlite::Database;
 use ring::aead::{AES_256_GCM, Aad, LessSafeKey, NONCE_LEN, Nonce, UnboundKey};
 use ring::rand::{SecureRandom, SystemRandom};
 use std::collections::BTreeMap;

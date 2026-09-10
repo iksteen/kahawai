@@ -5,16 +5,24 @@
 /// Anchored on the file identity throughout, and it says so. The display title
 /// is the (possibly wrong) match being judged, so heading the dialog with it
 /// would make a wrong match look like the thing being searched for.
-import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 
 import Btn from './Btn.vue'
 import type { ProviderCandidate } from '../api/generated/model/providerCandidate.ts'
-import { adminApplyMatch, adminReviewSearch } from '../api/generated/kahawai.ts'
+import {
+  adminApplyMatch,
+  adminReviewSearch,
+  itemDetail,
+  listItems,
+} from '../api/generated/kahawai.ts'
+import type { CollectionCopy } from '../api/generated/model/collectionCopy.ts'
+import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 import { sentence } from '../domain/refusal.ts'
 
 const props = defineProps<{
   item: {
     id: string
+    collection_item_id?: string
     kind: string
     title: string
     year?: number | null
@@ -25,10 +33,16 @@ const props = defineProps<{
   }
 }>()
 
-const emit = defineEmits<{ close: []; applied: [] }>()
+const emit = defineEmits<{ close: []; applied: [libraryItemIds: string[]] }>()
+const copies = ref<CollectionCopy[]>([])
+const selected = ref('')
+const copy = computed(() => copies.value.find((c) => c.id === selected.value))
+const local = ref<ItemRowI64[]>([])
+const picked = ref<string[]>([])
+const newYear = ref<string>('')
 
-const fileTitle = computed(() => props.item.file_title ?? props.item.title)
-const fileYear = computed(() => props.item.file_year ?? null)
+const fileTitle = computed(() => copy.value?.title ?? props.item.file_title ?? props.item.title)
+const fileYear = computed(() => copy.value?.year ?? props.item.file_year ?? null)
 const weak = computed(() => props.item.match_confidence === 'weak')
 
 const query = ref(fileTitle.value)
@@ -54,11 +68,18 @@ async function search(what: string) {
   busy.value = true
   failure.value = ''
   try {
+    const entries = await listItems({ q: what, limit: 200 })
+    if (mine !== asked) return
+    local.value = entries.items.filter((item) => item.kind === props.item.kind)
+    if (!['movie', 'series'].includes(props.item.kind)) {
+      results.value = []
+      return
+    }
     const answer = await adminReviewSearch({
       kind: props.item.kind,
       query: what,
       year: fileYear.value,
-      item: props.item.id,
+      item: copy.value?.id ?? null,
     })
     if (mine !== asked) return
     results.value = answer.candidates
@@ -78,15 +99,35 @@ function again() {
   void search(query.value)
 }
 
-async function apply(action: 'pick' | 'confirm' | 'reject', candidate?: ProviderCandidate) {
+async function apply(
+  action: 'pick' | 'confirm' | 'reject' | 'reset' | 'assign' | 'new',
+  candidate?: ProviderCandidate,
+  libraryItemIds?: string[],
+) {
+  if (!copy.value) return
   busy.value = true
   try {
-    await adminApplyMatch(props.item.id, {
+    const changed = await adminApplyMatch(copy.value.id, {
+      expected_revision: copy.value.assignment.revision,
+      library_item_ids: libraryItemIds ?? null,
+      new_item:
+        action === 'new'
+          ? {
+              kind: props.item.kind,
+              title: query.value,
+              year: newYear.value ? Number(newYear.value) : null,
+              artist: copy.value.artist ?? null,
+              parent_id: copy.value.parent_library_item_id ?? null,
+              season: copy.value.season ?? null,
+              episode: copy.value.episode ?? null,
+              edition: null,
+            }
+          : null,
       action,
       provider: candidate?.provider ?? null,
       candidate: candidate ?? null,
     })
-    emit('applied')
+    emit('applied', changed.library_item_ids)
     emit('close')
   } catch (cause) {
     failure.value = sentence(cause)
@@ -108,7 +149,7 @@ function keys(event: KeyboardEvent) {
   }
   if (event.key !== 'Tab' || !box.value) return
   const stops = [
-    ...box.value.querySelectorAll<HTMLElement>('button, input, [tabindex="0"]'),
+    ...box.value.querySelectorAll<HTMLElement>('button, input, select, [tabindex="0"]'),
   ].filter((el) => !el.hasAttribute('disabled'))
   const edge = event.shiftKey ? stops[0] : stops.at(-1)
   if (document.activeElement !== edge) return
@@ -119,11 +160,29 @@ function keys(event: KeyboardEvent) {
 /// On the WINDOW, not on the backdrop. A key only reaches the backdrop's
 /// handler when the focus is inside it, and clicking any prose in the dialog
 /// puts the focus on `<body>` — where Escape then did nothing at all.
-onMounted(() => {
+watch(selected, () => {
+  ++asked
+  results.value = null
+  local.value = []
+  picked.value = []
+  query.value = fileTitle.value
+  newYear.value = fileYear.value?.toString() ?? ''
+  void search(query.value)
+})
+onMounted(async () => {
   restore = document.activeElement as HTMLElement | null
   field.value?.focus()
   window.addEventListener('keydown', keys)
-  void search(fileTitle.value)
+  try {
+    const detail = await itemDetail(props.item.id)
+    copies.value = detail.copies
+    selected.value =
+      copies.value.find((c) => c.id === props.item.collection_item_id)?.id ??
+      copies.value[0]?.id ??
+      ''
+  } catch (cause) {
+    failure.value = sentence(cause)
+  }
 })
 onBeforeUnmount(() => {
   window.removeEventListener('keydown', keys)
@@ -154,11 +213,26 @@ const format = (candidate: ProviderCandidate) =>
         </h2>
         <Btn ghost small class="ml-auto" aria-label="Close" @click="emit('close')">✕</Btn>
       </div>
-      <!-- Said, rather than left to be inferred: without it a wrong match looks
-           like the thing being searched for. -->
-      <p class="mt-1 font-mono text-[11px] text-dimmer">
-        anchored on the file identity — the display title is the match being judged
+      <label class="mt-3 block text-dim" for="match-copy">Collection copy</label>
+      <select
+        id="match-copy"
+        v-model="selected"
+        class="w-full rounded border border-line bg-bg px-2 py-1"
+      >
+        <option v-for="entry in copies" :key="entry.id" :value="entry.id">
+          {{ entry.collection_id }} · {{ entry.paths.join(' + ') || entry.title }}
+        </option>
+      </select>
+      <p v-if="copy?.assignment.conflict" class="mt-2 text-warn">{{ copy.assignment.conflict }}</p>
+      <p class="mt-2 text-dim">
+        This decision applies to the selected copy and all its file parts.
       </p>
+      <div class="mt-2 flex gap-2">
+        <Btn ghost small :disabled="busy || !copy" @click="apply('reject')">Reject current</Btn>
+        <Btn ghost small :disabled="busy || !copy" @click="apply('reset')"
+          >Use automatic matching</Btn
+        >
+      </div>
 
       <div
         v-if="weak"
@@ -176,18 +250,65 @@ const format = (candidate: ProviderCandidate) =>
       </div>
 
       <form class="mt-3 flex flex-wrap items-center gap-2" @submit.prevent="again">
-        <label class="sr-only" for="match-query">Search providers</label>
+        <label class="sr-only" for="match-query">Search titles</label>
         <input
           id="match-query"
           ref="field"
           v-model="query"
           class="flex-1 rounded border border-line bg-bg px-2 py-1"
-          placeholder="Search providers"
+          placeholder="Search titles"
         />
         <Btn submit small :disabled="busy">Search</Btn>
       </form>
 
       <p class="mt-2 text-warn" role="alert">{{ failure }}</p>
+      <section v-if="local.length" class="mt-3">
+        <h3>Existing library items</h3>
+        <p v-if="props.item.kind === 'episode'" class="text-dim">
+          Select the episodes in playback order.
+        </p>
+        <ul class="mt-2 flex flex-col gap-2">
+          <li v-for="entry in local" :key="entry.id">
+            <label v-if="props.item.kind === 'episode'"
+              ><input v-model="picked" type="checkbox" :value="entry.id" />
+              {{ entry.parent_title }} · {{ entry.title }} · {{ entry.season }}/{{
+                entry.episode
+              }}</label
+            >
+            <Btn v-else ghost small :disabled="busy" @click="apply('assign', undefined, [entry.id])"
+              >{{ entry.title }}{{ entry.year ? ` (${entry.year})` : ''
+              }}{{ entry.artist ? ` · ${entry.artist}` : '' }}</Btn
+            >
+          </li>
+        </ul>
+        <Btn
+          v-if="props.item.kind === 'episode'"
+          class="mt-2"
+          small
+          :disabled="busy || !picked.length"
+          @click="apply('assign', undefined, picked)"
+          >Assign selected episodes</Btn
+        >
+      </section>
+      <details class="mt-3">
+        <summary>Create a distinct library item</summary>
+        <p class="mt-2 text-dim">
+          Use the title above for an unlisted work, or to distinguish two works with the same title
+          and year.
+        </p>
+        <label class="mt-2 block"
+          >Year
+          <input
+            v-model="newYear"
+            type="number"
+            min="1"
+            max="9999"
+            class="rounded border border-line bg-bg px-2 py-1"
+        /></label>
+        <Btn class="mt-2" small :disabled="busy || !copy || !query.trim()" @click="apply('new')"
+          >Create and assign</Btn
+        >
+      </details>
 
       <ul v-if="results" class="mt-3 grid gap-3" role="list">
         <li v-for="candidate in results" :key="`${candidate.provider}-${candidate.id}`">

@@ -3,8 +3,8 @@
 
 use std::path::Path;
 
+use crate::library::Database;
 use anyhow::{Context, Result};
-use kahawai_sqlite::Database;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode};
 
 pub async fn open(data_dir: &Path) -> Result<Database> {
@@ -86,6 +86,7 @@ pub async fn open(data_dir: &Path) -> Result<Database> {
     backfill_revision(&database).await?;
     backfill_playable_source_families(&database).await?;
     repair_release_tag_titles(&database).await?;
+    crate::library::initialize(&database).await?;
     Ok(database)
 }
 
@@ -96,7 +97,7 @@ pub async fn open(data_dir: &Path) -> Result<Database> {
 /// almost always fully populated.
 async fn backfill_norm_artist(pool: &Database) -> Result<()> {
     let missing: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, artist FROM items WHERE artist IS NOT NULL AND norm_artist IS NULL",
+        "SELECT id, artist FROM collection_items WHERE artist IS NOT NULL AND norm_artist IS NULL",
     )
     .fetch_all(pool)
     .await?;
@@ -105,7 +106,7 @@ async fn backfill_norm_artist(pool: &Database) -> Result<()> {
     }
     let mut tx = pool.begin().await?;
     for (id, artist) in &missing {
-        sqlx::query("UPDATE items SET norm_artist = ? WHERE id = ?")
+        sqlx::query("UPDATE collection_items SET norm_artist = ? WHERE id = ?")
             .bind(crate::enrich::fold(artist))
             .bind(id)
             .execute(&mut *tx)
@@ -121,7 +122,7 @@ async fn backfill_norm_artist(pool: &Database) -> Result<()> {
 /// bounded album backfill into the largest write of the upgrade.
 async fn backfill_artist_key(pool: &Database) -> Result<()> {
     let missing: Vec<(String, String)> = sqlx::query_as(
-        "SELECT id, artist FROM items
+        "SELECT id, artist FROM collection_items
           WHERE kind='album' AND artist IS NOT NULL AND artist_key IS NULL",
     )
     .fetch_all(pool)
@@ -131,7 +132,7 @@ async fn backfill_artist_key(pool: &Database) -> Result<()> {
     }
     let mut tx = pool.begin().await?;
     for (id, artist) in &missing {
-        sqlx::query("UPDATE items SET artist_key = ? WHERE id = ?")
+        sqlx::query("UPDATE collection_items SET artist_key = ? WHERE id = ?")
             .bind(crate::enrich::artist_key(artist))
             .bind(id)
             .execute(&mut *tx)
@@ -252,7 +253,7 @@ async fn backfill_playable_source_families(pool: &Database) -> Result<()> {
 /// dedup key can no longer tell apart.
 async fn repair_release_tag_titles(pool: &Database) -> Result<()> {
     let rows: Vec<(String, String, Option<i64>, String, String, String)> = sqlx::query_as(
-        "SELECT id,title,year,kind,module_id,collection_id FROM items
+        "SELECT id,title,year,kind,module_id,collection_id FROM collection_items
           WHERE kind IN ('show','movie') AND title LIKE '%)'",
     )
     .fetch_all(pool)
@@ -265,7 +266,7 @@ async fn repair_release_tag_titles(pool: &Database) -> Result<()> {
         }
         let norm = kahawai_core::names::normalize_title(&stripped);
         let taken: Option<String> = sqlx::query_scalar(
-            "SELECT id FROM items WHERE module_id=?1 AND collection_id=?2
+            "SELECT id FROM collection_items WHERE module_id=?1 AND collection_id=?2
                AND kind=?3 AND norm_title=?4 AND year IS ?5 AND id<>?6",
         )
         .bind(&module_id)
@@ -281,7 +282,7 @@ async fn repair_release_tag_titles(pool: &Database) -> Result<()> {
                 "release-tag title left in place: cleaned name already exists");
             continue;
         }
-        sqlx::query("UPDATE items SET title = ?, norm_title = ? WHERE id = ?")
+        sqlx::query("UPDATE collection_items SET title = ?, norm_title = ? WHERE id = ?")
             .bind(&stripped)
             .bind(&norm)
             .bind(&id)
@@ -306,11 +307,16 @@ async fn repair_release_tag_titles(pool: &Database) -> Result<()> {
 /// truncated. `execute()` discards that row, which made a checkpoint that did
 /// nothing look exactly like one that worked.
 pub async fn checkpoint_truncate(db: &Database) -> Result<()> {
-    let (busy, _log, _checkpointed): (i64, i64, i64) =
-        sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
-            .fetch_one(db)
-            .await
-            .context("truncating the write-ahead log")?;
+    let (busy, _log, _checkpointed): (i64, i64, i64) = db
+        .write("truncate checkpoint", |connection| {
+            Box::pin(async move {
+                sqlx::query_as("PRAGMA wal_checkpoint(TRUNCATE)")
+                    .fetch_one(connection)
+                    .await
+                    .context("truncating the write-ahead log")
+            })
+        })
+        .await?;
     if busy != 0 {
         tracing::warn!(
             "the write-ahead log could not be truncated — a reader held it open, so what was \
@@ -345,6 +351,7 @@ pub async fn open_in_memory() -> Result<Database> {
         })
         .await?;
     install_derived(&database).await?;
+    crate::library::initialize(&database).await?;
     Ok(database)
 }
 

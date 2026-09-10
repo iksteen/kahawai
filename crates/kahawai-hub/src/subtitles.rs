@@ -359,11 +359,10 @@ impl Subtitles {
         &self,
         registry: &Registry,
         sessions: &Sessions,
-        item_id: &str,
-        key: &str,
+        track: &crate::tracks::Track,
         shift_ms: i64,
     ) -> Result<String> {
-        let ex = self.load(registry, sessions, item_id, key).await?;
+        let ex = self.load(registry, sessions, track).await?;
         Ok(to_vtt(&ex.cues, shift_ms))
     }
 
@@ -380,15 +379,13 @@ impl Subtitles {
         &self,
         registry: &Registry,
         sessions: &Sessions,
-        item_id: &str,
-        key: &str,
+        track: &crate::tracks::Track,
     ) -> Option<String> {
-        match self.load(registry, sessions, item_id, key).await {
+        match self.load(registry, sessions, track).await {
             Ok(ex) => ex.ass,
             Err(e) => {
                 tracing::warn!(
-                    item = item_id,
-                    key,
+                    track = track.id,
                     error = format!("{e:#}"),
                     "ASS burn: sidecar script unreadable"
                 );
@@ -411,17 +408,24 @@ impl Subtitles {
         self: &Arc<Self>,
         registry: &Registry,
         sessions: &Sessions,
-        item_id: &str,
-        key: &str,
+        track: &crate::tracks::Track,
     ) -> Result<AssBody> {
+        let internal_key = track.internal_key();
+        let key = internal_key.as_str();
         // Downloaded/OCR ASS serves from the stored body — a hole in
         // the old keyspace (only embedded/sidecar could serve .ass).
         if key.starts_with('d') {
-            let ex = self.load(registry, sessions, item_id, key).await?;
+            let ex = self.load(registry, sessions, track).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let (module_id, collection_id, root_token, path_rel, info) =
-            source_row(registry, item_id).await?;
+        let TrackSource {
+            module_id,
+            collection_id,
+            root_token,
+            path_rel,
+            size,
+            info,
+        } = track_source(registry, track).await?;
         let entry = entries(&info)
             .into_iter()
             .find(|e| e.key == key)
@@ -433,7 +437,7 @@ impl Subtitles {
 
         // Sidecars are one small read; no streaming needed.
         let Some(n) = key.strip_prefix('e') else {
-            let ex = self.load(registry, sessions, item_id, key).await?;
+            let ex = self.load(registry, sessions, track).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         };
         let idx: usize = n.parse().context("bad embedded key")?;
@@ -475,8 +479,15 @@ impl Subtitles {
         {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let (_, _, size, _, lease) = sessions
-            .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+        let lease = sessions
+            .open_lease(
+                registry,
+                &module_id,
+                &collection_id,
+                &root_token,
+                &path_rel,
+                crate::sessions::Reader::Viewer,
+            )
             .await?;
         let source = crate::sessions::LeaseSource {
             lease,
@@ -543,9 +554,10 @@ impl Subtitles {
         &self,
         registry: &Registry,
         sessions: &Sessions,
-        item_id: &str,
-        key: &str,
+        track: &crate::tracks::Track,
     ) -> Result<Extracted> {
+        let internal_key = track.internal_key();
+        let key = internal_key.as_str();
         // HUB-24: downloaded subtitles live in the cache keyed by their
         // row id — independent of which source file the item resolves
         // to, so a re-scan or a second copy never orphans them.
@@ -555,8 +567,14 @@ impl Subtitles {
                 .context("downloaded subtitle missing from cache — download it again")?;
             return Ok(serde_json::from_slice(&bytes)?);
         }
-        let (module_id, collection_id, root_token, path_rel, info) =
-            source_row(registry, item_id).await?;
+        let TrackSource {
+            module_id,
+            collection_id,
+            root_token,
+            path_rel,
+            size,
+            info,
+        } = track_source(registry, track).await?;
         entries(&info)
             .into_iter()
             .find(|e| e.key == key)
@@ -622,8 +640,15 @@ impl Subtitles {
             {
                 return Ok(ex);
             }
-            let (_, _, size, _, lease) = sessions
-                .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+            let lease = sessions
+                .open_lease(
+                    registry,
+                    &module_id,
+                    &collection_id,
+                    &root_token,
+                    &path_rel,
+                    crate::sessions::Reader::Viewer,
+                )
                 .await?;
             let source = crate::sessions::LeaseSource {
                 lease,
@@ -696,7 +721,7 @@ impl Subtitles {
             return Ok(0);
         }
         let live: std::collections::HashSet<i64> = sqlx::query_scalar(
-            "SELECT id FROM subtitle_tracks WHERE id IN (SELECT value FROM json_each(?))",
+            "SELECT COALESCE(payload_id,id) FROM subtitle_tracks WHERE COALESCE(payload_id,id) IN (SELECT value FROM json_each(?))",
         )
         .bind(serde_json::to_string(
             &candidates.iter().map(|(id, _)| id).collect::<Vec<_>>(),
@@ -716,20 +741,44 @@ impl Subtitles {
 
     /// HUB-32d: the rasterised display sets for a `raster` row, in the
     /// exact NDJSON the client already consumes for PGS — one line per
-    /// composition. Keyed by row id, so `delete_track` removes it with
-    /// the row and nothing has to reason about cache keys.
+    /// composition. Use the immutable payload ID when an upgrade has split
+    /// one owner into several collection copies.
     pub(crate) fn raster_path(&self, id: i64) -> PathBuf {
         self.dir.join(format!("raster-{id}.jsonl"))
     }
 
-    /// Search results plus the entitlement state the UI must show.
-    /// HUB-21/22/24: search external providers for one item. Hash first
-    /// (exact file), title/year as the fallback the provider needs when
-    /// it doesn't know the hash.
+    // Fallbacks describe the assigned library item. Retained provider answers
+    // for a previous assignment must not redirect subtitle searches.
+    async fn search_identity(
+        registry: &Registry,
+        library_item_id: &str,
+        copy: &str,
+    ) -> Result<sqlx::sqlite::SqliteRow> {
+        sqlx::query("SELECT i.kind,i.season,i.episode,md.proj_season,md.proj_episode,
+            CASE WHEN COALESCE(pm.provider,md.provider)='tmdb' THEN COALESCE(pm.provider_id,md.provider_id) END AS tmdb_provider_id,
+            COALESCE(pai.mapped_tmdb,ai.mapped_tmdb) AS mapped_tmdb,
+            COALESCE(parent.title,i.title) AS search_title,COALESCE(i.year,parent.year) AS search_year
+            FROM library_entries i JOIN collection_item_library_items a ON a.library_item_id=i.id AND a.collection_item_id=?2
+            JOIN collection_items ci ON ci.id=a.collection_item_id
+            LEFT JOIN library_items parent ON parent.id=i.parent_id
+            LEFT JOIN resolved_metadata md ON md.item_id=ci.id AND ci.metadata_eligible=1 AND a.ordinal=1
+            LEFT JOIN anime_ids ai ON ai.item_id=md.item_id
+            LEFT JOIN collection_item_library_items pa ON pa.collection_item_id=ci.parent_id AND pa.library_item_id=i.parent_id AND pa.ordinal=1
+            LEFT JOIN collection_items pc ON pc.id=pa.collection_item_id AND pc.metadata_eligible=1
+            LEFT JOIN resolved_metadata pm ON pm.item_id=pc.id
+            LEFT JOIN anime_ids pai ON pai.item_id=pc.id
+            WHERE i.id=?1")
+            .bind(library_item_id).bind(copy).fetch_optional(registry.db()).await?.ok_or_else(|| NoSuchItem.into())
+    }
+
+    /// HUB-21/22/24: search the selected physical hash first, then the assigned
+    /// library identity. Return candidates and the caller's entitlement state.
     pub async fn search_external(
         &self,
         registry: &Registry,
+        library_item_id: &str,
         item_id: &str,
+        source_id: Option<i64>,
         languages: Vec<String>,
         user_id: &str,
     ) -> Result<(
@@ -743,38 +792,17 @@ impl Subtitles {
         // provider was unreachable, which was both wrong and unverifiable —
         // the 404 could not be reached at all until someone configured an
         // account.
-        let row = sqlx::query(
-            "SELECT i.kind, i.season, i.episode,
-                    md.proj_season, md.proj_episode,
-                    CASE WHEN COALESCE(pm.provider, md.provider) = 'tmdb'
-                         THEN COALESCE(pm.provider_id, md.provider_id) END AS tmdb_provider_id,
-                    COALESCE(pai.mapped_tmdb, ai.mapped_tmdb) AS mapped_tmdb,
-                    COALESCE(pm.title, p.title, md.title, i.title) AS search_title,
-                    COALESCE(i.year, p.year,
-                             CAST(substr(COALESCE(md.premiered, pmd.premiered), 1, 4) AS INTEGER))
-                        AS search_year
-             FROM items i
-             LEFT JOIN items p ON p.id = i.parent_id
-             LEFT JOIN resolved_metadata md ON md.item_id = i.id
-             LEFT JOIN resolved_metadata pmd ON pmd.item_id = i.parent_id
-             LEFT JOIN resolved_metadata pm ON pm.item_id = i.parent_id
-             LEFT JOIN anime_ids ai ON ai.item_id = i.id
-             LEFT JOIN anime_ids pai ON pai.item_id = i.parent_id
-             WHERE i.id = ?",
-        )
-        .bind(item_id)
-        .fetch_optional(registry.db())
-        .await?
-        .ok_or(NoSuchItem)?;
+        let row = Self::search_identity(registry, library_item_id, item_id).await?;
         let provider = self.external_provider(registry, user_id).await?;
         provider.refresh_quota().await;
 
         // The mediahost's oshash IS the OpenSubtitles moviehash (HUB-22).
         let hash: Option<i64> = sqlx::query_scalar(
             "SELECT f.oshash FROM files f JOIN file_bindings fb ON fb.file_id=f.id
-              WHERE fb.item_id=? ORDER BY f.size DESC LIMIT 1",
+              WHERE fb.item_id=?1 AND (?2 IS NULL OR EXISTS(SELECT 1 FROM playable_source_parts p WHERE p.playable_source_id=?2 AND p.file_id=f.id)) ORDER BY f.size DESC LIMIT 1",
         )
         .bind(item_id)
+        .bind(source_id)
         .fetch_optional(registry.db())
         .await?;
 
@@ -953,7 +981,7 @@ impl Subtitles {
             parent.format
         );
         let script = self
-            .ass_for_burn(registry, sessions, &parent.item_id, &parent.internal_key())
+            .ass_for_burn(registry, sessions, &parent)
             .await
             .context("track has no ASS form to rasterise")?;
         let (width, height, fps) = self.raster_geometry(registry, &parent).await?;
@@ -1519,21 +1547,28 @@ impl Subtitles {
         user_id: &str,
         is_admin: bool,
     ) -> Result<bool> {
-        let n = sqlx::query(
+        let payload: Option<i64> = sqlx::query_scalar(
             "DELETE FROM subtitle_tracks
              WHERE id = ? AND origin = 'downloaded'
-               AND (? OR created_by = ?)",
+               AND (? OR created_by = ?) RETURNING COALESCE(payload_id,id)",
         )
         .bind(id)
         .bind(is_admin)
         .bind(user_id)
-        .execute(registry.db())
-        .await?
-        .rows_affected();
-        if n > 0 {
-            let _ = std::fs::remove_file(self.downloaded_path(id));
+        .fetch_optional(registry.db())
+        .await?;
+        if let Some(payload) = payload {
+            let used: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM subtitle_tracks WHERE COALESCE(payload_id,id)=?)",
+            )
+            .bind(payload)
+            .fetch_one(registry.db())
+            .await?;
+            if !used {
+                let _ = std::fs::remove_file(self.downloaded_path(payload));
+            }
         }
-        Ok(n > 0)
+        Ok(payload.is_some())
     }
 
     /// Ingest a mediahost-extracted track into the cache (ladder step 2).
@@ -1855,9 +1890,10 @@ impl Subtitles {
         registry: &Registry,
         sessions: &Sessions,
         item_id: &str,
+        source_id: Option<i64>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let (module_id, collection_id, root_token, path_rel, info) =
-            source_row(registry, item_id).await?;
+            source_row_for(registry, item_id, source_id).await?;
         let cache_key = format!(
             "fonts-{:016x}",
             xxhash_rust::xxh3::xxh3_64(
@@ -2051,6 +2087,39 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
     out
 }
 
+/// Metadata and byte reads must use the physical file named by the track.
+/// A stream index such as e0 is only meaningful within that file; selecting a
+/// collection's default source here substitutes another release's timestamps.
+struct TrackSource {
+    module_id: String,
+    collection_id: String,
+    root_token: String,
+    path_rel: String,
+    size: u64,
+    info: kahawai_core::media::MediaInfo,
+}
+
+async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Result<TrackSource> {
+    let source_id = track
+        .source_id
+        .context("subtitle track has no physical source")?;
+    let row = sqlx::query(
+        "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,f.size,f.streams_json
+        FROM files f JOIN collection_roots r ON r.id=f.root_id WHERE f.id=?",
+    )
+    .bind(source_id)
+    .fetch_one(registry.db())
+    .await?;
+    Ok(TrackSource {
+        module_id: row.get("module_id"),
+        collection_id: row.get("collection_id"),
+        root_token: row.get("root_token"),
+        path_rel: row.get("path_rel"),
+        size: row.get::<i64, _>("size") as u64,
+        info: serde_json::from_str(row.get::<String, _>("streams_json").as_str())?,
+    })
+}
+
 /// The item's source the way `Sessions::open_source` picks it, without
 /// opening a lease: (module, collection, path, streams info).
 pub(crate) async fn source_row(
@@ -2063,14 +2132,29 @@ pub(crate) async fn source_row(
     String,
     kahawai_core::media::MediaInfo,
 )> {
+    source_row_for(registry, item_id, None).await
+}
+
+async fn source_row_for(
+    registry: &Registry,
+    item_id: &str,
+    source_id: Option<i64>,
+) -> Result<(
+    String,
+    String,
+    String,
+    String,
+    kahawai_core::media::MediaInfo,
+)> {
     let rows = sqlx::query(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
                 f.streams_json
          FROM files f JOIN collection_roots r ON r.id=f.root_id
          JOIN file_bindings fb ON fb.file_id=f.id
-         WHERE fb.item_id=? ORDER BY f.size DESC",
+         WHERE fb.item_id=?1 AND (?2 IS NULL OR EXISTS(SELECT 1 FROM playable_source_parts p WHERE p.playable_source_id=?2 AND p.file_id=f.id)) ORDER BY f.size DESC",
     )
     .bind(item_id)
+    .bind(source_id)
     .fetch_all(registry.db())
     .await?;
     let row = rows
@@ -2220,7 +2304,7 @@ mod ocr_memory_tests {
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
-             INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
                VALUES('e1','episode','One','one','one','m','c');
              INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
                                head_xxh3,tail_xxh3,oshash,streams_json)
@@ -2378,5 +2462,63 @@ mod cache_upgrade_tests {
 
         assert_eq!(std::fs::read(&exact).unwrap(), b"exact");
         assert_eq!(std::fs::read(&legacy).unwrap(), b"old");
+    }
+}
+
+#[cfg(test)]
+mod library_search_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn corrected_copy_uses_assigned_work_for_subtitle_fallback() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('h','mediahost','h','f');
+            INSERT INTO collections(module_id,collection_id,media_type) VALUES('h','c','movies');
+            INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES('wrong','movie','Old movie','old movie',2000,'h','c'),('right','movie','Correct movie','correct movie',1993,'h','c');
+            INSERT INTO provider_metadata(item_id,provider,provider_id,title,premiered,confidence,updated_at) VALUES('wrong','tmdb','100','Old movie','2000-01-01','strong',0)").execute(&db).await.unwrap();
+        db.transaction("correct subtitle identity", |c| {
+            Box::pin(async move { crate::library::assign(c, "wrong", &["right".into()]).await })
+        })
+        .await
+        .unwrap();
+        let registry = Registry::new(db, Default::default());
+        let identity = Subtitles::search_identity(&registry, "right", "wrong")
+            .await
+            .unwrap();
+        assert_eq!(identity.get::<String, _>("search_title"), "Correct movie");
+        assert_eq!(identity.get::<i64, _>("search_year"), 1993);
+        assert!(
+            identity
+                .get::<Option<String>, _>("tmdb_provider_id")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn corrected_episode_uses_assigned_series_and_numbering() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('h','mediahost','h','f');
+            INSERT INTO collections(module_id,collection_id,media_type) VALUES('h','c','tv');
+            INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES('old-show','show','Old series','old series',2000,'h','c'),('new-show','show','Correct series','correct series',2005,'h','c');
+            INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id,parent_id,season,episode) VALUES('wrong','episode','Old episode','old episode','h','c','old-show',1,3),('right','episode','Correct episode','correct episode','h','c','new-show',2,7);
+            INSERT INTO provider_metadata(item_id,provider,provider_id,title,premiered,confidence,updated_at) VALUES('old-show','tmdb','100','Old series','2000-01-01','strong',0)").execute(&db).await.unwrap();
+        db.transaction("correct subtitle episode", |c| {
+            Box::pin(async move { crate::library::assign(c, "wrong", &["right".into()]).await })
+        })
+        .await
+        .unwrap();
+        let registry = Registry::new(db, Default::default());
+        let identity = Subtitles::search_identity(&registry, "right", "wrong")
+            .await
+            .unwrap();
+        assert_eq!(identity.get::<String, _>("search_title"), "Correct series");
+        assert_eq!(identity.get::<i64, _>("search_year"), 2005);
+        assert_eq!(identity.get::<i64, _>("season"), 2);
+        assert_eq!(identity.get::<i64, _>("episode"), 7);
+        assert!(
+            identity
+                .get::<Option<String>, _>("tmdb_provider_id")
+                .is_none()
+        );
     }
 }

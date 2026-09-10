@@ -5,13 +5,16 @@
 //!
 //! ## Watch-state meaning
 //!
-//! `watch_state.played` is the boolean answer from the latest non-zero
+//! `user_item_state.played` is the boolean answer from the latest non-zero
 //! progress report (or an explicit watched mark), not a historical high-water
 //! mark. A zero report changes neither it nor `updated_at`, because zero is also
 //! emitted by an untouched player and a gapless preload. `play_count` is the
 //! monotonic history: an explicit mark increments it on a false-to-true change,
 //! while playback increments it once at session teardown only when that
 //! session crossed and ultimately stopped beyond the finish threshold.
+
+mod library_api;
+use library_api::item_body;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -178,6 +181,7 @@ pub struct NetOptions {
         admin_review_search,
         candidate_artwork,
         admin_apply_match,
+        admin_catalog_metadata,
         admin_sessions,
         admin_end_session,
         admin_session_log,
@@ -487,7 +491,14 @@ pub fn router(
         )
         .route("/admin/v1/enrich/review", get(admin_review_list))
         .route("/admin/v1/enrich/search", post(admin_review_search))
-        .route("/admin/v1/items/{id}/match", post(admin_apply_match))
+        .route(
+            "/admin/v1/collection-items/{id}/match",
+            post(admin_apply_match),
+        )
+        .route(
+            "/admin/v1/library-items/{id}/metadata",
+            axum::routing::put(admin_catalog_metadata),
+        )
         .route("/admin/v1/sessions", get(admin_sessions))
         .route(
             "/admin/v1/sessions/{id}",
@@ -752,6 +763,7 @@ struct RefreshResponse {
 #[derive(Serialize, ToSchema)]
 struct ReviewEntry {
     item_id: String,
+    collection_item_id: String,
     kind: String,
     title: String,
     #[schema(required)]
@@ -925,6 +937,13 @@ struct PlaybackStreams {
 #[derive(Serialize, ToSchema)]
 struct StartSessionResponse {
     session_id: String,
+    /// Start accepted for this physical version. Clients must use this offset.
+    effective_start_ms: u64,
+    source_fingerprint: String,
+    source_id: i64,
+    replay_gain: Option<kahawai_core::media::ReplayGain>,
+    library_item_ids: Vec<String>,
+    coverage: Vec<crate::library::SourceBoundary>,
     mode: &'static str,
     size: u64,
     #[schema(required)]
@@ -1630,8 +1649,45 @@ async fn admin_set_chain(
     Ok(Json(OkResponse { ok: true }))
 }
 
+/// Physical source context for actions whose result depends on a rendition.
+#[derive(Deserialize, ToSchema, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+struct SourceQuery {
+    source_id: Option<i64>,
+}
+
+async fn source_copy(
+    state: &AppState,
+    user: &str,
+    item: &str,
+    source: Option<i64>,
+) -> Result<(String, i64), ApiError> {
+    let copies = crate::library::copies(state.registry.db(), user, item)
+        .await
+        .map_err(internal)?;
+    if copies.is_empty() {
+        return Err(hidden("item"));
+    }
+    let sources: Vec<(String, i64)> = sqlx::query_as("SELECT ps.item_id,ps.id FROM playable_sources ps WHERE ps.item_id IN(SELECT value FROM json_each(?)) ORDER BY ps.id")
+        .bind(serde_json::to_string(&copies).map_err(internal)?).fetch_all(state.registry.db()).await.map_err(internal)?;
+    if let Some(source) = source {
+        return sources
+            .into_iter()
+            .find(|(_, id)| *id == source)
+            .ok_or_else(|| hidden("source"));
+    }
+    if sources.len() == 1 {
+        return Ok(sources.into_iter().next().unwrap());
+    }
+    Err(ApiError::new(
+        ErrorCode::BadRequest,
+        "source_id is required when choosing a physical copy",
+    ))
+}
+
 #[derive(Deserialize, ToSchema)]
 struct SubtitleSearchRequest {
+    source_id: Option<i64>,
     /// Preferred languages, ordered. Empty = whatever the provider has.
     #[serde(default)]
     languages: Vec<String>,
@@ -1667,9 +1723,20 @@ async fn subtitle_search(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiJson(body): ApiJson<SubtitleSearchRequest>,
 ) -> Result<Json<SubtitleSearchResponse>, ApiError> {
+    let library_item_id = crate::library::resolve_id(state.registry.db(), &id)
+        .await
+        .map_err(internal)?;
+    let (id, source_id) = source_copy(&state, &claims.sub, &id, body.source_id).await?;
     let (candidates, quota) = state
         .subtitles
-        .search_external(&state.registry, &id, body.languages, &claims.sub)
+        .search_external(
+            &state.registry,
+            &library_item_id,
+            &id,
+            Some(source_id),
+            body.languages,
+            &claims.sub,
+        )
         .await
         .map_err(subtitle_provider_refusal)?;
     Ok(Json(SubtitleSearchResponse { candidates, quota }))
@@ -1677,6 +1744,7 @@ async fn subtitle_search(
 
 #[derive(Deserialize, ToSchema)]
 struct SubtitleDownloadRequest {
+    source_id: Option<i64>,
     file_id: String,
     #[serde(default)]
     language: Option<String>,
@@ -1712,6 +1780,7 @@ async fn subtitle_download(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiJson(body): ApiJson<SubtitleDownloadRequest>,
 ) -> Result<Json<SubtitleDownloadResponse>, ApiError> {
+    let (id, _source_id) = source_copy(&state, &claims.sub, &id, body.source_id).await?;
     let (track_id, quota) = state
         .subtitles
         .download_external(
@@ -2386,16 +2455,16 @@ async fn admin_review_list(
     State(state): State<AppState>,
 ) -> Result<Json<ReviewEntriesResponse>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.title, i.year, m.confidence,
+        "SELECT i.id,a.library_item_id,CASE i.kind WHEN 'show' THEN 'series' WHEN 'track' THEN 'song' ELSE i.kind END AS kind, i.title, i.year, COALESCE(m.confidence,'miss') AS confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
                 (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id
                   WHERE fb.item_id=i.id LIMIT 1) AS path
-         FROM items i
-         JOIN resolved_metadata m ON m.item_id = i.id
-         -- Only what a human can act on: episodes and tracks inherit their
-         -- parent's match and have no re-match affordance in the UI.
-         WHERE m.confidence IN ('miss', 'weak', 'rejected')
-           AND i.kind IN ('movie', 'show', 'album')
+         FROM collection_items i
+         JOIN collection_item_library_items a ON a.collection_item_id=i.id AND a.ordinal=1
+         LEFT JOIN resolved_metadata m ON m.item_id = i.id
+         WHERE i.kind IN ('movie','show','album')
+           AND (m.confidence IS NULL OR m.confidence IN ('miss', 'weak', 'rejected'))
+           AND NOT (i.match_mode='manual' AND i.match_conflict IS NULL)
          ORDER BY m.confidence != 'miss', i.title",
     )
     .fetch_all(state.registry.db())
@@ -2404,7 +2473,8 @@ async fn admin_review_list(
     let entries = rows
         .iter()
         .map(|row| ReviewEntry {
-            item_id: row.get("id"),
+            item_id: row.get("library_item_id"),
+            collection_item_id: row.get("id"),
             kind: row.get("kind"),
             title: row.get("title"),
             year: row.get("year"),
@@ -2457,7 +2527,11 @@ async fn admin_review_search(
         .enricher
         .search_candidates(
             &state.registry,
-            &body.kind,
+            match body.kind.as_str() {
+                "series" => "show",
+                "song" => "track",
+                k => k,
+            },
             &body.query,
             body.year,
             body.item.as_deref(),
@@ -2517,7 +2591,59 @@ async fn candidate_artwork(
 }
 
 #[derive(Deserialize, ToSchema)]
+struct CatalogMetadataRequest {
+    expected_revision: i64,
+    fields: crate::library::MetadataOverrides,
+}
+
+#[utoipa::path(put,path="/admin/v1/library-items/{id}/metadata",tag="Admin enrichment",
+    security(("bearer_auth"=[])),params(("id"=String,Path)),request_body=CatalogMetadataRequest,
+    responses((status=200,body=OkResponse),(status=400,body=ApiErrorBody),(status=401,body=ApiErrorBody),
+    (status=403,body=ApiErrorBody),(status=404,body=ApiErrorBody),(status=409,body=ApiErrorBody),(status=500,body=ApiErrorBody)))]
+async fn admin_catalog_metadata(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<CatalogMetadataRequest>,
+) -> Result<Json<OkResponse>, ApiError> {
+    let mut tx = state.registry.db().begin().await.map_err(internal)?;
+    let revision: Option<i64> =
+        sqlx::query_scalar("SELECT revision FROM library_items WHERE id=? AND merged_into IS NULL")
+            .bind(&id)
+            .fetch_optional(&mut *tx)
+            .await
+            .map_err(internal)?;
+    let revision = revision.ok_or_else(|| hidden("item"))?;
+    if revision != body.expected_revision {
+        return Err(ApiError::new(
+            ErrorCode::StaleWrite,
+            "Catalogue metadata changed; reload before saving",
+        ));
+    }
+    if body
+        .fields
+        .rating
+        .is_some_and(|r| !r.is_finite() || !(0.0..=10.0).contains(&r))
+    {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "Rating must be between 0 and 10",
+        ));
+    }
+    sqlx::query("INSERT INTO library_overrides VALUES(?,?) ON CONFLICT(library_item_id) DO UPDATE SET fields=excluded.fields").bind(&id).bind(serde_json::to_string(&body.fields).map_err(internal)?).execute(&mut *tx).await.map_err(internal)?;
+    sqlx::query("UPDATE library_items SET revision=revision+1 WHERE id=?")
+        .bind(&id)
+        .execute(&mut *tx)
+        .await
+        .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    Ok(Json(OkResponse { ok: true }))
+}
+
+#[derive(Deserialize, ToSchema)]
 struct ApplyMatch {
+    expected_revision: i64,
+    library_item_ids: Option<Vec<String>>,
+    new_item: Option<crate::library::NewItem>,
     /// "pick": store the supplied candidate; "confirm": promote the
     /// current weak match; "reject": clear the match, excluded from
     /// auto-retries.
@@ -2533,12 +2659,13 @@ struct ApplyMatch {
 /// action, or a missing field, returns 400. Picked and confirmed matches are
 /// pinned against automatic re-matching.
 #[utoipa::path(
-    post, path = "/admin/v1/items/{id}/match", tag = "Admin enrichment",
+    post, path = "/admin/v1/collection-items/{id}/match", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
     params(("id" = String, Path)),
     request_body = ApplyMatch,
     responses(
-        (status = 200, body = OkResponse),
+        (status = 200, body = crate::library::Assignment),
+        (status = 409, body = ApiErrorBody),
         (status = 400, body = ApiErrorBody),
         (status = 401, body = ApiErrorBody),
         (status = 403, body = ApiErrorBody),
@@ -2552,64 +2679,8 @@ async fn admin_apply_match(
     State(state): State<AppState>,
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<ApplyMatch>,
-) -> Result<Json<OkResponse>, ApiError> {
-    let db = state.registry.db();
-    match body.action.as_str() {
-        "confirm" => {
-            // Pin what is already assigned: automatic re-picking then leaves
-            // it alone, whatever a later answer or a reorder says.
-            crate::providers::confirm_assignment(db, &id)
-                .await
-                .map_err(internal)?;
-        }
-        "reject" => {
-            // The refused records are remembered and the assignment goes;
-            // the ANSWERS stay. Deleting them made the next run re-ask every
-            // provider, AniDB included, for one click — and it is the
-            // refused set, not their absence, that keeps the item
-            // unassigned until a provider offers something new.
-            crate::providers::reject_matches(db, &id)
-                .await
-                .map_err(internal)?;
-        }
-        "pick" => {
-            let candidate = body
-                .candidate
-                .ok_or(ApiError::new(ErrorCode::BadRequest, "candidate required"))?;
-            let provider = body
-                .provider
-                .ok_or(ApiError::new(ErrorCode::BadRequest, "provider required"))?;
-            let provider_id = candidate.id.ok_or(ApiError::new(
-                ErrorCode::BadRequest,
-                "candidate.id required",
-            ))?;
-            // A human's choice: stored as that provider's answer and pinned,
-            // so automatic re-picking leaves it alone whatever lands later.
-            crate::providers::assign_manual(
-                db,
-                &id,
-                &provider,
-                &provider_id.to_string(),
-                crate::providers::Fields {
-                    title: candidate.title,
-                    overview: candidate.overview,
-                    poster_path: candidate.poster_path,
-                    rating: candidate.vote_average,
-                    premiered: candidate.release_date,
-                    ..Default::default()
-                },
-            )
-            .await
-            .map_err(internal)?;
-        }
-        other => {
-            return Err(ApiError::new(
-                ErrorCode::BadRequest,
-                format!("unknown action {other}"),
-            ));
-        }
-    }
-    Ok(Json(OkResponse { ok: true }))
+) -> Result<Json<crate::library::Assignment>, ApiError> {
+    library_api::apply_match(&state, &id, body).await.map(Json)
 }
 
 /// List users
@@ -3300,7 +3371,7 @@ async fn admin_sessions(
 ) -> Result<Json<AdminSessionsResponse>, ApiError> {
     let mut sessions = Vec::new();
     for session in state.sessions.list() {
-        let title = sqlx::query_scalar("SELECT title FROM items WHERE id = ?")
+        let title = sqlx::query_scalar("SELECT title FROM library_items WHERE id = ?")
             .bind(&session.item_id)
             .fetch_optional(state.registry.db())
             .await
@@ -3938,6 +4009,9 @@ async fn logout(
 #[derive(Deserialize, ToSchema)]
 struct StartSessionRequest {
     item_id: String,
+    /// Physical source whose stream indexes and chapter timeline are being used.
+    source_id: Option<i64>,
+    album_track_id: Option<i64>,
     /// Explicit mode = the pre-negotiation contract, verbatim (scripts,
     /// debugging). Absent = the hub negotiates from `profile`.
     #[serde(default)]
@@ -3948,7 +4022,13 @@ struct StartSessionRequest {
     /// Begin playback here (resume without waiting for a transcode to
     /// catch up) — keyframe-snapped by the pipeline.
     #[serde(default)]
-    start_ms: u64,
+    start_ms: Option<u64>,
+    /// For recovery or a seek, the fingerprint returned by the preceding session.
+    /// Saved resume is item-relative only when `resume` is true.
+    resume_source_fingerprint: Option<String>,
+    /// True for an item-relative saved resume; false for an explicit chapter position.
+    #[serde(default)]
+    resume: bool,
     /// Track indexes in the source's discovery order. The UI
     /// resolves defaults from /api/v1/prefs client-side.
     #[serde(default)]
@@ -4316,7 +4396,14 @@ async fn start_session(
             &body.item_id,
             body.mode.as_deref(),
             body.profile.clone(),
-            body.start_ms,
+            crate::sessions::StartOptions {
+                ms: body.start_ms.unwrap_or(0),
+                explicit_position: body.start_ms.is_some(),
+                source_id: body.source_id,
+                album_track_id: body.album_track_id,
+                resume: body.resume,
+                source_fingerprint: body.resume_source_fingerprint,
+            },
             body.audio_track,
             body.video_track,
             body.subtitle_track,
@@ -4359,7 +4446,7 @@ async fn start_session(
             .subtitles
             .list(
                 &state.registry,
-                &body.item_id,
+                &session.collection_item_id,
                 session.effective_profile(),
                 session.ass_policy(),
                 &claims.sub,
@@ -4374,6 +4461,12 @@ async fn start_session(
         StatusCode::CREATED,
         Json(StartSessionResponse {
             session_id: session.id.clone(),
+            effective_start_ms: session.effective_start_ms,
+            source_fingerprint: session.source_fingerprint.clone(),
+            source_id: session.playable_source_id,
+            replay_gain: session.replay_gain.clone(),
+            library_item_ids: session.library_item_ids.clone(),
+            coverage: session.boundaries.clone(),
             mode,
             size: session.size,
             duration_ms: session.duration_ms,
@@ -4740,7 +4833,7 @@ async fn artist_artwork(
     music_library(state.registry.db(), &claims, &q.library).await?;
     let belongs: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM items i JOIN library_collections lc
+             SELECT 1 FROM collection_items i JOIN library_collections lc
                ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
               WHERE lc.library_id=? AND i.kind='album' AND i.artist_key=?)",
     )
@@ -4831,9 +4924,28 @@ async fn artist_artwork(
 )]
 async fn item_artwork(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiPath(id): ApiPath<String>,
     ApiQuery(q): ApiQuery<ArtworkQuery>,
 ) -> Result<Response, ApiError> {
+    let library_item_id = crate::library::resolve_id(state.registry.db(), &id)
+        .await
+        .map_err(internal)?;
+    let id = crate::library::copies(state.registry.db(), &claims.sub, &id)
+        .await
+        .map_err(internal)?
+        .into_iter()
+        .next()
+        .ok_or_else(|| hidden("item"))?;
+    let eligible: bool =
+        sqlx::query_scalar("SELECT metadata_eligible AND EXISTS(SELECT 1 FROM collection_item_library_items WHERE collection_item_id=ci.id AND library_item_id=?2 AND ordinal=1) FROM collection_items ci WHERE id=?1")
+            .bind(&id).bind(&library_item_id)
+            .fetch_one(state.registry.db())
+            .await
+            .map_err(internal)?;
+    if !eligible {
+        return Err(hidden("artwork"));
+    }
     // The detail goes to the log, not to the caller: what fails here is
     // usually a fetch from a metadata provider, and its error names the
     // upstream URL. SEC-WEB-7 — a provider's address is not the client's
@@ -4928,9 +5040,21 @@ struct VttQuery {
 )]
 async fn item_subtitle_file(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiPath((id, file)): ApiPath<(String, String)>,
     ApiQuery(q): ApiQuery<VttQuery>,
 ) -> Result<Response, ApiError> {
+    let track_id = file
+        .split('.')
+        .next()
+        .and_then(|v| v.parse::<i64>().ok())
+        .ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "bad track id"))?;
+    let id = crate::tracks::get_for_library_item(state.registry.db(), &claims.sub, &id, track_id)
+        .await
+        .map_err(internal)?
+        .ok_or_else(|| hidden("track"))?
+        .item_id;
+
     // The public keyspace is TRACK IDS ({id}.vtt / {id}.ass); the
     // resolver maps them onto the internal cache/pipeline notation.
     let resolve = |raw: &str| -> Option<i64> { raw.parse().ok() };
@@ -4967,25 +5091,29 @@ async fn item_subtitle_file(
                 ErrorCode::NotFound,
                 "no such rasterised track",
             ))?;
-        let bytes = tokio::fs::read(state.subtitles.raster_path(track.id))
-            .await
-            .map_err(|e| {
-                // `tokio::fs::read` fails ONLY with an io error, and
-                // `refusal_or_internal` reads any io error as ours — so its
-                // refusal arm could never be reached here: every failure was a
-                // 500 and this route's declared 404 was dead. The row is
-                // INSERTed before the payload is written, so a missing file is
-                // an ordinary orphan and the client's business; anything else
-                // is the disk, and ours.
-                if e.kind() == std::io::ErrorKind::NotFound {
-                    ApiError::new(
-                        ErrorCode::NotFound,
-                        "that rasterised track has no body on disk",
-                    )
-                } else {
-                    internal(e)
-                }
-            })?;
+        let bytes = tokio::fs::read(
+            state
+                .subtitles
+                .raster_path(track.payload_id.unwrap_or(track.id)),
+        )
+        .await
+        .map_err(|e| {
+            // `tokio::fs::read` fails ONLY with an io error, and
+            // `refusal_or_internal` reads any io error as ours — so its
+            // refusal arm could never be reached here: every failure was a
+            // 500 and this route's declared 404 was dead. The row is
+            // INSERTed before the payload is written, so a missing file is
+            // an ordinary orphan and the client's business; anything else
+            // is the disk, and ours.
+            if e.kind() == std::io::ErrorKind::NotFound {
+                ApiError::new(
+                    ErrorCode::NotFound,
+                    "that rasterised track has no body on disk",
+                )
+            } else {
+                internal(e)
+            }
+        })?;
         return Ok((
             [(
                 axum::http::header::CONTENT_TYPE,
@@ -5004,10 +5132,9 @@ async fn item_subtitle_file(
             .await
             .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such subtitle track", e))?;
         refuse_image(&track)?;
-        let key = track.internal_key();
         let body = state
             .subtitles
-            .ass_body(&state.registry, &state.sessions, &id, &key)
+            .ass_body(&state.registry, &state.sessions, &track)
             .await
             .map_err(internal)?;
         let headers = [
@@ -5042,8 +5169,7 @@ async fn item_subtitle_file(
         .vtt(
             &state.registry,
             &state.sessions,
-            &id,
-            &track.internal_key(),
+            &track,
             q.shift_ms.round() as i64,
         )
         .await
@@ -5134,7 +5260,7 @@ async fn admin_segments_run(
 #[utoipa::path(
     get, path = "/api/v1/items/{id}/fonts", tag = "Item media",
     security(("bearer_auth" = [])),
-    params(("id" = String, Path)),
+    params(("id" = String, Path), SourceQuery),
     responses(
         (status = 200, body = FontsResponse),
         (status = 401, body = ApiErrorBody),
@@ -5146,11 +5272,14 @@ async fn admin_segments_run(
 )]
 async fn item_fonts(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiPath(id): ApiPath<String>,
+    ApiQuery(q): ApiQuery<SourceQuery>,
 ) -> Result<Json<FontsResponse>, ApiError> {
+    let (id, source_id) = source_copy(&state, &claims.sub, &id, q.source_id).await?;
     let fonts = state
         .subtitles
-        .fonts(&state.registry, &state.sessions, &id)
+        .fonts(&state.registry, &state.sessions, &id, Some(source_id))
         .await
         .map_err(internal)?
         .into_iter()
@@ -5169,7 +5298,8 @@ async fn item_fonts(
     security(("bearer_auth" = []), ("media_token" = [])),
     params(
         ("id" = String, Path),
-        ("n" = usize, Path)
+        ("n" = usize, Path),
+        SourceQuery
     ),
     responses(
         (status = 200, body = Vec<u8>, content_type = "font/ttf", headers(("cache-control" = String))),
@@ -5182,11 +5312,14 @@ async fn item_fonts(
 )]
 async fn item_font(
     State(state): State<AppState>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiPath((id, n)): ApiPath<(String, usize)>,
+    ApiQuery(q): ApiQuery<SourceQuery>,
 ) -> Result<Response, ApiError> {
+    let (id, source_id) = source_copy(&state, &claims.sub, &id, q.source_id).await?;
     let fonts = state
         .subtitles
-        .fonts(&state.registry, &state.sessions, &id)
+        .fonts(&state.registry, &state.sessions, &id, Some(source_id))
         .await
         .map_err(internal)?;
     let (_, bytes) = fonts
@@ -5276,7 +5409,7 @@ struct ArtistAlbumsQuery {
 }
 
 async fn music_library(
-    db: &kahawai_sqlite::Database,
+    db: &crate::library::Database,
     claims: &crate::auth::Claims,
     library: &str,
 ) -> Result<(), ApiError> {
@@ -5313,8 +5446,7 @@ fn artist_group_sql(descending: bool) -> String {
                 CASE WHEN aa.outcome='ready' THEN aa.updated_at END AS portrait_version
            FROM (
            SELECT i.artist_key AS key,MIN(i.artist) AS name,COUNT(*) AS album_count
-             FROM items i JOIN library_collections lc
-               ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+             FROM library_entries i JOIN (SELECT DISTINCT item_id,library_id FROM library_membership) lc ON lc.item_id=i.id
             WHERE lc.library_id=?1 AND i.kind='album'
               AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
               AND (?2='' OR i.norm_artist LIKE '%' || ?2 || '%')
@@ -5363,8 +5495,7 @@ async fn list_artists(
     .map_err(internal)?;
     let total: i64 = sqlx::query_scalar(
         "SELECT COUNT(DISTINCT i.artist_key)
-           FROM items i JOIN library_collections lc
-             ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+           FROM library_entries i JOIN (SELECT DISTINCT item_id,library_id FROM library_membership) lc ON lc.item_id=i.id
           WHERE lc.library_id=?1 AND i.kind='album'
             AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
             AND (?2='' OR i.norm_artist LIKE '%' || ?2 || '%')",
@@ -5437,8 +5568,7 @@ async fn artist_albums(
         "SELECT MIN(i.artist) AS name,COUNT(*) AS album_count,
                 (SELECT updated_at FROM artist_artwork
                   WHERE artist_key=?2 AND outcome='ready') AS portrait_version
-           FROM items i JOIN library_collections lc
-             ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+           FROM library_entries i JOIN (SELECT DISTINCT item_id,library_id FROM library_membership) lc ON lc.item_id=i.id
           WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
          HAVING COUNT(*) > 0",
     )
@@ -5462,13 +5592,14 @@ async fn artist_albums(
     let order_in = artist_album_order(q.sort.as_deref(), "c", "candidate_md");
     let order_out = artist_album_order(q.sort.as_deref(), "i", "md");
     let inner = format!(
-        "SELECT c.id AS item_id FROM items c JOIN library_collections lc
-           ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
-          LEFT JOIN resolved_metadata candidate_md ON candidate_md.item_id=c.id
+        "SELECT c.id AS item_id FROM library_entries c JOIN (SELECT DISTINCT item_id,library_id FROM library_membership) lc ON lc.item_id=c.id
+          LEFT JOIN resolved_metadata candidate_md ON candidate_md.item_id=c.representative_id
           WHERE lc.library_id=?2 AND c.kind='album' AND c.artist_key=?3
             AND (?4='' OR c.norm_title LIKE '%' || ?4 || '%'
                  OR c.sort_title LIKE '%' || ?4 || '%'
-                 OR EXISTS(SELECT 1 FROM items t WHERE t.parent_id=c.id
+                 OR EXISTS(SELECT 1 FROM album_copies at JOIN library_entries t ON t.id=at.song_id WHERE at.album_id=c.id
+                            AND EXISTS(SELECT 1 FROM collection_items ac JOIN library_collections alc ON (alc.module_id,alc.collection_id)=(ac.module_id,ac.collection_id)
+                                WHERE ac.id=at.collection_item_id AND alc.library_id=?2)
                             AND (t.norm_title LIKE '%' || ?4 || '%'
                                  OR t.sort_title LIKE '%' || ?4 || '%')))
           ORDER BY {order_in} LIMIT ?5 OFFSET ?6"
@@ -5486,12 +5617,13 @@ async fn artist_albums(
     .await
     .map_err(internal)?;
     let total: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM items c JOIN library_collections lc
-           ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
+        "SELECT COUNT(*) FROM library_entries c JOIN (SELECT DISTINCT item_id,library_id FROM library_membership) lc ON lc.item_id=c.id
           WHERE lc.library_id=?1 AND c.kind='album' AND c.artist_key=?2
             AND (?3='' OR c.norm_title LIKE '%' || ?3 || '%'
                  OR c.sort_title LIKE '%' || ?3 || '%'
-                 OR EXISTS(SELECT 1 FROM items t WHERE t.parent_id=c.id
+                 OR EXISTS(SELECT 1 FROM album_copies at JOIN library_entries t ON t.id=at.song_id WHERE at.album_id=c.id
+                            AND EXISTS(SELECT 1 FROM collection_items ac JOIN library_collections alc ON (alc.module_id,alc.collection_id)=(ac.module_id,ac.collection_id)
+                                WHERE ac.id=at.collection_item_id AND alc.library_id=?1)
                             AND (t.norm_title LIKE '%' || ?3 || '%'
                                  OR t.sort_title LIKE '%' || ?3 || '%')))",
     )
@@ -5573,145 +5705,10 @@ fn meaningful_unfinished(alias: &str) -> String {
 /// Appending `i.id` forced a temp b-tree and 96 ms → 912 ms deep pages.
 /// The membership orders below DO end in a unique column, because there
 /// `item_id` is inside the covering index and costs nothing.
-fn items_order(sort: Option<&str>) -> &'static str {
-    match sort.unwrap_or("title") {
-        "year" => "i.year IS NULL, i.year, i.sort_title",
-        "-year" => "i.year IS NULL, i.year DESC, i.sort_title",
-        // Item ids are ULIDs, which sort lexicographically by the time
-        // they were minted — so "recently added" needs no column, cannot
-        // disagree with one, and is already total on its own.
-        "added" => "i.id, i.sort_title",
-        "-added" => "i.id DESC, i.sort_title",
-        "-title" => "i.sort_title DESC, i.year",
-        _ => "i.sort_title, i.year",
-    }
-}
-
-/// [`items_order`] for the inner candidate scan, whose alias is `c` so it
-/// cannot collide with the outer join's `i`.
-fn items_order_c(sort: Option<&str>) -> String {
-    items_order(sort).replace("i.", "c.")
-}
-
-/// ORDER BY pairs for a library page driven from the collection-scoped item
-/// index and the outer re-order of the joined page.
-///
-/// Every inner order ends in `item_id`, which is IN the covering index,
-/// so the order is total for free — a tie cannot straddle a page
-/// boundary differently on two requests. `-title` runs the whole index
-/// backwards (year descends within a tied title, where it used to
-/// ascend): a uniform direction is what keeps a deep reverse page a
-/// plain backward scan instead of a temp sort.
-fn membership_order(sort: Option<&str>) -> (&'static str, &'static str) {
-    match sort.unwrap_or("title") {
-        "year" => (
-            "c.year IS NULL,c.year,c.sort_title,c.id",
-            "i.year IS NULL, i.year, i.sort_title, i.id",
-        ),
-        "-year" => (
-            "c.year IS NULL,c.year DESC,c.sort_title,c.id",
-            "i.year IS NULL, i.year DESC, i.sort_title, i.id",
-        ),
-        "added" => ("c.id", "i.id"),
-        "-added" => ("c.id DESC", "i.id DESC"),
-        "-title" => (
-            "c.sort_title DESC,c.year DESC,c.id DESC",
-            "i.sort_title DESC, i.year DESC, i.id DESC",
-        ),
-        _ => ("c.sort_title,c.year,c.id", "i.sort_title, i.year, i.id"),
-    }
-}
-
-/// The total for a library with no search term — the overwhelmingly
-/// common browse.
-///
-/// Libraries compose collections. The count joins the small composition row
-/// set to `items_collection_browse` and excludes children explicitly; there is
-/// no item-level membership cache to synchronize.
-const COUNT_IN_LIBRARY: &str = "SELECT COUNT(*) FROM items i JOIN library_collections lc
- ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
- WHERE lc.library_id=?1 AND i.parent_id IS NULL";
-
-/// The columns a browse row carries, resolved for the ≤200 rows of ONE
-/// page — never for a candidate. See [`item_page_sql`].
-///
-/// Takes the caller's reach because one column depends on it: see the
-/// `library_id` note below and `grants::VISIBLE_LIB`.
-fn item_page_cols(restricted: bool, scoped: bool) -> String {
-    // When the request named a library, prefer THAT one. `MIN` answers "some
-    // library it is in", which for an item in two is as likely to be the one
-    // the caller did not ask for — so browsing "3d" handed back cards whose
-    // every link, breadcrumb and back target pointed at "movies". Grant
-    // scoping is a different question and still applies to both halves.
-    let (lib_pref, lib_pref_end) = if scoped {
-        (
-            "COALESCE((SELECT lc.library_id FROM library_collections lc
-                        WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
-                          AND lc.library_id=?2),
-                      ",
-            ")",
-        )
-    } else {
-        ("", "")
-    };
-    let lib = if restricted {
-        crate::grants::VISIBLE_LIB
-    } else {
-        ""
-    };
-    format!(
-        "\
-i.id, i.kind, i.season, i.episode, i.artist,
-COALESCE(md.title, i.title) AS title,
-COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
-i.title AS file_title, i.year AS file_year,
-md.title AS matched_title,
-md.confidence AS match_confidence,
-md.updated_at AS art_version,
-(SELECT COUNT(*) FROM playable_sources ps WHERE ps.item_id=i.id) AS sources,
-i.parent_id,
-(SELECT p.sort_title FROM items p WHERE p.id = i.parent_id) AS parent_title,
--- A library this item is in, as navigation context: item URLs live under
--- a library, and a row that arrives from a cross-library browse (search,
--- continue watching) has no other way to know one. Membership is
--- many-to-many, so this is deliberately \"a library it is in\" and not
--- \"its library\" — MIN so the same row always answers the same way.
--- Keyed on COALESCE(parent_id, id) because membership only ever holds
--- top-level items: an episode belongs to a library through its show.
--- Indexed by library_collections and paid on the ≤200 rows of a page beside
--- the source count above, never on a candidate.
--- Scoped to what this account may open (grants::VISIBLE_LIB): an item
--- can be in more than one library, and naming one the caller was refused
--- both answers a question the grant said no to and sends the client
--- somewhere it will get a 404.
-{lib_pref}(SELECT MIN(lc.library_id) FROM library_collections lc
-  WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id) {lib}){lib_pref_end} AS library_id,
-w.position_ms, w.duration_ms, w.played, w.play_count"
-    )
-}
-
-/// Wrap an id-producing inner query in the joins that dress a page.
-///
-/// Every branch of the browse pages this way — a deferred join. The
-/// inner query decides WHICH ≤200 items make the page using only indexed
-/// scalar columns; the resolved-metadata view, the watch state and the
-/// source count are joined onto those ids afterwards. Joining first and
-/// paging second resolves the view for every candidate the sort visits,
-/// which is the 912 ms failure mode that keeps re-appearing whenever an
-/// ORDER BY stops matching an index.
-///
-/// The outer ORDER BY re-sorts only the returned page: the inner query
-/// already chose and ordered the ids, the join just does not promise to
-/// preserve that order.
-fn item_page_sql(inner: &str, order_out: &str, restricted: bool, scoped: bool) -> String {
-    let cols = item_page_cols(restricted, scoped);
-    format!(
-        "SELECT {cols}
-           FROM ({inner}) page
-           JOIN items i ON i.id = page.item_id
-           LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?1
-           LEFT JOIN resolved_metadata md ON md.item_id = i.id
-          ORDER BY {order_out}"
+fn item_page_sql(inner: &str, order_out: &str, _restricted: bool, _scoped: bool) -> String {
+    library_api::page(
+        &format!("SELECT *,item_id AS id FROM ({inner})"),
+        &order_out.replace("i.", "c."),
     )
 }
 
@@ -5738,287 +5735,7 @@ async fn list_items(
     ApiQuery(q): ApiQuery<ItemsQuery>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<ItemsResponse>, ApiError> {
-    let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
-    let offset = q.offset.unwrap_or(0);
-    // Folded once here, matched against norm_title (already folded) and
-    // the resolved title, so a search finds an item by what it is called
-    // now as well as by its filename.
-    let needle =
-        q.q.as_deref()
-            .map(crate::enrich::fold)
-            .filter(|s| !s.is_empty());
-    let db = state.registry.db();
-
-    // HUB-10. Resolved once, not folded into the predicates: for an
-    // unrestricted account — every account on a single-user hub, and
-    // every admin — the queries below must stay the ones the NFR-1
-    // numbers were measured on, byte for byte. A grant term they carried
-    // unconditionally would be a `users` lookup per candidate row.
-    let restricted = crate::grants::restricted(db, &claims)
-        .await
-        .map_err(internal)?;
-    // A library the account does not hold is answered before any of it
-    // is read. Once the grant is in hand, membership IS the answer: the
-    // rows of a granted library are visible by definition, so the page
-    // and count below stay untouched.
-    if restricted
-        && let Some(library) = &q.library
-        && !crate::grants::can_see_library(db, &claims, library)
-            .await
-            .map_err(internal)?
-    {
-        return Err(hidden("library"));
-    }
-    // Only the two scan-shaped browses need the predicate: a library
-    // page is already scoped by the grant checked above, and an
-    // in-library search by its own membership term.
-    let visible = if restricted {
-        crate::grants::VISIBLE_C
-    } else {
-        ""
-    };
-
-    // Continue watching. Its own path ahead of the three shapes below,
-    // rather than a fourth arm or a sort name, for two reasons.
-    //
-    // It is driven from `watch_state`, not from `items`: the set is
-    // "rows this account has a position in", which is small by
-    // construction, so starting there reads a key range of one user's
-    // rows instead of asking every item whether it has been started.
-    // A sort name could not have expressed that — the browse's watch
-    // join is in the OUTER dressing query, on the ≤200 rows of a page,
-    // and pulling it into the candidate scan is exactly the join-first
-    // shape that costs 912 ms.
-    //
-    // And the three shapes below stay byte for byte the queries their
-    // NFR-1 numbers were measured on.
-    //
-    // ponytail: sorts one account's watch rows without an index for it.
-    // Bounded by items you have touched, so it is milliseconds at any
-    // plausible size; a (user_id, updated_at) index if that stops being
-    // true.
-    let in_progress = q.in_progress.unwrap_or(false);
-    let (rows, total) = if in_progress {
-        let meaningful = meaningful_unfinished("w2");
-        // Tracks stay out: a resume position on a song is not something
-        // anyone comes back to, and one would sit among the films.
-        // Episodes very much stay in — they are most of this row.
-        let member = match &q.library {
-            Some(_) => {
-                "AND EXISTS(SELECT 1 FROM library_collections lc
-                              WHERE lc.library_id=?2
-                                AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
-            }
-            None => visible,
-        };
-        let sql = item_page_sql(
-            &format!(
-                "SELECT w2.item_id FROM watch_state w2
-                   JOIN items c ON c.id = w2.item_id
-                  WHERE w2.user_id = ?1 AND {meaningful}
-                    AND c.kind <> 'track' {member}
-                  ORDER BY w2.updated_at DESC, w2.item_id DESC
-                  LIMIT ?3 OFFSET ?4"
-            ),
-            // The outer query already joins this account's watch row as
-            // `w`, so re-ordering the page needs nothing new. Ends in a
-            // unique column: `item_id` is unique per user by the primary
-            // key, so the order is total and a tie cannot straddle a page
-            // boundary two different ways.
-            "w.updated_at DESC, i.id DESC",
-            restricted,
-            true,
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-            .bind(&claims.sub)
-            .bind(q.library.as_deref().unwrap_or(""))
-            .bind(limit)
-            .bind(offset)
-            .fetch_all(db)
-            .await
-            .map_err(internal)?;
-        let count = format!(
-            "SELECT COUNT(*) FROM watch_state w2
-               JOIN items c ON c.id = w2.item_id
-              WHERE w2.user_id = ?1 AND {meaningful}
-                AND c.kind <> 'track' {member}"
-        );
-        let total: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(count))
-            .bind(&claims.sub)
-            .bind(q.library.as_deref().unwrap_or(""))
-            .fetch_one(db)
-            .await
-            .map_err(internal)?;
-        (rows, total)
-    } else {
-        // Three explicit shapes rather than one query with
-        // `(?N IS NULL OR ...)` guards: a guard is opaque at plan time,
-        // which is the pattern that has cost us an index twice now.
-        match (&q.library, &needle) {
-            // A library, no search — the overwhelmingly common browse. The
-            // page comes from the collection-scoped item browse index after
-            // resolving the library's small collection composition.
-            (Some(library), None) => {
-                let (order_in, order_out) = membership_order(q.sort.as_deref());
-                let sql = item_page_sql(
-                    &format!(
-                        "SELECT c.id AS item_id FROM items c JOIN library_collections lc
-                          ON (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id)
-                         WHERE lc.library_id=?2 AND c.parent_id IS NULL
-                      ORDER BY {order_in} LIMIT ?3 OFFSET ?4"
-                    ),
-                    order_out,
-                    restricted,
-                    true,
-                );
-                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(&claims.sub)
-                    .bind(library)
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(db)
-                    .await
-                    .map_err(internal)?;
-                let total: i64 = sqlx::query_scalar(COUNT_IN_LIBRARY)
-                    .bind(library)
-                    .fetch_one(db)
-                    .await
-                    .map_err(internal)?;
-                (rows, total)
-            }
-            // Searching. The title predicate has to look at candidates, so
-            // the scan follows the sort index and streams: an underfull page
-            // means the scan ran out, and the total is known without a
-            // second pass. Only a FULL page pays the counting scan.
-            //
-            // What is searchable: titles by their folded filename and their
-            // resolved title, albums additionally by folded artist, and
-            // EPISODES by their resolved titles — sort_title is parent-aware
-            // since 0041, so an episode's is the title its show's assigned
-            // provider gave it. Episodes belong to a library through their
-            // parent, hence the COALESCE in the membership probe. Tracks
-            // stay out deliberately: matching "iron maiden" should offer the
-            // albums, not five hundred track rows above them.
-            (library, Some(needle)) => {
-                let member = match library {
-                    Some(_) => {
-                        "AND EXISTS(SELECT 1 FROM library_collections lc
-                                  WHERE lc.library_id=?2
-                                    AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
-                    }
-                    // Cross-library search by a restricted account: the same
-                    // shape, over every library it holds instead of one.
-                    None => visible,
-                };
-                let order_c = items_order_c(q.sort.as_deref());
-                let sql = item_page_sql(
-                    &format!(
-                        // +c.kind: degraded on purpose. As a plain term the
-                        // 5-value IN steers the planner onto items_kind_title
-                        // and every candidate pays a random table probe for
-                        // its LIKE columns — a search predicate this dense
-                        // (LIKE over most rows) wants the sequential scan.
-                        "SELECT c.id AS item_id FROM items c
-                      WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
-                        AND (c.norm_title LIKE '%' || ?3 || '%'
-                             OR c.sort_title LIKE '%' || ?3 || '%'
-                             -- Artist matches ALBUMS only. A track row for
-                             -- every song by the artist would bury the
-                             -- albums; titles are how songs are found.
-                             OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))
-                      ORDER BY {order_c} LIMIT ?4 OFFSET ?5"
-                    ),
-                    items_order(q.sort.as_deref()),
-                    restricted,
-                    true,
-                );
-                // ?2 must exist even without a library, so numbering is
-                // uniform; it is simply never referenced then.
-                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(&claims.sub)
-                    .bind(library.as_deref().unwrap_or(""))
-                    .bind(needle)
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(db)
-                    .await
-                    .map_err(internal)?;
-                let total: i64 = if rows.len() < limit as usize && !(rows.is_empty() && offset > 0)
-                {
-                    // The page underfilled: the scan saw everything.
-                    offset as i64 + rows.len() as i64
-                } else {
-                    let count = format!(
-                        // Same +c.kind degrade as the page query above.
-                        "SELECT COUNT(*) FROM items c
-                      WHERE +c.kind IN ('movie', 'show', 'album', 'episode', 'track') {member}
-                        AND (c.norm_title LIKE '%' || ?3 || '%'
-                             OR c.sort_title LIKE '%' || ?3 || '%'
-                             OR (c.kind = 'album' AND c.norm_artist LIKE '%' || ?3 || '%'))"
-                    );
-                    sqlx::query_scalar(sqlx::AssertSqlSafe(count))
-                        // ?1 is the user id as everywhere else — unused here
-                        // unless `member` is the grant predicate, and bound
-                        // either way so the numbering stays shared.
-                        .bind(&claims.sub)
-                        .bind(library.as_deref().unwrap_or(""))
-                        .bind(needle)
-                        .fetch_one(db)
-                        .await
-                        .map_err(internal)?
-                };
-                (rows, total)
-            }
-            // Unscoped, no search: everything, in sort order.
-            (None, None) => {
-                let order_c = items_order_c(q.sort.as_deref());
-                let sql = item_page_sql(
-                    &format!(
-                        "SELECT c.id AS item_id FROM items c
-                      WHERE c.kind NOT IN ('episode', 'track') {visible}
-                      ORDER BY {order_c} LIMIT ?2 OFFSET ?3"
-                    ),
-                    items_order(q.sort.as_deref()),
-                    restricted,
-                    // ?2 is the row limit on this branch, not a library.
-                    false,
-                );
-                let rows = sqlx::query(sqlx::AssertSqlSafe(sql))
-                    .bind(&claims.sub)
-                    .bind(limit)
-                    .bind(offset)
-                    .fetch_all(db)
-                    .await
-                    .map_err(internal)?;
-                // The same predicate as the page, not the cheaper
-                // a separate composition count a granted set would allow:
-                // a total that disagrees with the rows it counts is a paging
-                // bug that only shows up on the last page.
-                // ponytail: an unrestricted account keeps the bare count, so
-                // the extra probe is paid only where it decides something.
-                let count = format!(
-                    "SELECT COUNT(*) FROM items c
-                  WHERE c.kind NOT IN ('episode', 'track') {visible}"
-                );
-                let mut counter = sqlx::query_scalar(sqlx::AssertSqlSafe(count));
-                if restricted {
-                    counter = counter.bind(&claims.sub);
-                }
-                let total: i64 = counter.fetch_one(db).await.map_err(internal)?;
-                (rows, total)
-            }
-        }
-    };
-    let items = rows
-        .iter()
-        .map(|row| item_row(row, row.get::<i64, _>("sources")))
-        .collect();
-    Ok(Json(ItemsResponse {
-        items,
-        total,
-        limit,
-        offset,
-    }))
+    library_api::browse(&state, &claims, q).await.map(Json)
 }
 
 /// How long "recent" lasts for the up-next row: a month, taken as 30
@@ -6055,20 +5772,24 @@ struct UpNextQuery {
 /// unscoped, so the numbering is uniform), `?3` the watched-since cut,
 /// `?4` the added-since cut.
 ///
-/// Driven from `watch_state` for the reason continue watching is: the
+/// Driven from `user_item_state` for the reason continue watching is: the
 /// set is "series this account has finished an episode of", which is
 /// small by construction, so this reads one key range of one user's rows
 /// instead of asking every show whether it has been started.
 fn up_next_from(member: &str) -> String {
     let meaningful = meaningful_unfinished("pw");
+    let next_visible = library_api::visible("n");
+    let progress_visible = library_api::visible("pe");
+    let next_scope = member.replace("c.id", "n.id");
+    let progress_scope = member.replace("c.id", "pe.id");
     format!(
         "FROM (SELECT e.parent_id AS show_id, MAX(w.updated_at) AS last_watched
-                 FROM watch_state w
-                 JOIN items e ON e.id = w.item_id
+                 FROM user_item_state w
+                 JOIN library_entries e ON e.id = w.item_id
                 WHERE w.user_id = ?1 AND w.played = 1
                   AND e.kind = 'episode' AND e.parent_id IS NOT NULL
                 GROUP BY e.parent_id) seen
-         JOIN items c ON c.id = seen.show_id AND c.kind = 'show'
+         JOIN library_entries c ON c.id = seen.show_id AND c.kind = 'series'
          -- What to play next: the first episode, in (season, episode, id)
          -- order, that comes after the last one finished and has not
          -- itself been finished. A series with nothing after it leaves
@@ -6085,13 +5806,13 @@ fn up_next_from(member: &str) -> String {
          -- so the ORDER BYs stay on `items_children` while the row-value
          -- comparison, where one NULL makes the whole predicate NULL and
          -- silently drops the row, spells the -1 out.
-         JOIN items nx ON nx.id = (
-               SELECT n.id FROM items n
-                WHERE n.parent_id = c.id AND n.kind = 'episode'
+         JOIN library_entries nx ON nx.id = (
+               SELECT n.id FROM library_entries n
+                WHERE n.parent_id = c.id AND n.kind = 'episode' AND {next_visible} {next_scope}
                   AND (COALESCE(n.season, -1), COALESCE(n.episode, -1), n.id) >
                       (SELECT COALESCE(p.season, -1), COALESCE(p.episode, -1), p.id
-                         FROM items p
-                         JOIN watch_state pw ON pw.item_id = p.id
+                         FROM library_entries p
+                         JOIN user_item_state pw ON pw.item_id = p.id
                           AND pw.user_id = ?1 AND pw.played = 1
                         WHERE p.parent_id = c.id AND p.kind = 'episode'
                         -- Last is temporal. The sequence order is only the
@@ -6099,7 +5820,7 @@ fn up_next_from(member: &str) -> String {
                         -- rows share one second-resolution timestamp.
                         ORDER BY pw.updated_at DESC,
                                  p.season DESC, p.episode DESC, p.id DESC LIMIT 1)
-                  AND NOT EXISTS (SELECT 1 FROM watch_state nw
+                  AND NOT EXISTS (SELECT 1 FROM user_item_state nw
                                    WHERE nw.user_id = ?1 AND nw.item_id = n.id
                                      AND nw.played = 1)
                 ORDER BY n.season, n.episode, n.id LIMIT 1)
@@ -6109,9 +5830,9 @@ fn up_next_from(member: &str) -> String {
          -- the two rows partition the series between them instead of both
          -- claiming one or neither offering it. A barely opened next episode
          -- remains eligible here.
-        WHERE NOT EXISTS (SELECT 1 FROM items pe
-                            JOIN watch_state pw ON pw.item_id = pe.id AND pw.user_id = ?1
-                           WHERE pe.parent_id = c.id
+        WHERE NOT EXISTS (SELECT 1 FROM library_entries pe
+                            JOIN user_item_state pw ON pw.item_id = pe.id AND pw.user_id = ?1
+                           WHERE pe.parent_id = c.id AND {progress_visible} {progress_scope}
                              AND {meaningful})
           -- Still current, either way round: you watched one lately, or
           -- the one you would watch next arrived lately — the season
@@ -6171,9 +5892,7 @@ async fn up_next(
     }
     let member = match (&q.library, restricted) {
         (Some(_), _) => {
-            "AND EXISTS(SELECT 1 FROM library_collections lc
-                          WHERE lc.library_id=?2
-                            AND (lc.module_id,lc.collection_id)=(c.module_id,c.collection_id))"
+            "AND EXISTS(SELECT 1 FROM library_membership lc WHERE lc.library_id=?2 AND lc.item_id=c.id)"
         }
         (None, true) => crate::grants::VISIBLE_C,
         (None, false) => "",
@@ -6231,7 +5950,7 @@ async fn up_next(
     if !rows.is_empty() {
         let mut hints = sqlx::QueryBuilder::<sqlx::Sqlite>::new(
             "SELECT ps.item_id,ps.module_id,ps.collection_id,r.root_token,f.path_rel \
-             FROM playable_sources ps \
+             FROM library_sources ps \
              JOIN playable_source_parts p ON p.playable_source_id=ps.id AND p.ordinal=1 \
              JOIN files f ON f.id=p.file_id \
              JOIN collection_roots r ON r.id=f.root_id WHERE 0",
@@ -6281,6 +6000,9 @@ async fn up_next(
 #[schema(as = ItemRow<S>)]
 struct ItemRow<S> {
     id: String,
+    /// Album position context; the same song may occur more than once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    album_track_id: Option<i64>,
     kind: String,
     title: String,
     /// Album Artist for albums; recording Artist for tracks; absent elsewhere.
@@ -6364,6 +6086,7 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
     let played = r.get::<Option<i64>, _>("played").unwrap_or(0) != 0;
     ItemRow {
         id: r.get("id"),
+        album_track_id: None,
         kind: r.get("kind"),
         title: r.get("title"),
         artist: r.try_get("artist").ok().flatten(),
@@ -6397,7 +6120,7 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
         // A played item has nowhere to resume: the next Play starts at the
         // beginning, which is what clears `played` on that watch's first
         // progress report. Answered here rather than by storing a zero,
-        // because `watch_state.position_ms` is ALSO where a re-dispatched
+        // because `user_item_state.position_ms` is ALSO where a re-dispatched
         // transcode picks the stream back up (AR-6, `sessions.rs`) — zeroing
         // it would restart a failed-over film from the top for anyone in its
         // last ten minutes.
@@ -6431,74 +6154,12 @@ async fn item_children(
     ApiPath(id): ApiPath<String>,
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
 ) -> Result<Json<ChildrenResponse>, ApiError> {
-    let rows = sqlx::query(
-        "SELECT i.id, i.kind, i.year, i.season, i.episode, i.episode_end, i.artist,
-                COALESCE(md.title, i.title) AS title,
-                md.premiered AS premiered,
-                md.updated_at AS art_version,
-                md.proj_season, md.proj_episode,
-                COUNT(DISTINCT ps.id) AS sources,
-                -- HUB-19: the file's own loudness statement, passed
-                -- through for the player to apply. MIN() picks one
-                -- deterministically when an item has several sources;
-                -- copies of one track carry the same measurement, and
-                -- where they disagree the difference is under a dB.
-                MIN(json_extract(f.streams_json, '$.replay_gain')) AS replay_gain,
-                -- UI-4. SUM within a source, MIN across them. The join is one
-                -- row per FILE, so a bare MIN is taken over parts as well as
-                -- alternatives: a two-part episode of 45 minutes a side
-                -- reported 45, and so did a 90-minute single-file encode
-                -- sitting beside it. Which of the two is longer is not the
-                -- question — how long the work is, is.
-                (SELECT MIN(d) FROM (
-                   SELECT SUM(json_extract(f2.streams_json, '$.duration_ms')) AS d
-                     FROM playable_sources ps2
-                     JOIN playable_source_parts psp2 ON psp2.playable_source_id = ps2.id
-                     JOIN files f2 ON f2.id = psp2.file_id
-                    WHERE ps2.item_id = i.id
-                    GROUP BY ps2.id
-                    -- Only sources that could actually play, which is the
-                    -- same completeness `sessions::source_parts` requires:
-                    -- the ordinals are exactly 1..=expected, and every part
-                    -- has a running time. Without it a half-scanned two-CD
-                    -- source undercounts — SQLite's SUM skips NULLs — and
-                    -- the MIN outside prefers exactly that undercount, so a
-                    -- 90-minute film beside it reported 45.
-                    --
-                    -- DISTINCT and MAX rather than a plain COUNT: the primary
-                    -- key is (source, file), not (source, ordinal), so two
-                    -- files both numbered 1 satisfy a count and are refused by
-                    -- playback. With `ordinal > 0` checked by the schema, a
-                    -- distinct count and a maximum that both equal the
-                    -- expected number can only be 1..=expected.
-                   HAVING COUNT(DISTINCT psp2.ordinal) = ps2.expected_parts
-                      AND MAX(psp2.ordinal) = ps2.expected_parts
-                      AND COUNT(json_extract(f2.streams_json, '$.duration_ms'))
-                          = ps2.expected_parts
-                 )) AS file_duration_ms,
-                w.position_ms, w.duration_ms, w.played, w.play_count
-         FROM items i
-         LEFT JOIN playable_sources ps ON ps.item_id=i.id
-         LEFT JOIN playable_source_parts psp ON psp.playable_source_id=ps.id
-         LEFT JOIN files f ON f.id=psp.file_id
-         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
-         LEFT JOIN resolved_metadata md ON md.item_id = i.id
-         WHERE i.parent_id = ?
-         GROUP BY i.id ORDER BY i.season, i.episode",
-    )
-    .bind(&claims.sub)
-    .bind(&id)
-    .fetch_all(state.registry.db())
-    .await
-    .map_err(internal)?;
-    let children = rows
-        .iter()
-        .map(|row| item_row(row, row.get::<i64, _>("sources")))
-        .collect();
-    Ok(Json(ChildrenResponse { children }))
+    library_api::children(&state, &claims, &id).await.map(Json)
 }
 #[derive(Serialize, ToSchema)]
 struct ItemSource {
+    /// Assignment owner shared by every file part of this source.
+    collection_item_id: String,
     module_id: String,
     collection_id: String,
     /// Collection-relative media path. This is intentional client data: the
@@ -6705,7 +6366,7 @@ impl From<kahawai_core::media::MediaInfo> for ClientMediaInfo {
     }
 }
 
-#[derive(Serialize, ToSchema)]
+#[derive(Default, Serialize, ToSchema)]
 struct ItemMetadata {
     #[schema(required)]
     overview: Option<String>,
@@ -6770,6 +6431,8 @@ struct RelatedItem {
 
 #[derive(Serialize, ToSchema)]
 struct ItemDetailResponse {
+    library_revision: i64,
+    copies: Vec<library_api::CollectionCopy>,
     #[serde(flatten)]
     item: ItemRow<Vec<ItemSource>>,
     #[schema(required)]
@@ -6895,7 +6558,7 @@ async fn item_detail(
 /// `with_streams` is what separates them: the scan's `MediaInfo` per
 /// source is an answer to "what is in the file", and belongs to the
 /// request that asked a question about playing it.
-async fn item_body(
+async fn collection_body(
     state: &AppState,
     id: &str,
     user_id: &str,
@@ -6925,9 +6588,9 @@ async fn item_body(
                           = ps2.expected_parts
                  )) AS file_duration_ms,
                 w.position_ms, w.duration_ms, w.played, w.play_count
-         FROM items i
-         LEFT JOIN items p ON p.id = i.parent_id
-         LEFT JOIN watch_state w ON w.item_id = i.id AND w.user_id = ?
+         FROM collection_items i
+         LEFT JOIN collection_items p ON p.id = i.parent_id
+         LEFT JOIN collection_watch_state w ON w.item_id = i.id AND w.user_id = ?
          LEFT JOIN resolved_metadata md ON md.item_id = i.id
          LEFT JOIN resolved_metadata pmd ON pmd.item_id = p.id
          WHERE i.id = ?",
@@ -6988,6 +6651,7 @@ async fn item_body(
                 })
                 .flatten();
             ItemSource {
+                collection_item_id: id.to_string(),
                 available: state.registry.is_connected(&module_id),
                 module_id,
                 collection_id: r.get("collection_id"),
@@ -7025,7 +6689,7 @@ async fn item_body(
                 -- by a human.
                 (SELECT p2.provider_id FROM provider_metadata p2
                   WHERE p2.item_id = COALESCE(
-                          (SELECT sh.id FROM items sh
+                          (SELECT sh.id FROM collection_items sh
                             WHERE sh.id = i.parent_id AND sh.kind = 'show'),
                           CASE WHEN i.parent_id IS NULL THEN i.id END)
                     AND p2.provider = 'tmdb' AND p2.provider_id != ''
@@ -7040,7 +6704,7 @@ async fn item_body(
                                        AND rj.provider_id = p2.provider_id)) AS keyed_tmdb,
                 (SELECT p2.provider_id FROM provider_metadata p2
                   WHERE p2.item_id = COALESCE(
-                          (SELECT sh.id FROM items sh
+                          (SELECT sh.id FROM collection_items sh
                             WHERE sh.id = i.parent_id AND sh.kind = 'show'),
                           CASE WHEN i.parent_id IS NULL THEN i.id END)
                     AND p2.provider = 'tvdb' AND p2.provider_id != ''
@@ -7109,7 +6773,7 @@ async fn item_body(
                 COALESCE(NULLIF(m.cast_json, ''), NULLIF(pm.cast_json, '')) AS cast_json,
                 COALESCE(NULLIF(m.original_language, ''),
                          NULLIF(pm.original_language, '')) AS original_language
-         FROM items i
+         FROM collection_items i
          JOIN resolved_metadata m ON m.item_id IN (i.id, i.parent_id)
          LEFT JOIN resolved_metadata pm ON pm.item_id = i.parent_id
          WHERE i.id = ? AND m.provider_id != ''
@@ -7209,6 +6873,8 @@ async fn item_body(
         })
         .collect();
     Ok(ItemDetailResponse {
+        library_revision: 0,
+        copies: Vec::new(),
         chapters,
         item: item_row(&item, sources),
         show_title,
@@ -7344,6 +7010,7 @@ fn group_chapters(
 /// are actually playing.
 #[derive(Deserialize, Default, ToSchema)]
 struct ItemQuery {
+    source_id: Option<i64>,
     /// Absent = the conservative fallback, exactly as `start_session`
     /// treats a missing profile.
     #[serde(default)]
@@ -7427,6 +7094,8 @@ async fn item_query(
     ))?;
 
     let mut out = item_body(&state, &id, &claims.sub, true).await?;
+    let id = out.item.id.clone();
+    let representative_copy = out.copies[0].id.clone();
     let mut neg = crate::sessions::Negotiation::new(
         &state.sessions,
         &state.registry,
@@ -7457,7 +7126,10 @@ async fn item_query(
     // offline has none right now. Both are ordinary items whose detail
     // page must still load, so the converged half comes back null with
     // the reason beside it.
-    let (parts, info, sp, mode) = match neg.best_source(&id, q.mode.as_deref()).await {
+    let (parts, info, sp, mode) = match neg
+        .best_source(&id, q.mode.as_deref(), None, q.source_id, None)
+        .await
+    {
         Ok(v) => v,
         Err(e) => {
             let unavailable = if out.item.sources.is_empty() {
@@ -7486,7 +7158,7 @@ async fn item_query(
                 item: out,
                 query: ItemQueryResult {
                     negotiated: None,
-                    segments: crate::segments::for_item(state.registry.db(), &id)
+                    segments: crate::segments::for_item(state.registry.db(), &representative_copy)
                         .await
                         .unwrap_or_else(|e| {
                             tracing::warn!(item = %id, error = format!("{e:#}"),
@@ -7507,6 +7179,13 @@ async fn item_query(
         }
     };
 
+    out.item.duration_ms = if parts.len() > 1 {
+        Some(parts.iter().map(|p| p.duration_ms).sum::<u64>())
+    } else {
+        info.duration_ms
+    }
+    .map(|ms| ms as i64);
+    let (source_id, playable_source_id):(String,i64)=sqlx::query_as("SELECT ps.item_id,ps.id FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id WHERE p.file_id=?").bind(parts[0].file_id).fetch_one(state.registry.db()).await.map_err(internal)?;
     let mut verdicts = sp.subtitles.clone();
     crate::sessions::fill_verdict_track_ids(&state.registry, &parts, &mut verdicts).await;
     // The unified track list for the source the negotiation ACTUALLY
@@ -7518,7 +7197,7 @@ async fn item_query(
             .subtitles
             .list(
                 &state.registry,
-                &id,
+                &source_id,
                 neg.profile(),
                 &neg.ass,
                 &claims.sub,
@@ -7535,15 +7214,11 @@ async fn item_query(
     // as tiebreak, and on a multi-rendition item the two can disagree — a 4K
     // HEVC that needs a transcode beside a 1080p that direct-plays. When
     // negotiation chose, its choice supplies the ticks.
-    if let Some(part) = parts.first()
-        && let Some(of_group) = out.item.sources.iter().find(|s| {
-            // Size too: ItemSource does not carry the root token, and two
-            // roots of one collection can hold the same relative path.
-            s.module_id == part.module_id
-                && s.collection_id == part.collection_id
-                && s.path_rel == part.path_rel
-                && s.size == part.size as i64
-        })
+    if let Some(of_group) = out
+        .item
+        .sources
+        .iter()
+        .find(|s| s.source_id == playable_source_id)
     {
         let group = of_group.source_id;
         let members: Vec<_> = out
@@ -7573,12 +7248,7 @@ async fn item_query(
         out.item
             .sources
             .iter()
-            .find(|source| {
-                source.module_id == part.module_id
-                    && source.collection_id == part.collection_id
-                    && source.path_rel == part.path_rel
-                    && source.size == part.size as i64
-            })
+            .find(|source| source.source_id == playable_source_id)
             .map(|source| NegotiatedSource {
                 source_id: source.source_id,
                 module_id: part.module_id.clone(),
@@ -7609,7 +7279,7 @@ async fn item_query(
                 },
                 subtitles,
             }),
-            segments: crate::segments::for_item(state.registry.db(), &id)
+            segments: crate::segments::for_item(state.registry.db(), &source_id)
                 .await
                 .unwrap_or_else(|e| {
                     // Swallowed on purpose — the item must load — but LOUDLY:
@@ -7686,20 +7356,20 @@ async fn post_progress(
     // A track keeps no resume POSITION — but it keeps its played mark, which
     // the album page renders per row.
     //
-    // Continue-watching is driven off `watch_state` and excludes tracks by
+    // Continue-watching is driven off `user_item_state` and excludes tracks by
     // kind, but only AFTER joining `items`: every track ever skipped part-way
     // left a row matching both of its predicates that was then thrown away, and
     // nothing prunes them. A shuffle listener accumulates tens of thousands and
     // the home page pays for all of them, twice, on every load. Storing zero
     // keeps them out of that set for good, and costs nothing else: a record is
     // resumed from its place in the queue, never from a stored offset.
-    let is_track = sqlx::query_scalar::<_, String>("SELECT kind FROM items WHERE id = ?")
+    let is_track = sqlx::query_scalar::<_, String>("SELECT kind FROM library_items WHERE id = ?")
         .bind(&session.item_id)
         .fetch_optional(state.registry.db())
         .await
         .ok()
         .flatten()
-        .is_some_and(|k| k == "track");
+        .is_some_and(|k| k == "song");
     let stored_position = if is_track { 0 } else { body.position_ms };
     // A report from the very start is not a statement that this has not
     // been seen — and one arrives for something nobody has touched. The
@@ -7718,11 +7388,53 @@ async fn post_progress(
     // taking it as "not finished" left the two halves of one rule
     // disagreeing: the item read as played while the session that played
     // it had forgotten, so the play went uncounted.
+    let mut tx = state.registry.db().begin().await.map_err(internal)?;
+    let library_item_ids = crate::library::canonical_ids(&mut tx, &session.library_item_ids)
+        .await
+        .map_err(internal)?;
+    let visited = session.visit_members(body.position_ms);
+    let mut states = Vec::new();
+    if session.boundaries.is_empty() {
+        for id in &library_item_ids {
+            states.push(serde_json::json!({"id":id,"position":stored_position,"duration":duration,"played":finished,"at_start":at_start}));
+        }
+    } else {
+        for boundary in &session.boundaries {
+            if body.position_ms < boundary.start_ms {
+                continue;
+            }
+            let id = crate::library::canonical_id(&mut tx, &boundary.library_item_id)
+                .await
+                .map_err(internal)?;
+            let duration = boundary.end_ms - boundary.start_ms;
+            let position = body
+                .position_ms
+                .saturating_sub(boundary.start_ms)
+                .min(duration);
+            // Seeking into a later member is not a viewing of earlier members.
+            if !visited.contains(&boundary.library_item_id) {
+                continue;
+            }
+            states.push(serde_json::json!({"id":id,"position":position,"duration":duration,"played":position.saturating_mul(10)>=duration.saturating_mul(9),"at_start":position==0}));
+        }
+    }
+    if states.is_empty() {
+        session
+            .last_position_ms
+            .store(body.position_ms, std::sync::atomic::Ordering::Relaxed);
+        return Ok(Json(ProgressResponse {
+            position_ms: body.position_ms,
+            played: false,
+            play_count: 0,
+        }));
+    }
+
     let row = sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, 0, unixepoch())
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at,resume_source_fingerprint)
+         SELECT ?1,json_extract(value,'$.id'),json_extract(value,'$.position'),json_extract(value,'$.duration'),json_extract(value,'$.played'),0,unixepoch(),?3 FROM json_each(?2) WHERE 1
          ON CONFLICT (user_id, item_id) DO UPDATE SET
            position_ms = excluded.position_ms,
+           resume_source_fingerprint = CASE WHEN excluded.position_ms=0 THEN user_item_state.resume_source_fingerprint ELSE ?3 END,
            duration_ms = excluded.duration_ms,
            -- Not MAX(): a high-water mark is what made this a counter
            -- wearing a boolean's clothes. `played` is where the playhead
@@ -7733,27 +7445,29 @@ async fn post_progress(
            -- `at_start`. NOT `excluded.position_ms`, which is stored as 0
            -- for every track and would freeze their marks in both
            -- directions — this is what the report SAID.
-           played = CASE WHEN ?6 THEN played ELSE ?5 END,
+           played = CASE WHEN json_extract((SELECT value FROM json_each(?2) WHERE json_extract(value,'$.id')=excluded.item_id),'$.at_start') THEN played ELSE excluded.played END,
            -- The up-next row reads this as the last time an episode was
            -- finished. A zero report says nothing about `played`, so letting
            -- it refresh the timestamp would make a preload or untouched
            -- restarted player look like a newly completed watch.
-           updated_at = CASE WHEN ?6 THEN updated_at ELSE unixepoch() END
+           updated_at = CASE WHEN json_extract((SELECT value FROM json_each(?2) WHERE json_extract(value,'$.id')=excluded.item_id),'$.at_start') THEN updated_at ELSE unixepoch() END
          RETURNING played, play_count",
     )
     .bind(&claims.sub)
-    .bind(&session.item_id)
-    .bind(stored_position as i64)
-    .bind(duration.map(|d| d as i64))
-    .bind(finished)
-    .bind(at_start)
-    .fetch_one(state.registry.db())
+    .bind(serde_json::to_string(&states).map_err(internal)?)
+    .bind(&session.source_fingerprint)
+    .fetch_one(&mut *tx)
     .await
     .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
+    session
+        .last_position_ms
+        .store(body.position_ms, std::sync::atomic::Ordering::Relaxed);
     // Publish the per-session half only after the durable half succeeded, and
     // while teardown is still excluded by `report_guard`.
     if !at_start {
         session.report(finished);
+        session.report_members(body.position_ms);
     }
     drop(report_guard);
     Ok(Json(ProgressResponse {
@@ -7842,19 +7556,21 @@ async fn item_set_watched(
     // `duration_ms` is absent from the SET list, so an existing one
     // survives being marked watched. Progress overwrites it because
     // progress has just measured it; this has not.
-    let rows = sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
+    let visible = library_api::visible("i");
+    let album = library_api::album_child("i", "?4");
+    let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
          SELECT ?1, i.id, 0, NULL, ?3, ?3, unixepoch()
-           FROM items i
+           FROM library_entries i
           WHERE i.id IN (SELECT value FROM json_each(?2))
-            AND (i.id = ?4 OR i.parent_id = ?4)
+            AND (i.id = ?4 OR i.parent_id = ?4 OR {album}) AND {visible}
          ON CONFLICT (user_id, item_id) DO UPDATE SET
            position_ms = 0,
            play_count = play_count + (excluded.played AND NOT played),
            played = excluded.played,
            updated_at = unixepoch()
-         RETURNING item_id, played, play_count",
-    )
+         RETURNING item_id, played, play_count"
+    )))
     .bind(&claims.sub)
     .bind(&list)
     .bind(body.played)
@@ -8008,7 +7724,7 @@ async fn session_file(
             Some((num, ext)) if num.chars().all(|c| c.is_ascii_digit()) => {
                 let track = crate::tracks::get_for_item(
                     state.registry.db(),
-                    &session.item_id,
+                    &session.collection_item_id,
                     num.parse().unwrap(),
                 )
                 .await
@@ -8497,7 +8213,8 @@ mod tests {
             ("post", "/admin/v1/libraries/{id}/refresh"),
             ("get", "/admin/v1/enrich/review"),
             ("post", "/admin/v1/enrich/search"),
-            ("post", "/admin/v1/items/{id}/match"),
+            ("post", "/admin/v1/collection-items/{id}/match"),
+            ("put", "/admin/v1/library-items/{id}/metadata"),
             ("get", "/admin/v1/sessions"),
             ("delete", "/admin/v1/sessions/{id}"),
             ("get", "/admin/v1/sessions/{id}/log"),

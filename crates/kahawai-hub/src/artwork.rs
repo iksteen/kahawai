@@ -337,7 +337,7 @@ impl Artwork {
         }
         let mut albums = manifest.albums.iter().map(String::as_str);
         let visible: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT i.id) FROM items i
+            "SELECT COUNT(DISTINCT i.id) FROM collection_items i
                JOIN library_collections lc
                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
               WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
@@ -377,7 +377,7 @@ impl Artwork {
         let rows = sqlx::query(
             "SELECT lc.library_id,i.artist_key,i.id,md.poster_path,md.updated_at,
                     COALESCE(i.year,CAST(substr(md.premiered,1,4) AS INTEGER)) AS release_year
-               FROM items i
+               FROM collection_items i
                JOIN library_collections lc
                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
                LEFT JOIN resolved_metadata md ON md.item_id=i.id
@@ -867,7 +867,7 @@ pub const LOCAL: &str = "local://";
 /// fallback for episodes.
 async fn resolved_poster(registry: &Registry, item_id: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar(
-        "SELECT m.poster_path FROM items i
+        "SELECT m.poster_path FROM collection_items i
          JOIN resolved_metadata m ON m.item_id IN (i.id, i.parent_id)
          WHERE i.id = ? AND m.poster_path IS NOT NULL
          ORDER BY m.item_id = i.id DESC LIMIT 1",
@@ -890,7 +890,7 @@ pub(crate) async fn find_artwork_source(
          FROM files f JOIN collection_roots r ON r.id=f.root_id
          WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
                 AND (fb.item_id=?1 OR fb.item_id IN
-                     (SELECT id FROM items WHERE parent_id=?1)))
+                     (SELECT id FROM collection_items WHERE parent_id=?1)))
            AND art IS NOT NULL
          ORDER BY f.size DESC",
     )
@@ -1056,7 +1056,7 @@ mod tests {
             let id = format!("album-{number}");
             let poster = format!("https://covers.example/{number}.jpg");
             sqlx::query(
-                "INSERT INTO items
+                "INSERT INTO collection_items
                    (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
                  VALUES(?,'album',?,?,?,?,'Artist','artist','artist-key','host','albums')",
             )
@@ -1084,7 +1084,7 @@ mod tests {
         }
         let private_poster = "https://covers.example/private.jpg";
         sqlx::query(
-            "INSERT INTO items
+            "INSERT INTO collection_items
                (id,kind,title,norm_title,sort_title,year,artist,norm_artist,artist_key,module_id,collection_id)
              VALUES('private-album','album','Private','private','private',2099,
                     'Artist','artist','artist-key','host','private-albums')",

@@ -26,7 +26,7 @@ const DAY: u64 = 24 * 60 * 60;
 async fn harness() -> (
     axum::Router,
     Arc<kahawai_hub::auth::Auth>,
-    kahawai_sqlite::Database,
+    kahawai_hub::library::Database,
 ) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
@@ -116,7 +116,7 @@ fn id_added(days_ago: u64) -> String {
     ulid::Ulid::from_parts(now_ms() - days_ago * DAY * 1000, seq as u128).to_string()
 }
 
-async fn collection(db: &kahawai_sqlite::Database, library: Option<&str>) -> String {
+async fn collection(db: &kahawai_hub::library::Database, library: Option<&str>) -> String {
     sqlx::query(
         "INSERT OR IGNORE INTO satellites(module_id,module_type,name,cert_fingerprint)
          VALUES('fixture','mediahost','fixture','fp')",
@@ -147,10 +147,15 @@ async fn collection(db: &kahawai_sqlite::Database, library: Option<&str>) -> Str
     collection
 }
 
-async fn seed_show(db: &kahawai_sqlite::Database, id: &str, title: &str, library: Option<&str>) {
+async fn seed_show(
+    db: &kahawai_hub::library::Database,
+    id: &str,
+    title: &str,
+    library: Option<&str>,
+) {
     let collection = collection(db, library).await;
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
          VALUES(?,'show',?,?,?,'fixture',?)",
     )
     .bind(id)
@@ -168,7 +173,7 @@ async fn seed_show(db: &kahawai_sqlite::Database, id: &str, title: &str, library
 /// Episodes use a twenty-minute runtime so unfinished rows exercise the
 /// Continue Watching threshold as well as the boolean mark.
 async fn seed_episode(
-    db: &kahawai_sqlite::Database,
+    db: &kahawai_hub::library::Database,
     show: &str,
     title: &str,
     season: i64,
@@ -178,9 +183,9 @@ async fn seed_episode(
 ) -> String {
     let id = id_added(added_days_ago);
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+        "INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,
                            parent_id,season,episode)
-         SELECT ?,'episode',?,?,?,module_id,collection_id,id,?,? FROM items WHERE id = ?",
+         SELECT ?,'episode',?,?,?,module_id,collection_id,id,?,? FROM collection_items WHERE id = ?",
     )
     .bind(&id)
     .bind(title)
@@ -194,7 +199,7 @@ async fn seed_episode(
     .unwrap();
     if let Some((position_ms, played, days_ago)) = watch {
         sqlx::query(
-            "INSERT INTO watch_state
+            "INSERT INTO user_item_state
                     (user_id, item_id, position_ms, duration_ms, played, updated_at)
              SELECT id, ?, ?, 1200000, ?, unixepoch() - ?
                FROM users WHERE username = 'owner'",
@@ -363,13 +368,13 @@ async fn up_next_follows_the_last_finished_episode_and_not_the_first_unwatched_o
     // everything, so finishing it offers S01E01 rather than nothing.
     seed_show(&db, "s_special", "Special", None).await;
     let special = seed_episode(&db, "s_special", "Special extra", 0, 0, 200, None).await;
-    sqlx::query("UPDATE items SET season = NULL, episode = NULL WHERE id = ?")
+    sqlx::query("UPDATE collection_items SET season = NULL, episode = NULL WHERE id = ?")
         .bind(&special)
         .execute(&db)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, played, updated_at)
          SELECT id, ?, 0, 1, unixepoch() - 259200 FROM users WHERE username = 'owner'",
     )
     .bind(&special)
@@ -419,7 +424,7 @@ async fn up_next_respects_library_grants_and_scoping() {
     // first episode of both.
     for (id, days) in [(&a1, 2), (&b1, 1)] {
         sqlx::query(
-            "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
+            "INSERT INTO user_item_state (user_id, item_id, position_ms, played, updated_at)
              SELECT id, ?, 0, 1, unixepoch() - ? FROM users WHERE username = 'owner'",
         )
         .bind(id)
@@ -465,7 +470,7 @@ async fn up_next_respects_library_grants_and_scoping() {
         .unwrap();
     for (id, days) in [(&a1, 2), (&b1, 1)] {
         sqlx::query(
-            "INSERT INTO watch_state (user_id, item_id, position_ms, played, updated_at)
+            "INSERT INTO user_item_state (user_id, item_id, position_ms, played, updated_at)
              VALUES (?, ?, 0, 1, unixepoch() - ?)",
         )
         .bind(&uid)

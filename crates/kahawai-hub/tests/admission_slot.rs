@@ -47,7 +47,7 @@ async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) 
         .await
         .unwrap();
     registry.connected("01HOST", "mediahost", "nas", "fp", "test");
-    let item: String = sqlx::query_scalar("SELECT id FROM items LIMIT 1")
+    let item: String = sqlx::query_scalar("SELECT id FROM collection_items LIMIT 1")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -73,7 +73,7 @@ async fn start_once(registry: &Registry, sessions: &Arc<Sessions>, item: &str) -
             item,
             Some("direct"),
             None,
-            0,
+            0.into(),
             0,
             0,
             None,
@@ -108,7 +108,7 @@ async fn an_abandoned_start_does_not_keep_its_slot() {
                 &item,
                 Some("direct"),
                 None,
-                0,
+                0.into(),
                 0,
                 0,
                 None,

@@ -9,6 +9,10 @@
 //! Local metadata (embedded tags) acts earlier, at resolution time —
 //! it decides identity before enrichment ever runs (HUB-9, partial).
 //!
+//! Source IDs in this module are `collection_items.id`. Catalogue work IDs,
+//! cross-copy assignments and history are described in [`crate::catalog`].
+//! Provider answers remain source evidence when a copy changes catalogue work.
+//!
 //! # Inputs and derivations
 //!
 //! Every table here is one of two things, and which one it is decides who
@@ -22,7 +26,7 @@
 //! **Derivations** are functions of the inputs, stored only because a read
 //! cannot afford to compute them — browse cannot sort on a value resolved per
 //! row and still answer in 200 ms. `item_match` (which record an item IS) and
-//! `items.sort_title` (0035) are of this kind. Triggers maintain them on every
+//! `collection_items.sort_title` (0035) are of this kind. Triggers maintain them on every
 //! write to `provider_metadata`, `provider_ranks`, `rejected_matches`,
 //! `manual_match`, `collections`, or collection ownership on `items`; there is
 //! nothing for a caller to remember.
@@ -32,7 +36,7 @@
 //! correct depended on someone remembering to call something. Triggers
 //! remove the someone. That is why `set_chain` is one INSERT and
 //! `store_answer` is one upsert — reordering the chain re-decides
-//! ownership of a whole media type, and neither function knows it.
+//! source assignment for a whole media type, and neither function knows it.
 //!
 //! It also means a derivation must not carry an input as a column. The
 //! human pin used to be `item_match.manual`, which forced the pick to
@@ -115,8 +119,8 @@
 //!   asked", "only misses" and "everything refused" are all no row.
 //!   Maintained by [`repick_triggers`].
 
+use crate::library::Database as SqlitePool;
 use anyhow::Result;
-use kahawai_sqlite::Database as SqlitePool;
 
 /// One item as the chain walker sees it. The `anime_*` fields carry the
 /// selection context the anime chain needs (existing verified match,
@@ -344,11 +348,11 @@ SELECT item_id, provider, provider_id, media_type, pinned, unixepoch() FROM (
       SELECT i.id AS item_id,
              CASE WHEN c.media_type IN ('movies','series','anime','music')
                   THEN c.media_type ELSE 'movies' END AS media_type
-        FROM items i JOIN collections c
+        FROM collection_items i JOIN collections c
           ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
        -- Top level only. Episodes and tracks follow their parent, and this
        -- filter is the only thing enforcing that.
-       WHERE i.kind IN ('movie','show','album')
+       WHERE (i.kind IN ('movie','show','album') OR EXISTS(SELECT 1 FROM manual_match pin WHERE pin.item_id=i.id))
          AND (?1 IS NULL OR i.id = ?1)
     ) t
     JOIN provider_metadata pm ON pm.item_id = t.item_id
@@ -447,7 +451,7 @@ fn repick_body(item: Option<&str>, media_type: Option<&str>) -> String {
 /// recompute each, thousands per run. **WHEN guards** skip cascades whose
 /// parent item is already gone.
 pub fn repick_triggers() -> Vec<(String, String)> {
-    let survives = "EXISTS (SELECT 1 FROM items WHERE id = OLD.item_id)";
+    let survives = "EXISTS (SELECT 1 FROM collection_items WHERE id = OLD.item_id)";
 
     let mut out = Vec::new();
     let mut add = |name: &str, event: &str, table: &str, when: Option<String>, body: String| {
@@ -551,7 +555,7 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     add(
         "repick_item_collection_upd",
         "UPDATE OF module_id, collection_id",
-        "items",
+        "collection_items",
         None,
         repick_body(Some("NEW.id"), None),
     );
@@ -625,7 +629,7 @@ pub async fn reschedule(db: &SqlitePool, item_id: &str, provider: &str, reason: 
     let _ = sqlx::query(
         "INSERT INTO enrichment_queue (item_id, provider, due_at, attempts, reason)
          SELECT ?, ?, unixepoch() + ?, 1, ?
-          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
+          WHERE EXISTS (SELECT 1 FROM collection_items WHERE id = ?)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            due_at = unixepoch() + ?,
            attempts = enrichment_queue.attempts + 1,
@@ -687,7 +691,7 @@ fn chain_name(provider: &str) -> &str {
 /// The chain an item belongs to comes directly from its collection.
 pub async fn media_type_of_item(db: &SqlitePool, item_id: &str) -> String {
     let mt: Option<String> = sqlx::query_scalar(
-        "SELECT c.media_type FROM items i JOIN collections c
+        "SELECT c.media_type FROM collection_items i JOIN collections c
            ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
           WHERE i.id=?1",
     )
@@ -785,7 +789,7 @@ pub async fn record_question(
     let _ = sqlx::query(
         "INSERT INTO provider_queries (item_id, provider, query_type, query, rev, asked_at)
          SELECT ?, ?, ?, ?, ?, unixepoch()
-          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
+          WHERE EXISTS (SELECT 1 FROM collection_items WHERE id = ?)
          ON CONFLICT (item_id, provider, query_type, query)
          DO UPDATE SET rev = excluded.rev, asked_at = excluded.asked_at",
     )
@@ -868,7 +872,7 @@ INSERT INTO provider_metadata
             premiered, original_language, genres, cast_json, provider_artist_id,
             confidence, updated_at)
          SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()
-          WHERE EXISTS (SELECT 1 FROM items WHERE id = ?)
+          WHERE EXISTS (SELECT 1 FROM collection_items WHERE id = ?)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            provider_id = excluded.provider_id,
            title = excluded.title,
@@ -930,6 +934,18 @@ pub async fn assign_manual(
     fields: Fields,
 ) -> Result<()> {
     let mut tx = db.begin().await?;
+    assign_manual_in(&mut tx, item_id, provider, provider_id, fields).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn assign_manual_in(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: &str,
+    provider: &str,
+    provider_id: &str,
+    fields: Fields,
+) -> Result<()> {
     bind_answer(
         sqlx::query(STORE_ANSWER),
         item_id,
@@ -959,7 +975,6 @@ pub async fn assign_manual(
         .bind(provider_id)
         .execute(&mut *tx)
         .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -1287,7 +1302,7 @@ SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
        -- 0 sorts first: the assigned provider, then the preference order.
        (pm.provider IS NOT COALESCE(own.provider, par.provider)) AS not_chosen,
        COALESCE(r.rank, 99) AS rank
-  FROM items i
+  FROM collection_items i
   JOIN provider_metadata pm ON pm.item_id = i.id
   LEFT JOIN item_match own ON own.item_id = i.id
   LEFT JOIN item_match par ON par.item_id = i.parent_id
@@ -1357,7 +1372,7 @@ SELECT i.id AS item_id,
   -- changes no answer's updated_at.
   (SELECT NULLIF(MAX(MAX(ap.updated_at), MAX(ap.assigned_at)), 0)
      FROM answer_priority ap WHERE ap.item_id = i.id) AS updated_at
-FROM items i"
+FROM collection_items i"
     )
 }
 
@@ -1414,7 +1429,7 @@ mod tests {
         .await
         .unwrap();
         sqlx::query(
-            "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+            "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
              VALUES('item','movie','Item','item','fixture','default')",
         )
         .execute(db)

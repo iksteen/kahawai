@@ -340,7 +340,7 @@ fn exact_artist_search_id(
 
 #[allow(clippy::too_many_arguments)]
 async fn store_artist_artwork(
-    db: &kahawai_sqlite::Database,
+    db: &crate::library::Database,
     artist_key: &str,
     artist_name: &str,
     musicbrainz_id: Option<&str>,
@@ -376,7 +376,7 @@ async fn store_artist_artwork(
 }
 
 async fn store_backfilled_artist_identity(
-    db: &kahawai_sqlite::Database,
+    db: &crate::library::Database,
     artist_key: &str,
     release_group: &str,
     artist_id: &str,
@@ -390,7 +390,7 @@ async fn store_backfilled_artist_identity(
         "UPDATE provider_metadata SET provider_artist_id=?
           WHERE provider='musicbrainz' AND provider_id=?
             AND provider_artist_id IS NULL
-            AND item_id IN (SELECT id FROM items WHERE artist_key=?)",
+            AND item_id IN (SELECT id FROM collection_items WHERE artist_key=?)",
     )
     .bind(artist_id)
     .bind(release_group)
@@ -401,7 +401,7 @@ async fn store_backfilled_artist_identity(
 }
 
 async fn store_direct_artist_identity(
-    db: &kahawai_sqlite::Database,
+    db: &crate::library::Database,
     artist_key: &str,
     artist_id: &str,
 ) -> Result<()> {
@@ -411,7 +411,7 @@ async fn store_direct_artist_identity(
     sqlx::query(
         "UPDATE provider_metadata SET provider_artist_id=?
           WHERE provider='musicbrainz' AND provider_artist_id IS NULL
-            AND item_id IN (SELECT id FROM items WHERE artist_key=?)",
+            AND item_id IN (SELECT id FROM collection_items WHERE artist_key=?)",
     )
     .bind(artist_id)
     .bind(artist_key)
@@ -840,7 +840,7 @@ pub fn pick_candidate<'c>(
 pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title,i.year,
                     (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE fb.item_id=i.id LIMIT 1) AS src_path,
                     c0.media_type AS media_type
-             FROM items i JOIN collections c0
+             FROM collection_items i JOIN collections c0
                ON (c0.module_id,c0.collection_id)=(i.module_id,i.collection_id)
              WHERE i.kind IN ('movie', 'show')
                AND (
@@ -877,12 +877,12 @@ pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN collection_items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN collection_items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- or a provider refused and is due again (bans and
@@ -2067,7 +2067,7 @@ impl Enricher {
         providers: &Arc<crate::providers::ProviderSet>,
     ) -> Result<()> {
         let albums = sqlx::query(
-            "SELECT i.id, i.title, i.norm_title, i.artist, i.norm_artist FROM items i
+            "SELECT i.id, i.title, i.norm_title, i.artist, i.norm_artist FROM collection_items i
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
                AND (
                     -- Same rule as the video pass: MusicBrainz is owed
@@ -2095,12 +2095,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN collection_items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN collection_items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                     -- Work the chain still owes: a provider that refused
@@ -2385,7 +2385,7 @@ impl Enricher {
             "SELECT DISTINCT i.artist_key,i.artist,
                     NULLIF(pm.provider_id,'') AS release_group_id,
                     pm.provider_artist_id
-               FROM items i
+               FROM collection_items i
                LEFT JOIN provider_metadata pm
                  ON pm.item_id=i.id AND pm.provider='musicbrainz'
               WHERE i.kind='album' AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
@@ -2788,7 +2788,7 @@ impl Enricher {
                     i.artist, i.norm_artist,
                     m.provider, m.provider_id, COALESCE(m.manual, 0) AS manual,
                     a.anidb_id, a.anilist_id
-             FROM items i
+             FROM collection_items i
              LEFT JOIN item_match m ON m.item_id = i.id
              LEFT JOIN anime_ids a ON a.item_id = i.id
              -- Set membership, not a join: `s.item_id = i.id OR s.item_id IN
@@ -2847,12 +2847,12 @@ impl Enricher {
                                  WHERE pl.item_id = i.id AND pl.provider = 'local'
                                    AND pl.provider_id <> '')
                         != (i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN items ch ON ch.id=fb5.item_id
+                                       FROM files f5 JOIN file_bindings fb5 ON fb5.file_id=f5.id JOIN collection_items ch ON ch.id=fb5.item_id
                                       WHERE json_extract(f5.streams_json, '$.nfo') IS NOT NULL)))
                     OR (NOT EXISTS (SELECT 1 FROM provider_metadata pl
                                      WHERE pl.item_id = i.id AND pl.provider = 'local')
                         AND i.id IN (SELECT COALESCE(ch.parent_id, ch.id)
-                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN items ch ON ch.id=fb4.item_id
+                                       FROM files f4 JOIN file_bindings fb4 ON fb4.file_id=f4.id JOIN collection_items ch ON ch.id=fb4.item_id
                                       WHERE json_extract(f4.streams_json, '$.artwork') IS NOT NULL
                                          OR json_extract(f4.streams_json, '$.nfo') IS NOT NULL))
                  OR EXISTS (
@@ -2861,7 +2861,7 @@ impl Enricher {
                  -- Same shape, same reason: one pass over the unmapped
                  -- hashes rather than one per candidate item.
                  OR i.id IN (SELECT COALESCE(ch.parent_id,ch.id)
-                               FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ch ON ch.id=fb.item_id
+                               FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items ch ON ch.id=fb.item_id
                               WHERE f.ed2k IS NOT NULL
                                 AND f.ed2k NOT IN (SELECT ed2k FROM ed2k_aid)))
              ORDER BY i.title",
@@ -2950,7 +2950,7 @@ impl Enricher {
         // no API calls — and it feeds HUB-31's projection backfill.
         let stale = sqlx::query(
             "SELECT a.item_id, a.anidb_id, i.kind FROM anime_ids a
-             JOIN items i ON i.id = a.item_id
+             JOIN collection_items i ON i.id = a.item_id
              WHERE a.anidb_id IS NOT NULL
                AND a.mapped_tvdb IS NULL AND a.mapped_tmdb IS NULL",
         )
@@ -3117,7 +3117,7 @@ impl Enricher {
     /// ed2k_aid table — AniDB is never asked twice for the same hash.
     pub(crate) async fn anidb_identify(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         client: &mut crate::anidb::Anidb,
         item_id: &str,
         lease: &crate::gate::CredentialLease,
@@ -3125,7 +3125,7 @@ impl Enricher {
         let Some(row) = sqlx::query(
             "SELECT f.ed2k,f.size FROM files f
              WHERE f.ed2k IS NOT NULL
-               AND (EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM items WHERE parent_id=?1))))
+               AND (EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM collection_items WHERE parent_id=?1))))
              -- Prefer a file AniDB has never been asked about: a cached
              -- miss on the alphabetically-first file must not block the
              -- siblings from ever being consulted.
@@ -3176,7 +3176,7 @@ impl Enricher {
     /// run.
     async fn resolve_episode_hashes(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         client: &mut crate::anidb::Anidb,
         show_id: &str,
         budget: usize,
@@ -3185,7 +3185,7 @@ impl Enricher {
         // A row with an aid but no epno predates 0042 and is re-asked
         // once; a NULL aid is a recorded miss and stays terminal.
         let files: Vec<(String, i64)> = sqlx::query_as(
-            "SELECT f.ed2k,f.size FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ep ON ep.id=fb.item_id
+            "SELECT f.ed2k,f.size FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items ep ON ep.id=fb.item_id
              WHERE ep.parent_id = ?1 AND f.ed2k IS NOT NULL
                -- Span episodes (batch files, 0045) answer to their
                -- range, not to a single-epno FILE reply: skip the ask.
@@ -3235,7 +3235,7 @@ impl Enricher {
     /// were invisible to it, to browse, and to AniDB alike.
     async fn resolve_bare_hashes(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         client: &mut crate::anidb::Anidb,
         budget: usize,
         lease: &crate::gate::CredentialLease,
@@ -3279,7 +3279,7 @@ impl Enricher {
     /// an identity the catalogue holds: an episode slot under the show
     /// matched to that aid, or the movie item itself. Pure database
     /// work; a file whose aid matches nothing stays bare and is logged.
-    pub async fn bind_bare_files(&self, db: &kahawai_sqlite::Database) -> Result<usize> {
+    pub async fn bind_bare_files(&self, db: &crate::library::Database) -> Result<usize> {
         let rows = sqlx::query(
             "SELECT f.id AS source_id,f.module_id,f.collection_id,f.path_rel,c.aid,c.epno
              FROM files f
@@ -3300,7 +3300,7 @@ impl Enricher {
             let module_id: String = r.get("module_id");
             let collection_id: String = r.get("collection_id");
             let owner_row = sqlx::query_as::<_, (String, String)>(
-                "SELECT i.id,i.kind FROM anime_ids a JOIN items i ON i.id=a.item_id
+                "SELECT i.id,i.kind FROM anime_ids a JOIN collection_items i ON i.id=a.item_id
                   WHERE a.anidb_id=? AND i.module_id=? AND i.collection_id=? LIMIT 1",
             )
             .bind(aid)
@@ -3343,7 +3343,7 @@ impl Enricher {
                         }
                     };
                     let existing: Option<String> = sqlx::query_scalar(
-                        "SELECT id FROM items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3",
+                        "SELECT id FROM collection_items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3 AND COALESCE(episode_end,episode)=?3",
                     )
                     .bind(&owner)
                     .bind(slot.0)
@@ -3363,7 +3363,7 @@ impl Enricher {
                                 .unwrap_or(&path)
                                 .to_string();
                             sqlx::query(
-                                "INSERT INTO items
+                                "INSERT INTO collection_items
                                    (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
                                  VALUES (?,'episode',?,?,?,?,?,?,?)",
                             )
@@ -3398,7 +3398,7 @@ impl Enricher {
     /// otherwise. Returns None for non-movie types.
     async fn mint_movie_for_aid(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         aid: u32,
         module_id: &str,
         collection_id: &str,
@@ -3416,7 +3416,7 @@ impl Enricher {
         }
         let norm = kahawai_core::names::normalize_title(&info.title);
         let twin: Option<String> = sqlx::query_scalar(
-            "SELECT i.id FROM items i WHERE i.module_id=?1 AND i.collection_id=?2
+            "SELECT i.id FROM collection_items i WHERE i.module_id=?1 AND i.collection_id=?2
                 AND i.kind='movie' AND i.norm_title=?3 AND i.year IS ?4
                 AND NOT EXISTS(SELECT 1 FROM anime_ids a
                                 WHERE a.item_id=i.id AND a.anidb_id IS NOT NULL)",
@@ -3436,7 +3436,7 @@ impl Enricher {
             None => {
                 let id = ulid::Ulid::generate().to_string();
                 sqlx::query(
-                    "INSERT INTO items
+                    "INSERT INTO collection_items
                        (id,kind,title,norm_title,year,module_id,collection_id)
                      VALUES (?,'movie',?,?,?,?,?)",
                 )
@@ -3481,14 +3481,14 @@ impl Enricher {
     /// is an artifact of the numbering the hash exists to correct.
     pub async fn bind_hashed_episodes(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         show_id: &str,
         show_aid: u32,
     ) -> Result<Vec<EpisodeRebind>> {
         let rows = sqlx::query(
             "SELECT f.id AS source_id,f.path_rel AS source_path,ep.id AS item_id,
                     ep.title,ep.norm_title,ep.season,ep.episode,c.aid,c.epno,c.eid
-             FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN items ep ON ep.id=fb.item_id
+             FROM files f JOIN file_bindings fb ON fb.file_id=f.id JOIN collection_items ep ON ep.id=fb.item_id
              JOIN ed2k_aid c ON c.ed2k = f.ed2k
              WHERE ep.parent_id = ?1 AND c.aid IS NOT NULL AND c.epno IS NOT NULL
                -- Span episodes (batch files, 0045) are their own truth;
@@ -3556,7 +3556,7 @@ impl Enricher {
             let item_id: String = r.get("item_id");
             let mut tx = db.begin().await?;
             let existing: Option<String> = sqlx::query_scalar(
-                "SELECT id FROM items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3",
+                "SELECT id FROM collection_items WHERE parent_id = ?1 AND season IS ?2 AND episode = ?3 AND COALESCE(episode_end,episode)=?3",
             )
             .bind(show_id)
             .bind(target.0)
@@ -3570,10 +3570,10 @@ impl Enricher {
                     // The file's own title travels with it: it described
                     // this content, whatever number it wore.
                     sqlx::query(
-                        "INSERT INTO items
+                        "INSERT INTO collection_items
                            (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
                          SELECT ?,'episode',?,?,?,?,?,module_id,collection_id
-                           FROM items WHERE id=?",
+                           FROM collection_items WHERE id=?",
                     )
                     .bind(&id)
                     .bind(r.get::<String, _>("title"))
@@ -3591,21 +3591,12 @@ impl Enricher {
                 .await?;
             // Watch state follows the FILE — the user watched this
             // content under whatever number it was misfiled as.
-            sqlx::query(
-                "UPDATE watch_state SET item_id = ?1
-                 WHERE item_id = ?2
-                   AND NOT EXISTS (SELECT 1 FROM watch_state w2
-                                    WHERE w2.item_id = ?1 AND w2.user_id = watch_state.user_id)",
-            )
-            .bind(&target_id)
-            .bind(&item_id)
-            .execute(&mut *tx)
-            .await?;
+            crate::registry::Registry::merge_watch_state(&mut tx, &item_id, &target_id).await?;
             // A misnumbered episode item left with no sources is a ghost
             // row in the season view; its provider answers describe the
             // NUMBER and go with it (the projection refills the target).
             sqlx::query(
-                "DELETE FROM items
+                "DELETE FROM collection_items
                  WHERE id = ?1 AND kind = 'episode'
                    AND NOT EXISTS(SELECT 1 FROM playable_sources s WHERE s.item_id=?1)",
             )
@@ -3645,7 +3636,7 @@ impl Enricher {
     /// stable, claiming nothing about a keyspace this show does not use.
     async fn break_slot_collisions(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         show_id: &str,
         occupants: Vec<SlotOccupant>,
     ) -> Result<Vec<EpisodeRebind>> {
@@ -3674,7 +3665,7 @@ impl Enricher {
                 // of a real episode 1. Measured on the live database, which
                 // the fixture had not reproduced.
                 let episode: i64 = sqlx::query_scalar(
-                    "SELECT COALESCE(MAX(episode), 0) + 1 FROM items
+                    "SELECT COALESCE(MAX(episode), 0) + 1 FROM collection_items
                       WHERE parent_id = ?1 AND season IS ?2",
                 )
                 .bind(show_id)
@@ -3691,10 +3682,10 @@ impl Enricher {
                 let mut tx = db.begin().await?;
                 let id = ulid::Ulid::generate().to_string();
                 sqlx::query(
-                    "INSERT INTO items
+                    "INSERT INTO collection_items
                        (id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
                      SELECT ?,'episode',?,?,?,?,?,module_id,collection_id
-                       FROM items WHERE id=?",
+                       FROM collection_items WHERE id=?",
                 )
                 .bind(&id)
                 .bind(&title)
@@ -3708,17 +3699,7 @@ impl Enricher {
                 crate::registry::bind_file_to_item(&mut tx, o.source_id, &id).await?;
                 // Watch state follows the FILE, as everywhere else here:
                 // the user watched this content under the shared number.
-                sqlx::query(
-                    "UPDATE watch_state SET item_id = ?1
-                      WHERE item_id = ?2
-                        AND NOT EXISTS (SELECT 1 FROM watch_state w2
-                                         WHERE w2.item_id = ?1
-                                           AND w2.user_id = watch_state.user_id)",
-                )
-                .bind(&id)
-                .bind(&o.item_id)
-                .execute(&mut *tx)
-                .await?;
+                crate::registry::Registry::merge_watch_state(&mut tx, &o.item_id, &id).await?;
                 tx.commit().await?;
 
                 tracing::info!(path = %o.path, eid = ?o.eid, epno = %o.epno,
@@ -3737,7 +3718,7 @@ impl Enricher {
     #[allow(clippy::too_many_arguments)]
     pub(crate) async fn anime_one(
         self: &Arc<Self>,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         titles: &crate::anime::AnidbTitles,
         lists: &crate::anime::AnimeLists,
         item_id: &str,
@@ -3839,7 +3820,7 @@ impl Enricher {
     /// Persist an AniList match: metadata upsert + relations graph.
     pub async fn store_anime(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item_id: &str,
         kind: &str,
         media: &crate::anime::AnilistMedia,
@@ -3960,7 +3941,7 @@ impl Enricher {
     /// human's correction or a fresher answer always wins over a
     /// reconstruction.
     pub async fn rebuild_anime_ids(
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         lists: Option<&crate::anime::AnimeLists>,
     ) -> Result<u64> {
         let done = sqlx::query(
@@ -3970,14 +3951,14 @@ impl Enricher {
                  (SELECT ea.aid FROM ed2k_aid ea
                     JOIN files f ON f.ed2k = ea.ed2k
                    WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
-                          AND (fb.item_id=i.id OR fb.item_id IN (SELECT id FROM items WHERE parent_id=i.id)))
+                          AND (fb.item_id=i.id OR fb.item_id IN (SELECT id FROM collection_items WHERE parent_id=i.id)))
                      AND ea.aid IS NOT NULL
                    -- Same file the identification used, so the same answer.
                    ORDER BY f.path_rel LIMIT 1) AS aid,
                  (SELECT CAST(pm.provider_id AS INTEGER) FROM provider_metadata pm
                    WHERE pm.item_id = i.id AND pm.provider = 'anilist'
                      AND pm.provider_id <> '') AS anilist
-               FROM items i
+               FROM collection_items i
                WHERE i.kind IN ('movie', 'show')
              )
              WHERE aid IS NOT NULL OR anilist IS NOT NULL
@@ -4039,7 +4020,7 @@ impl Enricher {
     ) -> Result<()> {
         let rows = sqlx::query(
             "SELECT pm.item_id, i.kind, pm.provider_id AS tmdb_id
-             FROM provider_metadata pm JOIN items i ON i.id = pm.item_id
+             FROM provider_metadata pm JOIN collection_items i ON i.id = pm.item_id
              WHERE pm.provider = 'tmdb' AND pm.provider_id != ''
                AND i.kind IN ('movie', 'show')
                -- Any of the three missing is worth the one request that
@@ -4170,7 +4151,7 @@ impl Enricher {
         // pages per anime show; revisit if a library full of them appears.
         let shows = sqlx::query(
             "SELECT i.id, a.mapped_tvdb, a.mapped_tmdb, a.anidb_id
-             FROM items i
+             FROM collection_items i
              JOIN item_match m ON m.item_id = i.id AND m.provider_id != ''
              LEFT JOIN anime_ids a ON a.item_id = i.id
              WHERE i.kind = 'show'
@@ -4182,7 +4163,7 @@ impl Enricher {
                -- miss goes stale after a week so airing shows converge.
                AND (EXISTS (
                  SELECT 1 FROM provider_metadata sp
-                 JOIN items e ON e.parent_id = i.id
+                 JOIN collection_items e ON e.parent_id = i.id
                  LEFT JOIN provider_metadata ep
                         ON ep.item_id = e.id AND ep.provider = sp.provider
                  WHERE sp.item_id = i.id AND sp.provider_id != ''
@@ -4191,7 +4172,7 @@ impl Enricher {
                         OR (ep.confidence = 'miss'
                             AND ep.updated_at < unixepoch() - 7 * 86400)))
                OR EXISTS (
-                 SELECT 1 FROM items e
+                 SELECT 1 FROM collection_items e
                  JOIN provider_metadata em ON em.item_id = e.id
                  WHERE e.parent_id = i.id AND e.season IS NULL
                    AND em.provider IN ('tmdb', 'tvdb')
@@ -4274,7 +4255,7 @@ impl Enricher {
     #[allow(clippy::too_many_arguments)]
     async fn enrich_show_episodes(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         show_id: &str,
         provider: &str,
         pid: &str,
@@ -4286,7 +4267,7 @@ impl Enricher {
         // Our episode items: (item_id, season, episode). season NULL =
         // absolute numbering.
         let eps = sqlx::query(
-            "SELECT id, season, episode FROM items WHERE parent_id = ? AND kind = 'episode'",
+            "SELECT id, season, episode FROM collection_items WHERE parent_id = ? AND kind = 'episode'",
         )
         .bind(show_id)
         .fetch_all(db)
@@ -4551,7 +4532,7 @@ impl Enricher {
         // generic providers at equal relevance — and vice versa.
         let anime_first = match item {
             Some(id) => sqlx::query_scalar::<_, i64>(
-                "SELECT EXISTS(SELECT 1 FROM items i JOIN collections c
+                "SELECT EXISTS(SELECT 1 FROM collection_items i JOIN collections c
                     ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
                   WHERE i.id=?1 AND c.media_type='anime')",
             )
@@ -4956,7 +4937,7 @@ mod tests {
             ("same-b", "artist-b"),
         ] {
             sqlx::query(
-                "INSERT INTO items
+                "INSERT INTO collection_items
                     (id,kind,title,norm_title,artist_key,module_id,collection_id)
                  VALUES(?,'album',?,lower(?),?,'fixture','music')",
             )
@@ -5265,7 +5246,7 @@ mod tests {
         .unwrap();
         for (id, title) in [("tmdb-debt", "TMDB"), ("local-debt", "Local")] {
             sqlx::query(
-                "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+                "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES(?,'movie',?,?,'fixture','default')",
             )
             .bind(id)
@@ -5565,7 +5546,7 @@ mod tests {
 impl Enricher {
     pub(crate) async fn store_generic(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item_id: &str,
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
@@ -5577,7 +5558,7 @@ impl Enricher {
     /// Record one provider's answer and re-merge the item (HUB-5).
     pub(crate) async fn store_answer_for(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item_id: &str,
         provider: &str,
         pick: Option<&(Candidate, &'static str)>,
@@ -5707,7 +5688,7 @@ impl TmdbProvider {
     /// — that ban applies to anime identity, not to description.
     async fn fill_gaps(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
         owner: &str,
     ) -> Result<crate::providers::Outcome> {
@@ -5788,7 +5769,7 @@ impl crate::providers::Provider for TmdbProvider {
 
     async fn enrich(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -5909,7 +5890,7 @@ impl crate::providers::Provider for TvdbProvider {
 
     async fn enrich(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -6013,7 +5994,7 @@ impl crate::providers::Provider for AnimeProvider {
 
     async fn enrich(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         if !matches!(item.kind.as_str(), "movie" | "show") {
@@ -6103,7 +6084,7 @@ impl crate::providers::Provider for MusicbrainzProvider {
 
     async fn enrich(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         let (Some(artist), "album") = (&item.artist, item.kind.as_str()) else {
@@ -6217,7 +6198,7 @@ impl crate::providers::Provider for LocalProvider {
 
     async fn enrich(
         &self,
-        db: &kahawai_sqlite::Database,
+        db: &crate::library::Database,
         item: &crate::providers::ItemRef,
     ) -> Result<crate::providers::Outcome> {
         // Both local sources come out of the scan record, so an item with
@@ -6301,7 +6282,7 @@ async fn nfo_source(
                 json_extract(f.streams_json,'$.nfo') AS nfo
          FROM files f JOIN collection_roots r ON r.id=f.root_id
          WHERE EXISTS(SELECT 1 FROM file_bindings fb WHERE fb.file_id=f.id
-                AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM items WHERE parent_id=?1)))
+                AND (fb.item_id=?1 OR fb.item_id IN (SELECT id FROM collection_items WHERE parent_id=?1)))
            AND nfo IS NOT NULL
          LIMIT 1",
     )

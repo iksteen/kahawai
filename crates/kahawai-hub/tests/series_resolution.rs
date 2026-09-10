@@ -55,7 +55,7 @@ async fn resolves_series_into_shows_and_episodes() {
         .unwrap();
 
     let shows: Vec<(String, String)> =
-        sqlx::query("SELECT id, title FROM items WHERE kind = 'show' ORDER BY title")
+        sqlx::query("SELECT id, title FROM collection_items WHERE kind = 'show' ORDER BY title")
             .fetch_all(&db)
             .await
             .unwrap()
@@ -70,7 +70,7 @@ async fn resolves_series_into_shows_and_episodes() {
 
     let andor = &shows[0].0;
     let eps: Vec<(i64, i64, String)> = sqlx::query(
-        "SELECT season, episode, title FROM items
+        "SELECT season, episode, title FROM collection_items
          WHERE kind = 'episode' AND parent_id = ? ORDER BY season, episode",
     )
     .bind(andor)
@@ -102,7 +102,7 @@ async fn resolves_series_into_shows_and_episodes() {
         )
         .await
         .unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind = 'episode'")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE kind = 'episode'")
         .fetch_all(&db)
         .await
         .unwrap()[0];
@@ -127,7 +127,7 @@ async fn resolves_series_into_shows_and_episodes() {
         .await
         .unwrap();
     let titles: Vec<String> =
-        sqlx::query_scalar("SELECT title FROM items WHERE kind = 'show' ORDER BY title")
+        sqlx::query_scalar("SELECT title FROM collection_items WHERE kind = 'show' ORDER BY title")
             .fetch_all(&db)
             .await
             .unwrap();
@@ -239,14 +239,15 @@ async fn resolves_music_into_albums_and_tracks() {
         .await
         .unwrap();
 
-    let albums: Vec<(String, String, Option<i64>)> =
-        sqlx::query("SELECT title, artist, year FROM items WHERE kind = 'album' ORDER BY artist")
-            .fetch_all(&db)
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|r| (r.get("title"), r.get("artist"), r.get("year")))
-            .collect();
+    let albums: Vec<(String, String, Option<i64>)> = sqlx::query(
+        "SELECT title, artist, year FROM collection_items WHERE kind = 'album' ORDER BY artist",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap()
+    .into_iter()
+    .map(|r| (r.get("title"), r.get("artist"), r.get("year")))
+    .collect();
     assert_eq!(
         albums,
         vec![
@@ -261,8 +262,8 @@ async fn resolves_music_into_albums_and_tracks() {
     );
 
     let tracks: Vec<(i64, String)> = sqlx::query(
-        "SELECT i.episode, i.title FROM items i
-         JOIN items a ON a.id = i.parent_id
+        "SELECT i.episode, i.title FROM collection_items i
+         JOIN collection_items a ON a.id = i.parent_id
          WHERE i.kind = 'track' AND a.artist = 'Rotting Christ'
          ORDER BY i.episode",
     )
@@ -297,7 +298,7 @@ async fn resolves_music_into_albums_and_tracks() {
         .reconcile_files("01HOST", "music", &keep)
         .await
         .unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items WHERE kind = 'album'")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items WHERE kind = 'album'")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -347,21 +348,24 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         )
         .await
         .unwrap();
-    let old_tracks: Vec<(String, String)> =
-        sqlx::query_as("SELECT id,artist FROM items WHERE kind='track' ORDER BY episode")
-            .fetch_all(&db)
+    let old_tracks: Vec<(String, String)> = sqlx::query_as(
+        "SELECT id,artist FROM collection_items WHERE kind='track' ORDER BY episode",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    let retained_album: String =
+        sqlx::query_scalar("SELECT parent_id FROM collection_items WHERE id=?")
+            .bind(&old_tracks[0].0)
+            .fetch_one(&db)
             .await
             .unwrap();
-    let retained_album: String = sqlx::query_scalar("SELECT parent_id FROM items WHERE id=?")
-        .bind(&old_tracks[0].0)
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    let pinned_album: String = sqlx::query_scalar("SELECT parent_id FROM items WHERE id=?")
-        .bind(&old_tracks[1].0)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let pinned_album: String =
+        sqlx::query_scalar("SELECT parent_id FROM collection_items WHERE id=?")
+            .bind(&old_tracks[1].0)
+            .fetch_one(&db)
+            .await
+            .unwrap();
     sqlx::query(
         "INSERT INTO provider_metadata
            (item_id,provider,provider_id,title,poster_path,confidence,updated_at)
@@ -383,7 +387,7 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
     .unwrap();
     sqlx::query(
         "INSERT INTO users(id,username,password_hash) VALUES('listener','listener','x');
-         INSERT INTO watch_state
+         INSERT INTO user_item_state
            (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
          VALUES('listener',?,42000,180000,0,3,123),
                ('listener',?,84000,180000,0,2,124)",
@@ -421,7 +425,7 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         .unwrap();
 
     let albums: Vec<(String, String)> =
-        sqlx::query_as("SELECT title,artist FROM items WHERE kind='album'")
+        sqlx::query_as("SELECT title,artist FROM collection_items WHERE kind='album'")
             .fetch_all(&db)
             .await
             .unwrap();
@@ -429,15 +433,16 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         albums,
         [("Creme de la Core".into(), "Various Artists".into())]
     );
-    let tracks: Vec<(i64, String)> =
-        sqlx::query_as("SELECT episode,artist FROM items WHERE kind='track' ORDER BY episode")
-            .fetch_all(&db)
-            .await
-            .unwrap();
+    let tracks: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT episode,artist FROM collection_items WHERE kind='track' ORDER BY episode",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
     assert_eq!(tracks, [(1, "Guest One".into()), (2, "Guest Two".into())]);
     let state: Vec<(i64, i64, i64, i64)> = sqlx::query_as(
-        "SELECT i.episode,w.position_ms,w.play_count,w.updated_at FROM watch_state w
-          JOIN items i ON i.id=w.item_id WHERE i.kind='track' ORDER BY i.episode",
+        "SELECT i.episode,w.position_ms,w.play_count,w.updated_at FROM user_item_state w
+          JOIN collection_items i ON i.id=w.item_id WHERE i.kind='track' ORDER BY i.episode",
     )
     .fetch_all(&db)
     .await
@@ -448,7 +453,7 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         "identity correction lost state"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE id=?")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM collection_items WHERE id=?")
             .bind(&old_tracks[0].0)
             .fetch_one(&db)
             .await
@@ -457,7 +462,7 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         "the first track identity should survive the correction"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM items WHERE id=?")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM collection_items WHERE id=?")
             .bind(&old_tracks[1].0)
             .fetch_one(&db)
             .await
@@ -466,7 +471,7 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
         "a free target slot should reparent rather than replace the second track"
     );
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT id FROM items WHERE kind='album'")
+        sqlx::query_scalar::<_, String>("SELECT id FROM collection_items WHERE kind='album'")
             .fetch_one(&db)
             .await
             .unwrap(),
@@ -537,7 +542,7 @@ async fn album_artist_correction_preserves_a_human_musicbrainz_pin() {
         .upsert_files("01HOST", "music", vec![tagged(None)])
         .await
         .unwrap();
-    let album: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='album'")
+    let album: String = sqlx::query_scalar("SELECT id FROM collection_items WHERE kind='album'")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -610,13 +615,14 @@ async fn replacement_at_the_same_path_does_not_inherit_item_or_watch_state() {
         )
         .await
         .unwrap();
-    let old_track: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='track'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let old_track: String =
+        sqlx::query_scalar("SELECT id FROM collection_items WHERE kind='track'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     sqlx::query(
         "INSERT INTO users(id,username,password_hash) VALUES('listener','listener','x');
-         INSERT INTO watch_state
+         INSERT INTO user_item_state
            (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
          VALUES('listener',?,42000,180000,0,3,123)",
     )
@@ -633,13 +639,14 @@ async fn replacement_at_the_same_path_does_not_inherit_item_or_watch_state() {
         )
         .await
         .unwrap();
-    let new_track: String = sqlx::query_scalar("SELECT id FROM items WHERE kind='track'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let new_track: String =
+        sqlx::query_scalar("SELECT id FROM collection_items WHERE kind='track'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_ne!(new_track, old_track);
     assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM watch_state WHERE item_id=?")
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_item_state WHERE item_id=?")
             .bind(&new_track)
             .fetch_one(&db)
             .await

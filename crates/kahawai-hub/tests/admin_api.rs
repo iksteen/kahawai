@@ -454,7 +454,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .upsert_files("01ADM", "movies", vec![rec("Heat (1995).mkv", 100, 11, 22)])
         .await
         .unwrap();
-    let item: String = sqlx::query_scalar("SELECT id FROM items")
+    let item: String = sqlx::query_scalar("SELECT id FROM collection_items")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -463,7 +463,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO watch_state (user_id, item_id, position_ms, played, play_count)
+        "INSERT INTO user_item_state (user_id, item_id, position_ms, played, play_count)
          VALUES (?, ?, 4321, 1, 2)",
     )
     .bind(&admin_id)
@@ -493,11 +493,11 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             .fetch_one(&db)
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT COUNT(*) FROM items")
+        sqlx::query_scalar("SELECT COUNT(*) FROM collection_items")
             .fetch_one(&db)
             .await
             .unwrap(),
-        sqlx::query_scalar("SELECT COUNT(*) FROM watch_state")
+        sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state")
             .fetch_one(&db)
             .await
             .unwrap(),
@@ -508,8 +508,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     );
     assert_eq!(
         counts,
-        (0, 0, 0, 1),
-        "cascade deleted, watch state archived"
+        (0, 0, 1, 1),
+        "source deleted, catalogue history retained and archived"
     );
     let audit: Vec<String> = sqlx::query_scalar("SELECT action FROM satellite_audit ORDER BY id")
         .fetch_all(&db)
@@ -579,7 +579,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
         .await
         .unwrap();
     let restored: (i64, i64) =
-        sqlx::query_as("SELECT position_ms, play_count FROM watch_state WHERE user_id = ?")
+        sqlx::query_as("SELECT position_ms, play_count FROM user_item_state WHERE user_id = ?")
             .bind(&admin_id)
             .fetch_one(&db)
             .await
@@ -661,14 +661,16 @@ async fn review_queue_flow() {
         )
         .await
         .unwrap();
-    let miss_id: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Foobar'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    let weak_id: String = sqlx::query_scalar("SELECT id FROM items WHERE title = 'Weakling'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let miss_id: String =
+        sqlx::query_scalar("SELECT id FROM collection_items WHERE title = 'Foobar'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    let weak_id: String =
+        sqlx::query_scalar("SELECT id FROM collection_items WHERE title = 'Weakling'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     // The new model: the provider's own answer, plus an assignment when it
     // actually matched something. A miss is an answer with no record.
     for (id, pid, conf) in [(&miss_id, "", "miss"), (&weak_id, "42", "weak")] {
@@ -710,14 +712,21 @@ async fn review_queue_flow() {
     assert_eq!(entries[0]["confidence"], "miss"); // misses sort first
     assert_eq!(entries[1]["confidence"], "weak");
 
+    let revision: i64 =
+        sqlx::query_scalar("SELECT assignment_revision FROM collection_items WHERE id=?")
+            .bind(&miss_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
     // Pick a candidate for the miss.
     let resp = api
         .clone()
         .oneshot(authed(
             "POST",
-            format!("/admin/v1/items/{miss_id}/match"),
+            format!("/admin/v1/collection-items/{miss_id}/match"),
             Some(serde_json::json!({
                 "action": "pick",
+                "expected_revision":revision,
                 "provider": "tmdb",
                 "candidate": {"id": 603, "title": "The Matrix", "release_date": "1999-03-30"}
             })),
@@ -727,16 +736,63 @@ async fn review_queue_flow() {
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
     // Confirm the weak one; then reject it again.
     for action in ["confirm", "reject"] {
+        let revision: i64 =
+            sqlx::query_scalar("SELECT assignment_revision FROM collection_items WHERE id=?")
+                .bind(&weak_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
         let resp = api
             .clone()
             .oneshot(authed(
                 "POST",
-                format!("/admin/v1/items/{weak_id}/match"),
-                Some(serde_json::json!({ "action": action })),
+                format!("/admin/v1/collection-items/{weak_id}/match"),
+                Some(serde_json::json!({ "action": action,"expected_revision":revision })),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK, "{action}");
+        if action == "confirm" {
+            let review = body_json(
+                api.clone()
+                    .oneshot(authed("GET", "/admin/v1/enrich/review".into(), None))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert!(review["entries"].as_array().unwrap().is_empty(), "{review}");
+            let catalog: String = sqlx::query_scalar(
+                "SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=?",
+            )
+            .bind(&weak_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+            let detail = body_json(
+                api.clone()
+                    .oneshot(authed("GET", format!("/api/v1/items/{catalog}"), None))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(detail["match_confidence"], "manual");
+            let page = body_json(
+                api.clone()
+                    .oneshot(authed("GET", "/api/v1/items".into(), None))
+                    .await
+                    .unwrap(),
+            )
+            .await;
+            assert_eq!(
+                page["items"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|item| item["id"] == catalog)
+                    .unwrap()["match_confidence"],
+                "manual"
+            );
+        }
     }
 
     let states: Vec<(String, String)> = sqlx::query(
@@ -758,6 +814,13 @@ async fn review_queue_flow() {
     };
     assert_eq!(get(&miss_id), "manual");
     assert_eq!(get(&weak_id), "rejected");
+    let miss_id: String = sqlx::query_scalar(
+        "SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=?",
+    )
+    .bind(&miss_id)
+    .fetch_one(&db)
+    .await
+    .unwrap();
     // The picked title shows through the display API.
     let v = body_json(
         api.clone()

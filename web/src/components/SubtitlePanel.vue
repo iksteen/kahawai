@@ -18,6 +18,7 @@ import { subtitleDelete, subtitleDownload, subtitleSearch } from '../api/generat
 
 const props = defineProps<{
   item: { id: string; title: string; parent_id?: string | null }
+  sourceId?: number | undefined
   subs: TrackListing[]
   /// The media type's subtitle language preference (HUB-33). The search is
   /// filtered by it, with a one-click unfiltered retry.
@@ -82,7 +83,10 @@ async function find(languages: string[]) {
   busy.value = true
   note.value = ''
   try {
-    const answer = await subtitleSearch(props.item.id, { languages })
+    const answer = await subtitleSearch(props.item.id, {
+      languages,
+      source_id: props.sourceId ?? null,
+    })
     candidates.value = answer.candidates
     quota.value = answer.quota
     if (answer.candidates.length === 0) {
@@ -102,6 +106,7 @@ async function download(candidate: Candidate) {
   try {
     const answer = await subtitleDownload(props.item.id, {
       file_id: candidate.file_id,
+      source_id: props.sourceId ?? null,
       language: candidate.language,
     })
     quota.value = answer.quota

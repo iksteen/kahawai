@@ -226,7 +226,7 @@ describe('every screen says what it is showing', () => {
   for (const [what, view, at, expected] of screens) {
     test(what, async () => {
       if (what === 'a season') {
-        vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'show' }) as never)
+        vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'series' }) as never)
       }
       forgetScreenName()
       expect(screenShowing.value).toBe(null)
@@ -330,7 +330,7 @@ describe('nothing announces itself by appearing', () => {
     (wrapper.element as Element).querySelectorAll('[role="status"], [role="alert"]').length
 
   test('an item page has the same regions whether or not its list failed', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'show' }) as never)
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'series' }) as never)
     const quiet = regions(await screen(Detail, '/library/films/item/show'))
 
     vi.mocked(api.itemChildren).mockRejectedValue(new Error('nope'))

@@ -212,7 +212,7 @@ async fn migration_and_single_root_adoption_preserve_durable_state() {
                   +(SELECT COUNT(*) FROM manual_match)
                   +(SELECT COUNT(*) FROM enrichment_queue)
                   +(SELECT COUNT(*) FROM item_relations)
-                  +(SELECT COUNT(*) FROM watch_state)
+                  +(SELECT COUNT(*) FROM user_item_state)
                   +(SELECT COUNT(*) FROM user_libraries)"
         )
         .fetch_one(&db)
@@ -258,10 +258,12 @@ async fn artist_identity_is_backfilled_on_an_existing_catalogue() {
 
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     assert_eq!(
-        sqlx::query_scalar::<_, String>("SELECT artist_key FROM items WHERE id='old-album'")
-            .fetch_one(&db)
-            .await
-            .unwrap(),
+        sqlx::query_scalar::<_, String>(
+            "SELECT artist_key FROM collection_items WHERE id='old-album'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
         "artist-b25l",
         "the additive artist identity was not backfilled on an existing catalogue"
     );
@@ -280,7 +282,7 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('item','movie','Same','same','host','movies')",
     )
     .execute(&db)
@@ -294,9 +296,11 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
     .fetch_one(&db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), source_id, "item")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source_id, "item")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     sqlx::query(
         "INSERT INTO subtitle_tracks(id,source_id,origin,stream_index,format)
          VALUES(44,?,'embedded',0,'srt')",
@@ -348,7 +352,7 @@ async fn multi_root_legacy_state_is_never_guessed() {
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('item','movie','Same','same','host','movies')",
     )
     .execute(&db)

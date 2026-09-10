@@ -57,7 +57,7 @@ import {
 } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
 import { pipPhase, pipSupported } from '../domain/pip.ts'
-import { deliveryPlan } from '../domain/source.ts'
+import { deliveryPlan, sourceStreams } from '../domain/source.ts'
 import { forgetRecoveries, isSessionGone, mayRecover, startCeiling } from '../domain/recovery.ts'
 import {
   initialHealth,
@@ -300,11 +300,11 @@ const subtitles = useSubtitleRenderers({
 function resolve() {
   try {
     const detail = props.item
-    const audio = detail.sources[0]?.streams?.audio ?? []
+    const audio = sourceStreams(detail.sources, props.session.source_id)?.audio ?? []
     sendTrack({
       type: 'lists-arrived',
       audioList: audio,
-      videoList: detail.sources[0]?.streams?.video ?? [],
+      videoList: sourceStreams(detail.sources, props.session.source_id)?.video ?? [],
     })
     const resolved = resolveTracks(
       props.prefs,
@@ -313,6 +313,8 @@ function resolve() {
       props.mediaType,
       detail.metadata?.original_language,
       audio,
+
+      `source:${props.session.source_id}`,
     )
     // A restart carries BOTH axes: the session was started on the carried
     // video track, and a selector left reading zero would hand track 0 back
@@ -334,11 +336,9 @@ function resolve() {
     // profile this session actually negotiated with, where the item
     // QUERY's reflects the page-load profile — after a capability-masked
     // restart the two disagree, and reading the stale one kept the ASS
-    // renderer alive until a page reload. The QUERY listing remains the
-    // fallback for explicit-mode sessions that answer without one.
-    const subs = props.session.subtitle_listing?.length
-      ? props.session.subtitle_listing
-      : (detail.negotiated?.subtitles ?? [])
+    // renderer alive until a page reload. An empty session list means this
+    // source has no subtitles; only an absent list can use the QUERY fallback.
+    const subs = props.session.subtitle_listing ?? detail.negotiated?.subtitles ?? []
     sendTrack({ type: 'subtitles-arrived', subs })
     // A restart puts the viewer back exactly where they were — including
     // "subtitles off", which is as much a choice as any track. The prefs
@@ -350,8 +350,16 @@ function resolve() {
     // as stable as that stays true) falls back to the wishlist rather than
     // silently landing on subtitles-off.
     const carried = props.carried
-      ? subs.find((s) => String(s.id) === props.carried?.subKey)
+      ? (subs.find((s) => String(s.id) === props.carried?.subKey) ??
+        (props.carried.sourceFingerprint === props.session.source_fingerprint &&
+        props.carried.embeddedSub != null
+          ? subs.find(
+              (s) => s.origin === 'embedded' && s.stream_index === props.carried?.embeddedSub,
+            )
+          : undefined))
       : undefined
+    if (props.carried?.subKey && !carried)
+      playerNote('The previously selected subtitle is unavailable on this source.')
     const pick = carried ?? initialSubtitle({ subs, exactId: subTrackWish, wishlist: subsWish })
     if (!pick) return
     // Never overrides a choice already made.
@@ -413,7 +421,16 @@ function giveUp(why: string, gen = health.value.awaitingGen) {
 /// What the viewer is actually watching with right now, for the restart to
 /// hand back to the next mount.
 function liveChoice(): CarriedTracks {
-  return { audio: trk.value.audio, video: trk.value.video, subKey: trk.value.subKey }
+  const selected = trk.value.subs.find((s) => String(s.id) === trk.value.subKey)
+  return {
+    audio: trk.value.audio,
+    video: trk.value.video,
+    subKey: trk.value.subKey,
+    sourceFingerprint: props.session.source_fingerprint,
+    ...(selected?.origin === 'embedded' && selected.stream_index != null
+      ? { embeddedSub: selected.stream_index }
+      : {}),
+  }
 }
 
 /// The restart itself, without the guards. Shared by the automatic path and by
@@ -421,7 +438,14 @@ function liveChoice(): CarriedTracks {
 /// as one.
 async function restartAt(at: number): Promise<boolean> {
   try {
-    const fresh = await startPlaybackSession(props.item, at, trk.value.audio, trk.value.video)
+    const fresh = await startPlaybackSession(props.item, {
+      startMs: at,
+      audioTrack: trk.value.audio,
+      videoTrack: trk.value.video,
+      sourceFingerprint: props.session.source_fingerprint,
+      sourceId: props.session.source_id,
+      resume: false,
+    })
     if (goneAway) {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
       return false
@@ -504,7 +528,14 @@ async function restartWithCaps(): Promise<boolean> {
   const mine = beginRestart()
   try {
     const at = Math.round(absMs())
-    const fresh = await startPlaybackSession(props.item, at, trk.value.audio, trk.value.video)
+    const fresh = await startPlaybackSession(props.item, {
+      startMs: at,
+      audioTrack: trk.value.audio,
+      videoTrack: trk.value.video,
+      sourceFingerprint: props.session.source_fingerprint,
+      sourceId: props.session.source_id,
+      resume: false,
+    })
     if (goneAway) {
       void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
       return false
@@ -752,7 +783,8 @@ async function switchTracks(audio: number, videoTrack: number) {
     // deliberately do NOT pin, so one episode never freezes on an old choice.
     const value = trk.value.audioList[audio]?.language?.toLowerCase() ?? `#${audio}`
     remember(seriesId, 'audio', value)
-    if (props.item.kind === 'movie') remember(props.item.id, 'audio.track', `#${audio}`)
+    if (props.item.kind === 'movie')
+      remember(`source:${props.session.source_id}`, 'audio.track', `#${audio}`)
   }
   if (!owned(outcome)) settle(mine)
 }
@@ -1154,12 +1186,14 @@ watch(
       if (inFlight) return
       inFlight = true
       try {
-        const fresh = await startPlaybackSession(
-          props.item,
-          standby,
-          trk.value.audio,
-          trk.value.video,
-        )
+        const fresh = await startPlaybackSession(props.item, {
+          startMs: standby,
+          audioTrack: trk.value.audio,
+          videoTrack: trk.value.video,
+          sourceFingerprint: props.session.source_fingerprint,
+          sourceId: props.session.source_id,
+          resume: false,
+        })
         // A session started after the player left is one nobody will ever play,
         // ping or end.
         if (stop) void endSession(fresh.session_id, { keepalive: true }).catch(() => {})
@@ -1380,7 +1414,8 @@ onMounted(async () => {
   if (props.item.kind !== 'episode' || !props.item.parent_id) return
   try {
     const siblings = await itemChildren(props.item.parent_id)
-    const at = siblings.children.findIndex((e) => e.id === props.item.id)
+    const covered = new Set(props.session.library_item_ids ?? [props.item.id])
+    const at = siblings.children.findLastIndex((e) => covered.has(e.id))
     const after = at >= 0 ? siblings.children[at + 1] : undefined
     if (!after || goneAway) return
     const full = await itemQuery(after.id, { profile: buildProfile() })
@@ -1398,7 +1433,7 @@ const upNextOn = computed(
 )
 
 async function playNext() {
-  const after = next.value
+  let after = next.value
   if (!after || startingNext.value) return
   startingNext.value = true
   try {
@@ -1418,15 +1453,21 @@ async function playNext() {
       playerNote(`Could not re-read your preferences: ${sentence(cause)}`)
       return { prefs: props.prefs }
     })
+    const cap = prefs.prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
+    after = await itemQuery(after.id, { profile: buildProfile(cap ? Number(cap) : undefined) })
     const resolved = resolveTracks(
       prefs.prefs,
       seriesId,
       after.id,
       props.mediaType,
       after.metadata?.original_language,
-      after.sources[0]?.streams?.audio ?? [],
+      sourceStreams(after.sources, after.negotiated?.source?.source_id)?.audio ?? [],
+      `source:${after.negotiated?.source?.source_id}`,
     )
-    const fresh = await startPlaybackSession(after, 0, resolved.audioTrack, 0, prefs.prefs)
+    const fresh = await startPlaybackSession(after, {
+      audioTrack: resolved.audioTrack,
+      prefs: prefs.prefs,
+    })
     // Back was pressed while the hub was answering. Handing this up would
     // navigate them into the next episode against the thing they just did.
     if (goneAway) {
@@ -1515,7 +1556,7 @@ function chooseSubtitle(key: string) {
   // item remembers the exact row — the only spelling that can name a downloaded
   // or OCR track.
   remember(seriesId, 'subs', key === '' ? 'off' : (picked?.language ?? 'any').toLowerCase())
-  remember(props.item.id, 'subs.track', key)
+  remember(`source:${props.session.source_id}`, 'subs.track', key)
   // Burn transitions live server-side: a track whose delivery IS burn restarts
   // the pipeline with it, and leaving one withdraws it. The tier comes from the
   // ass_fallback preference, never from this list — picking says WHICH

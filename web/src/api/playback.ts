@@ -24,7 +24,7 @@ import { isRasterSub } from '../domain/subtitles.ts'
 
 /// Start a session for an item, with everything the hub needs to negotiate.
 ///
-/// `prefs` is REQUIRED, and `'read'` is how a caller says it has none in hand.
+/// `prefs: 'read'` fetches preferences when a caller has none in hand.
 /// This is the only reader of `bandwidth_kbps` in the app, so a default of `[]`
 /// is the cap silently dropped with nothing said anywhere — and four of the
 /// five callers had no preferences to pass: every recovery, every hand-pressed
@@ -33,10 +33,23 @@ import { isRasterSub } from '../domain/subtitles.ts'
 /// setting exists for.
 export async function startPlaybackSession(
   item: ItemQueryResponse,
-  startMs = 0,
-  audioTrack = 0,
-  videoTrack = 0,
-  prefs: Preference[] | 'read' = 'read',
+  {
+    startMs = 0,
+    audioTrack = 0,
+    videoTrack = 0,
+    prefs = 'read',
+    sourceFingerprint,
+    resume = true,
+    sourceId = item.negotiated?.source?.source_id,
+  }: {
+    startMs?: number
+    audioTrack?: number
+    videoTrack?: number
+    prefs?: Preference[] | 'read'
+    sourceFingerprint?: string
+    resume?: boolean
+    sourceId?: number
+  } = {},
 ): Promise<StartSessionResponse> {
   // Swallowed, and only here: these callers are automatic — a recovery, a
   // stand-by tick every five seconds — and the ones that are a deliberate press
@@ -55,8 +68,11 @@ export async function startPlaybackSession(
   const profile: CapabilityProfile = buildProfile(cap ? Number(cap) : undefined, announced)
   return startSession({
     item_id: item.id,
+    source_id: sourceId ?? null,
     profile,
     start_ms: Math.round(startMs),
+    resume_source_fingerprint: sourceFingerprint ?? null,
+    resume,
     audio_track: audioTrack,
     video_track: videoTrack,
   })
@@ -89,7 +105,8 @@ export function seekSession(
 export const subtitleFileUrl = (itemId: string, file: string, shiftMs?: number) =>
   getItemSubtitleFileUrl(itemId, file, shiftMs === undefined ? undefined : { shift_ms: shiftMs })
 
-export const fontUrl = (itemId: string, index: number) => getItemFontUrl(itemId, index)
+export const fontUrl = (itemId: string, index: number, sourceId: number) =>
+  getItemFontUrl(itemId, index, { source_id: sourceId })
 
 /// Where a track's display sets come from. An embedded image track is decoded
 /// by the RUNNING pipeline and tail-followed off the session; a rasterised one

@@ -45,10 +45,12 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":
     | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
     | json_field access_token) || { echo "login failed" >&2; exit 1; }
 
-BODY=$(python3 - "$ITEM" "${START_MS:-0}" "$MODE" "$PROFILE_FILE" <<'PYBODY'
+BODY=$(python3 - "$ITEM" "${START_MS:-}" "$MODE" "$PROFILE_FILE" <<'PYBODY'
 import json, sys
 item, start_ms, mode, profile_file = sys.argv[1:5]
-body = {"item_id": item, "start_ms": int(start_ms)}
+body = {"item_id": item}
+if start_ms:
+    body["start_ms"] = int(start_ms)
 if mode:
     body["mode"] = mode
 if profile_file:
@@ -72,4 +74,9 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mpv --http-header-fields="Authorization: Bearer $TOKEN" "$@" "http://$API$STREAM_URL"
+MPV_START=()
+if [ "$GOT_MODE" = direct ]; then
+    OFFSET=$(printf '%s' "$SESSION" | python3 -c 'import json,sys;s=json.load(sys.stdin);print(max(0,s["effective_start_ms"]-s["part_base_ms"])/1000)')
+    MPV_START=("--start=$OFFSET")
+fi
+mpv "${MPV_START[@]}" --http-header-fields="Authorization: Bearer $TOKEN" "$@" "http://$API$STREAM_URL"

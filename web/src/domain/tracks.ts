@@ -27,6 +27,7 @@ export function resolveTracks(
   mediaType: string,
   originalLanguage: string | null | undefined,
   audio: AudioStream[],
+  sourceScope = itemId,
 ): Resolved {
   const get = (scope: string, key: string) =>
     prefs.find((p) => p.scope === scope && p.key === key)?.value
@@ -47,7 +48,7 @@ export function resolveTracks(
   // feature and commentary — are common, so language cannot express the
   // choice), then the series language memory, then the ordered per-type list.
   let audioTrack: number | undefined
-  const exact = get(itemId, 'audio.track')
+  const exact = get(sourceScope, 'audio.track')
   if (exact?.startsWith('#')) {
     const at = Number(exact.slice(1))
     if (at >= 0 && at < audio.length) audioTrack = at
@@ -84,7 +85,7 @@ export function resolveTracks(
     remembers === 'off' ? [] : remembers ? [remembers] : list(get('', `subs.${mediaType}`))
   // Top precedence (subtitle unification): THIS item's exact track id — the
   // only spelling that can name a specific downloaded or OCR row.
-  const exactSub = get(itemId, 'subs.track')
+  const exactSub = get(sourceScope, 'subs.track')
   const subTrack = exactSub && /^\d+$/.test(exactSub) ? Number(exactSub) : null
   return { audioTrack: audioTrack ?? 0, subs, subTrack }
 }

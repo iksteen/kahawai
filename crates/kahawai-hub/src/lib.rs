@@ -12,6 +12,7 @@ pub mod error;
 pub mod gate;
 pub mod grants;
 pub mod leases;
+pub mod library;
 pub mod link_service;
 pub mod metrics;
 #[cfg(feature = "ocr")]

@@ -596,7 +596,7 @@ struct Fx {
     api: axum::Router,
     bearer: String,
     id: String,
-    db: kahawai_sqlite::Database,
+    db: kahawai_hub::library::Database,
     subs_dir: std::path::PathBuf,
 }
 
@@ -745,7 +745,9 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     let get = |id: String| {
         let api = fx.api.clone();
         let bearer = fx.bearer.clone();
+        let db = fx.db.clone();
         async move {
+            let id:String=sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=? AND ordinal=1").bind(id).fetch_one(&db).await.unwrap();
             let response = api
                 .oneshot(
                     axum::http::Request::get(format!("/api/v1/items/{id}"))
@@ -778,7 +780,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
 
     // An episode answers with its SHOW's id, never its own record's.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
          VALUES ('show1', 'show', 'Lain', 'lain', '01H', 'movies', NULL, NULL, NULL),
                 ('ep1', 'episode', 'Weird', 'weird', '01H', 'movies', 'show1', 1, 1)",
     )
@@ -798,7 +800,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
 
     // An AniList identity keys nothing.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id)
          VALUES ('anime1', 'movie', 'Akira', 'akira', '01H', 'movies')",
     )
     .execute(&fx.db)
@@ -826,7 +828,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     // key nothing — falling back to the episode's id would hand a lookup
     // the wrong namespace, which is the bug this ordering exists to stop.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id, parent_id, season, episode)
          VALUES ('bareshow', 'show', 'Bare', 'bare', '01H', 'movies', NULL, NULL, NULL),
                 ('bareep', 'episode', 'One', 'one', '01H', 'movies', 'bareshow', 1, 1)",
     )
@@ -847,7 +849,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     // stored tmdb answer must key anyway, and tvdb rides alongside
     // independently of which provider was chosen.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id)
          VALUES ('nfo1', 'movie', 'Kept', 'kept', '01H', 'movies')",
     )
     .execute(&fx.db)
@@ -877,7 +879,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     // 'weak' answer is the wrong title often enough to hand out another
     // film's boundaries, and a rejected one was rejected by a human.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id)
          VALUES ('weak1', 'movie', 'Guess', 'guess', '01H', 'movies')",
     )
     .execute(&fx.db)
@@ -989,17 +991,28 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
 
     // A double-episode file carries its span on the detail row — the
     // client's multi-episode guard reads it, so it must survive this path.
-    sqlx::query("UPDATE items SET episode_end = 2 WHERE id = 'ep1'")
+    sqlx::query("UPDATE collection_items SET episode_end = 2 WHERE id = 'ep1'")
         .execute(&fx.db)
         .await
         .unwrap();
     let doubled = get("ep1".into()).await;
-    assert_eq!(doubled["episode_end"], 2, "{doubled}");
+    assert!(
+        doubled["episode_end"].is_null(),
+        "a catalogue episode is one work"
+    );
+    assert_eq!(
+        doubled["copies"][0]["assignment"]["library_item_ids"]
+            .as_array()
+            .unwrap()
+            .len(),
+        2,
+        "{doubled}"
+    );
 
     // A zero-padded provider id parses to a DIFFERENT valid id; the
     // round-trip guard must refuse it rather than key another title.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id)
          VALUES ('padded', 'movie', 'Bond', 'bond', '01H', 'movies')",
     )
     .execute(&fx.db)
@@ -1018,7 +1031,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     // Zero and negatives round-trip cleanly; only the positivity guard
     // refuses them, and 0 or -1 handed to a lookup is a real key there.
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id)
          VALUES ('zero', 'movie', 'Zero', 'zero', '01H', 'movies'),
                 ('neg', 'movie', 'Neg', 'neg', '01H', 'movies')",
     )
@@ -1042,7 +1055,7 @@ async fn the_item_carries_the_id_a_lookup_keys_on() {
     // (wrong namespace) and not its own (the parent is the authority the
     // schema names).
     sqlx::query(
-        "INSERT INTO items (id, kind, title, norm_title, module_id, collection_id, parent_id)
+        "INSERT INTO collection_items (id, kind, title, norm_title, module_id, collection_id, parent_id)
          VALUES ('boxset', 'movie', 'Box', 'box', '01H', 'movies', NULL),
                 ('boxed', 'movie', 'Boxed', 'boxed', '01H', 'movies', 'boxset')",
     )
@@ -1119,7 +1132,7 @@ async fn fixture_net(file: FileUpsertRecord, net: kahawai_hub::api::NetOptions) 
     let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
 
-    let id: String = sqlx::query_scalar("SELECT id FROM items LIMIT 1")
+    let id: String = sqlx::query_scalar("SELECT id FROM collection_items LIMIT 1")
         .fetch_one(&db)
         .await
         .unwrap();

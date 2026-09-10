@@ -9,8 +9,201 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "3038ac23dda805c69db6949717e5df31740b3924fa29dcc3316f57f7ac84e52e",
+  "x-kahawai-source-sha256": "a16c7a96eb4d17752fe953f25edd9608450842fde861d83816a2e661eebd5d24",
   "paths": {
+    "/admin/v1/collection-items/{id}/match": {
+      "post": {
+        "tags": [
+          "Admin enrichment"
+        ],
+        "summary": "Apply a match decision to an item",
+        "description": "Admin only. Applies action pick, confirm or reject to the item's metadata\nmatch. A pick requires provider and candidate with an id; any other\naction, or a missing field, returns 400. Picked and confirmed matches are\npinned against automatic re-matching.",
+        "operationId": "admin_apply_match",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ApplyMatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Assignment"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/admin/v1/collections": {
       "get": {
         "tags": [
@@ -921,182 +1114,6 @@
             }
           },
           "404": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "The hub has no administrator yet: `setup_required`",
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ]
-      }
-    },
-    "/admin/v1/items/{id}/match": {
-      "post": {
-        "tags": [
-          "Admin enrichment"
-        ],
-        "summary": "Apply a match decision to an item",
-        "description": "Admin only. Applies action pick, confirm or reject to the item's metadata\nmatch. A pick requires provider and candidate with an id; any other\naction, or a missing field, returns 400. Picked and confirmed matches are\npinned against automatic re-matching.",
-        "operationId": "admin_apply_match",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          }
-        ],
-        "requestBody": {
-          "content": {
-            "application/json": {
-              "schema": {
-                "$ref": "#/components/schemas/ApplyMatch"
-              }
-            }
-          },
-          "required": true
-        },
-        "responses": {
-          "200": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/OkResponse"
-                }
-              }
-            }
-          },
-          "400": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "401": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "403": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "413": {
-            "description": "The body is past the hub's buffer limit",
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "415": {
-            "description": "The body needs Content-Type: application/json",
             "headers": {
               "X-Request-Id": {
                 "schema": {
@@ -2080,6 +2097,160 @@
           },
           "503": {
             "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/library-items/{id}/metadata": {
+      "put": {
+        "tags": [
+          "Admin enrichment"
+        ],
+        "operationId": "admin_catalog_metadata",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/CatalogMetadataRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
             "headers": {
               "X-Request-Id": {
                 "schema": {
@@ -7858,6 +8029,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "source_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
+            }
           }
         ],
         "responses": {
@@ -7997,6 +8177,15 @@
             "schema": {
               "type": "integer",
               "minimum": 0
+            }
+          },
+          {
+            "name": "source_id",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64"
             }
           }
         ],
@@ -11040,6 +11229,7 @@
       "ApplyMatch": {
         "type": "object",
         "required": [
+          "expected_revision",
           "action"
         ],
         "properties": {
@@ -11051,6 +11241,29 @@
             "oneOf": [
               {
                 "$ref": "#/components/schemas/ManualMatchCandidate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "library_item_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "new_item": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NewItem"
               },
               {
                 "type": "null"
@@ -11179,6 +11392,39 @@
             "minimum": 0
           },
           "total": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "Assignment": {
+        "type": "object",
+        "required": [
+          "collection_item_id",
+          "revision",
+          "mode",
+          "library_item_ids"
+        ],
+        "properties": {
+          "collection_item_id": {
+            "type": "string"
+          },
+          "conflict": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "library_item_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "mode": {
+            "type": "string"
+          },
+          "revision": {
             "type": "integer",
             "format": "int64"
           }
@@ -11489,6 +11735,22 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "CatalogMetadataRequest": {
+        "type": "object",
+        "required": [
+          "expected_revision",
+          "fields"
+        ],
+        "properties": {
+          "expected_revision": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "fields": {
+            "$ref": "#/components/schemas/MetadataOverrides"
           }
         }
       },
@@ -11828,6 +12090,77 @@
             "type": "integer",
             "format": "int32",
             "minimum": 0
+          }
+        }
+      },
+      "CollectionCopy": {
+        "type": "object",
+        "required": [
+          "id",
+          "title",
+          "paths",
+          "assignment"
+        ],
+        "properties": {
+          "artist": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "assignment": {
+            "$ref": "#/components/schemas/Assignment"
+          },
+          "collection_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "episode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "id": {
+            "type": "string"
+          },
+          "module_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "parent_library_item_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "paths": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "season": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          },
+          "year": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },
@@ -12278,6 +12611,8 @@
           {
             "type": "object",
             "required": [
+              "library_revision",
+              "copies",
               "show_title"
             ],
             "properties": {
@@ -12287,6 +12622,16 @@
                   "$ref": "#/components/schemas/Chapter"
                 },
                 "description": "The chapters the file declares, on the ITEM's timeline —\nwhat a seek bar puts ticks on and what a detail page lists. On the\nitem rather than per source because a client is playing one of\nthem: the first COMPLETE, reachable source in `sources` (not\nnecessarily `sources[0]` — incomplete part sets and offline\nrenditions are passed over), and on QUERY the source negotiation\nactually chose. Do not correlate them with `sources[0]`.\n\nEmpty when the file declares none and when nothing has looked yet.\nA player cannot act on the difference, and the file being asked is\nthe same file either way."
+              },
+              "copies": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/CollectionCopy"
+                }
+              },
+              "library_revision": {
+                "type": "integer",
+                "format": "int64"
               },
               "metadata": {
                 "oneOf": [
@@ -12444,6 +12789,13 @@
               }
             ]
           },
+          "source_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "subtitle_track": {
             "type": [
               "integer",
@@ -12535,6 +12887,14 @@
           "play_count"
         ],
         "properties": {
+          "album_track_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Album position context; the same song may occur more than once."
+          },
           "art_version": {
             "type": [
               "integer",
@@ -12688,6 +13048,7 @@
             "items": {
               "type": "object",
               "required": [
+                "collection_item_id",
                 "module_id",
                 "collection_id",
                 "path_rel",
@@ -12704,6 +13065,10 @@
                 },
                 "collection_id": {
                   "type": "string"
+                },
+                "collection_item_id": {
+                  "type": "string",
+                  "description": "Assignment owner shared by every file part of this source."
                 },
                 "module_id": {
                   "type": "string"
@@ -12790,6 +13155,14 @@
           "play_count"
         ],
         "properties": {
+          "album_track_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Album position context; the same song may occur more than once."
+          },
           "art_version": {
             "type": [
               "integer",
@@ -13146,6 +13519,40 @@
           }
         }
       },
+      "MetadataOverrides": {
+        "type": "object",
+        "description": "Shared descriptions, independent of collection metadata and matching.\nReplacing this object with an empty one restores provider descriptions.",
+        "properties": {
+          "genres": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "original_language": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "overview": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "rating": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double"
+          }
+        }
+      },
       "NegotiatedItem": {
         "type": "object",
         "required": [
@@ -13259,6 +13666,60 @@
           },
           "video": {
             "type": "string"
+          }
+        }
+      },
+      "NewItem": {
+        "type": "object",
+        "required": [
+          "kind",
+          "title"
+        ],
+        "properties": {
+          "artist": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "edition": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "episode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "kind": {
+            "type": "string"
+          },
+          "parent_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "season": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
+          "title": {
+            "type": "string"
+          },
+          "year": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },
@@ -13704,6 +14165,7 @@
         "type": "object",
         "required": [
           "item_id",
+          "collection_item_id",
           "kind",
           "title",
           "year",
@@ -13714,6 +14176,9 @@
           "provider"
         ],
         "properties": {
+          "collection_item_id": {
+            "type": "string"
+          },
           "confidence": {
             "type": "string"
           },
@@ -14278,12 +14743,43 @@
           }
         }
       },
+      "SourceBoundary": {
+        "type": "object",
+        "description": "Exact physical coverage. Without a complete valid set, playback stays combined.",
+        "required": [
+          "library_item_id",
+          "start_ms",
+          "end_ms"
+        ],
+        "properties": {
+          "end_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "library_item_id": {
+            "type": "string"
+          },
+          "start_ms": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          }
+        }
+      },
       "StartSessionRequest": {
         "type": "object",
         "required": [
           "item_id"
         ],
         "properties": {
+          "album_track_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
+          },
           "audio_track": {
             "type": "integer",
             "format": "int32",
@@ -14311,8 +14807,30 @@
               }
             ]
           },
+          "resume": {
+            "type": "boolean",
+            "description": "True for an item-relative saved resume; false for an explicit chapter position."
+          },
+          "resume_source_fingerprint": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "For recovery or a seek, the fingerprint returned by the preceding session.\nSaved resume is item-relative only when `resume` is true."
+          },
+          "source_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Physical source whose stream indexes and chapter timeline are being used."
+          },
           "start_ms": {
-            "type": "integer",
+            "type": [
+              "integer",
+              "null"
+            ],
             "format": "int64",
             "description": "Begin playback here (resume without waiting for a transcode to\ncatch up) — keyframe-snapped by the pipeline.",
             "minimum": 0
@@ -14336,6 +14854,11 @@
         "type": "object",
         "required": [
           "session_id",
+          "effective_start_ms",
+          "source_fingerprint",
+          "source_id",
+          "library_item_ids",
+          "coverage",
           "mode",
           "size",
           "duration_ms",
@@ -14350,6 +14873,12 @@
           "content_type": {
             "type": "string"
           },
+          "coverage": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/SourceBoundary"
+            }
+          },
           "duration_ms": {
             "type": [
               "integer",
@@ -14357,6 +14886,18 @@
             ],
             "format": "int64",
             "minimum": 0
+          },
+          "effective_start_ms": {
+            "type": "integer",
+            "format": "int64",
+            "description": "Start accepted for this physical version. Clients must use this offset.",
+            "minimum": 0
+          },
+          "library_item_ids": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
           },
           "mode": {
             "type": "string"
@@ -14370,6 +14911,16 @@
             "type": "integer",
             "minimum": 0
           },
+          "replay_gain": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ReplayGain"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "session_id": {
             "type": "string"
           },
@@ -14377,6 +14928,13 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          },
+          "source_fingerprint": {
+            "type": "string"
+          },
+          "source_id": {
+            "type": "integer",
+            "format": "int64"
           },
           "stream_url": {
             "type": "string"
@@ -14487,6 +15045,13 @@
               "string",
               "null"
             ]
+          },
+          "source_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },
@@ -14515,6 +15080,13 @@
               "type": "string"
             },
             "description": "Preferred languages, ordered. Empty = whatever the provider has."
+          },
+          "source_id": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64"
           }
         }
       },

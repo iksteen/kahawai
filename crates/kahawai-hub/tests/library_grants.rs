@@ -19,7 +19,7 @@ use tower::ServiceExt;
 
 struct Hub {
     api: axum::Router,
-    db: kahawai_sqlite::Database,
+    db: kahawai_hub::library::Database,
     /// The setup admin: bypasses grants whatever its rows say.
     boss: String,
     /// all_libraries = 0, granted L1 only.
@@ -182,7 +182,7 @@ async fn harness() -> Hub {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,year,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
          VALUES('m1','movie','Test Alpha','test alpha',2020,'m','c1'),
                ('s1','show','Test Bravo','test bravo',2021,'m','c2'),
                ('g1','movie','Test Gamma','test gamma',2022,'m','c3')",
@@ -193,7 +193,7 @@ async fn harness() -> Hub {
     // The episode carries the source; membership projects it onto the
     // show, which is what makes the parent hop below worth asserting.
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
          VALUES('e1','episode','Episode One','episode one','s1',1,1,'m','c2')",
     )
     .execute(&db)
@@ -321,9 +321,11 @@ async fn a_grant_bounds_browse_search_and_detail() {
     .fetch_one(&h.db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut h.db.acquire().await.unwrap(), source, "e1")
+    let mut tx = h.db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, source, "e1")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     let track: i64 = sqlx::query_scalar(
         "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
          VALUES(?,'embedded',0,'srt') RETURNING id",
@@ -878,7 +880,7 @@ async fn a_browse_row_names_only_a_library_you_may_open() {
 
     // The kid holds L1 only. Confirm the fixture really is ambiguous.
     let both: Vec<String> = sqlx::query_scalar(
-        "SELECT lc.library_id FROM items i JOIN library_collections lc
+        "SELECT lc.library_id FROM collection_items i JOIN library_collections lc
            ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
           WHERE i.id='m1' ORDER BY lc.library_id",
     )
@@ -938,4 +940,101 @@ async fn a_browse_row_names_only_a_library_you_may_open() {
     // would be perfectly happy with.
     let (_, v) = get(&h.api, &h.guest, "/api/v1/items?library=AAA").await;
     assert_eq!(named(&v), ["AAA"], "naming AAA must not narrow it away");
+}
+
+#[tokio::test]
+async fn merged_series_checks_each_child_in_lists_up_next_and_batch_marks() {
+    let h = harness().await;
+    sqlx::raw_sql("INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
+        VALUES('visible-show','show','Test Bravo','test bravo',2021,'m','c1');
+        INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        VALUES('seen','episode','Seen','seen','visible-show',1,0,'m','c1'),('next','episode','Next','next','visible-show',1,2,'m','c1');").execute(&h.db).await.unwrap();
+    sqlx::query("INSERT INTO user_item_state(user_id,item_id,played,updated_at) VALUES(?,'seen',1,unixepoch())").bind(&h.kid_id).execute(&h.db).await.unwrap();
+    let (status, children) = get(&h.api, &h.kid, "/api/v1/items/s1/children").await;
+    assert_eq!(status, StatusCode::OK);
+    let ids: Vec<&str> = children["children"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["id"].as_str().unwrap())
+        .collect();
+    assert_eq!(ids, vec!["seen", "next"]);
+    for suffix in ["", "?library=L1"] {
+        let (status, next) = get(&h.api, &h.kid, &format!("/api/v1/up-next{suffix}")).await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(next["items"][0]["id"], "next", "{next}");
+    }
+    let (status, marked) = call(
+        &h.api,
+        &h.kid,
+        "PUT",
+        "/api/v1/items/s1/watched",
+        Some(json!({"played":true,"items":["e1","next"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{marked}");
+    let marked: Value = serde_json::from_str(&marked).unwrap();
+    assert_eq!(marked["updated"].as_array().unwrap().len(), 1);
+    assert_eq!(marked["updated"][0]["item_id"], "next");
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM user_item_state WHERE user_id=? AND item_id='e1'"
+        )
+        .bind(&h.kid_id)
+        .fetch_one(&h.db)
+        .await
+        .unwrap(),
+        0
+    );
+}
+
+#[tokio::test]
+async fn shared_recording_does_not_expose_another_albums_track_membership() {
+    let h = harness().await;
+    sqlx::raw_sql("INSERT INTO collection_items(id,kind,title,norm_title,year,artist,module_id,collection_id)
+        VALUES('a-public','album','Public','public',2000,'Artist','m','c1'),('a-other','album','Other','other',2000,'Artist','m','c1'),('a-hidden','album','Other','other',2000,'Artist','m','c2');
+        INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        VALUES('record-public','track','Song','song','a-public',1,1,'m','c1'),('record-hidden','track','Song','song','a-hidden',1,1,'m','c2');").execute(&h.db).await.unwrap();
+    h.db.transaction("choose shared recording", |c| {
+        Box::pin(async move {
+            kahawai_hub::library::assign(c, "record-hidden", &["record-public".into()]).await
+        })
+    })
+    .await
+    .unwrap();
+    sqlx::query("UPDATE collection_items SET title='Private alias',norm_title='private alias' WHERE id='record-hidden'").execute(&h.db).await.unwrap();
+    let (_, search) = get(&h.api, &h.kid, "/api/v1/items?q=private").await;
+    assert_eq!(
+        search["total"], 0,
+        "hidden copy names cannot supply search matches: {search}"
+    );
+    let album: String = sqlx::query_scalar(
+        "SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='a-other'",
+    )
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let (_, children) = get(&h.api, &h.kid, &format!("/api/v1/items/{album}/children")).await;
+    assert!(
+        children["children"].as_array().unwrap().is_empty(),
+        "{children}"
+    );
+    let (status, _) = call(
+        &h.api,
+        &h.kid,
+        "PUT",
+        &format!("/api/v1/items/{album}/watched"),
+        Some(json!({"played":true,"items":["record-public"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+    let (status, _) = call(
+        &h.api,
+        &h.kid,
+        "PUT",
+        "/api/v1/items/a-public/watched",
+        Some(json!({"played":true,"items":["record-public"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
 }

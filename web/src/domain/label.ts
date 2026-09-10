@@ -60,7 +60,7 @@ export function metaLine(i: Labelled): string {
   if (i.kind === 'episode') {
     return [i.parent_title, seLabel(i.season, i.episode, i.episode_end)].filter(Boolean).join(' ')
   }
-  if (i.kind === 'track') return [i.artist, i.parent_title].filter(Boolean).join(' · ')
+  if (i.kind === 'song') return [i.artist, i.parent_title].filter(Boolean).join(' · ')
   // An album is told apart by who made it AND when — there are four Greatest
   // Hits by four bands and three pressings of one of them.
   if (i.kind === 'album') return [i.artist, i.year].filter(Boolean).join(' · ')
@@ -70,7 +70,7 @@ export function metaLine(i: Labelled): string {
 /// Where an item's own page lives. Tracks have no page of their own, so a
 /// track opens its album.
 export function targetOf(i: Pick<Labelled, 'kind' | 'id' | 'parent_id'>): string {
-  return i.kind === 'track' && i.parent_id ? i.parent_id : i.id
+  return i.kind === 'song' && i.parent_id ? i.parent_id : i.id
 }
 
 /// How far through, as a percentage, or null when it has not been started or

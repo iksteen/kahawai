@@ -278,6 +278,20 @@ pub async fn get_for_item(db: &sqlx::SqlitePool, item_id: &str, id: i64) -> Resu
     .map(row_to_track))
 }
 
+pub async fn get_for_library_item(
+    db: &crate::library::Database,
+    user: &str,
+    item: &str,
+    id: i64,
+) -> Result<Option<Track>> {
+    for copy in crate::library::copies(db, user, item).await? {
+        if let Some(track) = get_for_item(db, &copy, id).await? {
+            return Ok(Some(track));
+        }
+    }
+    Ok(None)
+}
+
 /// Every item-owned track or physical track bound to the source `source_row`
 /// picked, so the list matches what a session would actually play.
 pub async fn for_item_source(

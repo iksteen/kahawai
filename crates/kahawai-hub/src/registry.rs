@@ -41,9 +41,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
+use crate::library::Database;
 use anyhow::{Context, Result};
 use kahawai_core::names;
-use kahawai_sqlite::Database;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 use sqlx::Row;
@@ -168,16 +168,16 @@ pub struct CollectionRow {
 /// file's content identity.
 const ARCHIVE_WATCH_FOR_FILE_SQL: &str = "
     INSERT OR REPLACE INTO watch_state_archive
-      (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
+      (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count,library_item_id,state_updated_at,resume_source_fingerprint)
     SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
-           w.position_ms, w.duration_ms, w.played, w.play_count
+           w.position_ms, w.duration_ms, w.played, w.play_count,w.library_item_id,w.updated_at,w.resume_source_fingerprint
     FROM files f
     JOIN playable_source_parts p ON p.file_id=f.id
     JOIN playable_sources s ON s.id=p.playable_source_id
-    JOIN watch_state w ON w.item_id=s.item_id
+    JOIN collection_watch_state w ON w.item_id=s.item_id
     WHERE f.module_id = ? AND f.collection_id = ? AND f.path_rel = ?";
 
-fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
+pub(crate) fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
     use data_encoding::BASE64URL_NOPAD;
 
     let mut hash = Sha256::new();
@@ -2466,13 +2466,13 @@ impl Registry {
                 sqlx::query(
                     "INSERT OR REPLACE INTO watch_state_archive
                        (user_id,size,head_xxh3,tail_xxh3,
-                        position_ms,duration_ms,played,play_count)
+                        position_ms,duration_ms,played,play_count,library_item_id,state_updated_at,resume_source_fingerprint)
                      SELECT w.user_id,f.size,f.head_xxh3,f.tail_xxh3,
-                            w.position_ms,w.duration_ms,w.played,w.play_count
+                            w.position_ms,w.duration_ms,w.played,w.play_count,w.library_item_id,w.updated_at,w.resume_source_fingerprint
                        FROM files f
                        JOIN playable_source_parts p ON p.file_id=f.id
                        JOIN playable_sources ps ON ps.id=p.playable_source_id
-                       JOIN watch_state w ON w.item_id=ps.item_id
+                       JOIN collection_watch_state w ON w.item_id=ps.item_id
                       WHERE f.id=?",
                 )
                 .bind(old_file_id)
@@ -2536,7 +2536,7 @@ impl Registry {
                 source_part = guess.part;
                 let norm = names::normalize_title(&guess.title);
                 let existing: Option<String> = sqlx::query_scalar(
-                    "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                    "SELECT id FROM collection_items WHERE module_id=? AND collection_id=?
                        AND kind='movie' AND norm_title=? AND year IS ?",
                 )
                 .bind(module_id)
@@ -2550,7 +2550,7 @@ impl Registry {
                     None => {
                         let id = ulid::Ulid::generate().to_string();
                         sqlx::query(
-                            "INSERT INTO items
+                            "INSERT INTO collection_items
                                (id,kind,title,norm_title,year,module_id,collection_id)
                              VALUES (?,'movie',?,?,?,?,?)",
                         )
@@ -2602,7 +2602,7 @@ impl Registry {
                         let album_artist_norm = crate::enrich::fold(&album_artist);
                         let album_artist_key = crate::enrich::artist_key(&album_artist);
                         let existing: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items
+                            "SELECT id FROM collection_items
                              WHERE module_id=? AND collection_id=? AND kind='album'
                                AND norm_title=? AND artist_key=?",
                         )
@@ -2626,7 +2626,7 @@ impl Registry {
                                     previous_item.as_deref()
                                 {
                                     sqlx::query_as(
-                                        "SELECT a.id,a.artist_key FROM items t JOIN items a ON a.id=t.parent_id
+                                        "SELECT a.id,a.artist_key FROM collection_items t JOIN collection_items a ON a.id=t.parent_id
                                               WHERE t.id=? AND t.kind='track' AND a.kind='album'
                                                 AND a.module_id=? AND a.collection_id=?
                                                 AND a.norm_title=?",
@@ -2646,7 +2646,7 @@ impl Registry {
                                             .await?;
                                     }
                                     sqlx::query(
-                                        "UPDATE items SET artist=?,norm_artist=?,artist_key=? WHERE id=?",
+                                        "UPDATE collection_items SET artist=?,norm_artist=?,artist_key=? WHERE id=?",
                                     )
                                     .bind(&album_artist)
                                     .bind(&album_artist_norm)
@@ -2658,7 +2658,7 @@ impl Registry {
                                 } else {
                                     let id = ulid::Ulid::generate().to_string();
                                     sqlx::query(
-                                        "INSERT INTO items
+                                        "INSERT INTO collection_items
                                        (id,kind,title,norm_title,year,artist,norm_artist,artist_key,
                                         module_id,collection_id)
                                      VALUES (?,'album',?,?,?,?,?,?,?,?)",
@@ -2685,7 +2685,7 @@ impl Registry {
                         // (same disc/track already exists in the target album)
                         // needs the merge path below.
                         let existing_track: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items
+                            "SELECT id FROM collection_items
                              WHERE kind = 'track' AND parent_id = ?
                                AND season IS ? AND episode = ?",
                         )
@@ -2694,10 +2694,13 @@ impl Registry {
                         .bind(track)
                         .fetch_optional(&mut *tx)
                         .await?;
-                        let previous_track: Option<(String, Option<String>)> =
-                            if let Some(previous_item) = previous_item.as_deref() {
-                                sqlx::query_as(
-                                    "SELECT id,parent_id FROM items WHERE id=? AND kind='track'
+                        let previous_track: Option<(String, Option<String>)> = if let Some(
+                            previous_item,
+                        ) =
+                            previous_item.as_deref()
+                        {
+                            sqlx::query_as(
+                                    "SELECT id,parent_id FROM collection_items WHERE id=? AND kind='track'
                                    AND module_id=? AND collection_id=?",
                                 )
                                 .bind(previous_item)
@@ -2705,9 +2708,9 @@ impl Registry {
                                 .bind(collection_id)
                                 .fetch_optional(&mut *tx)
                                 .await?
-                            } else {
-                                None
-                            };
+                        } else {
+                            None
+                        };
                         if let Some((_, Some(previous_album))) = previous_track.as_ref()
                             && previous_album != &album_id
                         {
@@ -2715,13 +2718,19 @@ impl Registry {
                                 .await?;
                         }
                         Some(match existing_track {
-                            Some(id) => id,
+                            Some(id) => {
+                                let display_artist =
+                                    song_artist.as_deref().unwrap_or(&album_artist);
+                                sqlx::query("UPDATE collection_items SET title=?,norm_title=?,artist=?,norm_artist=? WHERE id=?")
+                                    .bind(&title).bind(names::normalize_title(&title)).bind(display_artist).bind(crate::enrich::fold(display_artist)).bind(&id).execute(&mut *tx).await?;
+                                id
+                            }
                             None if previous_track.is_some() => {
                                 let id = previous_track.expect("guarded above").0;
                                 let display_artist =
                                     song_artist.as_deref().unwrap_or(&album_artist);
                                 sqlx::query(
-                                    "UPDATE items SET title=?,norm_title=?,parent_id=?,season=?,episode=?,
+                                    "UPDATE collection_items SET title=?,norm_title=?,parent_id=?,season=?,episode=?,
                                                       artist=?,norm_artist=?
                                       WHERE id=?",
                                 )
@@ -2740,7 +2749,7 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items
+                                    "INSERT INTO collection_items
                                        (id,kind,title,norm_title,year,parent_id,season,episode,
                                         artist,norm_artist,module_id,collection_id)
                                      VALUES (?,'track',?,?,NULL,?,?,?,?,?,?,?)",
@@ -2788,7 +2797,7 @@ impl Registry {
                         source_part = mg.part;
                         let norm = names::normalize_title(&mg.title);
                         let existing: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                            "SELECT id FROM collection_items WHERE module_id=? AND collection_id=?
                                AND kind='movie' AND norm_title=? AND year IS ?",
                         )
                         .bind(module_id)
@@ -2802,7 +2811,7 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items
+                                    "INSERT INTO collection_items
                                        (id,kind,title,norm_title,year,module_id,collection_id)
                                      VALUES (?,'movie',?,?,?,?,?)",
                                 )
@@ -2827,7 +2836,7 @@ impl Registry {
                     Some(g) => {
                         let norm = names::normalize_title(&g.show_title);
                         let show: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items WHERE module_id=? AND collection_id=?
+                            "SELECT id FROM collection_items WHERE module_id=? AND collection_id=?
                                AND kind='show' AND norm_title=? AND year IS ?",
                         )
                         .bind(module_id)
@@ -2841,7 +2850,7 @@ impl Registry {
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 sqlx::query(
-                                    "INSERT INTO items
+                                    "INSERT INTO collection_items
                                        (id,kind,title,norm_title,year,module_id,collection_id)
                                      VALUES (?,'show',?,?,?,?,?)",
                                 )
@@ -2857,42 +2866,18 @@ impl Registry {
                             }
                         };
                         let ep: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM items
-                             WHERE kind = 'episode' AND parent_id = ?
-                               AND season IS ? AND episode = ?",
+                            "SELECT id FROM collection_items
+                             WHERE kind='episode' AND parent_id=? AND season IS ?
+                               AND episode=? AND COALESCE(episode_end,episode)=?",
                         )
                         .bind(&show_id)
                         .bind(g.season)
                         .bind(g.episode)
+                        .bind(g.episode_end.unwrap_or(g.episode))
                         .fetch_optional(&mut *tx)
                         .await?;
                         Some(match ep {
-                            Some(id) => {
-                                // A batch marker learned on a later scan
-                                // widens the existing slot in place — and
-                                // an auto-generated "Episode N" title
-                                // widens with it (a provider/human title
-                                // is never touched).
-                                sqlx::query(
-                                    "UPDATE items SET episode_end = ?1,
-                                            title = CASE
-                                              WHEN ?1 IS NOT NULL
-                                               AND title = 'Episode ' || episode
-                                              THEN 'Episodes ' || episode || '-' || ?1
-                                              ELSE title END,
-                                            norm_title = CASE
-                                              WHEN ?1 IS NOT NULL
-                                               AND norm_title = 'episode ' || episode
-                                              THEN 'episodes ' || episode || '-' || ?1
-                                              ELSE norm_title END
-                                      WHERE id = ?2 AND episode_end IS NOT ?1",
-                                )
-                                .bind(g.episode_end)
-                                .bind(&id)
-                                .execute(&mut *tx)
-                                .await?;
-                                id
-                            }
+                            Some(id) => id,
                             None => {
                                 let id = ulid::Ulid::generate().to_string();
                                 let title = g.episode_title.clone().unwrap_or_else(|| {
@@ -2904,7 +2889,7 @@ impl Registry {
                                     }
                                 });
                                 sqlx::query(
-                                    "INSERT INTO items
+                                    "INSERT INTO collection_items
                                        (id,kind,title,norm_title,year,parent_id,season,episode,
                                         episode_end,module_id,collection_id)
                                      VALUES (?,'episode',?,?,NULL,?,?,?,?,?,?)",
@@ -2959,9 +2944,9 @@ impl Registry {
                 // HUB-20/MH-5: the same bytes came back (any host, any
                 // path) — restore archived watch state. Live rows win.
                 sqlx::query(
-                    "INSERT INTO watch_state
-                       (user_id, item_id, position_ms, duration_ms, played, play_count)
-                     SELECT user_id, ?, position_ms, duration_ms, played, play_count
+                    "INSERT INTO state_imports
+                       (user_id, item_id, position_ms, duration_ms, played, play_count,expected_library_item_id,updated_at,resume_source_fingerprint)
+                     SELECT user_id, ?, position_ms, duration_ms, played, play_count,library_item_id,COALESCE(state_updated_at,0),resume_source_fingerprint
                      FROM watch_state_archive
                      WHERE size = ? AND head_xxh3 = ? AND tail_xxh3 = ?
                      ON CONFLICT (user_id, item_id) DO NOTHING",
@@ -3001,11 +2986,16 @@ impl Registry {
                     if parts.len() as i64 == expected {
                         let fingerprint = source_fingerprint(&parts);
                         sqlx::query(
-                            "INSERT INTO watch_state
-                               (user_id,item_id,position_ms,duration_ms,played,play_count)
-                             SELECT user_id,?,position_ms,duration_ms,played,play_count
+                            "INSERT INTO state_imports
+                               (user_id,item_id,position_ms,duration_ms,played,play_count,expected_library_item_id,updated_at,resume_source_fingerprint)
+                             SELECT user_id,?,position_ms,duration_ms,played,play_count,library_item_id,COALESCE(state_updated_at,0),
+                                    CASE WHEN library_item_id IS NULL THEN COALESCE(resume_source_fingerprint,source_fingerprint) ELSE resume_source_fingerprint END
                                FROM watch_source_archive WHERE source_fingerprint=?
-                             ON CONFLICT(user_id,item_id) DO NOTHING",
+                             ON CONFLICT(user_id,item_id) DO UPDATE SET
+                               position_ms=excluded.position_ms,duration_ms=excluded.duration_ms,played=excluded.played,
+                               play_count=MAX(state_imports.play_count,excluded.play_count),updated_at=excluded.updated_at,
+                               expected_library_item_id=excluded.expected_library_item_id,resume_source_fingerprint=excluded.resume_source_fingerprint
+                             WHERE excluded.updated_at>=state_imports.updated_at",
                         )
                         .bind(&item_id)
                         .bind(&fingerprint)
@@ -3023,14 +3013,14 @@ impl Registry {
         // (multi-part regrouping, better parses) without any file being
         // deleted — sweep orphans here, not only in reconciliation.
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
+            "DELETE FROM collection_items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=collection_items.id)",
         )
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
-                SELECT DISTINCT p.parent_id FROM items p WHERE p.parent_id IS NOT NULL)",
+            "DELETE FROM collection_items WHERE kind IN ('show', 'album') AND id NOT IN (
+                SELECT DISTINCT p.parent_id FROM collection_items p WHERE p.parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
         .await?;
@@ -3213,25 +3203,27 @@ impl Registry {
     /// beneath per-song artists. Position/played follow the newest write;
     /// play_count is monotonic and takes the larger value rather than adding
     /// two rows that may describe the same physical recording.
-    async fn merge_watch_state(
+    pub(crate) async fn merge_watch_state(
         tx: &mut sqlx::SqliteConnection,
         from_item: &str,
         to_item: &str,
     ) -> Result<()> {
         sqlx::query(
-            "INSERT INTO watch_state
-               (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at)
-             SELECT user_id,?2,position_ms,duration_ms,played,play_count,updated_at
-               FROM watch_state WHERE item_id=?1
+            "INSERT INTO state_imports
+               (user_id,item_id,position_ms,duration_ms,played,play_count,updated_at,expected_library_item_id,resume_source_fingerprint)
+             SELECT user_id,?2,position_ms,duration_ms,played,play_count,updated_at,library_item_id,resume_source_fingerprint
+               FROM collection_watch_state WHERE item_id=?1
              ON CONFLICT(user_id,item_id) DO UPDATE SET
-               position_ms=CASE WHEN excluded.updated_at >= watch_state.updated_at
-                                THEN excluded.position_ms ELSE watch_state.position_ms END,
-               duration_ms=CASE WHEN excluded.updated_at >= watch_state.updated_at
-                                THEN excluded.duration_ms ELSE watch_state.duration_ms END,
-               played=CASE WHEN excluded.updated_at >= watch_state.updated_at
-                           THEN excluded.played ELSE watch_state.played END,
-               play_count=MAX(watch_state.play_count,excluded.play_count),
-               updated_at=MAX(watch_state.updated_at,excluded.updated_at)",
+               position_ms=CASE WHEN excluded.updated_at >= state_imports.updated_at
+                                THEN excluded.position_ms ELSE state_imports.position_ms END,
+               duration_ms=CASE WHEN excluded.updated_at >= state_imports.updated_at
+                                THEN excluded.duration_ms ELSE state_imports.duration_ms END,
+               played=CASE WHEN excluded.updated_at >= state_imports.updated_at
+                           THEN excluded.played ELSE state_imports.played END,
+               expected_library_item_id=CASE WHEN excluded.updated_at>=state_imports.updated_at THEN excluded.expected_library_item_id ELSE state_imports.expected_library_item_id END,
+               resume_source_fingerprint=CASE WHEN excluded.updated_at>=state_imports.updated_at THEN excluded.resume_source_fingerprint ELSE state_imports.resume_source_fingerprint END,
+               play_count=MAX(state_imports.play_count,excluded.play_count),
+               updated_at=MAX(state_imports.updated_at,excluded.updated_at)",
         )
         .bind(from_item)
         .bind(to_item)
@@ -3396,9 +3388,9 @@ impl Registry {
             let fingerprint = source_fingerprint(&parts);
             sqlx::query(
                 "INSERT OR REPLACE INTO watch_source_archive
-                   (user_id,source_fingerprint,position_ms,duration_ms,played,play_count)
-                 SELECT user_id,?,position_ms,duration_ms,played,play_count
-                   FROM watch_state WHERE item_id=?",
+                   (user_id,source_fingerprint,position_ms,duration_ms,played,play_count,library_item_id,state_updated_at,resume_source_fingerprint)
+                 SELECT user_id,?,position_ms,duration_ms,played,play_count,library_item_id,updated_at,resume_source_fingerprint
+                   FROM collection_watch_state WHERE item_id=?",
             )
             .bind(fingerprint)
             .bind(item_id)
@@ -3475,16 +3467,16 @@ impl Registry {
         .execute(&mut *tx)
         .await?;
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
+            "DELETE FROM collection_items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=collection_items.id)",
         )
         .execute(&mut *tx)
         .await?;
         // Shows and albums never have direct sources; they die of
         // childlessness.
         sqlx::query(
-            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
-                SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
+            "DELETE FROM collection_items WHERE kind IN ('show', 'album') AND id NOT IN (
+                SELECT DISTINCT parent_id FROM collection_items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
         .await?;
@@ -3562,7 +3554,7 @@ impl Registry {
             .await?;
         sqlx::query(
             "DELETE FROM media_segments WHERE item_id IN (
-               SELECT id FROM items WHERE module_id=? AND collection_id=?)",
+               SELECT id FROM collection_items WHERE module_id=? AND collection_id=?)",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -3570,7 +3562,7 @@ impl Registry {
         .await?;
         sqlx::query(
             "DELETE FROM media_segment_scans WHERE item_id IN (
-               SELECT id FROM items WHERE module_id=? AND collection_id=?)",
+               SELECT id FROM collection_items WHERE module_id=? AND collection_id=?)",
         )
         .bind(module_id)
         .bind(collection_id)
@@ -4373,12 +4365,12 @@ impl Registry {
         // keyed; restore drops it again if the item still has live sources).
         sqlx::query(
             "INSERT OR REPLACE INTO watch_state_archive
-               (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count)
+               (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count,library_item_id,state_updated_at,resume_source_fingerprint)
              SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
-                    w.position_ms, w.duration_ms, w.played, w.play_count
+                    w.position_ms, w.duration_ms, w.played, w.play_count,w.library_item_id,w.updated_at,w.resume_source_fingerprint
              FROM files f JOIN playable_source_parts p ON p.file_id=f.id
              JOIN playable_sources s ON s.id=p.playable_source_id
-             JOIN watch_state w ON w.item_id=s.item_id
+             JOIN collection_watch_state w ON w.item_id=s.item_id
              WHERE f.module_id=?",
         )
         .bind(module_id)
@@ -4401,16 +4393,16 @@ impl Registry {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
         }
         sqlx::query(
-            "DELETE FROM items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=items.id)",
+            "DELETE FROM collection_items WHERE kind NOT IN ('show','album')
+               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=collection_items.id)",
         )
         .execute(&mut *tx)
         .await?;
         // Shows and albums never have direct sources; they die of
         // childlessness.
         sqlx::query(
-            "DELETE FROM items WHERE kind IN ('show', 'album') AND id NOT IN (
-                SELECT DISTINCT parent_id FROM items WHERE parent_id IS NOT NULL)",
+            "DELETE FROM collection_items WHERE kind IN ('show', 'album') AND id NOT IN (
+                SELECT DISTINCT parent_id FROM collection_items WHERE parent_id IS NOT NULL)",
         )
         .execute(&mut *tx)
         .await?;

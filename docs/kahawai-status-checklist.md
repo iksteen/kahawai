@@ -158,17 +158,17 @@ How something works and why it was built that way belong in
 
 - [x] HUB-1 Registry of mediahosts, collections, transcoders (live + persistent)
 - [x] HUB-2 Libraries composed from same-typed collections
-- [x] HUB-3 Collection-scoped identity: each item belongs to one collection;
-      alternate sources deduplicate only within that item/collection. Libraries
-      compose collections and reuse the same item IDs/watch state; equal works
-      in different collections remain independent (provider/manual/query/watch
-      state included). Playable renditions are explicit: one source row owns
-      one ordered file set, multipart families are root/directory/release-local,
-      and incomplete or ambiguous editions cannot mix with another edition.
-      `files` contains physical facts only; rendition ownership and ordinals
-      live in the explicit source tables. Direct level-52→59 migration and
-      conflict-detecting migration-56 replay are runnable and real-catalogue
-      proven.
+- [x] HUB-3 Library items for movies, series, episodes, albums and songs;
+      anime is a classification. Collection copies link directly to shared items
+      using assigned metadata. CDs stay together, and combined episode files
+      have ordered links. Matching uses typed fields, with manual choices and
+      revision guards on collection items. Migration 78 retains metadata and
+      history while removing duplicate assignment and identity-key storage.
+      Correcting an identified copy leaves the previous item's history intact.
+      Source-specific subtitles, fonts and resume use the selected rendition.
+      Text/ASS serving and extraction retain the selected track's physical file;
+      an empty session subtitle list cannot reuse another source's preview.
+      Runnable regression and upgrade audit: `scripts/kahawai-library.sh`.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions,
       music layout). Music albums group on Album Artist while tracks retain
       their recording Artist; missing Album Artist falls back to path artist,
@@ -872,15 +872,13 @@ How something works and why it was built that way belong in
 
 ## Non-functional (NFR)
 
-- [x] NFR-1 Performance. Browse meets the 200 ms target at 50k items on
-      every path — first page, last page, search and item detail — and
-      holds it at 250k (`tests/scale_bench.rs`, worst run asserted).
-      Start latency and 100-session concurrency measured against the
-      live fleet by `scripts/kahawai-latency.sh` (worst of N, every run
-      printed), across a local file, a 12 GB 4K-class DTS title and an
-      HDR10 one.
-- [x] NFR-2 Scale targets. 250k files across 10 collections hold on
-      every browse path, deep pages and adversarial search included.
+- [x] NFR-1 Performance. Browse latency is gated at 50k library items by
+      `tests/scale_bench.rs`, including deep pages and dense search.
+      Start latency and concurrent playback are exercised by
+      `scripts/kahawai-latency.sh` against the live fleet.
+- [x] NFR-2 Scale targets. The library model supports 250k files across
+      collections, exercised by `tests/scale_bench.rs`. Its 250k run records
+      browse latency; the 200 ms response target applies at 50k (NFR-1).
       Five full video executors exercised together (four enrolled
       transcoders plus AIO's enabled local transcoder): eleven concurrent
       video transcodes filled every box to its own max_sessions and no

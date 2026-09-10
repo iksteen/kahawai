@@ -17,9 +17,9 @@ async fn season(chapters: &[&str]) -> (tempfile::TempDir, Arc<kahawai_hub::regis
            VALUES('m','c','series');
          INSERT INTO collection_roots(module_id,collection_id,root_token,normalized_path)
            VALUES('m','c','r','/series');
-         INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id)
+         INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
            VALUES('show','show','Show','show','show','m','c');
-         INSERT INTO items(id,kind,title,norm_title,sort_title,module_id,collection_id,
+         INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id,
                            parent_id,season,episode)
            VALUES('e1','episode','One','one','one','m','c','show',1,1),
                  ('e2','episode','Two','two','two','m','c','show',1,2);",

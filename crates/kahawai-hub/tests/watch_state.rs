@@ -265,11 +265,12 @@ async fn progress_resume_played_caps_and_idle() {
     assert_eq!(v["resume_position_ms"], serde_json::Value::Null);
     // The hub still knows where the viewer was, though — a re-dispatched
     // transcode resumes the stream from it (AR-6).
-    let stored: i64 = sqlx::query_scalar("SELECT position_ms FROM watch_state WHERE item_id = ?")
-        .bind(&item_id)
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let stored: i64 =
+        sqlx::query_scalar("SELECT position_ms FROM user_item_state WHERE item_id = ?")
+            .bind(&item_id)
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(
         stored, 97_000,
         "the playhead is kept, it is just not offered"
@@ -289,7 +290,7 @@ async fn progress_resume_played_caps_and_idle() {
     // until the element has its metadata. Clearing the mark on those wiped
     // the seen ticks a row ahead of the playhead through an album already
     // heard.
-    sqlx::query("UPDATE watch_state SET updated_at = 123 WHERE item_id = ?")
+    sqlx::query("UPDATE user_item_state SET updated_at = 123 WHERE item_id = ?")
         .bind(&item_id)
         .execute(&db)
         .await
@@ -302,7 +303,7 @@ async fn progress_resume_played_caps_and_idle() {
         "a ping from a standing start does not unwatch anything"
     );
     let watched_at: i64 =
-        sqlx::query_scalar("SELECT updated_at FROM watch_state WHERE item_id = ?")
+        sqlx::query_scalar("SELECT updated_at FROM user_item_state WHERE item_id = ?")
             .bind(&item_id)
             .fetch_one(&db)
             .await

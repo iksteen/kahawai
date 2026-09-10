@@ -62,8 +62,8 @@ const done = computed(() => (props.progress ? watchedPct(props.item) : null))
 
 function kindGlyph(kind: string): IconName | null {
   if (kind === 'movie') return 'movie'
-  if (kind === 'show' || kind === 'episode') return 'show'
-  if (kind === 'album' || kind === 'track') return 'album'
+  if (kind === 'series' || kind === 'episode') return 'show'
+  if (kind === 'album' || kind === 'song') return 'album'
   return null
 }
 const glyph = computed(() => kindGlyph(props.item.kind))
@@ -87,7 +87,7 @@ const glyph = computed(() => kindGlyph(props.item.kind))
     <span
       v-if="glyph"
       class="badge left-1.5 top-1.5"
-      :title="props.item.kind === 'show' ? 'series' : props.item.kind"
+      :title="props.item.kind === 'series' ? 'series' : props.item.kind"
     >
       <Icon :name="glyph" />
     </span>

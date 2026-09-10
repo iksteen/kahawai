@@ -359,7 +359,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     // hub-owned identity decisions. Stream the same current source through a
     // forced snapshot and verify its stable item row (and manual pin) survive.
     let item_id: String = sqlx::query_scalar(
-        "SELECT id FROM items WHERE module_id='01LINK' AND collection_id='movies' AND kind='movie'",
+        "SELECT id FROM collection_items WHERE module_id='01LINK' AND collection_id='movies' AND kind='movie'",
     )
     .fetch_one(hub.registry.db())
     .await

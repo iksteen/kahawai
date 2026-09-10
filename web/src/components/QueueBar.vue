@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { trackKey } from '../domain/queue.ts'
 /// Queue playback for a record (HUB-27): one direct-play session per track,
 /// auto-advance when one ends, prev/next, and a list you can jump about in.
 /// The <audio> element streams with the media cookie.
@@ -123,7 +124,7 @@ const listing = ref(false)
 /// measured on: recover at 0:42, jump to another track before the new session
 /// arrives, and the jumped-to track started 42 seconds in — or ended at once, if
 /// it was shorter than that.
-let resumeAt: { key: string; at: number } | null = null
+let resumeAt: { key: string; at: number; fingerprint: string | undefined } | null = null
 
 function release(slot: Slot, keepalive = false, after?: Promise<unknown>) {
   clearTimeout(slot.timer)
@@ -157,13 +158,17 @@ function release(slot: Slot, keepalive = false, after?: Promise<unknown>) {
 async function prepare(which: 0 | 1, want: number) {
   const slot = slots[which]
   const track = entries.value[want]?.track
-  if (!track || slot.key === track.id) return
+  if (!track || slot.key === trackKey(track)) return
   release(slot)
-  slot.key = track.id
+  slot.key = trackKey(track)
   slot.trouble = null
   try {
     const session = await startSession(
-      { item_id: track.id, mode: 'direct' },
+      {
+        item_id: track.id,
+        ...(track.album_track_id == null ? {} : { album_track_id: track.album_track_id }),
+        mode: 'direct',
+      },
       { signal: AbortSignal.timeout(START_TIMEOUT_MS) },
     )
     // The queue may have moved on while the hub answered — or another attempt
@@ -178,7 +183,7 @@ async function prepare(which: 0 | 1, want: number) {
     // out. That is an ordering between a watcher, an interval and a DOM event
     // — none of which this function controls — and the cost of being wrong is
     // a session pinged for half an hour against a per-user cap of four.
-    if (slots[which].key !== track.id || slots[which].session) {
+    if (slots[which].key !== trackKey(track) || slots[which].session) {
       void endSession(session.session_id).catch(() => {})
       return
     }
@@ -187,7 +192,7 @@ async function prepare(which: 0 | 1, want: number) {
     slots[which].tries = 0
     slots[which].triesFor = null
   } catch (cause) {
-    if (slots[which].key !== track.id) return
+    if (slots[which].key !== trackKey(track)) return
     // The claim is KEPT, and the retry timer below is the only thing that drops
     // it. Giving it back here is what let `timeupdate` ask again on the very
     // next frame — four times a second while a host was away.
@@ -201,8 +206,8 @@ async function prepare(which: 0 | 1, want: number) {
     // ambiguity that forced it: a stream cap waits as long as it takes, and an
     // unplayable track stops asking at once.
     const slot_ = slots[which]
-    if (slot_.triesFor !== track.id) {
-      slot_.triesFor = track.id
+    if (slot_.triesFor !== trackKey(track)) {
+      slot_.triesFor = trackKey(track)
       slot_.tries = 0
     }
     slot_.tries += 1
@@ -243,7 +248,7 @@ watch(
   () => {
     const track = entries.value[at.value]?.track
     if (!track) return
-    if (slots[active.value].key !== track.id) void prepare(active.value, at.value)
+    if (slots[active.value].key !== trackKey(track)) void prepare(active.value, at.value)
   },
   { immediate: true },
 )
@@ -262,7 +267,11 @@ watch(
 // nobody is going to play.
 watch([entries, at, active], () => {
   const idle = slots[other.value]
-  if (idle.key && idle.key !== entries.value[at.value + 1]?.track.id) release(idle)
+  if (
+    idle.key &&
+    idle.key !== (entries.value[at.value + 1] && trackKey(entries.value[at.value + 1]!.track))
+  )
+    release(idle)
 })
 
 /// A direct-play element stops fetching the moment it has the whole file, which
@@ -340,7 +349,12 @@ async function recover(which: 0 | 1, want: number, seconds: number, isPaused: bo
   }
   // Only the audible slot has a position worth restoring, and a preload
   // recovering at 0 would otherwise wipe one the active slot was waiting to use.
-  if (seconds > 0 && track) resumeAt = { key: track.id, at: seconds }
+  if (seconds > 0 && track)
+    resumeAt = {
+      key: trackKey(track),
+      at: seconds,
+      fingerprint: slots[which].session?.source_fingerprint,
+    }
   // `prepare` no-ops when the slot already claims this track, and it does —
   // with a session the hub has forgotten. Drop the claim.
   slots[which].key = null
@@ -354,9 +368,14 @@ async function recover(which: 0 | 1, want: number, seconds: number, isPaused: bo
 let audio: { ctx: AudioContext; gain: GainNode } | null = null
 const wired = new WeakSet<HTMLAudioElement>()
 
-const factor = computed(() =>
-  replayGainFactor(entries.value[at.value]?.track, entries.value[at.value]?.gain ?? 'album'),
-)
+const factor = computed(() => {
+  const track = entries.value[at.value]?.track
+  const session = slots[active.value].session
+  return replayGainFactor(
+    track && session ? { ...track, replay_gain: session.replay_gain ?? null } : track,
+    entries.value[at.value]?.gain ?? 'album',
+  )
+})
 
 function level() {
   const Ctor =
@@ -494,7 +513,7 @@ function onEnded(which: 0 | 1) {
   if (
     slots[warmed].session &&
     !slots[warmed].trouble &&
-    slots[warmed].key === entries.value[next]?.track.id
+    slots[warmed].key === (entries.value[next] && trackKey(entries.value[next]!.track))
   ) {
     active.value = warmed
     queue.jump(next)
@@ -555,7 +574,12 @@ function onLoaded(which: 0 | 1) {
     return
   }
   const element = elementOf(which)
-  if (element) element.currentTime = resumeAt.at
+  if (
+    element &&
+    resumeAt.fingerprint &&
+    slots[which].session?.source_fingerprint === resumeAt.fingerprint
+  )
+    element.currentTime = resumeAt.at
   resumeAt = null
 }
 
@@ -602,7 +626,7 @@ const sub = computed(() =>
       <ul ref="rows" role="list" aria-labelledby="queue-list-head">
         <li
           v-for="(entry, index) in entries"
-          :key="`${entry.track.id}-${index}`"
+          :key="`${trackKey(entry.track)}-${index}`"
           class="flex items-center hover:bg-hover"
         >
           <button

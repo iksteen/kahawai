@@ -9,7 +9,7 @@
 use kahawai_hub::enrich::Enricher;
 use sqlx::Row;
 
-async fn seed(db: &kahawai_sqlite::Database) {
+async fn seed(db: &kahawai_hub::library::Database) {
     // One anime show whose first file carries an ed2k AniDB identified,
     // and an AniList answer whose provider_id IS the AniList media id.
     sqlx::query(
@@ -27,7 +27,7 @@ async fn seed(db: &kahawai_sqlite::Database) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('show1','show','Lain','lain','m','c')",
     )
     .execute(db)
@@ -49,9 +49,11 @@ async fn seed(db: &kahawai_sqlite::Database) {
     .fetch_one(db)
     .await
     .unwrap();
-    kahawai_hub::registry::bind_file_to_item(&mut db.acquire().await.unwrap(), file_id, "show1")
+    let mut tx = db.begin().await.unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, file_id, "show1")
         .await
         .unwrap();
+    tx.commit().await.unwrap();
     sqlx::query(
         "INSERT INTO ed2k_aid (ed2k, aid, updated_at) VALUES ('deadbeef', 2129, unixepoch())",
     )

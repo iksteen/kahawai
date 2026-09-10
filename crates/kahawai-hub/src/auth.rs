@@ -44,11 +44,11 @@ use std::path::Path;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 
+use crate::library::Database;
 use anyhow::{Context, Result, bail};
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation};
-use kahawai_sqlite::Database;
 use rand_core::{OsRng, RngCore};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};

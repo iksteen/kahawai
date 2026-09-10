@@ -11,7 +11,7 @@
 //! Nothing here calls the pick. If a single assertion needs one, the
 //! design has a hole in it.
 
-use kahawai_sqlite::Database as SqlitePool;
+use kahawai_hub::library::Database as SqlitePool;
 
 /// The assignment, re-derived from scratch: the winning candidate per
 /// item under the same rules, compared against what is stored.
@@ -45,7 +45,7 @@ WITH truth AS (
                                           (i.module_id,i.collection_id)),
                                   'movies')),99),
                pm.provider) AS n
-      FROM items i JOIN provider_metadata pm ON pm.item_id = i.id
+      FROM collection_items i JOIN provider_metadata pm ON pm.item_id = i.id
      WHERE i.kind IN ('movie', 'show', 'album')
        AND pm.confidence IN ('auto', 'weak') AND pm.provider_id <> ''
        AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
@@ -90,7 +90,7 @@ async fn item(db: &SqlitePool, id: &str) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES(?,'movie',?,?,'fixture','default')",
     )
     .bind(id)
@@ -338,7 +338,7 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
         .unwrap();
     }
     item(&db, "i1").await;
-    sqlx::query("UPDATE items SET module_id='c-movies',collection_id='c' WHERE id='i1'")
+    sqlx::query("UPDATE collection_items SET module_id='c-movies',collection_id='c' WHERE id='i1'")
         .execute(&db)
         .await
         .unwrap();
@@ -352,7 +352,7 @@ async fn moving_a_source_between_collections_re_ranks_the_item() {
     );
     assert_eq!(drifted(&db).await, 0);
 
-    sqlx::query("UPDATE items SET module_id='c-anime' WHERE id='i1'")
+    sqlx::query("UPDATE collection_items SET module_id='c-anime' WHERE id='i1'")
         .execute(&db)
         .await
         .unwrap();

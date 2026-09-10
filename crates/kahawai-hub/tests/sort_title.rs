@@ -7,12 +7,12 @@
 //! deliberately mutates through RAW SQL as well as through the provider
 //! API — a hand-written UPDATE is exactly how the old merge drifted.
 
-use kahawai_sqlite::Database as SqlitePool;
+use kahawai_hub::library::Database as SqlitePool;
 
 /// What `sort_title` must equal at every moment, computed from scratch.
 /// If this and the stored column ever disagree, browse is sorting by
 /// something the user cannot see.
-const TRUTH: &str = "SELECT COUNT(*) FROM items i WHERE i.sort_title IS NOT COALESCE(
+const TRUTH: &str = "SELECT COUNT(*) FROM collection_items i WHERE i.sort_title IS NOT COALESCE(
         (SELECT pm.title FROM item_match im
            JOIN provider_metadata pm
              ON pm.item_id = i.id AND pm.provider = im.provider
@@ -25,7 +25,7 @@ async fn drifted(db: &SqlitePool) -> i64 {
 }
 
 async fn sort_title(db: &SqlitePool, id: &str) -> Option<String> {
-    sqlx::query_scalar("SELECT sort_title FROM items WHERE id = ?")
+    sqlx::query_scalar("SELECT sort_title FROM collection_items WHERE id = ?")
         .bind(id)
         .fetch_one(db)
         .await
@@ -48,7 +48,7 @@ async fn item(db: &SqlitePool, id: &str, title: &str) {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES(?,'movie',?,?,'fixture','default')",
     )
     .bind(id)
@@ -148,7 +148,7 @@ async fn sort_title_never_drifts() {
     assert_eq!(drifted(&db).await, 0);
 
     // A rescan renaming the file has to follow too.
-    sqlx::query("UPDATE items SET title = '12 Monkeys (1995)' WHERE id = 'i1'")
+    sqlx::query("UPDATE collection_items SET title = '12 Monkeys (1995)' WHERE id = 'i1'")
         .execute(&db)
         .await
         .unwrap();
@@ -186,14 +186,14 @@ async fn an_episodes_sort_title_follows_the_shows_assignment() {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     item(&db, "show1", "A Show").await;
-    sqlx::query("UPDATE items SET kind='show' WHERE id='show1'")
+    sqlx::query("UPDATE collection_items SET kind='show' WHERE id='show1'")
         .execute(&db)
         .await
         .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
          SELECT 'ep1','episode','S01E01','s01e01','show1',1,1,module_id,collection_id
-           FROM items WHERE id='show1'",
+           FROM collection_items WHERE id='show1'",
     )
     .execute(&db)
     .await
@@ -353,7 +353,7 @@ async fn libraries_compose_collection_items_directly() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
                  VALUES('i','movie','Film','film','m','c1')",
     )
     .execute(&db)
@@ -361,7 +361,7 @@ async fn libraries_compose_collection_items_directly() {
     .unwrap();
 
     let visible: Vec<(String, String)> = sqlx::query_as(
-        "SELECT lc.library_id,i.id FROM items i JOIN library_collections lc
+        "SELECT lc.library_id,i.id FROM collection_items i JOIN library_collections lc
            ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
           WHERE i.id='i' ORDER BY lc.library_id",
     )
@@ -373,12 +373,12 @@ async fn libraries_compose_collection_items_directly() {
         vec![("l1".into(), "i".into()), ("l2".into(), "i".into())]
     );
 
-    sqlx::query("UPDATE items SET collection_id='c2' WHERE id='i'")
+    sqlx::query("UPDATE collection_items SET collection_id='c2' WHERE id='i'")
         .execute(&db)
         .await
         .unwrap();
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM items i JOIN library_collections lc
+        "SELECT COUNT(*) FROM collection_items i JOIN library_collections lc
            ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
           WHERE i.id='i'",
     )
@@ -422,18 +422,18 @@ async fn library_browse_counts_only_top_level_collection_items() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id) VALUES
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id) VALUES
                  ('show','show','Show','show','m','c'),
                  ('film','movie','Film','film','m','c')",
     )
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query("INSERT INTO items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+    sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
                  VALUES('ep','episode','Episode','episode','show',1,1,'m','c')")
         .execute(&db).await.unwrap();
     let ids: Vec<String> = sqlx::query_scalar(
-        "SELECT i.id FROM items i JOIN library_collections lc
+        "SELECT i.id FROM collection_items i JOIN library_collections lc
            ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
           WHERE lc.library_id='l' AND i.parent_id IS NULL ORDER BY i.id",
     )

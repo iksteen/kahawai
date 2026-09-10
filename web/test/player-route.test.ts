@@ -51,20 +51,26 @@ const { notice, clearNotices } = await import('../src/composables/notices.ts')
 const Player = (await import('../src/views/Player.vue')).default
 const Picture = (await import('../src/components/Picture.vue')).default
 
-const film = (over: Record<string, unknown> = {}) => ({
-  id: 'heat',
-  kind: 'movie',
-  title: 'Heat',
-  parent_id: null,
-  resume_position_ms: null,
-  metadata: null,
-  negotiated: null,
-  sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
-  ...over,
-})
+const film = (over: Record<string, unknown> = {}) => {
+  const item = {
+    id: 'heat',
+    kind: 'movie',
+    title: 'Heat',
+    parent_id: null,
+    resume_position_ms: null,
+    metadata: null,
+    negotiated: null,
+    sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
+    ...over,
+  }
+  return { ...item, sources: item.sources.map((source) => ({ source_id: 1, ...source })) }
+}
 
 const session = (id = 's1', over: Record<string, unknown> = {}) => ({
   session_id: id,
+  source_id: 1,
+  source_fingerprint: 'physical-version-1',
+  effective_start_ms: 0,
   stream_url: `/stream/${id}/index.m3u8`,
   content_type: 'application/vnd.apple.mpegurl',
   mode: 'remux',
@@ -129,6 +135,26 @@ afterEach(() => {
 })
 
 describe('opening the player', () => {
+  test('adopts a first-identification alias and retains its chapter request', async () => {
+    vi.mocked(api.itemQuery).mockResolvedValue(
+      film({ id: 'canonical', title: 'Canonical' }) as never,
+    )
+    const { router, wrapper } = await open('/library/films/item/heat/play?start=470512&source=1')
+    await flushPromises()
+    expect(router.currentRoute.value.params.id).toBe('canonical')
+    expect(api.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ item_id: 'canonical', start_ms: 470512 }),
+    )
+    expect(wrapper.find('h1').text()).toBe('Canonical')
+    wrapper.findComponent(Picture).vm.$emit('restart', 'canonical', session('recovered'), 470512, {
+      audio: 0,
+      video: 0,
+      subKey: '',
+    })
+    await flushPromises()
+    expect(api.endSession).not.toHaveBeenCalledWith('recovered', expect.anything())
+  })
+
   test('starts a session for the item in the URL', async () => {
     // `/play` is an ADDRESS, not an instruction to the item page: a deep link, a
     // reload and a forward all have to land where pressing Play does.
@@ -214,6 +240,7 @@ describe('opening the player', () => {
   test('and asks for the track the viewer’s preferences name (HUB-33)', async () => {
     vi.mocked(api.itemQuery).mockResolvedValue(
       film({
+        negotiated: { source: { source_id: 1 } },
         sources: [
           {
             streams: {
@@ -231,7 +258,9 @@ describe('opening the player', () => {
       prefs: [{ scope: '', key: 'audio.movies', value: 'jpn' }],
     } as never)
     await open()
-    expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ audio_track: 1 }))
+    expect(api.startSession).toHaveBeenCalledWith(
+      expect.objectContaining({ audio_track: 1, source_id: 1 }),
+    )
   })
 
   test('and a preference read that fails does not cost the bandwidth cap silently', async () => {
@@ -241,7 +270,7 @@ describe('opening the player', () => {
     // anime-in-English bug.
     vi.mocked(api.getPrefs).mockRejectedValue(new ApiError(500, 'nope'))
     await open()
-    expect(notice.value).toContain('Could not resolve the audio track')
+    expect(notice.value).toContain('Could not read your preferences')
     expect(api.startSession).toHaveBeenCalled()
   })
 

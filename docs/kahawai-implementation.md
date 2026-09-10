@@ -131,48 +131,80 @@ Fast-path change detection uses `(path, size, mtime)`; `ContentId` resolves rena
 
 ### 4.1 Data model (SQLite)
 
-Core tables: `satellites` (module ID/type/name/certificate fingerprints; the mTLS allowlist), `collections`, `collection_roots` (one validated root-token/path binding), `items` (logical entities owned by `(module_id, collection_id)`; parent and child are constrained to the same collection), `files` (the authoritative physical source row with stable integer ID, exact root, relative path and technical metadata), `playable_sources` plus `playable_source_parts` (one collection item rendition and its ordered physical files; ordinary files are one-part sources), `libraries` plus `library_collections` (composition only), `subtitle_tracks` (exactly one direct owner: physical streams and their OCR/raster derivatives reference `files.id`; downloaded/manual rows and their derivatives reference the collection item), `users` (including `all_libraries`), `user_libraries`, `watch_state (user, item, position_ms, play_count, updated_at)`, `watch_state_archive`, `sessions`, and append-only `satellite_audit`. There is no item-level library membership cache. Playable-source rows are explicit rendition identity, not a library presentation projection: they prevent multipart editions from being assembled by choosing one file per ordinal at read time.
+A **library item** is what the user browses and keeps history for. A
+**collection item** is a copy with detected metadata, provider answers and
+physical sources. `collection_item_library_items` links the two. Usually there
+is one link per copy; a combined episode file has one ordered link per episode.
+CD1/CD2 remain parts of one physical source and one movie assignment. Two files
+with different episode coverage have different collection items.
 
-Watch-state writes are batched but flushed on session teardown and every 10 s (NFR-3).
+`library_items` holds movies, series, episodes, albums and songs with stable,
+globally searchable IDs. Anime is a classification. Matching compares ordinary
+columns: movie/series title and year; episode series, numbering, season and
+number; album artist, title, year and edition; song album position or recording
+ID. Assigned title/year takes precedence over detected title/year, so assigning
+`X-Men.mp4` to X-Men (2000) joins `X-Men (2000).mkv`, across collections and
+providers. Missing fields and multiple matching items require identification or
+an explicit choice. Provider IDs do not define movie or series identity.
 
-**Inputs and derivations.** Every enrichment table is one of two kinds, and which one decides who writes it. **Inputs** are facts nothing can recompute: `provider_metadata` (what each provider answered, per collection item), `provider_ranks` (chain order per media type), `rejected_matches`, `manual_match`, `anime_ids`, `enrichment_queue`, and the collection ownership on `items`. **Derivations** are functions of those, stored only because a read cannot afford to compute them: `item_match` (which provider record an item IS) and `items.sort_title`. Library visibility is not a derivation to synchronize: browse joins `library_collections` to the collection-scoped item index. A retitle flows answer → `items.sort_title`; moving an item to another collection immediately repicks its provider chain.
+`episode_details` stores the series and episode numbering. `album_tracks` stores
+stable album positions. `collection_items.album_track_id` selects the current
+position of each copy; a shared recording can occur on several albums. Access to one album cannot reveal another album's copies.
 
-Nothing in the codebase writes a derivation. Triggers do, on every write to an input. This replaced an earlier `merged_metadata` table that was maintained by explicit calls and spent its life subtly stale — the rule against storing what a read can derive was right, and the reason it was right is staleness, so the answer is to remove the human step rather than the storage. Consequences worth knowing:
+An assignment edits the existing links and sets
+`collection_items.assignment_manual`. Automatic matching then leaves those links
+alone. `assignment_revision` rejects stale edits; a queued source change advances
+it without storing a second snapshot of the metadata. Parent corrections update
+automatic children; manually assigned children retain their choice and report a
+parent conflict. `rejected_library_matches` records rejected choices.
 
-- A derivation must not carry an input as a column. The human pin used to be `item_match.manual`, which forced the pick to recompute *around* rows it must not touch; it lives in `manual_match` now and wins as the pick's first sort key.
-- Trigger bodies must not use `(?N IS NULL OR col = ?N)` optional-filter guards. That form is unavoidable with a bound parameter and it defeats every index; in a trigger the filter is known at compile time, so it is substituted as a plain equality. Getting this wrong made a rescan quadratic.
-- `INSERT OR REPLACE` into an input is forbidden: SQLite fires no DELETE triggers for REPLACE unless `recursive_triggers` is on, and it is off.
+Provider answers and provider choices stay on the collection item.
+`metadata_eligible` prevents a manually selected different item from inheriting
+an answer describing the old item. A combined file's first-episode answer cannot
+describe all covered episodes. `library_overrides` contains shared descriptive
+overrides; clearing them restores available provider descriptions.
 
-The reference for what each table means is the `hub/providers.rs` module doc, next to the code that enforces it. `tests/item_match_derived.rs` and `tests/sort_title.rs` re-derive the truth independently after every kind of write, raw SQL included.
+Source changes and matching commit together through the existing database
+writer. The hub installs a before-commit function; triggers enqueue affected
+collection items, and Rust matches parents before children. Reads do no repair.
+The cost is indexed comparisons and local writes for affected copies, without
+provider calls or media reads. Browse paginates library items before loading
+source context. Schema meaning lives beside the implementation in
+`hub/library/mod.rs`; matching, history and playback have separate modules.
 
-**Connections and write serialization.** The hub keeps eight SQLite
-connections in WAL mode with foreign keys on: seven OS/read-only query
-connections and one writable connection owned by a bounded FIFO task. Every
-statement that can mutate state and every explicit transaction goes through
-that task; transactions claim the SQLite writer slot with `BEGIN IMMEDIATE`,
-so application concurrency waits in one visible queue instead of racing
-deferred-transaction upgrades into `SQLITE_BUSY`. The exposed pool also has
-`PRAGMA query_only=ON`, making an accidental bypass fail immediately. The
-queue holds at most 256 requests (senders then apply backpressure), skips work
-cancelled before it starts, rolls back an abandoned started transaction, and
-warns with its operation label when either queue wait or execution exceeds one
-second. A nested request for the same database from the task already holding
-its writer is rejected instead of deadlocking; another physical database stays
-independent. Raw `BEGIN`/savepoint/commit/rollback statements are rejected at
-the generic executor boundary so a caller cannot return the sole connection in
-transaction state; callers use the serialized transaction API instead.
+Public browse/search/detail/artwork/playback IDs are library item IDs. Details
+expose collection copies and their assignment revisions. Admin matching uses
+`/admin/v1/collection-items/{id}/match`; descriptive overrides use
+`/admin/v1/library-items/{id}/metadata`. Both require the current revision.
+Item QUERY and playback start accept a physical source ID so stream indexes
+and chapter offsets retain their meaning. Subtitle search/download and font
+requests name that source too. Music sessions return its actual ReplayGain.
+Grants apply to the supporting copies, including child lists and album search.
 
-The existing cache cost model is unchanged: every connection has
-`cache_size = -8192` (8 MiB). SQLite's 2 MB default is smaller than the index a
-deep browse page walks, which made the same query cost 253 ms or 50 ms depending
-on which pooled connection served it. Measured at 2/8/16/64 MiB: the bimodality
-disappears at 8 and nothing improves above it. Seven readers plus one writer
-retain the 8 × 8 MiB memory ceiling, allocated lazily. Reads still run
-concurrently and continue against their prior WAL snapshot while a write is in
-progress. Each physical database owns its own writer task, so all-in-one has
-one for `hub.db` and an independent one for `catalog.db`; a separate process
-writing either file can still contend because it cannot join the in-process
-queue.
+`user_item_state` belongs to the library item. Correcting an identified copy
+leaves history with the previous item. An unidentified item retains its ID on
+first identification when possible; if it joins an existing item, its history
+transfers once and `merged_into` lets already playing sessions finish correctly.
+Sessions capture the copy, ordered library item IDs and physical fingerprint.
+Recovery carries that fingerprint; an offset from another version starts at the
+beginning. Optional known episode boundaries make progress episode-relative;
+missing boundaries keep combined playback. Autoplay advances past the episodes
+covered by the current source. Legacy offsets without provenance remain stored
+but cannot resume an arbitrary physical version.
+
+Portable preferences follow the initially identified library item, with an
+existing library preference winning conflicts. Exact track preferences use a
+`source:{id}` scope. A legacy exact choice is copied only when its collection
+item has one physical source; ambiguous original preferences remain stored.
+
+Migration 77 is the immutable introduction of shared items. Migration 78 removes
+the key, pin, assignment-snapshot and duplicate-numbering storage, retaining item
+IDs, source metadata, links, decisions and history. A version-76 database runs
+both migrations and derives library items directly from its existing metadata.
+Startup repairs legacy episode coverages using stored paths, preserving source
+IDs and downloaded subtitle payloads, then finishes matching before accepting requests. Rehearse an upgrade on a
+database copy with `scripts/kahawai-library.sh audit DATA_DIRECTORY`; without
+arguments the script runs the library regression tests.
 
 ### 4.2 Item resolution pipeline
 
@@ -262,7 +294,7 @@ Entitlement handling: remaining downloads and reset time come from the download 
 
 ### 4.3b Anime pipeline (HUB-29..33)
 
-**Exact-file episode identity (HUB-30).** AniDB's `FILE` reply names the episode, group and version of the exact bytes on disk, keyed by ED2K hash — identity no filename heuristic can match. Every hashed episode file is asked once, budgeted per enrichment run and paced by the client's flood rule; the full reply is cached in `ed2k_aid` (misses included, terminally). A binder then re-binds files whose cached answer disagrees with their name-derived slot: the hash wins (HUB-30a), watch state follows the file, and a misnumbered episode item left sourceless is deleted rather than haunting the season view. The binder is deliberately narrow where numbering spaces differ: `epno` is scoped to one AniDB entry, so only files whose aid matches their show's move — and that narrowness is now a decision rather than a gap (2026-08-06): AniDB splits Pokemon into an entry per season, so 213 of this library's 217 aid disagreements are files ALREADY in the right slot, and moving them to their entry's numbering would break a correct `Pokemon 06x01` to satisfy a keyspace kahawai presents as a per-user projection anyway (HUB-31). What the hash still settles across aids is collisions: several files on ONE slot whose hashes name DIFFERENT eids are different episodes and get split apart, numbered from the hash — several sources sharing an eid remain the legitimate two-copies case, so the eid is the test and the count is not; regular numbers apply to absolute-keyed episodes only; every typed number lands in season 0 under a banded layout (S=n, C=100+n, T=200+n, P=300+n, O=400+n — the hub's own layout, collision-free by construction): specials, credits reels and trailers are precisely the files name-parsing cannot place, and one squatting on an episode slot is an artifact of the numbering the hash exists to correct. Binding runs BEFORE the provider chain so the bridge projection writes titles onto corrected slots in the same pass. Name-side, the fansub tokenizer slots release designations (NCOP/NCED, OVA/OAV/ONA, SP/SPECIAL, MOVIE; arabic or roman indexes) into the same season-0 bands, with precedence calibrated on real filenames: an explicitly-indexed designator beats a stray title number, an indexless one loses to a real episode number, and SxxEyy names never reach designator logic at all. Files bound to NOTHING answer to their hash: looked up by ED2K, bound under whatever their aid names — and when nothing owns the aid and AniDB's type says Movie, the item is MINTED from the provider's answer (title, year from the cached per-anime XML) or an aid-less twin adopted. That is the one place an item originates from an answer rather than a filename, and it is deliberate: a yearless "Akira.mkv" can never earn an item any other way, and every minted field is AniDB's statement about the exact bytes. "Movie-shaped" includes single-episode OVA/Web entries (Kite Liberator is `type OVA, episodecount 1` — a movie in everything but the type string); a MULTI-episode series-type aid stays bare — one stray file must not scaffold a show.
+**Exact-file episode identity (HUB-30).** AniDB's `FILE` reply names the episode, group and version of the exact bytes on disk, keyed by ED2K hash — identity no filename heuristic can match. Every hashed episode file is asked once, budgeted per enrichment run and paced by the client's flood rule; the full reply is cached in `ed2k_aid` (misses included, terminally). A binder then re-binds files whose cached answer disagrees with their name-derived slot: the hash wins (HUB-30a), provisional history can follow the file while established catalogue history stays with its work, and a misnumbered episode item left sourceless is deleted rather than haunting the season view. The binder is deliberately narrow where numbering spaces differ: `epno` is scoped to one AniDB entry, so only files whose aid matches their show's move — and that narrowness is now a decision rather than a gap (2026-08-06): AniDB splits Pokemon into an entry per season, so 213 of this library's 217 aid disagreements are files ALREADY in the right slot, and moving them to their entry's numbering would break a correct `Pokemon 06x01` to satisfy a keyspace kahawai presents as a per-user projection anyway (HUB-31). What the hash still settles across aids is collisions: several files on ONE slot whose hashes name DIFFERENT eids are different episodes and get split apart, numbered from the hash — several sources sharing an eid remain the legitimate two-copies case, so the eid is the test and the count is not; regular numbers apply to absolute-keyed episodes only; every typed number lands in season 0 under a banded layout (S=n, C=100+n, T=200+n, P=300+n, O=400+n — the hub's own layout, collision-free by construction): specials, credits reels and trailers are precisely the files name-parsing cannot place, and one squatting on an episode slot is an artifact of the numbering the hash exists to correct. Binding runs BEFORE the provider chain so the bridge projection writes titles onto corrected slots in the same pass. Name-side, the fansub tokenizer slots release designations (NCOP/NCED, OVA/OAV/ONA, SP/SPECIAL, MOVIE; arabic or roman indexes) into the same season-0 bands, with precedence calibrated on real filenames: an explicitly-indexed designator beats a stray title number, an indexless one loses to a real episode number, and SxxEyy names never reach designator logic at all. Files bound to NOTHING answer to their hash: looked up by ED2K, bound under whatever their aid names — and when nothing owns the aid and AniDB's type says Movie, the item is MINTED from the provider's answer (title, year from the cached per-anime XML) or an aid-less twin adopted. That is the one place an item originates from an answer rather than a filename, and it is deliberate: a yearless "Akira.mkv" can never earn an item any other way, and every minted field is AniDB's statement about the exact bytes. "Movie-shaped" includes single-episode OVA/Web entries (Kite Liberator is `type OVA, episodecount 1` — a movie in everything but the type string); a MULTI-episode series-type aid stays bare — one stray file must not scaffold a show.
 
 **Batch markers are spans, not duplicates.** "OVA 1-2" and "S01E01-E02" parse to an episode range, and the range becomes ONE episode item covering `episode..=episode_end` (`items.episode_end`, 0045), rendered "E01-02". Two entries would be dishonest twice over: an explicit playable source binds the physical file to exactly one collection item (everything from sessions to watch state leans on that), and with no per-episode byte offsets, "play episode 2" could only ever play the whole file. Span slots are exempt from hash re-binding — a single-epno FILE reply must not collapse a range — and a span learned on a later scan widens the existing slot (and its auto-generated title) in place. Range detection is deliberately conservative: a dashed number pair counts only immediately after a designator or as the name's final token, so "Ranma 1-2" stays a title; and among designator tokens an explicitly-indexed one outranks an earlier indexless one, so the adjective in "Kite Special Edition Uncut OVA 1-2" cannot shadow the real "OVA 1-2".
 

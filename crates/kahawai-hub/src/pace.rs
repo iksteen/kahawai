@@ -37,8 +37,8 @@
 //! Registry and dies with the disconnect. Persisting it would only let
 //! a stale number outlive the truth it described.
 
+use crate::library::Database as SqlitePool;
 use anyhow::Result;
-use kahawai_sqlite::Database as SqlitePool;
 
 /// EWMA weight for a new sample. See the module doc.
 pub const ALPHA: f64 = 0.3;

@@ -40,6 +40,10 @@ async fn item_with(
 ) -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    sqlx::query("INSERT INTO users(id,username,password_hash) VALUES('u1','tester','unused')")
+        .execute(&db)
+        .await
+        .unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
     let hosts: std::collections::BTreeSet<&str> = files.iter().map(|(h, _)| *h).collect();
     for host in &hosts {
@@ -71,10 +75,11 @@ async fn item_with(
     for host in present {
         assert!(registry.is_connected(host), "{host} must count as present");
     }
-    let items: Vec<String> = sqlx::query_scalar("SELECT id FROM items WHERE kind = 'movie'")
-        .fetch_all(&db)
-        .await
-        .unwrap();
+    let items: Vec<String> =
+        sqlx::query_scalar("SELECT id FROM collection_items WHERE kind = 'movie'")
+            .fetch_all(&db)
+            .await
+            .unwrap();
     assert_eq!(items.len(), 1, "the fixture must fold to exactly one item");
     let item = items.into_iter().next().unwrap();
     let sources: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM file_bindings WHERE item_id = ?")
@@ -105,7 +110,18 @@ async fn refusal_in(mode: Option<&str>, files: Vec<(&str, &str)>, present: &[&st
     let (registry, sessions, item, _dir) = item_with(files, present).await;
     let subs = kahawai_hub::subtitles::Subtitles::new(_dir.path().join("subs"));
     let started = sessions
-        .start(&registry, &subs, "u1", &item, mode, None, 0, 0, 0, None)
+        .start(
+            &registry,
+            &subs,
+            "u1",
+            &item,
+            mode,
+            None,
+            0.into(),
+            0,
+            0,
+            None,
+        )
         .await;
     // `Session` has no Debug, so unwrap the error by hand rather than expect_err.
     let err = match started {
@@ -189,7 +205,7 @@ async fn multipart_names_never_merge_across_collections() {
         .await
         .unwrap();
     let rows: Vec<(String, String, Option<i64>)> = sqlx::query_as(
-        "SELECT i.module_id,i.id,fb.part FROM items i JOIN file_bindings fb ON fb.item_id=i.id
+        "SELECT i.module_id,i.id,fb.part FROM collection_items i JOIN file_bindings fb ON fb.item_id=i.id
           ORDER BY i.module_id",
     )
     .fetch_all(&db)
@@ -320,5 +336,53 @@ async fn a_lone_part_is_a_playable_film() {
     assert!(
         !verdict.contains("incomplete") && verdict != "source-offline",
         "one part is a complete run of one, got {verdict:?}"
+    );
+}
+
+#[tokio::test]
+async fn an_incomplete_copy_does_not_block_a_complete_copy_in_another_collection() {
+    let (registry, sessions, item, dir) = item_with(
+        vec![
+            ("01HOST", "Same (2000) CD1.avi"),
+            ("01HOST", "Same (2000) CD3.avi"),
+        ],
+        &["01HOST"],
+    )
+    .await;
+    registry
+        .announce_collection("02HOST", "movies", "movies", &[TEST_ROOT.into()])
+        .await
+        .unwrap();
+    registry
+        .upsert_files("02HOST", "movies", vec![rec("Same (2000).avi")])
+        .await
+        .unwrap();
+    registry.connected("02HOST", "mediahost", "nas", "fp2", "test");
+    let subs = kahawai_hub::subtitles::Subtitles::new(dir.path().join("subs"));
+    let error = match sessions
+        .start(
+            &registry,
+            &subs,
+            "u1",
+            &item,
+            Some("direct"),
+            None,
+            0.into(),
+            0,
+            0,
+            None,
+        )
+        .await
+    {
+        Ok(_) => panic!("the fixture has no byte-serving mediahost"),
+        Err(e) => e,
+    };
+    assert!(
+        !error.to_string().contains("incomplete"),
+        "good copy was blocked: {error:#}"
+    );
+    assert!(
+        error.downcast_ref::<SourceOffline>().is_none(),
+        "good copy was considered offline: {error:#}"
     );
 }

@@ -40,7 +40,7 @@ export function discsIn<T extends { season: number | null }>(tracks: T[]): Disc<
 /// is its album's square sleeve, an episode's is a 16:9 still, and everything
 /// else has a poster.
 export function artShape(kind: string): { width: string; ratio: string } {
-  if (kind === 'album' || kind === 'track') return { width: '180px', ratio: '1' }
+  if (kind === 'album' || kind === 'song') return { width: '180px', ratio: '1' }
   if (kind === 'episode') return { width: '320px', ratio: '16 / 9' }
   return { width: '190px', ratio: '2 / 3' }
 }

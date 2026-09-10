@@ -63,7 +63,7 @@ async fn fixture() -> Fx {
     );
     auth.complete_setup("admin", "password-123").await.unwrap();
     let pair = auth.login("admin", "password-123").await.unwrap();
-    let id: String = sqlx::query_scalar("SELECT id FROM items LIMIT 1")
+    let id: String = sqlx::query_scalar("SELECT id FROM collection_items LIMIT 1")
         .fetch_one(&db)
         .await
         .unwrap();

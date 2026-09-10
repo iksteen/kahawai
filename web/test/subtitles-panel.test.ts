@@ -65,6 +65,7 @@ async function panel(over: Record<string, unknown> = {}) {
     attachTo: document.body,
     props: {
       item: { id: 'heat', title: 'Heat', parent_id: null },
+      sourceId: 1,
       subs: [track()],
       languages: ['eng'],
       titleChoice: '',
@@ -150,7 +151,7 @@ describe('searching', () => {
   test('is filtered by the media type’s language preference', async () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
-    expect(api.subtitleSearch).toHaveBeenCalledWith('heat', { languages: ['eng'] })
+    expect(api.subtitleSearch).toHaveBeenCalledWith('heat', { languages: ['eng'], source_id: 1 })
   })
 
   test('and nothing found offers the unfiltered search', async () => {
@@ -159,7 +160,7 @@ describe('searching', () => {
     await press(wrapper, 'Find subtitles (eng)')
     expect(wrapper.text()).toContain('Nothing in eng for this file.')
     await press(wrapper, 'Search every language instead')
-    expect(vi.mocked(api.subtitleSearch).mock.calls[1]![1]).toEqual({ languages: [] })
+    expect(vi.mocked(api.subtitleSearch).mock.calls[1]![1]).toEqual({ languages: [], source_id: 1 })
   })
 
   test('and a refusal is reported rather than swallowed', async () => {
@@ -218,6 +219,7 @@ describe('a candidate', () => {
     expect(api.subtitleDownload).toHaveBeenCalledWith('heat', {
       file_id: 'f1',
       language: 'eng',
+      source_id: 1,
     })
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
     expect(notice.value).toContain('now a track on this item')

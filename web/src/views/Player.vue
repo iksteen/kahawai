@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { sourceStreams } from '../domain/source.ts'
 /// The player as a page: everything between a `/play` URL and a picture.
 ///
 /// Acquiring a session belongs HERE rather than to the item page, which is what
@@ -182,8 +183,30 @@ async function start() {
   }
   const mine = ++attempt.value
   try {
-    const detail = await itemQuery(id.value, { profile: buildProfile() })
+    const preferences = await getPrefs().catch((cause: unknown) => {
+      notify(`Could not read your preferences: ${sentence(cause)}`)
+      return { prefs: [] as Preference[] }
+    })
+    const cap = preferences.prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
+    const source =
+      typeof route.query.source === 'string' && /^\d+$/.test(route.query.source)
+        ? Number(route.query.source)
+        : undefined
+    const detail = await itemQuery(id.value, {
+      profile: buildProfile(cap ? Number(cap) : undefined),
+      ...(source === undefined ? {} : { source_id: source }),
+    })
     if (mine !== attempt.value || left) return
+    if (detail.id !== id.value) {
+      // A first-identification alias is the same item. Let the canonical route
+      // own playback and keep any requested source/chapter for its start.
+      await router.replace({
+        name: 'player',
+        params: { ...route.params, id: detail.id },
+        query: route.query,
+      })
+      return
+    }
     // The item and the session render as a PAIR. A session still alive here
     // belongs to the item this route just left (Back/Forward reuse this
     // component); assigning the new item beside it rendered one item's
@@ -197,35 +220,17 @@ async function start() {
         ? startAt.value
         : null
     const at = asked ?? detail.resume_position_ms ?? 0
-    const audio = detail.sources[0]?.streams?.audio ?? []
+    const audio = sourceStreams(detail.sources, detail.negotiated?.source?.source_id)?.audio ?? []
     let audioTrack = 0
     prefs.value = []
     carried.value = null
     try {
-      const [preferences, libraries] = await Promise.all([
-        // NOT from the query cache, unlike the library list below: `putPref`
-        // writes through without invalidating it, and the write that matters
-        // most here is the one this player just made — pick Japanese on
-        // episode one, start episode two, and a cached list still says English.
-        getPrefs(),
-        // Whatever screen you came from already read this — every route into
-        // the player is one of them — and libraries change when an admin edits
-        // one, not while somebody is starting an episode. Read, not
-        // `ensureQueryData`: that would put this call under the cache's retry
-        // policy, and a failing one would hold up the session start for as
-        // long as it retried.
-        //
-        // Guarded: `prefs` is assigned after this await, so a rejection here
-        // left it `[]` — and `[]` is not nullish, so the preferences that DID
-        // arrive were replaced by nothing. That drops the bandwidth cap
-        // silently and starts on track 0, which is the anime-in-English bug.
-        // The media type is the only thing actually at stake.
+      const libraries =
         cache.getQueryData<{ libraries: { id: string; media_type: string }[] }>(['libraries']) ??
-          listLibraries().catch((cause: unknown) => {
-            notify(`Could not load the library details: ${sentence(cause)}`)
-            return { libraries: [] }
-          }),
-      ])
+        (await listLibraries().catch((cause: unknown) => {
+          notify(`Could not load the library details: ${sentence(cause)}`)
+          return { libraries: [] }
+        }))
       prefs.value = preferences.prefs
       mediaType.value = libraries.libraries.find((l) => l.id === library.value)?.media_type ?? ''
       audioTrack = resolveTracks(
@@ -235,6 +240,7 @@ async function start() {
         mediaType.value,
         detail.metadata?.original_language,
         audio,
+        `source:${detail.negotiated?.source?.source_id}`,
       ).audioTrack
     } catch (cause) {
       // Both halves report and fall back, so this is `resolveTracks` itself — a
@@ -242,12 +248,17 @@ async function start() {
       // to pick is the one about to play.
       notify(`Could not resolve the audio track: ${sentence(cause)}`)
     }
-    const fresh = await startPlaybackSession(detail, at, audioTrack, 0, prefs.value)
+    const fresh = await startPlaybackSession(detail, {
+      startMs: at,
+      audioTrack,
+      prefs: prefs.value,
+      resume: asked === null || (asked === 0 && source === undefined),
+    })
     if (mine !== attempt.value || left) {
       void release(fresh.session_id)
       return
     }
-    resumeMs.value = at
+    resumeMs.value = fresh.effective_start_ms
     retire(fresh)
     // The start position is spent only NOW, with the session up: an hour in,
     // a reload must resume from progress rather than jump back to the
@@ -293,7 +304,7 @@ const ratio = computed(() => {
 /// A restart replaces the session in place: same page, same frame, new picture.
 /// The watcher above releases the one it replaced, after the picture holding it
 /// has reported where the viewer got to.
-function restarted(from: string, fresh: StartSessionResponse, at: number, choice: CarriedTracks) {
+function restarted(from: string, fresh: StartSessionResponse, _at: number, choice: CarriedTracks) {
   // A picture the route has already left behind can finish its restart late;
   // adopting that session would put the previous episode's stream under this
   // item's page. Release it instead — nobody else holds it. BOTH checks:
@@ -306,7 +317,7 @@ function restarted(from: string, fresh: StartSessionResponse, at: number, choice
   }
   // Any start() still in flight is now about a session nobody wants twice.
   attempt.value++
-  resumeMs.value = at
+  resumeMs.value = fresh.effective_start_ms
   carried.value = choice
   retire(fresh)
 }
@@ -330,7 +341,7 @@ function advanced(
   // keeps the remounted one from drawing its selectors off a staler set.
   prefs.value = nextPrefs
   carried.value = null
-  resumeMs.value = 0
+  resumeMs.value = fresh.effective_start_ms
   retire(fresh)
   // Replaces the entry rather than stacking one: browser-back should leave the
   // player, not walk back through an evening's autoplay.

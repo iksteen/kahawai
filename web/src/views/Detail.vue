@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { trackKey } from '../domain/queue.ts'
 /// One item's page: a film, a series, or an episode.
 ///
 /// Three failures live here and they are three different things — see
@@ -14,6 +15,7 @@ import { useRoute, useRouter } from 'vue-router'
 
 import Attribution from '../components/Attribution.vue'
 import Btn from '../components/Btn.vue'
+import MatchDialog from '../components/MatchDialog.vue'
 import CapabilityDebug from '../components/CapabilityDebug.vue'
 import SubtitlePanel from '../components/SubtitlePanel.vue'
 import DetailHead from '../components/DetailHead.vue'
@@ -59,6 +61,12 @@ const router = useRouter()
 const id = computed(() => String(route.params.id ?? ''))
 const library = computed(() => String(route.params.library ?? ''))
 
+const matching = ref(false)
+async function matched(ids: string[]) {
+  if (ids[0] && ids[0] !== id.value)
+    await router.replace({ name: 'detail', params: { library: library.value, id: ids[0] } })
+  else await query.refetch()
+}
 const query = useItem(id)
 const item = computed(() => query.data.value)
 /// UI-17: this screen is titled by the thing on it, and nothing above it knows
@@ -184,7 +192,9 @@ const discs = computed(() => discsIn(tracks.value))
 const isMultiDisc = computed(() => discs.value.length > 1)
 /// Which track of THIS record is playing, so the list can mark it. By id: the
 /// queue may hold another record entirely.
-const nowPlaying = computed(() => queue.playing.value?.track.id ?? null)
+const nowPlaying = computed(() =>
+  queue.playing.value ? trackKey(queue.playing.value.track) : null,
+)
 
 /// Why the two actions cannot be pressed, or '' when they can. Said out loud
 /// as well as in a title: a disabled button is out of the tab order, so its
@@ -214,7 +224,7 @@ const resumeAt = computed(() => (item.value ? resumeMs(item.value) : 0))
 const subline = computed(() => {
   const it = item.value
   if (!it) return ''
-  if (it.kind === 'show') return childCount(children.data.value ?? null, 'episode', 'episodes')
+  if (it.kind === 'series') return childCount(children.data.value ?? null, 'episode', 'episodes')
   if (it.kind === 'album') {
     return [it.artist, childCount(children.data.value ?? null, 'track', 'tracks')]
       .filter(Boolean)
@@ -232,11 +242,20 @@ const subline = computed(() => {
 /// `at` is a position in milliseconds; leaving it out resumes. Zero is
 /// "play from start", which is the same statement — the player reads a
 /// number, so a chapter is one too rather than a second kind of link.
-function play(at?: number) {
+function play(at?: number, chapter = false) {
   void router.push({
     name: 'player',
     params: { library: library.value, id: id.value },
-    ...(at === undefined ? {} : { query: { start: String(Math.round(at)) } }),
+    ...(at === undefined
+      ? {}
+      : {
+          query: {
+            start: String(Math.round(at)),
+            ...(chapter && item.value?.negotiated?.source?.source_id
+              ? { source: String(item.value.negotiated.source.source_id) }
+              : {}),
+          },
+        }),
   })
 }
 
@@ -288,8 +307,12 @@ function markSeason(season: number | null, played: boolean) {
          button in the app that is not `.back`. -->
     <Btn ghost small @click="goUp">{{ up.label }}</Btn>
 
-    <DetailHead :item="item" :subline="subline" :progress="item.kind === 'show' ? null : undefined">
-      <template v-if="item.kind === 'show'">
+    <DetailHead
+      :item="item"
+      :subline="subline"
+      :progress="item.kind === 'series' ? null : undefined"
+    >
+      <template v-if="item.kind === 'series'">
         <!-- The series' one action: get on with it. Named, so it is obvious
              which episode pressing it starts — and numbered the way the list
              below is, because reading the native fields here put "Continue ·
@@ -348,7 +371,7 @@ function markSeason(season: number | null, played: boolean) {
     </DetailHead>
 
     <!-- A series -->
-    <template v-if="item.kind === 'show'">
+    <template v-if="item.kind === 'series'">
       <!-- Always in the document, and empty most of the time: a live region
            inserted together with its text is not reliably announced, which is
            the case they are least good at. The button is OUTSIDE it, or its
@@ -498,14 +521,14 @@ function markSeason(season: number | null, played: boolean) {
           <ul class="flex flex-col">
             <li
               v-for="entry in disc.entries"
-              :key="entry.track.id"
+              :key="trackKey(entry.track)"
               class="flex items-center gap-3 border-b border-hairline last:border-0"
-              :class="entry.track.id === nowPlaying && 'text-teal'"
+              :class="trackKey(entry.track) === nowPlaying && 'text-teal'"
             >
               <button
                 class="flex flex-1 cursor-pointer items-center gap-3 py-1.5 text-left hover:text-teal"
                 type="button"
-                :aria-current="entry.track.id === nowPlaying ? 'true' : undefined"
+                :aria-current="trackKey(entry.track) === nowPlaying ? 'true' : undefined"
                 :title="`Play this record from ${entry.track.title}`"
                 @click="queue.playAlbum(tracks, entry.albumIndex)"
               >
@@ -513,7 +536,7 @@ function markSeason(season: number | null, played: boolean) {
                      it is matters more than where it sits. -->
                 <span class="w-8 shrink-0 text-right font-mono text-[12px] text-dim">
                   {{
-                    entry.track.id === nowPlaying
+                    trackKey(entry.track) === nowPlaying
                       ? '▶'
                       : (entry.track.episode ?? entry.albumIndex + 1)
                   }}
@@ -643,7 +666,7 @@ function markSeason(season: number | null, played: boolean) {
               :title="
                 best?.available ? undefined : 'The machine holding this file is not answering'
               "
-              @click="play(chapter.start_ms)"
+              @click="play(chapter.start_ms, true)"
             >
               <span class="font-mono text-[12px] text-dim tabular-nums">
                 {{ hms(chapter.start_ms) }}
@@ -749,9 +772,10 @@ function markSeason(season: number | null, played: boolean) {
          tracks are audio-only; showing an online subtitle search below a
          record's track list is an unrelated action, not an empty state. -->
     <SubtitlePanel
-      v-if="item.kind !== 'album' && item.kind !== 'track'"
+      v-if="item.kind !== 'album' && item.kind !== 'song'"
       :item="item"
       :subs="item.negotiated?.subtitles ?? []"
+      :source-id="item.negotiated?.source?.source_id"
       :languages="subLanguages"
       :title-choice="titleChoice"
       :fps="fileFps"
@@ -759,6 +783,8 @@ function markSeason(season: number | null, played: boolean) {
       @cleared="subtitlesChanged"
     />
 
+    <Btn v-if="me.admin" ghost small @click="matching = true">Match collection copy</Btn>
+    <MatchDialog v-if="matching" :item="item" @close="matching = false" @applied="matched" />
     <Attribution :provider="item.metadata?.provider" />
   </main>
 </template>

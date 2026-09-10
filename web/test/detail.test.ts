@@ -36,7 +36,7 @@ describe('the artwork', () => {
   test('follows what the artwork is, not what the page is about', () => {
     // A track's art is its album's square sleeve; an episode's is a still.
     expect(artShape('album').ratio).toBe('1')
-    expect(artShape('track').ratio).toBe('1')
+    expect(artShape('song').ratio).toBe('1')
     expect(artShape('episode').ratio).toBe('16 / 9')
     expect(artShape('movie').ratio).toBe('2 / 3')
     expect(artShape('show').ratio).toBe('2 / 3')

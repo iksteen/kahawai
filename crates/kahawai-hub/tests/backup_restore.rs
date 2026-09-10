@@ -35,7 +35,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     .await
     .unwrap();
     sqlx::query(
-        "INSERT INTO items(id,kind,title,norm_title,module_id,collection_id)
+        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
          VALUES('i1','movie','Solaris','solaris','fixture','default')",
     )
     .execute(&db)
@@ -122,7 +122,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
 
     // And the database is a working one, not just bytes.
     let db = kahawai_hub::db::open(fresh.path()).await.unwrap();
-    let title: String = sqlx::query_scalar("SELECT title FROM items WHERE id = 'i1'")
+    let title: String = sqlx::query_scalar("SELECT title FROM collection_items WHERE id = 'i1'")
         .fetch_one(&db)
         .await
         .unwrap();
@@ -381,7 +381,7 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
         tokio::spawn(async move {
             for n in 0..200 {
                 let _ = sqlx::query(
-                    "INSERT INTO items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)",
+                    "INSERT INTO collection_items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)",
                 )
                 .bind(format!("w{n}"))
                 .bind(format!("Film {n}"))
@@ -404,7 +404,7 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
         .await
         .unwrap();
     let db2 = kahawai_hub::db::open(restored.path()).await.unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM items")
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items")
         .fetch_one(&db2)
         .await
         .unwrap();
