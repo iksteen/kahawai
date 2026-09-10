@@ -175,6 +175,62 @@ async fn browse_and_matching_use_library_identity_and_guard_copy_revision() {
 }
 
 #[tokio::test]
+async fn detail_preserves_confidence_and_reports_each_copys_match() {
+    use kahawai_hub::providers::{Fields, assign_manual, store_answer};
+    let (api, token, db, _, _) = harness().await;
+    sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','host','fp');
+        INSERT INTO collections(module_id,collection_id,media_type) VALUES('host','one','movies'),('host','two','movies');
+        INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES
+        ('auto-copy','movie','Men in Black','men in black',1997,'host','one'),
+        ('manual-copy','movie','Men in Black','men in black',1997,'host','two');")
+        .execute(&db).await.unwrap();
+    let fields = || Fields {
+        title: Some("Men in Black".into()),
+        premiered: Some("1997-07-02".into()),
+        ..Default::default()
+    };
+    store_answer(&db, "auto-copy", "tmdb", "607", "auto", fields())
+        .await
+        .unwrap();
+    assign_manual(&db, "manual-copy", "tmdb", "607", fields())
+        .await
+        .unwrap();
+    let detail = page(&api, &token, "/api/v1/items/auto-copy").await;
+    let overview = page(&api, &token, "/api/v1/items?q=Men%20in%20Black").await;
+    assert_eq!(detail["match_confidence"], "auto");
+    assert_eq!(
+        detail["match_confidence"],
+        overview["items"][0]["match_confidence"]
+    );
+    assert_eq!(detail["matched_title"], "Men in Black");
+    let confidence = |detail: &serde_json::Value, id: &str| {
+        detail["copies"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|copy| copy["id"] == id)
+            .unwrap()["match_confidence"]
+            .clone()
+    };
+    assert_eq!(confidence(&detail, "auto-copy"), "auto");
+    assert_eq!(confidence(&detail, "manual-copy"), "manual");
+
+    store_answer(&db, "auto-copy", "tmdb", "607", "weak", fields())
+        .await
+        .unwrap();
+    let detail = page(&api, &token, "/api/v1/items/auto-copy").await;
+    assert_eq!(confidence(&detail, "auto-copy"), "weak");
+    assert_eq!(confidence(&detail, "manual-copy"), "manual");
+    sqlx::query("DELETE FROM provider_metadata WHERE item_id='auto-copy'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let detail = page(&api, &token, "/api/v1/items/auto-copy").await;
+    assert!(confidence(&detail, "auto-copy").is_null());
+    assert_eq!(confidence(&detail, "manual-copy"), "manual");
+}
+
+#[tokio::test]
 async fn subtitle_bodies_keep_the_selected_tracks_source_and_timing() {
     use kahawai_media::subtitles::{Cue, Extracted};
     let (api, token, db, _, artwork) = harness().await;

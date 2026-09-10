@@ -16,6 +16,7 @@ import { useRoute, useRouter } from 'vue-router'
 import Attribution from '../components/Attribution.vue'
 import Btn from '../components/Btn.vue'
 import MatchDialog from '../components/MatchDialog.vue'
+import MatchButton from '../components/MatchButton.vue'
 import CapabilityDebug from '../components/CapabilityDebug.vue'
 import SubtitlePanel from '../components/SubtitlePanel.vue'
 import DetailHead from '../components/DetailHead.vue'
@@ -61,7 +62,7 @@ const router = useRouter()
 const id = computed(() => String(route.params.id ?? ''))
 const library = computed(() => String(route.params.library ?? ''))
 
-const matching = ref(false)
+const matching = ref<string | null>(null)
 async function matched(ids: string[]) {
   if (ids[0] && ids[0] !== id.value)
     await router.replace({ name: 'detail', params: { library: library.value, id: ids[0] } })
@@ -689,18 +690,34 @@ function markSeason(season: number | null, played: boolean) {
             :key="work.id"
             class="rounded-md border border-line bg-surface p-2"
           >
-            <div v-if="work.parts.length > 1" class="mb-1 font-mono text-[11px] text-dim">
-              {{ work.parts.length }} parts
-              <span v-if="!work.whole" class="text-warn">
-                — incomplete, {{ work.parts[0]!.parts }} expected
-              </span>
-            </div>
-            <div
-              v-for="source in work.parts"
-              :key="`${source.source_id}-${source.part}`"
-              class="truncate font-mono text-[12px] text-dim"
-            >
-              {{ source.path_rel }}
+            <div class="flex items-start gap-3">
+              <div class="min-w-0 flex-1">
+                <div class="mb-1 font-mono text-[11px] text-dim">
+                  {{ work.parts[0]!.collection_id }}
+                  <template v-if="work.parts.length > 1"> · {{ work.parts.length }} parts</template>
+                  <span v-if="!work.whole" class="text-warn">
+                    — incomplete, {{ work.parts[0]!.parts }} expected
+                  </span>
+                </div>
+                <div
+                  v-for="source in work.parts"
+                  :key="`${source.source_id}-${source.part}`"
+                  class="truncate font-mono text-[12px] text-dim"
+                >
+                  {{ source.path_rel }}
+                </div>
+              </div>
+              <MatchButton
+                v-if="me.admin"
+                always-visible
+                :confidence="
+                  item.copies.find((copy) => copy.id === work.parts[0]!.collection_item_id)
+                    ?.match_confidence
+                "
+                :label="`${work.parts.map((part) => part.path_rel).join(' + ')} (${work.parts[0]!.collection_id})`"
+                title="Search metadata for this source"
+                @click="matching = work.parts[0]!.collection_item_id"
+              />
             </div>
             <div class="mt-1 flex flex-wrap gap-1.5">
               <span v-if="work.parts[0]!.streams?.container" class="chip">
@@ -783,8 +800,34 @@ function markSeason(season: number | null, played: boolean) {
       @cleared="subtitlesChanged"
     />
 
-    <Btn v-if="me.admin" ghost small @click="matching = true">Match collection copy</Btn>
-    <MatchDialog v-if="matching" :item="item" @close="matching = false" @applied="matched" />
+    <section v-if="me.admin && !works.length && item.copies.length" class="mt-8">
+      <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Sources</h2>
+      <ul class="flex flex-col gap-2">
+        <li
+          v-for="copy in item.copies"
+          :key="copy.id"
+          class="flex items-center gap-3 rounded-md border border-line bg-surface p-2"
+        >
+          <div class="min-w-0 flex-1">
+            <div class="font-mono text-[11px] text-dim">{{ copy.collection_id }}</div>
+            <div>{{ copy.title }}</div>
+          </div>
+          <MatchButton
+            always-visible
+            :confidence="copy.match_confidence"
+            :label="`${copy.title} (${copy.collection_id})`"
+            title="Search metadata for this source"
+            @click="matching = copy.id"
+          />
+        </li>
+      </ul>
+    </section>
+    <MatchDialog
+      v-if="matching"
+      :item="{ ...item, collection_item_id: matching }"
+      @close="matching = null"
+      @applied="matched"
+    />
     <Attribution :provider="item.metadata?.provider" />
   </main>
 </template>

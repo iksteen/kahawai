@@ -6570,6 +6570,8 @@ async fn collection_body(
                 COALESCE(i.year, CAST(substr(md.premiered, 1, 4) AS INTEGER)) AS year,
                 p.id AS parent_id,
                 md.updated_at AS art_version,
+                i.title AS file_title, i.year AS file_year, md.title AS matched_title,
+                CASE WHEN i.match_mode='manual' THEN 'manual' ELSE md.confidence END AS match_confidence,
                 COALESCE(pmd.title, p.title) AS show_title,
                 (SELECT COUNT(*) FROM playable_sources ps WHERE ps.item_id=i.id) AS sources,
                 -- UI-4, the same shape as `item_children`: the running time

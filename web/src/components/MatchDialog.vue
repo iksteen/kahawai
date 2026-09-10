@@ -176,10 +176,10 @@ onMounted(async () => {
   try {
     const detail = await itemDetail(props.item.id)
     copies.value = detail.copies
-    selected.value =
-      copies.value.find((c) => c.id === props.item.collection_item_id)?.id ??
-      copies.value[0]?.id ??
-      ''
+    selected.value = props.item.collection_item_id
+      ? (copies.value.find((c) => c.id === props.item.collection_item_id)?.id ?? '')
+      : (copies.value[0]?.id ?? '')
+    if (!selected.value) failure.value = 'This source is no longer available. Reload the item.'
   } catch (cause) {
     failure.value = sentence(cause)
   }
@@ -213,16 +213,22 @@ const format = (candidate: ProviderCandidate) =>
         </h2>
         <Btn ghost small class="ml-auto" aria-label="Close" @click="emit('close')">✕</Btn>
       </div>
-      <label class="mt-3 block text-dim" for="match-copy">Collection copy</label>
-      <select
-        id="match-copy"
-        v-model="selected"
-        class="w-full rounded border border-line bg-bg px-2 py-1"
-      >
-        <option v-for="entry in copies" :key="entry.id" :value="entry.id">
-          {{ entry.collection_id }} · {{ entry.paths.join(' + ') || entry.title }}
-        </option>
-      </select>
+      <template v-if="!props.item.collection_item_id">
+        <label class="mt-3 block text-dim" for="match-copy">Collection copy</label>
+        <select
+          id="match-copy"
+          v-model="selected"
+          class="w-full rounded border border-line bg-bg px-2 py-1"
+        >
+          <option v-for="entry in copies" :key="entry.id" :value="entry.id">
+            {{ entry.collection_id }} · {{ entry.paths.join(' + ') || entry.title }}
+          </option>
+        </select>
+      </template>
+      <div v-else-if="copy" class="mt-3 font-mono text-[12px] text-dim">
+        <div>{{ copy.collection_id }}</div>
+        <div v-for="path in copy.paths" :key="path" class="break-all">{{ path }}</div>
+      </div>
       <p v-if="copy?.assignment.conflict" class="mt-2 text-warn">{{ copy.assignment.conflict }}</p>
       <p class="mt-2 text-dim">
         This decision applies to the selected copy and all its file parts.

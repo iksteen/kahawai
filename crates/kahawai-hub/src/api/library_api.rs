@@ -14,6 +14,7 @@ pub(super) struct CollectionCopy {
     pub module_id: Option<String>,
     pub collection_id: Option<String>,
     pub paths: Vec<String>,
+    pub match_confidence: Option<String>,
     pub assignment: crate::library::Assignment,
 }
 
@@ -410,7 +411,10 @@ pub(super) async fn item_body(
         }
     }
     for copy in &copies {
-        let row=sqlx::query("SELECT title,year,artist,season,episode,module_id,collection_id,(SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1) AS parent_library_item_id FROM collection_items ci WHERE id=?").bind(copy).fetch_one(db).await.map_err(internal)?;
+        let row=sqlx::query("SELECT ci.title,ci.year,ci.artist,ci.season,ci.episode,ci.module_id,ci.collection_id,
+            CASE WHEN ci.match_mode='manual' THEN 'manual' ELSE md.confidence END AS match_confidence,
+            (SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1) AS parent_library_item_id
+            FROM collection_items ci LEFT JOIN resolved_metadata md ON md.item_id=ci.id WHERE ci.id=?").bind(copy).fetch_one(db).await.map_err(internal)?;
         let paths=sqlx::query_scalar("SELECT f.path_rel FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id JOIN files f ON f.id=p.file_id WHERE ps.item_id=? ORDER BY ps.id,p.ordinal").bind(copy).fetch_all(db).await.map_err(internal)?;
         let mut read = db.read_pool().acquire().await.map_err(internal)?;
         let assignment = crate::library::assignment(&mut read, copy)
@@ -427,6 +431,7 @@ pub(super) async fn item_body(
             module_id: row.get("module_id"),
             collection_id: row.get("collection_id"),
             paths,
+            match_confidence: row.get("match_confidence"),
             assignment,
         });
     }

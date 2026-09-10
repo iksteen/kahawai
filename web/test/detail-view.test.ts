@@ -13,6 +13,10 @@ import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   itemQuery: vi.fn(),
+  itemDetail: vi.fn(),
+  listItems: vi.fn(),
+  adminReviewSearch: vi.fn(),
+  adminApplyMatch: vi.fn(),
   itemChildren: vi.fn(),
   itemSetWatched: vi.fn(),
   adminItemLog: vi.fn(),
@@ -33,6 +37,10 @@ vi.mock('../src/api/capabilities.ts', () => ({
 
 const {
   adminItemLog,
+  itemDetail,
+  listItems,
+  adminReviewSearch,
+  adminApplyMatch,
   getPrefs,
   itemChildren,
   itemQuery,
@@ -66,8 +74,20 @@ const film = (over: Record<string, unknown> = {}) => ({
   episode_end: null,
   metadata: null,
   negotiated: null,
+  copies: [
+    {
+      id: 'heat-copy',
+      match_confidence: null as string | null,
+      title: 'Heat',
+      year: 1995,
+      collection_id: 'c',
+      paths: ['Heat.mkv'],
+      assignment: { revision: 1, library_item_ids: ['heat'] },
+    },
+  ],
   sources: [
     {
+      collection_item_id: 'heat-copy',
       available: true,
       collection_id: 'c',
       module_id: 'm',
@@ -147,6 +167,11 @@ async function open(view: typeof Detail | typeof Season, at: string) {
 }
 
 beforeEach(() => {
+  admin.value = false
+  vi.mocked(itemDetail).mockResolvedValue(film() as never)
+  vi.mocked(listItems).mockResolvedValue({ items: [] } as never)
+  vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
+  vi.mocked(adminApplyMatch).mockResolvedValue({ library_item_ids: ['heat'] } as never)
   vi.mocked(itemQuery).mockResolvedValue(film() as never)
   vi.mocked(itemChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(itemSetWatched).mockResolvedValue({ updated: 1 } as never)
@@ -271,6 +296,77 @@ describe('what the hub says it would do with the file', () => {
 })
 
 describe('the files it is made of', () => {
+  test('a magnifier targets its source copy and keeps its CDs together', async () => {
+    admin.value = true
+    const detail = film()
+    detail.sources = [1, 2].map((part) => ({
+      ...detail.sources[0]!,
+      part,
+      parts: 2,
+      path_rel: `Heat CD${part}.avi`,
+    }))
+    detail.sources.push({
+      ...detail.sources[0]!,
+      source_id: 2,
+      collection_item_id: 'other-copy',
+      collection_id: 'other',
+      part: 1,
+      parts: 1,
+      path_rel: 'Heat CD1.avi',
+    })
+    detail.copies = [
+      { ...detail.copies[0]!, paths: ['Heat CD1.avi', 'Heat CD2.avi'], match_confidence: 'weak' },
+      {
+        ...detail.copies[0]!,
+        id: 'other-copy',
+        match_confidence: 'manual',
+        collection_id: 'other',
+        paths: ['Heat CD1.avi'],
+        assignment: { revision: 7, library_item_ids: ['heat'] },
+      },
+    ]
+    vi.mocked(itemQuery).mockResolvedValue(detail as never)
+    vi.mocked(itemDetail).mockResolvedValue(detail as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    const buttons = wrapper.findAll('button[title="Search metadata for this source"]')
+    expect(buttons).toHaveLength(2)
+    expect(buttons[0]!.classes()).toContain('text-sand')
+    expect(buttons[1]!.classes()).toContain('text-dim')
+    expect(buttons[1]!.classes()).not.toContain('opacity-0')
+    expect(buttons[0]!.find('svg').exists()).toBe(true)
+    expect(buttons[0]!.element.closest('li')!.textContent).toContain('Heat CD2.avi')
+    expect(wrapper.text()).not.toContain('Match collection copy')
+    await buttons[1]!.trigger('click')
+    await flushPromises()
+    const dialog = wrapper.find('[role="dialog"]')
+    expect(dialog.find('#match-copy').exists()).toBe(false)
+    expect(dialog.text()).toContain('other')
+    expect(dialog.text()).not.toContain('Heat CD2.avi')
+    expect(adminReviewSearch).toHaveBeenCalledWith(expect.objectContaining({ item: 'other-copy' }))
+    await dialog
+      .findAll('button')
+      .find((b) => b.text() === 'Reject current')!
+      .trigger('click')
+    await flushPromises()
+    expect(adminApplyMatch).toHaveBeenCalledWith(
+      'other-copy',
+      expect.objectContaining({ expected_revision: 7, action: 'reject' }),
+    )
+    wrapper.unmount()
+  })
+
+  test('source matching is hidden from non-admins', async () => {
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.find('button[title="Search metadata for this source"]').exists()).toBe(false)
+  })
+
+  test('series copies have their own source actions too', async () => {
+    admin.value = true
+    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', sources: [] }) as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.findAll('button[title="Search metadata for this source"]')).toHaveLength(1)
+  })
+
   test('parts of one work are one entry, not one each', async () => {
     // UI-27: a film in seven numbered parts read as seven alternative encodes.
     const multi = film()

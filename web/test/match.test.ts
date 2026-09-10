@@ -313,6 +313,16 @@ describe('the dialog’s keyboard', () => {
   })
 })
 
+test('a removed explicit copy cannot fall back to another copy', async () => {
+  const wrapper = await open({ collection_item_id: 'removed' })
+  expect(wrapper.text()).toContain('This source is no longer available')
+  expect(wrapper.find('#match-copy').exists()).toBe(false)
+  expect(api.adminReviewSearch).not.toHaveBeenCalled()
+  const reject = wrapper.findAll('button').find((b) => b.text() === 'Reject current')!
+  expect(reject.attributes('disabled')).toBeDefined()
+  wrapper.unmount()
+})
+
 describe('the card’s match affordance', () => {
   const row = (over: Record<string, unknown> = {}) =>
     ({

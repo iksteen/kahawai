@@ -24,7 +24,7 @@
 /// makes this component multi-root and changes what a parent's layout sees.
 import Art from './Art.vue'
 import CardFrame from './CardFrame.vue'
-import Icon from './Icon.vue'
+import MatchButton from './MatchButton.vue'
 import { type Labelled, metaLine } from '../domain/label.ts'
 
 type Row = Labelled & {
@@ -41,22 +41,6 @@ const props = defineProps<{
   matchable?: boolean
 }>()
 const emit = defineEmits<{ open: [item: Row]; match: [item: Row] }>()
-
-/// HUB-8. Three states, because they are three different jobs: nothing matched
-/// (fix it), matched but uncertain (review it), matched (re-match if you
-/// disagree). The middle one is the reason this is on the card at all — an
-/// operator scanning a grid for the wrong covers.
-function matching(item: Row): { tone: string; why: string; quiet: boolean } {
-  const at = item.match_confidence
-  if (at === 'weak') return { tone: 'text-sand', why: 'Uncertain match — review', quiet: false }
-  // A library where everything matched is a library with nothing to fix, and a
-  // magnifier on every one of two thousand cards is noise. It appears on hover
-  // — and on keyboard focus, which the CSS version did not do, so the control
-  // existed for the mouse alone.
-  if (at === 'auto' || at === 'manual')
-    return { tone: 'text-dim', why: 'Re-match metadata', quiet: true }
-  return { tone: 'text-warn', why: 'No metadata match — fix', quiet: false }
-}
 
 /// Never empty. `metaLine` gives '' for a film with no year, and an empty span
 /// takes no line box — one short cell in a grid row makes the whole row short,
@@ -86,20 +70,13 @@ function state(item: Row): string {
          17px, not 16: the kind and seen badges sit 6px inside the art, and the
          art starts at the card's 1px border plus its 10px padding. At 16 this
          misses its two siblings on the same corner by a pixel. -->
-    <button
+    <MatchButton
       v-if="props.matchable"
-      class="absolute top-[17px] right-[17px] z-1 flex h-[22px] w-[22px] cursor-pointer items-center justify-center rounded bg-bg/80 transition-opacity hover:text-teal focus-visible:opacity-100"
-      :class="[
-        matching(props.item).tone,
-        matching(props.item).quiet && 'opacity-0 group-hover:opacity-100',
-      ]"
-      type="button"
-      :title="matching(props.item).why"
-      :aria-label="`${matching(props.item).why}: ${props.item.title}`"
+      class="absolute top-[17px] right-[17px] z-1"
+      :confidence="props.item.match_confidence"
+      :label="props.item.title"
       @click="emit('match', props.item)"
-    >
-      <Icon name="search" />
-    </button>
+    />
     <CardFrame :title="props.item.title" :meta="meta(props.item)" @open="emit('open', props.item)">
       <template #art><Art :item="props.item" size="card" /></template>
       <span v-if="state(props.item)" class="sr-only">{{ state(props.item) }}</span>
