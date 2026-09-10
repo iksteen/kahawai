@@ -777,7 +777,8 @@ How something works and why it was built that way belong in
       long recorded as if it were not: a per-run pace sample exists
       (HUB-36 — the un-throttled phase, once per run), but there is
       still no continuous progress percentage per session
-- [x] TC-5 Cancellable sessions; transcode-ahead pacing window
+- [x] TC-5 Cancellable sessions; transcode-ahead pacing window defaults to
+      15 minutes, overridable with `KAHAWAI_PACE_WINDOW_MS`
 - [x] TC-6 Resource ceilings, as amended 2026-08-08: `max_sessions` at
       placement, and CPU shares as `[transcoder] worker_nice` +
       `worker_threads`, which each pipeline worker applies to itself

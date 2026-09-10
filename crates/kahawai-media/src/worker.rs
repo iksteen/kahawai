@@ -110,12 +110,12 @@ pub fn run_parts(
     // whole film. The supervisor keeps `viewer.pos` fresh (absolute ms,
     // from the client's progress pings); muxer-bound buffers beyond
     // viewer+window block in-band until the viewer catches up.
-    // ponytail: fixed window, env-tunable; per-session config later.
+    // Default to 15 minutes ahead; the environment can override the window.
     let pace = remux::PaceConfig {
         window_ms: std::env::var("KAHAWAI_PACE_WINDOW_MS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(120_000),
+            .unwrap_or(900_000),
         floor_ms: start_ms,
         viewer_file: out_dir.join("viewer.pos"),
         out_dir: out_dir.to_path_buf(),
