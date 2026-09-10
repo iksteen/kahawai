@@ -8,6 +8,7 @@
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
 import type { AuthWire } from '../src/api/session.ts'
+import { authWire } from '../src/api/auth-wire.ts'
 import {
   accessToken,
   browserLogin,
@@ -455,4 +456,34 @@ describe('restoring on a reload', () => {
     expect(await restoreSession()).toBe('authenticated')
     expect(accessToken()).toBe('access-restored')
   })
+})
+
+test('a timed-out restore cancels its HTTP request before retrying', async () => {
+  let pending: AbortSignal | undefined
+  const fetch = vi
+    .fn()
+    .mockImplementationOnce((_url: string, options: RequestInit) => {
+      pending = options.signal as AbortSignal
+      return new Promise((_resolve, reject) => {
+        pending!.addEventListener('abort', () => reject(pending!.reason), { once: true })
+      })
+    })
+    .mockResolvedValueOnce(
+      new Response(JSON.stringify({ access_token: 'restored', expires_in: 900 }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      }),
+    )
+  vi.stubGlobal('fetch', fetch)
+  startAuthSession(authWire)
+  const stalled = expect(restoreSession()).rejects.toThrow('hub did not answer in time')
+  await vi.advanceTimersByTimeAsync(15_000)
+  await stalled
+  expect(pending?.aborted).toBe(true)
+  expect(accessToken()).toBeNull()
+  expect(locks.active).toBe(0)
+  expect(await restoreSession()).toBe('authenticated')
+  expect(accessToken()).toBe('restored')
+  expect(fetch).toHaveBeenCalledTimes(2)
+  expect(locks.maxActive).toBe(1)
 })

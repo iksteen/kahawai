@@ -45,7 +45,7 @@ export type AuthWire = {
     password: string,
     signal: AbortSignal,
   ) => Promise<{ access_token: string; expires_in: number }>
-  refresh: () => Promise<{ access_token: string; expires_in: number }>
+  refresh: (signal: AbortSignal) => Promise<{ access_token: string; expires_in: number }>
   logout: (bearer: string) => Promise<void>
 }
 
@@ -140,7 +140,7 @@ async function alone<T>(run: () => Promise<T>): Promise<T> {
 async function rotate(started: number, throwTransient: boolean): Promise<boolean> {
   if (generation !== started) return false
   try {
-    const fresh = await withTimeout(wire!.refresh())
+    const fresh = await requestRefresh()
     return installAccess(fresh.access_token, fresh.expires_in, started)
   } catch (error) {
     // A refusal is the session being over. Anything else — a restart, a
@@ -156,13 +156,20 @@ async function rotate(started: number, throwTransient: boolean): Promise<boolean
   }
 }
 
-function withTimeout<T>(work: Promise<T>): Promise<T> {
-  return Promise.race([
-    work,
-    new Promise<never>((_, reject) =>
-      setTimeout(() => reject(new Error('the hub did not answer in time')), REFRESH_TIMEOUT_MS),
-    ),
-  ])
+/// Cancel the HTTP request before releasing the auth lock. Racing a timer
+/// alone left expired requests running, so a retry could overlap them and
+/// a late response could still replace the browser's refresh cookie.
+async function requestRefresh() {
+  const controller = new AbortController()
+  const timeout = setTimeout(
+    () => controller.abort(new DOMException('The hub did not answer in time.', 'TimeoutError')),
+    REFRESH_TIMEOUT_MS,
+  )
+  try {
+    return await wire!.refresh(controller.signal)
+  } finally {
+    clearTimeout(timeout)
+  }
 }
 
 /// Refresh, sharing one request with any caller that asks while it is out.
@@ -230,7 +237,7 @@ async function revoke(captured: string): Promise<void> {
       // The captured bearer expired while we waited for the lock. Refresh
       // inside the same lock and revoke with the fresh one — WITHOUT
       // installing it, because this session is ending.
-      const fresh = await withTimeout(wire!.refresh())
+      const fresh = await requestRefresh()
       await wire!.logout(fresh.access_token)
     }
   })

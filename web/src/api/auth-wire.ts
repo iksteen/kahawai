@@ -20,7 +20,8 @@ export const authWire: AuthWire = {
       { client: 'browser', username, password },
       { skipAuthRefresh: true, skipAuthorization: true, signal },
     ),
-  refresh: () => refresh({ client: 'browser' }, { skipAuthRefresh: true, skipAuthorization: true }),
+  refresh: (signal) =>
+    refresh({ client: 'browser' }, { skipAuthRefresh: true, skipAuthorization: true, signal }),
   logout: async (bearer) => {
     // The captured bearer explicitly, not whatever is in memory: by the time
     // this runs, memory has already been cleared.
