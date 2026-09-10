@@ -1,6 +1,10 @@
 //! Collection scanner (MH-2/3/5/8, minimal first cut): walk roots, discover
 //! technical metadata, compute content identity + oshash in one read pass,
 //! and push FileUpsert batches up the link.
+//! Scans reserve storage, not the sustained-analysis CPU slot: discovery is
+//! bounded per file, identity reads cover only the first/last 64 KiB, and
+//! container declarations read headers/indexes. Full-file analysis is queued
+//! separately. This lets catalogue freshness progress during playback.
 //!
 //! ponytail: full rescan on every (re)connect; the journaled resumable scan
 //! + fs watcher (MH-2/MH-7) land when libraries get big enough to hurt.
@@ -873,7 +877,7 @@ mod tests {
             .resolved_roots()
             .map(|root| root.token)
             .collect::<Vec<_>>();
-        let resources = scheduler.resources(roots.iter().map(String::as_str), true);
+        let resources = scheduler.resources(roots.iter().map(String::as_str), false);
         ScanAdmission::new(
             scheduler,
             resources,
@@ -1034,7 +1038,7 @@ id: nl, index: 1
         let permit = scheduler
             .acquire(
                 crate::scheduler::Priority::CatalogFreshness,
-                scheduler.resources([source.root_token.as_str()], true),
+                scheduler.resources([source.root_token.as_str()], false),
                 None,
                 "music tag refresh test",
             )

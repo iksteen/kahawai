@@ -153,7 +153,9 @@ impl Bg {
     }
 
     fn cpu_heavy(self) -> bool {
-        matches!(self, Self::Geometry | Self::Ed2k)
+        // Geometry uses the same bounded discovery as a scan. ED2K hashes
+        // every byte and therefore needs sustained CPU admission as well.
+        matches!(self, Self::Ed2k)
     }
 }
 

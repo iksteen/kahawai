@@ -1399,6 +1399,7 @@ fn playlist_span_secs(playlist: &str) -> f64 {
 type LocalResolver =
     std::sync::Arc<dyn Fn(&str, &str, &str) -> Result<std::path::PathBuf> + Send + Sync>;
 type LocalActivity = std::sync::Arc<dyn Fn(&str) -> Box<dyn Send + Sync> + Send + Sync>;
+type LocalPlayback = std::sync::Arc<dyn Fn() -> Box<dyn Send + Sync> + Send + Sync>;
 type LocalBackground = std::sync::Arc<dyn Fn(&str) -> LocalAdmission + Send + Sync>;
 
 /// How long a burn-in session waits for the mediahost to walk its
@@ -1442,8 +1443,10 @@ pub struct Sessions {
     /// AR-5: the in-process mediahost, if any — (module_id, path
     /// resolver). Its leases are direct file reads, no OpenRead.
     local_source: Mutex<Option<(String, LocalResolver)>>,
-    /// Registers an in-process viewer lease as interactive scheduler work.
+    /// Interactive storage admission around individual local read operations.
     local_activity: Mutex<Option<LocalActivity>>,
+    /// CPU reservation held throughout an in-process viewer lease.
+    local_playback: Mutex<Option<LocalPlayback>>,
     /// Scheduler admission for non-interactive all-in-one reads.
     local_background: Mutex<Option<LocalBackground>>,
     /// Scratch space for remux sessions (`<data_dir>/sessions`).
@@ -1763,6 +1766,7 @@ impl Sessions {
             leases: Leases::default(),
             local_source: Mutex::new(None),
             local_activity: Mutex::new(None),
+            local_playback: Mutex::new(None),
             local_background: Mutex::new(None),
             scratch_root,
             max_per_user,
@@ -2057,6 +2061,13 @@ impl Sessions {
         *self.local_background.lock().unwrap() = Some(std::sync::Arc::new(admit));
     }
 
+    pub fn set_local_playback(
+        &self,
+        enter: impl Fn() -> Box<dyn Send + Sync> + Send + Sync + 'static,
+    ) {
+        *self.local_playback.lock().unwrap() = Some(std::sync::Arc::new(enter));
+    }
+
     pub(crate) async fn open_lease(
         &self,
         registry: &Registry,
@@ -2075,6 +2086,15 @@ impl Sessions {
                 .and_then(|(id, resolve)| (id == module_id).then(|| resolve.clone()))
         };
         if let Some(resolve) = local {
+            let playback = (reader == Reader::Viewer)
+                .then(|| {
+                    self.local_playback
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .map(|enter| enter())
+                })
+                .flatten();
             let foreground_admission = (reader == Reader::Viewer)
                 .then(|| {
                     self.local_activity.lock().unwrap().as_ref().map(|enter| {
@@ -2117,7 +2137,7 @@ impl Sessions {
             .await
             .context("local media path resolution task failed")?;
             drop(resolution_permit);
-            return Ok(Lease::local_guarded(path?, admission));
+            return Ok(Lease::local_guarded(path?, admission, playback));
         }
         let token = new_lease_token();
         let msg = HubToHost {
@@ -4353,7 +4373,7 @@ mod lease_purpose_tests {
     }
 
     #[tokio::test]
-    async fn a_local_viewer_is_admitted_only_around_filesystem_operations() {
+    async fn a_local_viewer_holds_cpu_for_the_lease_and_storage_only_for_operations() {
         struct Guard(std::sync::Arc<std::sync::atomic::AtomicUsize>);
         impl Drop for Guard {
             fn drop(&mut self) {
@@ -4369,9 +4389,17 @@ mod lease_purpose_tests {
         let sessions = Sessions::new(dir.path().join("sessions"));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let entered_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let cpu = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let playback_cpu = cpu.clone();
+        sessions.set_local_playback(move || {
+            playback_cpu.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Box::new(Guard(playback_cpu.clone()))
+        });
+        let resolving_cpu = cpu.clone();
         let resolving = active.clone();
         sessions.set_local_source("local", move |_, _, _| {
             assert_eq!(resolving.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert_eq!(resolving_cpu.load(std::sync::atomic::Ordering::Relaxed), 1);
             Ok(source.clone())
         });
         let entered = active.clone();
@@ -4398,7 +4426,18 @@ mod lease_purpose_tests {
             "path resolution, open/metadata, seek and read must each be admitted"
         );
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
+        assert_eq!(cpu.load(std::sync::atomic::Ordering::Relaxed), 1);
+        let clone = lease.clone();
         drop(lease);
+        assert_eq!(cpu.load(std::sync::atomic::Ordering::Relaxed), 1);
+        drop(clone);
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            while cpu.load(std::sync::atomic::Ordering::Relaxed) != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("closing the local lease did not release CPU");
     }
 
     #[tokio::test]
@@ -4416,6 +4455,7 @@ mod lease_purpose_tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = crate::registry::Registry::new(db, Default::default());
         let sessions = Sessions::new(dir.path().join("sessions"));
+        sessions.set_local_playback(|| panic!("background reads must not reserve playback CPU"));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let resolving = active.clone();
         sessions.set_local_source("local", move |_, _, _| {

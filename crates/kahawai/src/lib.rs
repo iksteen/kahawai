@@ -642,6 +642,10 @@ async fn run_hub_inner(
         });
         let local_scheduler =
             kahawai_mediahost::scheduler::Scheduler::new(&mh.collections, &mh.scheduler)?;
+        let playback_scheduler = local_scheduler.clone();
+        sessions.set_local_playback(move || {
+            Box::new(playback_scheduler.enter_playback("local playback byte lease"))
+        });
         let viewer_scheduler = local_scheduler.clone();
         sessions.set_local_activity(move |root_token| {
             Box::new(viewer_scheduler.enter_interactive(

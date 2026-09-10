@@ -13,6 +13,11 @@
 //! array known to sustain parallel I/O. Thus an I/O-only header read on one
 //! device may overlap a CPU decode on another without allowing two jobs to
 //! contend accidentally for the same default resource.
+//! Playback holds an interactive CPU reservation for its byte lease, while
+//! storage is reserved only around actual reads. Scans and bounded metadata
+//! probes request storage only; sustained hashing and analysis also request
+//! CPU. Resource conflicts apply at every queue priority, including demand
+//! hints. Viewer reads and urgent extraction enter immediately.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -161,12 +166,14 @@ impl State {
         (cpu, io)
     }
 
-    fn available(&self, resources: &Resources) -> bool {
-        if self
-            .interactive
+    fn interrupted(&self, resources: &Resources) -> bool {
+        self.interactive
             .values()
             .any(|interactive| interactive.conflicts(resources))
-        {
+    }
+
+    fn available(&self, resources: &Resources) -> bool {
+        if self.interrupted(resources) {
             return false;
         }
         let (used_cpu, used_io) = self.used();
@@ -363,8 +370,15 @@ impl Scheduler {
         })))
     }
 
+    /// Hold for the lifetime of a viewer's byte lease, including network waits.
+    /// Reserve CPU for delivery without holding storage between reads.
+    /// Queue priority cannot bypass this reservation; I/O-only work continues.
+    pub fn enter_playback(&self, label: impl Into<String>) -> InteractiveGuard {
+        self.enter_interactive(self.resources([], true), label)
+    }
+
     /// Interactive work is never capacity-gated. Its presence pauses only
-    /// conflicting scheduled work and prevents a new conflicting admission.
+    /// conflicting scheduled work and prevents new conflicting admission.
     pub fn enter_interactive(
         &self,
         resources: Resources,
@@ -513,10 +527,7 @@ fn refresh_demand_priorities(state: &mut State) {
 fn request_preemption(state: &mut State) {
     refresh_demand_priorities(state);
     for active in state.active.values() {
-        let interactive_conflict = state
-            .interactive
-            .values()
-            .any(|interactive| interactive.conflicts(&active.resources));
+        let interactive_conflict = state.interrupted(&active.resources);
         active
             .control
             .pause
@@ -526,6 +537,8 @@ fn request_preemption(state: &mut State) {
     let requests = state
         .pending
         .iter()
+        // A job blocked by interactive work cannot use freed capacity yet.
+        .filter(|pending| !state.interrupted(&pending.resources))
         .map(|pending| {
             let cpu_full =
                 pending.resources.cpu != 0 && used_cpu + pending.resources.cpu > state.cpu_capacity;
@@ -827,6 +840,156 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(1), paused)
             .await
             .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_holds_analysis_between_reads_until_the_lease_closes() {
+        use std::time::Duration;
+
+        let (_temp, scheduler, movie_root, analysis_root) = scheduler();
+        let analysis = scheduler
+            .acquire(
+                Priority::Segments,
+                scheduler.resources([analysis_root.as_str()], true),
+                None,
+                "analysis on another disk",
+            )
+            .await
+            .unwrap();
+        let playback = scheduler.enter_playback("viewer lease");
+        let mut waiting_analysis =
+            tokio::task::spawn_blocking(move || analysis.checkpoint_blocking());
+        // Finishing a disk read must not clear the lease's CPU protection.
+        drop(scheduler.enter_interactive(
+            scheduler.resources([movie_root.as_str()], false),
+            "one viewer read",
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut waiting_analysis)
+                .await
+                .is_err(),
+            "analysis resumed while the viewer lease was still open"
+        );
+        drop(playback);
+        tokio::time::timeout(Duration::from_secs(1), waiting_analysis)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn playback_reserves_cpu_but_allows_storage_work_at_every_priority() {
+        use std::time::Duration;
+
+        for priority in [
+            Priority::Demand,
+            Priority::CatalogFreshness,
+            Priority::Geometry,
+            Priority::SubtitlePrewarm,
+            Priority::Segments,
+            Priority::Loudness,
+        ] {
+            let (_temp, scheduler, root, _) = scheduler();
+            let io = scheduler.resources([root.as_str()], false);
+            let running = scheduler
+                .acquire(priority, io.clone(), None, "storage work")
+                .await
+                .unwrap();
+            let playback = scheduler.enter_playback("viewer lease");
+            running.checkpoint().await.unwrap();
+            // Actual reads/extraction still interrupt conflicting storage,
+            // irrespective of the queue priority. Finishing the operation
+            // releases storage even while the playback CPU reservation lives.
+            let extraction = scheduler.enter_interactive(io.clone(), "urgent extraction");
+            assert!(running.0.control.pause.load(Ordering::Acquire));
+            drop(extraction);
+            tokio::time::timeout(Duration::from_secs(1), running.checkpoint())
+                .await
+                .unwrap()
+                .unwrap();
+            drop(running);
+            let next = tokio::time::timeout(
+                Duration::from_secs(1),
+                scheduler.acquire(priority, io, None, "new storage work"),
+            )
+            .await
+            .expect("playback held storage between reads")
+            .unwrap();
+            drop(next);
+            let cpu = scheduler.acquire(priority, scheduler.resources([], true), None, "CPU work");
+            tokio::pin!(cpu);
+            assert!(
+                tokio::time::timeout(Duration::from_millis(10), &mut cpu)
+                    .await
+                    .is_err(),
+                "queue priority bypassed the playback CPU reservation"
+            );
+            drop(playback);
+            tokio::time::timeout(Duration::from_secs(1), cpu)
+                .await
+                .unwrap()
+                .unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn hinted_background_analysis_waits_without_interrupting_a_rescan() {
+        use std::time::Duration;
+
+        let (_temp, scheduler, root, _) = scheduler();
+        let playback = scheduler.enter_playback("viewer lease");
+        let rescan = tokio::time::timeout(
+            Duration::from_secs(1),
+            scheduler.acquire(
+                Priority::CatalogFreshness,
+                scheduler.resources([root.as_str()], false),
+                None,
+                "rescan during playback",
+            ),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        let job = kahawai_proto::v1::DetectSegments {
+            collection_id: "series".into(),
+            episodes: vec![kahawai_proto::v1::SegmentEpisode {
+                source: Some(kahawai_proto::v1::SourcePath::new(&root, "episode.mkv")),
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        scheduler.hint_segment(
+            "hub",
+            "series",
+            &root,
+            "episode.mkv",
+            Duration::from_secs(60),
+        );
+        let waiting = scheduler.acquire_segments(
+            scheduler.resources([root.as_str()], true),
+            None,
+            "hinted background season",
+            &job,
+        );
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        assert!(!rescan.0.control.pause.load(Ordering::Acquire));
+        drop(rescan);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        drop(playback);
+        tokio::time::timeout(Duration::from_secs(1), waiting)
+            .await
             .unwrap()
             .unwrap();
     }

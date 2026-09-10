@@ -125,13 +125,20 @@ impl Lease {
     /// serving task speaks the same ReadRequest/ByteChunk protocol so
     /// every consumer of Lease works unchanged.
     pub fn local(path: std::path::PathBuf) -> Lease {
-        Self::local_guarded(path, None)
+        Self::local_guarded(path, None, None)
     }
 
-    pub fn local_guarded(path: std::path::PathBuf, admission: Option<LocalAdmission>) -> Lease {
+    pub fn local_guarded(
+        path: std::path::PathBuf,
+        admission: Option<LocalAdmission>,
+        activity: Option<Box<dyn Send + Sync>>,
+    ) -> Lease {
         let (req_tx, mut req_rx) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(4);
         let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
         tokio::spawn(async move {
+            // CPU protection lasts through network waits and idle reads;
+            // storage admission below lasts only for filesystem operations.
+            let _activity = activity;
             const CHUNK: usize = 256 * 1024;
             use tokio::io::{AsyncReadExt, AsyncSeekExt};
             let open_permit = match &admission {
@@ -367,7 +374,7 @@ mod tests {
             })
         };
 
-        let lease = Lease::local_guarded(path, Some(admission));
+        let lease = Lease::local_guarded(path, Some(admission), None);
         // Keep the stream alive without consuming it. Both bounded channels
         // fill, leaving the producer blocked on delivery rather than I/O.
         let _stream = lease.read_range(0, 16 * 1024 * 1024);

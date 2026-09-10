@@ -134,7 +134,12 @@ How something works and why it was built that way belong in
       standalone or all-in-one reads as atomic CPU + storage-domain bundles.
       Fixed semantic priority never ages; conflicting higher work interrupts
       at checkpoints, independent I/O-only work overlaps, and protocol-4.1
-      playback/up-next hints temporarily make matching segment work demand
+      playback/up-next hints temporarily make matching segment work demand.
+      Remote and all-in-one viewer leases reserve CPU until closure; storage
+      is reserved only around reads. Scans and bounded probes use storage-only
+      admission, so they progress between reads while sustained CPU work waits.
+      On-demand extraction remains immediate; no priority bypasses a resource
+      reservation.
 - [~] MH-12 WITHDRAWN 2026-08-02, false premise — see the amendment in
       the requirement. Built and reverted the same night: probing one
       host read 30 s for `movies` and 23 ms for `anime` on the same

@@ -214,7 +214,7 @@ impl LocalRuntime {
                         .map(|root| root.token)
                         .collect::<Vec<_>>();
                     let resources =
-                        scan_scheduler.resources(root_tokens.iter().map(String::as_str), true);
+                        scan_scheduler.resources(root_tokens.iter().map(String::as_str), false);
                     let priority = if trigger.demand {
                         scheduler::Priority::Demand
                     } else {
@@ -1736,7 +1736,7 @@ impl Engine {
                 let next = version + 1;
                 let force_dirs = trig.force_dirs;
                 let roots = c.resolved_roots().map(|root| root.token).collect::<Vec<_>>();
-                let resources = scan_scheduler.resources(roots.iter().map(String::as_str), true);
+                let resources = scan_scheduler.resources(roots.iter().map(String::as_str), false);
                 let priority = if trig.demand {
                     scheduler::Priority::Demand
                 } else {
@@ -2372,6 +2372,57 @@ mod scheduler_integration_tests {
         run_local_multi, schedule_catalog_updates, scheduler, send_catalog_pages,
         send_link_message_with_timeout,
     };
+
+    #[tokio::test]
+    async fn startup_scan_discovers_new_media_while_playback_reserves_cpu() {
+        if !kahawai_media::testutil::require_h264_aac_fixture() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        kahawai_media::testutil::render_h264_aac_mkv(&root.path().join("new.mkv"));
+        let collections = vec![CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().to_path_buf()],
+        }];
+        let scheduler = scheduler::Scheduler::new(&collections, &Default::default()).unwrap();
+        let _playback = scheduler.enter_playback("viewer already playing");
+        let runtime = super::LocalRuntime::start_with_scheduler(
+            state.path(),
+            collections,
+            0,
+            scheduler,
+            false,
+        )
+        .await
+        .unwrap();
+        let mut versions = runtime.catalog.subscribe_versions();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if versions
+                    .borrow_and_update()
+                    .get("movies")
+                    .is_some_and(|state| state.2)
+                {
+                    break;
+                }
+                versions.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("playback blocked the initial scan");
+        let known = runtime.catalog.known_files("movies").await.unwrap();
+        assert_eq!(
+            known.len(),
+            1,
+            "new media was not discovered during playback"
+        );
+        let info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&known.values().next().unwrap().streams_json).unwrap();
+        assert_eq!(info.video.len(), 1);
+        assert_eq!(info.audio.len(), 1);
+    }
 
     #[test]
     fn hub_rescans_name_exactly_one_shared_collection() {

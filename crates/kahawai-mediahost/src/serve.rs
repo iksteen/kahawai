@@ -162,6 +162,12 @@ pub async fn serve_lease_scheduled(
     let mut client = MediahostLinkClient::new(channel);
     let (tx, rx) = tokio::sync::mpsc::channel::<ByteChunk>(8);
     let resources = scheduler.resources([root_token.as_str()], false);
+    // Keep playback demand present between disk reads and while the network
+    // applies backpressure. Brief per-read guards can disappear before an
+    // analyzer reaches its next checkpoint, leaving it running during playback.
+    // Reserve CPU only; storage guards below cover actual filesystem work.
+    // Dropping the lease resumes scheduled CPU work.
+    let _playback = (!background).then(|| scheduler.enter_playback("playback byte lease"));
 
     // First chunk binds the token; carry a resolution error if there is one.
     let (bind_error, file, size) = match path {
