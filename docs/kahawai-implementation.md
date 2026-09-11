@@ -147,7 +147,9 @@ ID. Assigned title/year takes precedence over detected title/year, so assigning
 providers. Missing fields and multiple matching items require identification or
 an explicit choice. Provider IDs do not define movie or series identity.
 
-`episode_details` stores the series and episode numbering. `album_tracks` stores
+`episode_details` stores the series and native episode numbering. Provider season
+projections change presentation without changing the episode ID or watch history.
+`album_tracks` stores
 stable album positions. `collection_items.album_track_id` selects the current
 position of each copy; a shared recording can occur on several albums. Access to one album cannot reveal another album's copies.
 
@@ -156,11 +158,20 @@ An assignment edits the existing links and sets
 alone. `assignment_revision` rejects stale edits; a queued source change advances
 it without storing a second snapshot of the metadata. Parent corrections update
 automatic children; manually assigned children retain their choice and report a
-parent conflict. `rejected_library_matches` records rejected choices.
+parent conflict. `rejected_library_matches` records rejected choices. Permanent
+item aliases preserve those refusals: identifying a rejected work does not make
+it acceptable again. An explicit assignment clears only equivalent refusals.
+Resetting an episode or song also clears its independent provider choice,
+so it inherits from its parent again.
+Album Artist regrouping carries compatible album and song choices and rejections
+to the surviving copies. Conflicting choices keep the physical copies
+separate until resolved; their existing decisions determine the visible conflict.
+Provider-priority changes also refresh dependent episode descriptions and search
+text, preserving native numbering and history.
 
 Provider answers and provider choices stay on the collection item.
-`metadata_eligible` prevents a manually selected different item from inheriting
-an answer describing the old item. A combined file's first-episode answer cannot
+`metadata_eligible` prevents a manually selected different item, and its automatic
+children, from inheriting an answer describing the old item. A combined file's first-episode answer cannot
 describe all covered episodes. `library_overrides` contains shared descriptive
 overrides; clearing them restores available provider descriptions.
 
@@ -179,28 +190,48 @@ expose collection copies and their assignment revisions. Admin matching uses
 Item QUERY and playback start accept a physical source ID so stream indexes
 and chapter offsets retain their meaning. Subtitle search/download and font
 requests name that source too. Music sessions return its actual ReplayGain.
+Public subtitle listings name the library item; extraction keeps the physical owner.
 Grants apply to the supporting copies, including child lists and album search.
+Copy selectors include the mediahost identity. The review queue includes unresolved
+library assignments and conflicts regardless of provider confidence.
+Matching can merge or reorder grid rows. The web grid invalidates its paginated
+results together and reloads the visible range while retaining the scroll position.
 
 `user_item_state` belongs to the library item. Correcting an identified copy
 leaves history with the previous item. An unidentified item retains its ID on
 first identification when possible; if it joins an existing item, its history
 transfers once and `merged_into` lets already playing sessions finish correctly.
+Reordering combined coverage retains each surviving item's identity and history;
+only removed unidentified items promote into newly added targets. Diagnostic log
+downloads search the permanent alias family for the newest session bundle.
 Sessions capture the copy, ordered library item IDs and physical fingerprint.
-Recovery carries that fingerprint; an offset from another version starts at the
-beginning. Optional known episode boundaries make progress episode-relative;
+Subtitle and font requests from an active session retain that source after a
+copy is reassigned, subject to the session owner's current collection access.
+Recovery carries that fingerprint; a removed version returns a conflict, while
+a matching version on a disconnected host remains retryable. An offset from another version starts at the
+beginning. Successful recovery refreshes source details before the player adopts
+its new session. Optional known episode boundaries make progress episode-relative;
 missing boundaries keep combined playback. Autoplay advances past the episodes
 covered by the current source. Legacy offsets without provenance remain stored
 but cannot resume an arbitrary physical version.
+Automatic playback ranks sources using the final capability profile and each
+source's preferred audio track before fixing the selected source for session start.
 
 Portable preferences follow the initially identified library item, with an
 existing library preference winning conflicts. Exact track preferences use a
-`source:{id}` scope. A legacy exact choice is copied only when its collection
+`source:{collection_item_id}:{source_id}` scope, so reused numeric source IDs
+cannot apply another copy's choice. Shared audio preferences select languages,
+not numeric stream indexes. A legacy exact choice is copied only when its collection
 item has one physical source; ambiguous original preferences remain stored.
 
 Migration 77 is the immutable introduction of shared items. Migration 78 removes
 the key, pin, assignment-snapshot and duplicate-numbering storage, retaining item
 IDs, source metadata, links, decisions and history. A version-76 database runs
 both migrations and derives library items directly from its existing metadata.
+Migrations 79–82 repair episode descriptions, source-qualified preferences,
+native episode identities and public collection-item aliases. Migration 83 also
+repairs unresolved songs whose recording identity is already known; migration 84
+repairs alias-qualified rejections. The existing content archive for manual provider matches and watch state remains unchanged.
 Startup repairs legacy episode coverages using stored paths, preserving source
 IDs and downloaded subtitle payloads, then finishes matching before accepting requests. Rehearse an upgrade on a
 database copy with `scripts/kahawai-library.sh audit DATA_DIRECTORY`; without
@@ -459,7 +490,7 @@ transports, but take application URLs from generated URL builders or
 server-returned session URLs. The post-1.0 compatibility baseline remains
 ENG-6 work.
 
-*This breaks v1 in place, against NFR-7* ("breaking changes only in a new major API version"). Deliberate, with the maintainer's sanction: there are no external clients yet, and carrying a `/api/v2` for a pre-release keyspace costs more than it protects. NFR-7 governs from the first outside consumer.
+API stability begins with the first formal release (NFR-7, clarified by the maintainer on 2026-09-11). Kahawai has not had a formal release, so the GET/QUERY split and unified library kinds (`series`/`song`, replacing `show`/`track`) change `/api/v1` in place. The web and Android clients use the unified library vocabulary.
 
 **The general item browse is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one. The narrower artist-album exception and its cost boundary are below.
 

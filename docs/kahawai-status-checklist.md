@@ -165,12 +165,35 @@ How something works and why it was built that way belong in
       revision guards on collection items. Migration 78 retains metadata and
       history while removing duplicate assignment and identity-key storage.
       Correcting an identified copy leaves the previous item's history intact.
+      Upgrade aliases preserve old item URLs when copies coalesce. Parent
+      corrections suppress inherited metadata describing the previous parent.
+      Resetting a child provider match clears its independent assignment.
+      Provider season projections preserve native episode identity and history;
+      bridge titles and projected numbers remain available in browse and search.
+      Combined files retain a separate provider projection for every covered
+      native episode, including season boundaries, without sharing the first
+      episode's description. Missing legacy coverage uses the normal episode pass.
+      Provider-rank changes refresh bridge descriptions and search text. Reordered
+      combined coverage retains surviving episode identities and their history.
       Source-specific subtitles, fonts and resume use the selected rendition.
+      Audio changes retain that rendition's tracks; subtitle searches retain
+      the source they searched. Removed source overrides and recovery versions
+      return a conflict; disconnected matching versions remain retryable.
       Text/ASS serving and extraction retain the selected track's physical file;
       an empty session subtitle list cannot reuse another source's preview.
+      Active sessions retain subtitle/font access across copy reassignment,
+      guarded by session ownership and current collection grants.
+      Subtitle listings expose usable library URLs. Recovery refreshes the actual
+      source's tracks, and season playback follows the negotiated online copy.
       The item page offers a source selector before playback, defaults to the
       automatic choice, and keeps CDs together. Overrides update the playback
       preview and apply to Play, Resume and chapters without saving a preference.
+      Subtitle management can select a persisted source while its host is offline.
+      Exact track preferences include the collection copy to prevent source ID reuse.
+      Matching refreshes all affected grid offsets while retaining the viewport.
+      Review queues include library conflicts despite confident provider metadata;
+      copy selectors name the host, and diagnostics follow permanent item aliases.
+      Automatic source selection accounts for each rendition's preferred audio.
       Runnable regression and upgrade audit: `scripts/kahawai-library.sh`.
 - [x] HUB-4 Filename/dirname parsing (movies, episodes, anime conventions,
       music layout). Music albums group on Album Artist while tracks retain
@@ -179,7 +202,11 @@ How something works and why it was built that way belong in
       identities (merging state only on a real slot collision), invalidates an
       obsolete automatic MusicBrainz answer while preserving a human pin, and
       never transfers state across different content at the same path
-- [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll
+      Manual album/song choices and rejections survive regrouping; conflicting
+      choices retain separate copies until resolved.
+      Rejections follow permanent item aliases; an explicit correction clears
+      equivalent refusals while retaining unrelated ones.
+- [x] HUB-20 Mediahost deletion cascade + watch-state/match archives restored on re-enroll.
 - [x] HUB-5 Provider trait + declared chains + walker (TMDB, TVDB, anime
       composite, MusicBrainz + CAA), plus Fanart.tv → TheAudioDB Album Artist
       artwork
@@ -502,8 +529,9 @@ How something works and why it was built that way belong in
       `sort=-added` orders by. Ordered by the series' last viewing, most
       recent first (`kahawai-list.sh -n`). Same shape and same page as
       the browse: `ItemsResponse`, `library` scopes it, grants bind it —
-      correlated on the SHOW, since an episode belongs to a library
-      through its parent. Checked by `tests/up_next.rs`, including a
+      checked on both the shared series and its candidate episode's copies.
+      Episode candidates use the existing series index in `episode_details`.
+      Checked by `tests/up_next.rs` and `tests/library_grants.rs`, including a
       series brought back by a new episode alone beside an otherwise
       identical one that stays quiet.
 - [x] HUB-13 All hub state in embedded storage; survives restart without rescan
@@ -640,7 +668,10 @@ How something works and why it was built that way belong in
       and presentation as native or TVDB-style seasons — a per-USER
       preference (settings page, default seasons; the requirement's
       per-library knob was dropped 2026-07-25 as needless bookkeeping) —
-      with the projection stored per episode during the TVDB/TMDB bridge
+      with each covered native episode's projection stored on its TVDB/TMDB
+      answer, including combined files that cross a season boundary. Provider
+      order reuses these answers; third-party lookup numbers stay paired with
+      that provider's show ID. Recorded gaps retain the ordinary retry interval
       *(episodes TVDB never curated absolute numbers for stay unprojected
       and fall into an "Other" bucket)*
 - [x] HUB-32 (see subtitles above)
@@ -904,13 +935,15 @@ How something works and why it was built that way belong in
       no file = not served at all), SIGHUP reload for what can change
       under a running process.
 - [x] NFR-7 Versioned client API (`/api/v1`)
-      *(One sanctioned exception, taken in place rather than as `/api/v2`:
-      the item resource was split by method — `GET` for what was
-      discovered, `QUERY` (RFC 10008) for what this client would be
-      served — and `GET /items/{id}/subtitles` plus `sources[].streams`
-      on `GET` were deleted with it. There are no external clients yet;
-      NFR-7 governs from the first one. See §4.4 of the implementation
-      doc for the shape and the reasoning.)*
+      The original `/admin/v1/items/{id}/match` request and `{"ok":true}`
+      response remain supported for existing collection-copy IDs. The additive
+      collection-items match route requires a revision to reject stale edits.
+      Review entries retain the copy ID in `item_id`; `library_item_id` supplies
+      the shared identity separately so a correction cannot target another copy.
+      API stability begins with the first formal release; none has occurred.
+      Pre-release changes therefore use `/api/v1` in place, including the
+      GET/QUERY split and unified `series`/`song` kinds used by web and Android.
+      After that release, NFR-7 requires major versioning and a deprecation window.
 - [x] NFR-8 Codec support delegated to system GStreamer; MIT throughout —
       the OCR tier links leptess/Tesseract (MIT/Apache-2.0), not
       subtile-ocr, so no GPL combined-work consequence exists;
