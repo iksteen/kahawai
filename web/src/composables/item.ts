@@ -20,6 +20,8 @@ import { useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import { buildProfile } from '../api/capabilities.ts'
 import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { Preference } from '../api/generated/model/preference.ts'
+import { queryPlaybackItem } from '../api/playback.ts'
 import { itemChildren, itemQuery, itemSetWatched } from '../api/generated/kahawai.ts'
 import { notify } from './notices.ts'
 import { sentence } from '../domain/refusal.ts'
@@ -30,14 +32,28 @@ import { sentence } from '../domain/refusal.ts'
 /// and the profile is a body. The verdicts it comes back with are the hub's
 /// own — the point of asking the item what it would serve is that the answer
 /// comes from the code that will serve it.
-export function useItem(id: Ref<string>) {
+export function useItem(
+  id: Ref<string>,
+  playback?: {
+    prefs: Ref<Preference[]>
+    mediaType: Ref<string>
+    ready: Ref<boolean>
+  },
+) {
   return useQuery({
-    queryKey: computed(() => ['item', id.value]),
+    queryKey: computed(() => [
+      'item',
+      id.value,
+      ...(playback ? [{ prefs: playback.prefs.value, mediaType: playback.mediaType.value }] : []),
+    ]),
     // Nothing is asked for an id nobody has chosen — the season page's open
     // panel has none until a still is picked, and asking anyway sent a QUERY
     // for the empty id on every visit and after every mark.
-    enabled: computed(() => id.value !== ''),
-    queryFn: (): Promise<ItemQueryResponse> => itemQuery(id.value, { profile: buildProfile() }),
+    enabled: computed(() => id.value !== '' && (playback?.ready.value ?? true)),
+    queryFn: (): Promise<ItemQueryResponse> =>
+      playback
+        ? queryPlaybackItem(id.value, playback.prefs.value, playback.mediaType.value)
+        : itemQuery(id.value, { profile: buildProfile() }),
   })
 }
 

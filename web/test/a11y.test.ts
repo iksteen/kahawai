@@ -33,8 +33,15 @@ vi.mock('../src/api/session.ts', () => ({
 }))
 /// Left hanging on purpose: the player is in the audit for the frame around the
 /// picture, and a resolved session mounts hls.js.
-vi.mock('../src/api/playback.ts', () => ({
+vi.mock('../src/api/playback.ts', async (importOriginal) => ({
+  ...(await importOriginal<typeof import('../src/api/playback.ts')>()),
   startPlaybackSession: vi.fn(() => new Promise(() => {})),
+  selectPlaybackSource: vi.fn(async (item, _prefs, _mediaType, profile, sourceId) => ({
+    item,
+    profile,
+    sourceId: sourceId ?? item.negotiated?.source?.source_id,
+    audioTrack: 0,
+  })),
 }))
 vi.mock('../src/api/capabilities.ts', () => ({
   buildProfile: () => ({}),

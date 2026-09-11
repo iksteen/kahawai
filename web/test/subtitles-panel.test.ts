@@ -148,6 +148,46 @@ describe('what the item already has', () => {
 })
 
 describe('searching', () => {
+  test('changing sources discards a pending search, even after returning to that source', async () => {
+    let finish!: (value: unknown) => void
+    vi.mocked(api.subtitleSearch).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve
+      }) as never,
+    )
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    await wrapper.setProps({ sourceId: 2 })
+    await wrapper.setProps({ sourceId: 1 })
+    finish({ candidates: [candidate({ release_name: 'OLD source search' })], quota: quota() })
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    await press(wrapper, 'Find subtitles (eng)')
+    expect(wrapper.text()).toContain('Heat.1995.BluRay')
+    expect(wrapper.text()).not.toContain('OLD source search')
+    wrapper.unmount()
+  })
+
+  test('changing sources closes results before another source can download them', async () => {
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    await wrapper.setProps({ sourceId: 2 })
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(api.subtitleDownload).not.toHaveBeenCalled()
+    await press(wrapper, 'Find subtitles (eng)')
+    await press(wrapper, 'Download')
+    expect(api.subtitleSearch).toHaveBeenLastCalledWith('heat', {
+      languages: ['eng'],
+      source_id: 2,
+    })
+    expect(api.subtitleDownload).toHaveBeenLastCalledWith('heat', {
+      file_id: 'f1',
+      language: 'eng',
+      source_id: 2,
+    })
+    wrapper.unmount()
+  })
+
   test('is filtered by the media type’s language preference', async () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
@@ -181,6 +221,30 @@ describe('searching', () => {
 })
 
 describe('a candidate', () => {
+  test('a download finishing for an old source cannot close the new source’s results', async () => {
+    let finish!: (value: unknown) => void
+    vi.mocked(api.subtitleDownload).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve
+      }) as never,
+    )
+    const wrapper = await panel()
+    await press(wrapper, 'Find subtitles (eng)')
+    await press(wrapper, 'Download')
+    expect(api.subtitleDownload).toHaveBeenLastCalledWith('heat', {
+      file_id: 'f1',
+      language: 'eng',
+      source_id: 1,
+    })
+    await wrapper.setProps({ sourceId: 2 })
+    await press(wrapper, 'Find subtitles (eng)')
+    finish({ track_id: 9, quota: quota() })
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
+    expect(wrapper.emitted('changed')).toBeUndefined()
+    wrapper.unmount()
+  })
+
   test('says when the provider matched the exact file (HUB-22)', async () => {
     vi.mocked(api.subtitleSearch).mockResolvedValue({
       candidates: [candidate({ hash_match: true })],

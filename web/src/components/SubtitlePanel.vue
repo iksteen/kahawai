@@ -16,19 +16,23 @@ import { quotaLabel } from '../domain/quota.ts'
 import { sentence } from '../domain/refusal.ts'
 import { subtitleDelete, subtitleDownload, subtitleSearch } from '../api/generated/kahawai.ts'
 
-const props = defineProps<{
-  item: { id: string; title: string; parent_id?: string | null }
-  sourceId?: number | undefined
-  subs: TrackListing[]
-  /// The media type's subtitle language preference (HUB-33). The search is
-  /// filtered by it, with a one-click unfiltered retry.
-  languages: string[]
-  /// A standing choice for THIS title, which beats the language list in
-  /// Settings — so it has to be visible here, and revocable.
-  titleChoice: string
-  /// The file's own frame rate, for the drift warning.
-  fps?: number | null | undefined
-}>()
+const props = withDefaults(
+  defineProps<{
+    item: { id: string; title: string; parent_id?: string | null }
+    sourceId?: number | undefined
+    subs: TrackListing[]
+    listingKnown?: boolean
+    /// The media type's subtitle language preference (HUB-33). The search is
+    /// filtered by it, with a one-click unfiltered retry.
+    languages: string[]
+    /// A standing choice for THIS title, which beats the language list in
+    /// Settings — so it has to be visible here, and revocable.
+    titleChoice: string
+    /// The file's own frame rate, for the drift warning.
+    fps?: number | null | undefined
+  }>(),
+  { listingKnown: true },
+)
 
 const emit = defineEmits<{ changed: []; cleared: [] }>()
 
@@ -39,6 +43,23 @@ const quota = ref<Quota | null>(null)
 /// `null` while the dialog is closed. An empty array is a search that found
 /// nothing, which is a different thing and has its own offer.
 const candidates = ref<Candidate[] | null>(null)
+type SearchTarget = { itemId: string; sourceId: number | undefined }
+let candidateTarget: SearchTarget | null = null
+let request = 0
+
+// Cached source choices reuse this panel. Results and in-flight work belong
+// to the source that was searched, including after switching away and back.
+watch(
+  [() => props.item.id, () => props.sourceId],
+  () => {
+    request++
+    candidateTarget = null
+    candidates.value = null
+    note.value = ''
+    busy.value = false
+  },
+  { flush: 'sync' },
+)
 
 /// The dialog has to be ENTERED to be announced, and Tab must not walk out of
 /// it into the page behind: `aria-modal` hides the background from a virtual
@@ -77,16 +98,23 @@ watch(candidates, async (open) => {
 })
 
 onMounted(() => window.addEventListener('keydown', keys))
-onBeforeUnmount(() => window.removeEventListener('keydown', keys))
+onBeforeUnmount(() => {
+  request++
+  window.removeEventListener('keydown', keys)
+})
 
 async function find(languages: string[]) {
+  const mine = ++request
+  const target = { itemId: props.item.id, sourceId: props.sourceId }
   busy.value = true
   note.value = ''
   try {
-    const answer = await subtitleSearch(props.item.id, {
+    const answer = await subtitleSearch(target.itemId, {
       languages,
-      source_id: props.sourceId ?? null,
+      source_id: target.sourceId ?? null,
     })
+    if (mine !== request) return
+    candidateTarget = target
     candidates.value = answer.candidates
     quota.value = answer.quota
     if (answer.candidates.length === 0) {
@@ -95,28 +123,34 @@ async function find(languages: string[]) {
         : 'No subtitles found for this file.'
     }
   } catch (cause) {
+    if (mine !== request) return
     note.value = sentence(cause)
   } finally {
-    busy.value = false
+    if (mine === request) busy.value = false
   }
 }
 
 async function download(candidate: Candidate) {
+  const target = candidateTarget
+  if (!target || busy.value) return
+  const mine = request
   busy.value = true
   try {
-    const answer = await subtitleDownload(props.item.id, {
+    const answer = await subtitleDownload(target.itemId, {
       file_id: candidate.file_id,
-      source_id: props.sourceId ?? null,
+      source_id: target.sourceId ?? null,
       language: candidate.language,
     })
+    if (mine !== request) return
     quota.value = answer.quota
     candidates.value = null
     notify('Subtitle downloaded — it is now a track on this item.')
     emit('changed')
   } catch (cause) {
+    if (mine !== request) return
     note.value = sentence(cause)
   } finally {
-    busy.value = false
+    if (mine === request) busy.value = false
   }
 }
 
@@ -140,6 +174,7 @@ async function followSettings() {
 
 /// What is in the FILE, as one line: the player is where these get picked.
 const inTheFile = computed(() => {
+  if (props.listingKnown === false) return 'Subtitle listing is unavailable for this source.'
   const own = props.subs.filter((s) => s.origin === 'embedded' || s.origin === 'sidecar')
   if (own.length === 0) return 'No subtitles in the file.'
   const languages = [...new Set(own.map((s) => s.language ?? '?'))]

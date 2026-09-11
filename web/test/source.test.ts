@@ -12,10 +12,24 @@ import {
   LOUD_DELIVERY,
   planRow,
   size,
+  sourceLocation,
   subtitleChip,
   subtitleChipTitle,
   subtitleVerdict,
 } from '../src/domain/source.ts'
+
+test('host names stay readable without merging identically named hosts', () => {
+  expect(sourceLocation({ module_id: 'a', host_name: 'NAS', collection_id: 'movies' })).toBe(
+    'NAS (a) · movies',
+  )
+  expect(sourceLocation({ module_id: 'b', host_name: 'NAS', collection_id: 'movies' })).toBe(
+    'NAS (b) · movies',
+  )
+  expect(sourceLocation({ module_id: 'a', collection_id: 'movies' })).toBe('a · movies')
+  expect(sourceLocation({ id: 'copy-without-host', collection_id: 'movies' })).toBe(
+    'copy-without-host · movies',
+  )
+})
 
 describe('a running time', () => {
   test('is minutes, and hours once there are enough of them', () => {

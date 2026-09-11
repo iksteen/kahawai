@@ -47,6 +47,7 @@ const {
   itemSetWatched,
   listLibraries,
   subtitleDelete,
+  subtitleDownload,
   subtitleSearch,
 } = await import('../src/api/generated/kahawai.ts')
 const { loadMask } = await import('../src/api/capabilities.ts')
@@ -296,6 +297,97 @@ describe('what the hub says it would do with the file', () => {
 })
 
 describe('choosing a playback source', () => {
+  test('default subtitle downloads follow the same preferred-audio source as Play', async () => {
+    const base = film().sources[0]!
+    vi.mocked(getPrefs).mockResolvedValue({
+      prefs: [{ scope: '', key: 'audio.movies', value: 'jpn' }],
+    } as never)
+    vi.mocked(itemQuery).mockImplementation(async (_id, body) => {
+      const selected = body?.source_id ?? (body?.source_audio_tracks?.['1'] === 1 ? 2 : 1)
+      return film({
+        sources: [
+          {
+            ...base,
+            path_rel: 'Preview.mkv',
+            streams: {
+              video: [],
+              audio: [
+                { language: 'eng', codec: 'aac' },
+                { language: 'jpn', codec: 'dts' },
+              ],
+            },
+          },
+          {
+            ...base,
+            source_id: 2,
+            collection_item_id: 'preferred-copy',
+            path_rel: 'Preferred.mkv',
+            streams: {
+              video: [],
+              audio: [
+                { language: 'eng', codec: 'dts' },
+                { language: 'jpn', codec: 'aac' },
+              ],
+            },
+          },
+        ],
+        negotiated: {
+          source: { source_id: selected },
+          cost: 'copy',
+          streams: { video: 'copy', audio: 'copy' },
+          subtitles: [],
+        },
+      }) as never
+    })
+    vi.mocked(subtitleSearch).mockResolvedValue({
+      candidates: [
+        { file_id: 'preferred-sub', language: 'eng', release_name: 'Preferred release' },
+      ],
+      quota: null,
+    } as never)
+    vi.mocked(subtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.find('#playback-source option').text()).toContain('Preferred.mkv')
+    expect(wrapper.find('#subtitle-source option').text()).toContain('Preferred.mkv')
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Find subtitles online')!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 2 })
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Download')!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleDownload).toHaveBeenLastCalledWith('heat', {
+      file_id: 'preferred-sub',
+      language: 'eng',
+      source_id: 2,
+    })
+    wrapper.unmount()
+  })
+
+  test('a subtitle download target is not offered before playback preferences arrive', async () => {
+    let answer!: () => void
+    vi.mocked(getPrefs).mockReturnValue(
+      new Promise((resolve) => {
+        answer = () => resolve({ prefs: [] } as never)
+      }),
+    )
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    const search = wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Find subtitles online')
+    expect(!search || search.attributes('disabled') !== undefined).toBe(true)
+    answer()
+    await flushPromises()
+    expect(
+      wrapper.findAll('button').some((button) => button.text() === 'Find subtitles online'),
+    ).toBe(true)
+    wrapper.unmount()
+  })
+
   const rendition = (selected = 2) => {
     const base = film().sources[0]!
     return film({
@@ -330,7 +422,7 @@ describe('choosing a playback source', () => {
     const { wrapper, router } = await open(Detail, '/library/films/item/heat')
     const options = wrapper.find('#playback-source').findAll('option')
     expect(options).toHaveLength(5)
-    expect(options[0]!.text()).toContain('Automatic · c · Heat 1080p.mkv')
+    expect(options[0]!.text()).toContain('Automatic · m · c · Heat 1080p.mkv')
     expect((options[0]!.element as HTMLOptionElement).selected).toBe(true)
     expect(options[1]!.text()).toContain('Heat CD1.avi + Heat CD2.avi')
     expect(options[3]!.attributes('disabled')).toBeDefined()
@@ -338,6 +430,65 @@ describe('choosing a playback source', () => {
     await playButton(wrapper).trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.query.source).toBeUndefined()
+  })
+
+  test('offline encodes remain selectable for subtitle lookup without changing playback', async () => {
+    const offline = rendition()
+    offline.sources = offline.sources.slice(0, 3).map((source) => ({ ...source, available: false }))
+    offline.negotiated = null
+    vi.mocked(itemQuery).mockResolvedValue(offline as never)
+    vi.mocked(subtitleSearch).mockResolvedValue({
+      candidates: [{ file_id: 'offline-sub', language: 'eng', release_name: 'Heat 1080p' }],
+      quota: null,
+    } as never)
+    vi.mocked(subtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(playButton(wrapper).attributes('disabled')).toBeDefined()
+    expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
+      true,
+    )
+    const subtitleOptions = wrapper.find('#subtitle-source').findAll('option')
+    expect(subtitleOptions).toHaveLength(3)
+    expect(subtitleOptions.every((option) => option.attributes('disabled') === undefined)).toBe(
+      true,
+    )
+    await wrapper.find('#subtitle-source').setValue('2')
+    await flushPromises()
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Find subtitles online')!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 2 })
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Download')!
+      .trigger('click')
+    await flushPromises()
+    expect(subtitleDownload).toHaveBeenLastCalledWith('heat', {
+      file_id: 'offline-sub',
+      language: 'eng',
+      source_id: 2,
+    })
+    expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
+      true,
+    )
+    expect(playButton(wrapper).attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).toContain('Subtitle listing is unavailable for this source.')
+    wrapper.unmount()
+  })
+
+  test('a subtitle override leaves automatic playback on its negotiated source', async () => {
+    const { wrapper, router } = await open(Detail, '/library/films/item/heat')
+    await wrapper.find('#subtitle-source').setValue('1')
+    await flushPromises()
+    expect(itemQuery).toHaveBeenLastCalledWith('heat', expect.objectContaining({ source_id: 1 }))
+    expect(wrapper.text()).toContain('REMUX')
+    expect(wrapper.text()).not.toContain('TRANSCODE')
+    await playButton(wrapper).trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.query.source).toBeUndefined()
+    wrapper.unmount()
   })
 
   test.each(['resume', 'start', 'chapter'] as const)(
@@ -388,7 +539,7 @@ describe('choosing a playback source', () => {
     expect(wrapper.find('h1').text()).toContain('Heat')
     expect(wrapper.text()).toContain('Could not check this source')
     expect(playButton(wrapper).attributes('disabled')).toBeDefined()
-    await wrapper.find('#playback-source').setValue('Automatic · c · Heat 1080p.mkv · 8.0 GB')
+    await wrapper.find('#playback-source').setValue('Automatic · m · c · Heat 1080p.mkv · 8.0 GB')
     await flushPromises()
     expect(wrapper.text()).not.toContain('Could not check this source')
     expect(playButton(wrapper).attributes('disabled')).toBeUndefined()
@@ -409,9 +560,84 @@ describe('choosing a playback source', () => {
     )
     expect((await import('../src/api/generated/kahawai.ts')).putPref).not.toHaveBeenCalled()
   })
+
+  test('returning to automatic during subtitle search cannot reuse the override’s results', async () => {
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    await wrapper.find('#playback-source').setValue('1')
+    await flushPromises()
+    let finish!: (value: unknown) => void
+    vi.mocked(subtitleSearch).mockReturnValueOnce(
+      new Promise((resolve) => {
+        finish = resolve
+      }) as never,
+    )
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Find subtitles online')!
+      .trigger('click')
+    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 1 })
+    await wrapper.find('#playback-source').setValue('Automatic · m · c · Heat 1080p.mkv · 8.0 GB')
+    await flushPromises()
+    finish({
+      candidates: [{ file_id: 'wrong-version', language: 'eng', release_name: 'CD release' }],
+      quota: null,
+    })
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('CD release')
+    wrapper.unmount()
+  })
 })
 
 describe('the files it is made of', () => {
+  test('identical paths on different hosts remain identifiable in every source control', async () => {
+    admin.value = true
+    const base = film()
+    const detail = film({
+      sources: ['a', 'b'].map((suffix, at) => ({
+        ...base.sources[0],
+        source_id: at + 1,
+        module_id: `host-${suffix}`,
+        collection_id: 'movies',
+        collection_item_id: `copy-${suffix}`,
+        path_rel: 'Heat (1995).mkv',
+      })),
+      copies: ['a', 'b'].map((suffix) => ({
+        ...base.copies[0],
+        id: `copy-${suffix}`,
+        module_id: `host-${suffix}`,
+        collection_id: 'movies',
+        paths: ['Heat (1995).mkv'],
+      })),
+      negotiated: {
+        source: { source_id: 1 },
+        cost: 'copy',
+        streams: { video: 'copy', audio: 'copy' },
+        subtitles: [],
+      },
+    })
+    vi.mocked(itemQuery).mockResolvedValue(detail as never)
+    vi.mocked(itemDetail).mockResolvedValue(detail as never)
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    for (const selector of ['#playback-source', '#subtitle-source']) {
+      const choices = wrapper.findAll(`${selector} option`)
+      expect(choices.find((option) => option.attributes('value') === '1')!.text()).toContain(
+        'host-a · movies',
+      )
+      expect(choices.find((option) => option.attributes('value') === '2')!.text()).toContain(
+        'host-b · movies',
+      )
+    }
+    const buttons = wrapper.findAll('button[title="Search metadata for this source"]')
+    expect(buttons[0]!.attributes('aria-label')).toContain('host-a · movies')
+    expect(buttons[1]!.attributes('aria-label')).toContain('host-b · movies')
+    expect(buttons[1]!.element.closest('li')!.textContent).toContain('host-b · movies')
+    await buttons[1]!.trigger('click')
+    await flushPromises()
+    expect(wrapper.find('[role="dialog"]').text()).toContain('host-b · movies')
+    wrapper.unmount()
+  })
+
   test('a magnifier targets its source copy and keeps its CDs together', async () => {
     admin.value = true
     const detail = film()
@@ -564,6 +790,34 @@ describe('when something goes wrong', () => {
 describe('a series', () => {
   const show = () => film({ kind: 'series', id: 'show', title: 'Fringe', duration_ms: null })
 
+  test('a same-ID match refreshes the reconciled episode grouping', async () => {
+    admin.value = true
+    const detail = { ...show(), sources: [] }
+    vi.mocked(itemQuery).mockResolvedValue(detail as never)
+    vi.mocked(itemDetail).mockResolvedValue(detail as never)
+    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(adminApplyMatch).mockImplementation(async () => {
+      vi.mocked(itemChildren).mockResolvedValue({
+        children: [episode(1, { season: 2, title: 'Corrected episode' })],
+      } as never)
+      return { library_item_ids: ['show'] } as never
+    })
+    const { router, wrapper } = await open(Detail, '/library/shows/item/show')
+    expect(wrapper.text()).toContain('Season 1')
+    await wrapper.find('button[title="Search metadata for this source"]').trigger('click')
+    await flushPromises()
+    await wrapper
+      .findAll('[role="dialog"] button')
+      .find((button) => button.text() === 'Use automatic matching')!
+      .trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.params.id).toBe('show')
+    expect(itemChildren).toHaveBeenCalledTimes(2)
+    expect(wrapper.text()).toContain('Season 2')
+    expect(wrapper.text()).not.toContain('Season 1')
+    wrapper.unmount()
+  })
+
   test('counts its episodes, and says where to carry on', async () => {
     vi.mocked(itemQuery).mockResolvedValue(show() as never)
     vi.mocked(itemChildren).mockResolvedValue({
@@ -648,6 +902,61 @@ describe('a series', () => {
 
 describe('a season', () => {
   const show = () => film({ kind: 'series', id: 'show', title: 'Fringe', duration_ms: null })
+
+  test.each([null, 60_000])(
+    'plays the negotiated online copy when the first copy is offline (resume %s)',
+    async (resume) => {
+      const base = film().sources[0]!
+      const detail = film({
+        ...episode(1),
+        resume_position_ms: resume,
+        resume_duration_ms: 600_000,
+        negotiated: { source: { source_id: 2 } },
+        sources: [
+          { ...base, available: false },
+          { ...base, source_id: 2, collection_item_id: 'online-copy' },
+        ],
+      })
+      vi.mocked(itemQuery).mockImplementation(
+        async (id) => (id === 'show' ? show() : detail) as never,
+      )
+      vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+      const { router, wrapper } = await open(Season, '/library/shows/item/show/season/1')
+      const play = wrapper
+        .findAll('button')
+        .find((b) => b.text() === `▶ ${resume ? 'Resume' : 'Play'}`)!
+      expect(play.attributes('disabled')).toBeUndefined()
+      await play.trigger('click')
+      await flushPromises()
+      expect(router.currentRoute.value.fullPath).toBe('/library/shows/item/e1/play')
+      wrapper.unmount()
+    },
+  )
+
+  test('an online first copy cannot enable an unavailable negotiated copy', async () => {
+    const base = film().sources[0]!
+    const detail = film({
+      ...episode(1),
+      resume_position_ms: 60_000,
+      resume_duration_ms: 600_000,
+      negotiated: { source: { source_id: 2 } },
+      sources: [base, { ...base, source_id: 2, available: false }],
+    })
+    vi.mocked(itemQuery).mockImplementation(
+      async (id) => (id === 'show' ? show() : detail) as never,
+    )
+    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
+    for (const text of ['▶ Resume', 'Play from start']) {
+      expect(
+        wrapper
+          .findAll('button')
+          .find((b) => b.text() === text)!
+          .attributes('disabled'),
+      ).toBeDefined()
+    }
+    wrapper.unmount()
+  })
 
   test('shows its episodes as stills', async () => {
     vi.mocked(itemQuery).mockResolvedValue(show() as never)
@@ -1414,7 +1723,7 @@ describe('the subtitles section (HUB-24)', () => {
       negotiated: {
         cost: 'copy',
         mode: 'remux',
-        source: null,
+        source: { source_id: 1 },
         streams: { video: 'copy', audio: 'copy' },
         subtitles,
         target_duration_secs: 6,
@@ -1464,7 +1773,7 @@ describe('the subtitles section (HUB-24)', () => {
     await flushPromises()
     expect(subtitleSearch).toHaveBeenCalledWith('heat', {
       languages: ['eng', 'fra'],
-      source_id: null,
+      source_id: 1,
     })
   })
 

@@ -214,7 +214,6 @@ export type IntrodbItem = {
   season?: number | null
   episode?: number | null
   episode_end?: number | null
-  copies?: { assignment: { library_item_ids: string[] } }[]
   metadata?: {
     tmdb_id?: number | null
     tvdb_id?: number | null
@@ -228,16 +227,18 @@ export type IntrodbItem = {
 /// their side and resolves their null-end convention on ours, so the wrong
 /// one fetches the wrong cut's times. Without it there is no lookup at all —
 /// a question whose answer cannot be applied is not worth quota.
-export async function introdbSegments(item: IntrodbItem, durationMs: number): Promise<Segment[]> {
+export async function introdbSegments(
+  item: IntrodbItem,
+  durationMs: number,
+  libraryItemIds: readonly string[] = [],
+): Promise<Segment[]> {
   if (!durationMs) return []
   // Only the kinds their database describes. A multi-episode file is out
   // too: its single answer would be E01's credits offered mid-file.
   if (item.kind !== 'movie' && item.kind !== 'episode') return []
-  if (
-    item.episode_end != null ||
-    item.copies?.some((copy) => copy.assignment.library_item_ids.length > 1)
-  )
-    return []
+  // Coverage comes from the running session: another copy of this episode
+  // may combine several episodes while the selected source is standalone.
+  if (item.episode_end != null || libraryItemIds.length > 1) return []
   const tv = item.kind === 'episode'
   // The provider's curated numbering outranks the file's own. Today the
   // hub only curates absolute-numbered releases (a file with no season of

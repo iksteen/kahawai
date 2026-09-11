@@ -7,6 +7,21 @@
 
 const GB = 1024 * 1024 * 1024
 
+/// A collection name and relative path can exist on several mediahosts. Keep
+/// the stored host name readable and its stable identity visible even when
+/// two hosts share a name; a container copy without a host uses its own ID.
+export function sourceLocation(source: {
+  host_name?: string | null
+  module_id?: string | null
+  collection_id?: string | null
+  id?: string
+}): string {
+  const host = source.module_id ?? source.id ?? 'Unknown host'
+  const name =
+    source.host_name && source.host_name !== host ? `${source.host_name} (${host})` : host
+  return [name, source.collection_id].filter(Boolean).join(' · ')
+}
+
 /// Whole minutes, and hours once there are enough of them. Null rather than
 /// "0 min" for a duration nobody knows: a browse row has no `duration_ms` at
 /// all, and printing zero there states a fact about the file.
@@ -158,4 +173,17 @@ export function sourceStreams<T extends { source_id: number; streams?: unknown }
   sourceId: number | undefined,
 ): T['streams'] | undefined {
   return sources.find((source) => source.source_id === sourceId)?.streams
+}
+
+/// Numeric source IDs can be reused after deletion. Exact track choices also
+/// name their collection copy, whose identity is available before playback.
+export type SourcePreferenceScope = `source:${string}:${number}`
+
+export function sourcePreferenceScope(
+  sources: { source_id: number; collection_item_id?: string }[],
+  sourceId: number | undefined,
+): SourcePreferenceScope | null {
+  if (sourceId === undefined) return null
+  const copy = sources.find((source) => source.source_id === sourceId)?.collection_item_id
+  return copy ? `source:${copy}:${sourceId}` : null
 }

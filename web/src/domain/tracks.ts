@@ -8,6 +8,7 @@
 /// says.
 
 import type { Preference } from '../api/generated/model/preference.ts'
+import type { SourcePreferenceScope } from './source.ts'
 
 export type AudioStream = { language?: string | null }
 
@@ -23,14 +24,19 @@ export type Resolved = {
 export function resolveTracks(
   prefs: Preference[],
   seriesId: string,
-  itemId: string,
   mediaType: string,
   originalLanguage: string | null | undefined,
   audio: AudioStream[],
-  sourceScope = itemId,
+  sourceScope: SourcePreferenceScope | null,
 ): Resolved {
   const get = (scope: string, key: string) =>
     prefs.find((p) => p.scope === scope && p.key === key)?.value
+  // Legacy numeric choices can remain under a now-shared work ID after
+  // copies coalesce. They have no portable meaning on another source.
+  const shared = (key: string) => {
+    const value = get(seriesId, key)?.trim()
+    return value?.startsWith('#') || /^\d+$/.test(value ?? '') ? undefined : value
+  }
   const list = (value?: string) =>
     (value ?? '')
       .split(',')
@@ -48,17 +54,14 @@ export function resolveTracks(
   // feature and commentary — are common, so language cannot express the
   // choice), then the series language memory, then the ordered per-type list.
   let audioTrack: number | undefined
-  const exact = get(sourceScope, 'audio.track')
+  const exact = sourceScope === null ? undefined : get(sourceScope, 'audio.track')
   if (exact?.startsWith('#')) {
     const at = Number(exact.slice(1))
     if (at >= 0 && at < audio.length) audioTrack = at
   }
-  const remembered = get(seriesId, 'audio')
+  const remembered = shared('audio')
   if (audioTrack !== undefined) {
     // The exact item preference already decided.
-  } else if (remembered?.startsWith('#')) {
-    const at = Number(remembered.slice(1))
-    if (at >= 0 && at < audio.length) audioTrack = at
   } else if (remembered) {
     const at = audio.findIndex((a) => langEq(a.language, remembered))
     if (at >= 0) audioTrack = at
@@ -80,12 +83,12 @@ export function resolveTracks(
   }
 
   // Subtitles: the memory ('off' | 'any' | a language), else the per-type list.
-  const remembers = get(seriesId, 'subs')
+  const remembers = shared('subs')
   const subs =
     remembers === 'off' ? [] : remembers ? [remembers] : list(get('', `subs.${mediaType}`))
   // Top precedence (subtitle unification): THIS item's exact track id — the
   // only spelling that can name a specific downloaded or OCR row.
-  const exactSub = get(sourceScope, 'subs.track')
+  const exactSub = sourceScope === null ? undefined : get(sourceScope, 'subs.track')
   const subTrack = exactSub && /^\d+$/.test(exactSub) ? Number(exactSub) : null
   return { audioTrack: audioTrack ?? 0, subs, subTrack }
 }

@@ -302,21 +302,21 @@ describe('the library’s own size', () => {
   })
 })
 
-describe('one row changed underneath', () => {
-  test('re-reads only the chunk it is in', async () => {
-    // A hand-match rewrites the title, the year and the artwork of exactly one
-    // row. Re-reading the library would throw away every other chunk that had
-    // been scrolled through.
+describe('matching changes the result set underneath', () => {
+  test('re-reads the visible range without eagerly reloading previously visited chunks', async () => {
     const { api } = driven()
     await flushPromises()
     api().need([1, 2])
     await flushPromises()
+    api().need([1])
     const reads = vi.mocked(listItems).mock.calls.length
 
-    api().refresh(CHUNK + 5)
+    api().refresh()
     await flushPromises()
     expect(vi.mocked(listItems).mock.calls.length).toBe(reads + 1)
     expect(vi.mocked(listItems).mock.calls.at(-1)![0]).toMatchObject({ offset: CHUNK })
+    expect(api().loaded.value.has(0)).toBe(false)
+    expect(api().loaded.value.has(2 * CHUNK)).toBe(false)
   })
 
   test('and asking again is the only thing that would', async () => {
@@ -331,7 +331,7 @@ describe('one row changed underneath', () => {
     expect(vi.mocked(listItems).mock.calls.length).toBe(reads)
   })
 
-  test('and the refreshed rows replace the old ones without clearing the rest', async () => {
+  test('and the refreshed visible rows replace every obsolete page', async () => {
     const { api } = driven()
     await flushPromises()
     api().need([1])
@@ -342,9 +342,122 @@ describe('one row changed underneath', () => {
       limit: CHUNK,
       offset: params?.offset ?? 0,
     }))
-    api().refresh(CHUNK)
+    api().refresh()
     await flushPromises()
     expect(api().loaded.value.get(CHUNK)?.id).toBe('matched')
-    expect(api().loaded.value.get(0)?.id).toBe('i0')
+    expect(api().loaded.value.has(0)).toBe(false)
+  })
+
+  test.each([0, 120])(
+    'removing work %s leaves no duplicated boundary or missing final row',
+    async (removed) => {
+      let rows = Array.from({ length: 205 }, (_, n) => item(`work-${n}`))
+      vi.mocked(listItems).mockImplementation(async (params) => {
+        const offset = params?.offset ?? 0
+        return {
+          items: rows.slice(offset, offset + CHUNK),
+          total: rows.length,
+          limit: CHUNK,
+          offset,
+        }
+      })
+      const { api, wrapper } = driven()
+      await flushPromises()
+      api().need([1, 2])
+      await flushPromises()
+      // Return to the matched card after visiting all three pages.
+      api().need([Math.floor(removed / CHUNK)])
+      rows = rows.filter((row) => row.id !== `work-${removed}`)
+      api().refresh()
+      await flushPromises()
+      api().need([0, 1, 2])
+      await flushPromises()
+      const ids = Array.from(
+        { length: api().total.value! },
+        (_, at) => api().loaded.value.get(at)?.id,
+      )
+      expect(ids).toEqual(rows.map((row) => row.id))
+      expect(ids.filter((id) => id === 'work-100')).toHaveLength(1)
+      expect(ids.at(-1)).toBe('work-204')
+      expect(api().loaded.value.size).toBe(204)
+      wrapper.unmount()
+    },
+  )
+
+  test('an old page request cannot restore offsets after a second match', async () => {
+    const { api, wrapper } = driven()
+    await flushPromises()
+    let oldPage = () => {}
+    vi.mocked(listItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        oldPage = () =>
+          resolve({ items: [item('old-page')], total: 1000, limit: CHUNK, offset: CHUNK })
+      }),
+    )
+    api().need([1])
+    let firstMatch = () => {}
+    vi.mocked(listItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        firstMatch = () =>
+          resolve({ items: [item('first-match')], total: 999, limit: CHUNK, offset: CHUNK })
+      }),
+    )
+    api().refresh()
+    vi.mocked(listItems).mockResolvedValueOnce({
+      items: [item('second-match')],
+      total: 998,
+      limit: CHUNK,
+      offset: CHUNK,
+    })
+    api().refresh()
+    await flushPromises()
+    oldPage()
+    firstMatch()
+    await flushPromises()
+    expect(api().total.value).toBe(998)
+    expect(api().loaded.value.get(CHUNK)?.id).toBe('second-match')
+    expect(api().loaded.value.has(0)).toBe(false)
+    wrapper.unmount()
+  })
+
+  test('keeps the old viewport until the anchor arrives, then fills the latest needed range', async () => {
+    const { api, wrapper } = driven()
+    await flushPromises()
+    api().need([2])
+    await flushPromises()
+    let anchor = () => {}
+    vi.mocked(listItems).mockReturnValueOnce(
+      new Promise((resolve) => {
+        anchor = () =>
+          resolve({ items: [item('new-anchor')], total: 999, limit: CHUNK, offset: 2 * CHUNK })
+      }),
+    )
+    const reads = vi.mocked(listItems).mock.calls.length
+    api().refresh()
+    api().need([2, 3])
+    await flushPromises()
+    expect(api().loaded.value.get(2 * CHUNK)?.id).toBe('i200')
+    expect(listItems).toHaveBeenCalledTimes(reads + 1)
+    anchor()
+    await flushPromises()
+    expect(api().loaded.value.get(2 * CHUNK)?.id).toBe('new-anchor')
+    expect(api().loaded.value.get(3 * CHUNK)?.id).toBe('i300')
+    expect(api().loaded.value.has(0)).toBe(false)
+    wrapper.unmount()
+  })
+
+  test('drops an unfiltered count invalidated by matching within a search', async () => {
+    const { api, query, wrapper } = driven()
+    await flushPromises()
+    hub(12)
+    query.value = 'heat'
+    await flushPromises()
+    expect(api().libraryTotal.value).toBe(1000)
+    hub(11)
+    api().refresh()
+    await flushPromises()
+    expect(api().total.value).toBe(11)
+    expect(api().libraryTotal.value).toBeNull()
+    wrapper.unmount()
   })
 })

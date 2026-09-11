@@ -1,5 +1,4 @@
 <script setup lang="ts">
-import { sourceStreams } from '../domain/source.ts'
 /// The player as a page: everything between a `/play` URL and a picture.
 ///
 /// Acquiring a session belongs HERE rather than to the item page, which is what
@@ -28,12 +27,11 @@ import type { StartSessionResponse } from '../api/generated/model/startSessionRe
 import { buildProfile } from '../api/capabilities.ts'
 import { endSession, getPrefs, itemQuery, listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
-import { resolveTracks } from '../domain/tracks.ts'
 import { sentence } from '../domain/refusal.ts'
 import { isSourceOffline } from '../domain/recovery.ts'
 import { itemName } from '../domain/titles.ts'
 import { useScreenName } from '../composables/title.ts'
-import { startPlaybackSession } from '../api/playback.ts'
+import { selectPlaybackSource, startPlaybackSession } from '../api/playback.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -107,6 +105,7 @@ const mode = ref<PlayerMode>('window')
 let left = false
 onBeforeUnmount(() => {
   left = true
+  cancelRecovery()
   const open = session.value
   if (open) void release(open.session_id)
   // Whatever the watcher below still owed: its queued post-flush job is
@@ -119,6 +118,14 @@ onBeforeUnmount(() => {
 })
 
 const release = (id: string) => endSession(id, { keepalive: true }).catch(() => {})
+
+/// A newly started recovery is ours while its source metadata is loading,
+/// even though the picture still holds the old session. Keep only the latest.
+let pendingRecovery: string | null = null
+function cancelRecovery() {
+  if (pendingRecovery) void release(pendingRecovery)
+  pendingRecovery = null
+}
 
 /// Sessions retired but not yet released: the release rides on the
 /// post-flush watcher below, and this is the ledger that survives the one
@@ -169,6 +176,7 @@ watch(
 )
 
 async function start() {
+  cancelRecovery()
   // Cleared BEFORE the guard, or Try again cannot clear a failure that was not
   // the session's.
   failure.value = ''
@@ -192,8 +200,9 @@ async function start() {
       typeof route.query.source === 'string' && /^\d+$/.test(route.query.source)
         ? Number(route.query.source)
         : undefined
+    const previewProfile = buildProfile(cap ? Number(cap) : undefined)
     const detail = await itemQuery(id.value, {
-      profile: buildProfile(cap ? Number(cap) : undefined),
+      profile: previewProfile,
       ...(source === undefined ? {} : { source_id: source }),
     })
     if (mine !== attempt.value || left) return
@@ -220,39 +229,38 @@ async function start() {
         ? startAt.value
         : null
     const at = asked ?? detail.resume_position_ms ?? 0
-    const audio = sourceStreams(detail.sources, detail.negotiated?.source?.source_id)?.audio ?? []
-    let audioTrack = 0
-    prefs.value = []
+    prefs.value = preferences.prefs
     carried.value = null
-    try {
-      const libraries =
-        cache.getQueryData<{ libraries: { id: string; media_type: string }[] }>(['libraries']) ??
-        (await listLibraries().catch((cause: unknown) => {
-          notify(`Could not load the library details: ${sentence(cause)}`)
-          return { libraries: [] }
-        }))
-      prefs.value = preferences.prefs
-      mediaType.value = libraries.libraries.find((l) => l.id === library.value)?.media_type ?? ''
-      audioTrack = resolveTracks(
-        prefs.value,
-        detail.parent_id ?? detail.id,
-        detail.id,
-        mediaType.value,
-        detail.metadata?.original_language,
-        audio,
-        `source:${detail.negotiated?.source?.source_id}`,
-      ).audioTrack
-    } catch (cause) {
-      // Both halves report and fall back, so this is `resolveTracks` itself — a
-      // bug rather than an outage. Said out loud, because the track it failed
-      // to pick is the one about to play.
-      notify(`Could not resolve the audio track: ${sentence(cause)}`)
+    const libraries =
+      cache.getQueryData<{ libraries: { id: string; media_type: string }[] }>(['libraries']) ??
+      (await listLibraries().catch((cause: unknown) => {
+        notify(`Could not load the library details: ${sentence(cause)}`)
+        return { libraries: [] }
+      }))
+    mediaType.value = libraries.libraries.find((l) => l.id === library.value)?.media_type ?? ''
+    const selected = await selectPlaybackSource(
+      detail,
+      prefs.value,
+      mediaType.value,
+      previewProfile,
+      source,
+    )
+    if (mine !== attempt.value || left) return
+    if (selected.item.id !== id.value) {
+      await router.replace({
+        name: 'player',
+        params: { ...route.params, id: selected.item.id },
+        query: route.query,
+      })
+      return
     }
-    const fresh = await startPlaybackSession(detail, {
+    item.value = selected.item
+    const fresh = await startPlaybackSession(selected.item, {
       startMs: at,
-      audioTrack,
+      audioTrack: selected.audioTrack,
       prefs: prefs.value,
-      ...(source === undefined ? {} : { sourceId: source }),
+      sourceId: selected.sourceId,
+      profile: selected.profile,
       // Starting an episode from zero is item-relative even with a chosen
       // source; a chapter explicitly names a position within the source.
       resume: asked === null || (asked === 0 && route.query.chapter !== '1'),
@@ -307,22 +315,59 @@ const ratio = computed(() => {
 /// A restart replaces the session in place: same page, same frame, new picture.
 /// The watcher above releases the one it replaced, after the picture holding it
 /// has reported where the viewer got to.
-function restarted(from: string, fresh: StartSessionResponse, _at: number, choice: CarriedTracks) {
+async function restarted(
+  from: string,
+  fresh: StartSessionResponse,
+  _at: number,
+  choice: CarriedTracks,
+) {
   // A picture the route has already left behind can finish its restart late;
   // adopting that session would put the previous episode's stream under this
   // item's page. Release it instead — nobody else holds it. BOTH checks:
   // Back/Forward moves `id` before `item` catches up, while an autoplay
   // advance moves `item` before the route commits — a stale restart landing
   // in either gap matches the one that has not moved yet.
-  if (from !== id.value || from !== item.value?.id) {
+  if (left || from !== id.value || from !== item.value?.id) {
     void release(fresh.session_id)
     return
   }
   // Any start() still in flight is now about a session nobody wants twice.
-  attempt.value++
-  resumeMs.value = fresh.effective_start_ms
-  carried.value = choice
-  retire(fresh)
+  const mine = ++attempt.value
+  cancelRecovery()
+  pendingRecovery = fresh.session_id
+  try {
+    // Fingerprint recovery can return a newly registered source, even with a
+    // reused numeric ID. Refresh its copy identity and streams BEFORE pairing
+    // it with the new session; automatic negotiation may choose another copy.
+    const cap = prefs.value.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
+    const announced = item.value.sources.flatMap((source) => source.streams?.video ?? [])
+    const detail = await itemQuery(from, {
+      source_id: fresh.source_id,
+      profile: buildProfile(cap ? Number(cap) : undefined, announced),
+      audio_track: choice.audio,
+      video_track: choice.video,
+    })
+    if (left || mine !== attempt.value || from !== id.value || from !== item.value?.id) return
+    if (!detail.sources.some((source) => source.source_id === fresh.source_id)) {
+      throw new Error('The recovered source is no longer listed for this item.')
+    }
+    pendingRecovery = null
+    item.value = detail
+    resumeMs.value = fresh.effective_start_ms
+    carried.value = choice
+    retire(fresh)
+    if (detail.id !== from) {
+      void router.replace({ name: 'player', params: { library: library.value, id: detail.id } })
+    }
+  } catch (cause) {
+    if (left || mine !== attempt.value || from !== id.value || from !== item.value?.id) return
+    retire(null)
+    failure.value = `Could not refresh playback details: ${sentence(cause)}`
+  } finally {
+    // Route changes/unmount may already have ended it, or adoption transferred
+    // ownership to `session`. Never release a newer recovery here.
+    if (pendingRecovery === fresh.session_id) cancelRecovery()
+  }
 }
 
 /// The next episode: the URL follows it WITHOUT this component remounting and
@@ -339,6 +384,7 @@ function advanced(
     return
   }
   attempt.value++
+  cancelRecovery()
   item.value = nextItem
   // The picture read these to resolve the next episode's tracks; adopting them
   // keeps the remounted one from drawing its selectors off a staler set.

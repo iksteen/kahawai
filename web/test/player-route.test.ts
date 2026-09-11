@@ -14,6 +14,7 @@ import { ApiError } from '../src/api/errors.ts'
 import { createQueryClient } from '../src/api/query.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  putPref: vi.fn(),
   itemQuery: vi.fn(),
   itemChildren: vi.fn(),
   getPrefs: vi.fn(),
@@ -63,7 +64,14 @@ const film = (over: Record<string, unknown> = {}) => {
     sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
     ...over,
   }
-  return { ...item, sources: item.sources.map((source) => ({ source_id: 1, ...source })) }
+  return {
+    ...item,
+    sources: item.sources.map((source) => ({
+      source_id: 1,
+      collection_item_id: 'heat-copy',
+      ...source,
+    })),
+  }
 }
 
 const session = (id = 's1', over: Record<string, unknown> = {}) => ({
@@ -135,6 +143,115 @@ afterEach(() => {
 })
 
 describe('opening the player', () => {
+  test.each([
+    { swapped: false, override: false },
+    { swapped: true, override: false },
+    { swapped: false, override: true },
+    { swapped: true, override: true },
+  ])(
+    'ranks preferred audio per source (swapped $swapped, override $override)',
+    async ({ swapped, override }) => {
+      const secondAudio = [
+        { language: 'eng', codec: 'dts' },
+        { language: 'jpn', codec: 'aac' },
+      ]
+      if (swapped) secondAudio.reverse()
+      const sources = [
+        {
+          source_id: 1,
+          collection_item_id: 'copy-a',
+          streams: {
+            video: [],
+            audio: [
+              { language: 'eng', codec: 'aac' },
+              { language: 'jpn', codec: 'dts' },
+            ],
+          },
+        },
+        { source_id: 2, collection_item_id: 'copy-b', streams: { video: [], audio: secondAudio } },
+      ]
+      vi.mocked(api.getPrefs).mockResolvedValue({
+        prefs: [{ scope: '', key: 'audio.movies', value: 'jpn' }],
+      } as never)
+      vi.mocked(api.itemQuery).mockImplementation(async (_id, body) => {
+        // Simulate the hub judging each candidate's announced AAC/DTS stream.
+        // A preview sees index0; only the final map can choose Japanese on B.
+        const chosen =
+          body?.source_id ??
+          sources.find(
+            (source) =>
+              source.streams.audio[
+                body?.source_audio_tracks?.[source.source_id] ?? body?.audio_track ?? 0
+              ]?.codec === 'aac',
+          )!.source_id
+        return film({ sources, negotiated: { source: { source_id: chosen } } }) as never
+      })
+      vi.mocked(api.startSession).mockImplementation(
+        async (body) => session('s1', { source_id: body.source_id }) as never,
+      )
+      const { wrapper } = await open(`/library/films/item/heat/play${override ? '?source=1' : ''}`)
+      const chosen = override ? 1 : 2
+      const index = override || !swapped ? 1 : 0
+      expect(api.itemQuery).toHaveBeenLastCalledWith(
+        'heat',
+        expect.objectContaining({
+          source_audio_tracks: { 1: 1, 2: swapped ? 0 : 1 },
+          ...(override ? { source_id: 1 } : {}),
+        }),
+      )
+      expect(api.startSession).toHaveBeenCalledWith(
+        expect.objectContaining({ source_id: chosen, audio_track: index }),
+      )
+      const picture = wrapper.findComponent(Picture)
+      expect(picture.props('item').negotiated?.source?.source_id).toBe(chosen)
+      expect(picture.props('session').source_id).toBe(chosen)
+      expect((wrapper.find('[aria-label="Audio track"]').element as HTMLSelectElement).value).toBe(
+        String(index),
+      )
+      wrapper.unmount()
+    },
+  )
+
+  test.each([
+    { copy: 'old-copy', audio: 1 },
+    { copy: 'new-copy', audio: 0 },
+  ])(
+    'an exact track belongs to collection copy $copy as well as the source number',
+    async ({ copy, audio }) => {
+      vi.mocked(api.getPrefs).mockResolvedValue({
+        prefs: [
+          { scope: 'source:old-copy:1', key: 'audio.track', value: '#1' },
+          { scope: 'source:1', key: 'audio.track', value: '#1' },
+          { scope: 'heat', key: 'audio', value: '#1' },
+        ],
+      } as never)
+      vi.mocked(api.itemQuery).mockResolvedValue(
+        film({
+          negotiated: { source: { source_id: 1 } },
+          sources: [
+            {
+              source_id: 1,
+              collection_item_id: copy,
+              streams: {
+                audio: [{ language: 'eng' }, { language: 'eng' }],
+                video: [],
+              },
+            },
+          ],
+        }) as never,
+      )
+      const { wrapper } = await open()
+      expect(api.startSession).toHaveBeenCalledWith(
+        expect.objectContaining({ source_id: 1, audio_track: audio }),
+      )
+      expect((wrapper.find('[aria-label="Audio track"]').element as HTMLSelectElement).value).toBe(
+        String(audio),
+      )
+      expect(api.putPref).not.toHaveBeenCalled()
+      wrapper.unmount()
+    },
+  )
+
   test('adopts a first-identification alias and retains its chapter request', async () => {
     vi.mocked(api.itemQuery).mockResolvedValue(
       film({ id: 'canonical', title: 'Canonical' }) as never,
@@ -433,6 +550,206 @@ describe('a session nobody will play', () => {
     wrapper.unmount()
     await flushPromises()
     expect(api.endSession).toHaveBeenCalledWith('s1', { keepalive: true })
+  })
+})
+
+describe('refreshing the physical source after recovery', () => {
+  const choice = {
+    audio: 1,
+    video: 1,
+    subKey: '10',
+    embeddedSub: 3,
+    sourceFingerprint: 'physical-version-1',
+  }
+  const recovered = (sourceId = 99) =>
+    film({
+      negotiated: {
+        source: { source_id: sourceId, display_width: 1920, display_height: 800 },
+        subtitles: [],
+      },
+      sources: [
+        {
+          source_id: sourceId,
+          collection_item_id: 'returned-copy',
+          streams: {
+            audio: [
+              { language: 'eng', codec: 'aac', channels: 2 },
+              { language: 'nld', codec: 'aac', channels: 2 },
+            ],
+            video: [
+              { codec: 'h264', width: 1920, height: 800 },
+              { codec: 'h264', width: 1280, height: 720 },
+            ],
+          },
+        },
+      ],
+    })
+
+  test.each([99, 1])(
+    'refreshes the returned source %s, even when its number was reused',
+    async (sourceId) => {
+      const { wrapper } = await open()
+      const slow = held(recovered(sourceId))
+      // Automatic negotiation would choose a third copy. The recovery must ask
+      // for the actual source in its response, not the original/default copy.
+      vi.mocked(api.itemQuery).mockImplementation(
+        (_id, body) =>
+          (body?.source_id === sourceId
+            ? slow.promise
+            : Promise.resolve(film({ negotiated: { source: { source_id: 2 } } }))) as never,
+      )
+      const fresh = session('s2', {
+        source_id: sourceId,
+        effective_start_ms: 12_345,
+        subtitle_listing: [
+          {
+            id: 20,
+            origin: 'embedded',
+            stream_index: 3,
+            language: 'nld',
+            format: 'srt',
+            delivery: 'vtt',
+          },
+        ],
+      })
+      wrapper.findComponent(Picture).vm.$emit('restart', 'heat', fresh, 999, choice)
+      await flushPromises()
+      expect(api.itemQuery).toHaveBeenLastCalledWith(
+        'heat',
+        expect.objectContaining({
+          source_id: sourceId,
+          profile: { containers: ['mp4'] },
+          audio_track: 1,
+          video_track: 1,
+        }),
+      )
+      expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s1')
+      slow.settle()
+      await flushPromises()
+      const picture = wrapper.findComponent(Picture)
+      expect(picture.props('session').session_id).toBe('s2')
+      expect(picture.props('item').sources[0]?.collection_item_id).toBe('returned-copy')
+      expect(picture.props('resumeMs')).toBe(12_345)
+      expect((wrapper.find('[aria-label="Audio track"]').element as HTMLSelectElement).value).toBe(
+        '1',
+      )
+      expect((wrapper.find('[aria-label="Video track"]').element as HTMLSelectElement).value).toBe(
+        '1',
+      )
+      expect((wrapper.find('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe(
+        '20',
+      )
+
+      vi.mocked(api.seekSession).mockResolvedValue({ part_base_ms: 0 } as never)
+      vi.mocked(api.putPref).mockResolvedValue(undefined as never)
+      await wrapper.find('[aria-label="Audio track"]').setValue('0')
+      await flushPromises()
+      expect(api.putPref).toHaveBeenCalledWith({
+        scope: `source:returned-copy:${sourceId}`,
+        key: 'audio.track',
+        value: '#0',
+      })
+      wrapper.unmount()
+    },
+  )
+
+  test.each(['refusal', 'missing source'])(
+    'releases the new session if refreshing fails: %s',
+    async (failure) => {
+      const { wrapper } = await open()
+      if (failure === 'refusal')
+        vi.mocked(api.itemQuery).mockRejectedValueOnce(new ApiError(503, 'refresh unavailable'))
+      else vi.mocked(api.itemQuery).mockResolvedValueOnce(film() as never)
+      wrapper
+        .findComponent(Picture)
+        .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
+      await flushPromises()
+      expect(api.endSession).toHaveBeenCalledWith('s2', { keepalive: true })
+      expect(wrapper.text()).toContain('Could not refresh playback details')
+      expect(wrapper.findComponent(Picture).exists()).toBe(false)
+      vi.mocked(api.itemQuery).mockResolvedValue(film() as never)
+      vi.mocked(api.startSession).mockResolvedValue(session('s3') as never)
+      await wrapper
+        .findAll('button')
+        .find((b) => b.text().includes('Try again'))!
+        .trigger('click')
+      await flushPromises()
+      expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s3')
+      wrapper.unmount()
+      expect(vi.mocked(api.endSession).mock.calls.filter(([id]) => id === 's2')).toHaveLength(1)
+    },
+  )
+
+  test('a route change cancels a pending refresh without adopting its late answer', async () => {
+    const { wrapper, router } = await open()
+    const slow = held(recovered())
+    vi.mocked(api.itemQuery).mockReturnValueOnce(slow.promise as never)
+    wrapper
+      .findComponent(Picture)
+      .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
+    await flushPromises()
+    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'other' }) as never)
+    vi.mocked(api.startSession).mockResolvedValue(session('s3') as never)
+    await router.push('/library/films/item/other/play')
+    await flushPromises()
+    expect(api.endSession).toHaveBeenCalledWith('s2', { keepalive: true })
+    slow.settle()
+    await flushPromises()
+    expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s3')
+    expect(wrapper.findComponent(Picture).props('item').id).toBe('other')
+    expect(vi.mocked(api.endSession).mock.calls.filter(([id]) => id === 's2')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  test('a superseded refresh cannot release or replace the newer recovery', async () => {
+    const { wrapper } = await open()
+    const old = held(recovered(98))
+    const latest = held(recovered(99))
+    vi.mocked(api.itemQuery)
+      .mockReturnValueOnce(old.promise as never)
+      .mockReturnValueOnce(latest.promise as never)
+    const picture = wrapper.findComponent(Picture)
+    picture.vm.$emit('restart', 'heat', session('s2', { source_id: 98 }), 0, choice)
+    picture.vm.$emit('restart', 'heat', session('s3', { source_id: 99 }), 0, choice)
+    expect(api.endSession).toHaveBeenCalledWith('s2', { keepalive: true })
+    old.settle()
+    await flushPromises()
+    expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s1')
+    expect(api.endSession).not.toHaveBeenCalledWith('s3', { keepalive: true })
+    latest.settle()
+    await flushPromises()
+    expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s3')
+    expect(vi.mocked(api.endSession).mock.calls.filter(([id]) => id === 's2')).toHaveLength(1)
+    wrapper.unmount()
+  })
+
+  test('a refreshed canonical identity updates the route without starting another session', async () => {
+    const { wrapper, router } = await open()
+    vi.mocked(api.itemQuery).mockResolvedValueOnce({ ...recovered(), id: 'canonical' } as never)
+    wrapper
+      .findComponent(Picture)
+      .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
+    await flushPromises()
+    expect(router.currentRoute.value.params.id).toBe('canonical')
+    expect(wrapper.findComponent(Picture).props('session').session_id).toBe('s2')
+    expect(wrapper.findComponent(Picture).props('item').id).toBe('canonical')
+    expect(api.startSession).toHaveBeenCalledTimes(1)
+    wrapper.unmount()
+  })
+
+  test('unmount releases a pending recovery before its metadata request completes', async () => {
+    const { wrapper } = await open()
+    const slow = held(recovered())
+    vi.mocked(api.itemQuery).mockReturnValueOnce(slow.promise as never)
+    wrapper
+      .findComponent(Picture)
+      .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
+    await flushPromises()
+    wrapper.unmount()
+    expect(api.endSession).toHaveBeenCalledWith('s2', { keepalive: true })
+    slow.settle()
+    await flushPromises()
+    expect(vi.mocked(api.endSession).mock.calls.filter(([id]) => id === 's2')).toHaveLength(1)
   })
 })
 

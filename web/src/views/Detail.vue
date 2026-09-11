@@ -28,6 +28,7 @@ import {
   groupSources,
   planRow,
   size,
+  sourceLocation,
   subtitleChip,
   subtitleChipTitle,
 } from '../domain/source.ts'
@@ -45,6 +46,7 @@ import { chapterTitle } from '../domain/chapters.ts'
 import { adminItemLog, itemQuery, listLibraries } from '../api/generated/kahawai.ts'
 import { notify } from '../composables/notices.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
+import { queryPlaybackItem } from '../api/playback.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
 import { saveAs } from '../api/download.ts'
@@ -66,16 +68,48 @@ const matching = ref<string | null>(null)
 async function matched(ids: string[]) {
   if (ids[0] && ids[0] !== id.value)
     await router.replace({ name: 'detail', params: { library: library.value, id: ids[0] } })
-  else await refreshItem()
+  else
+    await Promise.all([
+      refreshItem(),
+      ...(item.value?.kind === 'series' || item.value?.kind === 'album'
+        ? [children.refetch()]
+        : []),
+    ])
 }
-const query = useItem(id)
+// These inputs choose both the automatic playback source and the default
+// subtitle target. Do not expose a provisional source before they arrive.
+const prefs = usePrefs()
+const libraries = useQuery({
+  queryKey: ['libraries'],
+  queryFn: () => listLibraries(),
+  select: (answer) => answer.libraries,
+})
+const mediaType = computed(
+  () => libraries.data.value?.find((l) => l.id === library.value)?.media_type ?? '',
+)
+const playbackPrefs = computed(() => prefs.query.data.value?.prefs ?? [])
+const playbackReady = computed(() => !prefs.query.isPending.value && !libraries.isPending.value)
+const query = useItem(id, { prefs: playbackPrefs, mediaType, ready: playbackReady })
 // A source choice belongs to this visit, never to the user's preferences.
 const sourceOverride = ref<number>()
-watch(id, () => (sourceOverride.value = undefined), { flush: 'sync' })
+const subtitleSourceOverride = ref<number>()
+watch(
+  id,
+  () => {
+    sourceOverride.value = undefined
+    subtitleSourceOverride.value = undefined
+  },
+  { flush: 'sync' },
+)
 const sourceQuery = useQuery({
-  queryKey: computed(() => ['item', id.value, { source: sourceOverride.value }]),
-  enabled: computed(() => sourceOverride.value !== undefined),
-  queryFn: () => itemQuery(id.value, { profile: buildProfile(), source_id: sourceOverride.value! }),
+  queryKey: computed(() => [
+    'item',
+    id.value,
+    { source: sourceOverride.value, prefs: playbackPrefs.value, mediaType: mediaType.value },
+  ]),
+  enabled: computed(() => sourceOverride.value !== undefined && playbackReady.value),
+  queryFn: () =>
+    queryPlaybackItem(id.value, playbackPrefs.value, mediaType.value, sourceOverride.value),
 })
 // Keep the item and source choices on screen if checking an override fails.
 const item = computed(() =>
@@ -158,6 +192,28 @@ const automaticSource = computed(
 const selectedSource = computed(() => sourceOverride.value ?? automaticSource.value)
 const selectedWork = computed(() => works.value.find((work) => work.id === selectedSource.value))
 const best = computed(() => selectedWork.value?.parts[0])
+// Subtitle lookup uses persisted hashes/metadata, even when playback cannot
+// negotiate an offline source. Its override does not change what Play starts.
+const subtitleSource = computed(() => subtitleSourceOverride.value ?? selectedSource.value)
+const subtitleNeedsQuery = computed(
+  () =>
+    subtitleSourceOverride.value !== undefined &&
+    subtitleSource.value !== item.value?.negotiated?.source?.source_id,
+)
+const subtitleQuery = useQuery({
+  queryKey: computed(() => ['item', id.value, { source: subtitleSource.value }]),
+  enabled: subtitleNeedsQuery,
+  queryFn: () => itemQuery(id.value, { profile: buildProfile(), source_id: subtitleSource.value! }),
+})
+const subtitleDetail = computed(() =>
+  subtitleNeedsQuery.value ? subtitleQuery.data.value : item.value,
+)
+const subtitleListingKnown = computed(
+  () =>
+    subtitleSource.value !== undefined &&
+    subtitleDetail.value?.negotiated?.source?.source_id === subtitleSource.value,
+)
+const subtitleWork = computed(() => works.value.find((work) => work.id === subtitleSource.value))
 const canPlay = computed(
   () =>
     sourceReady.value &&
@@ -168,7 +224,7 @@ function sourceLabel(work: (typeof works.value)[number]) {
   const first = work.parts[0]!
   const video = first.streams?.video?.[0]
   return [
-    first.collection_id,
+    sourceLocation(first),
     work.parts.map((part) => part.path_rel.split('/').at(-1)).join(' + '),
     video ? [video.height ? `${video.height}p` : '', video.codec].filter(Boolean).join(' ') : '',
     size(work.parts.reduce((total, part) => total + part.size, 0)),
@@ -182,19 +238,7 @@ const automaticLabel = computed(() => {
   return work ? `Automatic · ${sourceLabel(work)}` : 'Automatic'
 })
 
-/// HUB-24, and the two preferences the panel has to know about: the media
-/// type's subtitle wishlist, and this TITLE's own standing choice — which
-/// outranks it, is set by picking a language while watching, and would
-/// otherwise make the list above it read as a lie.
-const prefs = usePrefs()
-const libraries = useQuery({
-  queryKey: ['libraries'],
-  queryFn: () => listLibraries(),
-  select: (answer) => answer.libraries,
-})
-const mediaType = computed(
-  () => libraries.data.value?.find((l) => l.id === library.value)?.media_type ?? '',
-)
+/// HUB-24: the media type's wishlist and this title's own subtitle choice.
 const subLanguages = computed(() =>
   (prefs.known.value[`subs.${mediaType.value}`] ?? '')
     .split(',')
@@ -209,13 +253,17 @@ const titleChoice = computed(
 )
 /// The file's own frame rate, for the drift warning on a candidate.
 const fileFps = computed(() => {
-  const fps = best.value?.streams?.video?.[0]?.fps
+  const fps = subtitleWork.value?.parts[0]?.streams?.video?.[0]?.fps
   return fps ? fps[0] / fps[1] : null
 })
 
 /// A download, a removal or a cleared override all change what this page shows.
 async function subtitlesChanged() {
-  await Promise.all([refreshItem(), prefs.query.refetch()])
+  await Promise.all([
+    refreshItem(),
+    prefs.query.refetch(),
+    ...(subtitleNeedsQuery.value ? [subtitleQuery.refetch()] : []),
+  ])
 }
 
 /// What the stored capability mask changes, if anything.
@@ -778,7 +826,7 @@ function markSeason(season: number | null, played: boolean) {
             <div class="flex items-start gap-3">
               <div class="min-w-0 flex-1">
                 <div class="mb-1 font-mono text-[11px] text-dim">
-                  {{ work.parts[0]!.collection_id }}
+                  {{ sourceLocation(work.parts[0]!) }}
                   <template v-if="work.parts.length > 1"> · {{ work.parts.length }} parts</template>
                   <span v-if="!work.whole" class="text-warn">
                     — incomplete, {{ work.parts[0]!.parts }} expected
@@ -799,7 +847,7 @@ function markSeason(season: number | null, played: boolean) {
                   item.copies.find((copy) => copy.id === work.parts[0]!.collection_item_id)
                     ?.match_confidence
                 "
-                :label="`${work.parts.map((part) => part.path_rel).join(' + ')} (${work.parts[0]!.collection_id})`"
+                :label="`${work.parts.map((part) => part.path_rel).join(' + ')} (${sourceLocation(work.parts[0]!)})`"
                 title="Search metadata for this source"
                 @click="matching = work.parts[0]!.collection_item_id"
               />
@@ -873,17 +921,34 @@ function markSeason(season: number | null, played: boolean) {
     <!-- Subtitle management belongs to playable video titles. Albums and
          tracks are audio-only; showing an online subtitle search below a
          record's track list is an unrelated action, not an empty state. -->
-    <SubtitlePanel
-      v-if="sourceReady && item.kind !== 'album' && item.kind !== 'song'"
-      :item="item"
-      :subs="item.negotiated?.subtitles ?? []"
-      :source-id="item.negotiated?.source?.source_id"
-      :languages="subLanguages"
-      :title-choice="titleChoice"
-      :fps="fileFps"
-      @changed="subtitlesChanged"
-      @cleared="subtitlesChanged"
-    />
+    <template v-if="item.kind !== 'album' && item.kind !== 'song'">
+      <div v-if="works.length > 1" class="mt-8">
+        <label for="subtitle-source" class="mb-1 block text-[13px] text-dim">Subtitle source</label>
+        <select
+          id="subtitle-source"
+          v-model="subtitleSourceOverride"
+          class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
+        >
+          <option :value="undefined">
+            {{ selectedWork ? `Playback source · ${sourceLabel(selectedWork)}` : 'Automatic' }}
+          </option>
+          <option v-for="work in works" :key="work.id" :value="work.id">
+            {{ sourceLabel(work) }}
+          </option>
+        </select>
+      </div>
+      <SubtitlePanel
+        :item="item"
+        :subs="subtitleListingKnown ? (subtitleDetail?.negotiated?.subtitles ?? []) : []"
+        :listing-known="subtitleListingKnown"
+        :source-id="subtitleSource"
+        :languages="subLanguages"
+        :title-choice="titleChoice"
+        :fps="fileFps"
+        @changed="subtitlesChanged"
+        @cleared="subtitlesChanged"
+      />
+    </template>
 
     <section v-if="me.admin && !works.length && item.copies.length" class="mt-8">
       <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Sources</h2>
@@ -894,13 +959,13 @@ function markSeason(season: number | null, played: boolean) {
           class="flex items-center gap-3 rounded-md border border-line bg-surface p-2"
         >
           <div class="min-w-0 flex-1">
-            <div class="font-mono text-[11px] text-dim">{{ copy.collection_id }}</div>
+            <div class="font-mono text-[11px] text-dim">{{ sourceLocation(copy) }}</div>
             <div>{{ copy.title }}</div>
           </div>
           <MatchButton
             always-visible
             :confidence="copy.match_confidence"
-            :label="`${copy.title} (${copy.collection_id})`"
+            :label="`${copy.title} (${sourceLocation(copy)})`"
             title="Search metadata for this source"
             @click="matching = copy.id"
           />

@@ -16,21 +16,107 @@ import {
   getPrefs,
   getItemSubtitleFileUrl,
   getSessionFileUrl,
+  itemQuery,
   seekSession as seek,
   startSession,
 } from './generated/kahawai.ts'
 import { buildProfile } from './capabilities.ts'
 import { isRasterSub } from '../domain/subtitles.ts'
+import { resolveTracks } from '../domain/tracks.ts'
+import { sourcePreferenceScope, sourceStreams } from '../domain/source.ts'
+
+function playbackProfile(item: ItemQueryResponse, prefs: Preference[]): CapabilityProfile {
+  const cap = prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
+  const announced = item.sources.flatMap((source) => source.streams?.video ?? [])
+  return buildProfile(cap ? Number(cap) : undefined, announced)
+}
+
+function sourceAudioTracks(item: ItemQueryResponse, prefs: Preference[], mediaType: string) {
+  return Object.fromEntries(
+    [...new Set(item.sources.map((source) => source.source_id))].map((id) => [
+      id,
+      resolveTracks(
+        prefs,
+        item.parent_id ?? item.id,
+        mediaType,
+        item.metadata?.original_language,
+        sourceStreams(item.sources, id)?.audio ?? [],
+        sourcePreferenceScope(item.sources, id),
+      ).audioTrack,
+    ]),
+  )
+}
+
+/// The audio-zero preview is only final when every chosen track and the
+/// source-aware profile agree with it. Let the hub rank each rendition on its
+/// own preferred audio index, then pin that source/index pair for START.
+export async function selectPlaybackSource(
+  preview: ItemQueryResponse,
+  prefs: Preference[],
+  mediaType: string,
+  previewProfile: CapabilityProfile,
+  sourceId?: number,
+) {
+  let item = preview
+  let profile = playbackProfile(item, prefs)
+  let audio = sourceAudioTracks(item, prefs, mediaType)
+  const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
+  let needsQuery =
+    !same(profile, previewProfile) ||
+    (sourceId === undefined
+      ? Object.values(audio).some((track) => track !== 0)
+      : (audio[sourceId] ?? 0) !== 0)
+  for (let attempt = 0; ; attempt++) {
+    if (!needsQuery) {
+      const selected = item.negotiated?.source?.source_id ?? sourceId
+      return {
+        item,
+        profile,
+        sourceId: selected,
+        audioTrack: selected === undefined ? 0 : (audio[selected] ?? 0),
+      }
+    }
+    if (attempt === 3)
+      throw new Error('The available sources changed while choosing playback. Try again.')
+    item = await itemQuery(item.id, {
+      profile,
+      source_audio_tracks: audio,
+      ...(sourceId === undefined ? {} : { source_id: sourceId }),
+    })
+    const nextAudio = sourceAudioTracks(item, prefs, mediaType)
+    const nextProfile = playbackProfile(item, prefs)
+    // A concurrent scan may return a new rendition or changed stream order.
+    // Re-rank its real preference before starting, never borrow an old index.
+    needsQuery = !same(nextAudio, audio) || !same(nextProfile, profile)
+    audio = nextAudio
+    profile = nextProfile
+  }
+}
+
+/// Detail previews and subtitle defaults need the same preference-aware
+/// source choice as Play. Capture the preview profile with its request so a
+/// later capability change cannot make an old negotiation look current.
+export async function queryPlaybackItem(
+  id: string,
+  prefs: Preference[],
+  mediaType: string,
+  sourceId?: number,
+): Promise<ItemQueryResponse> {
+  const cap = prefs.find((pref) => pref.scope === '' && pref.key === 'bandwidth_kbps')?.value
+  const profile = buildProfile(cap ? Number(cap) : undefined)
+  const preview = await itemQuery(id, {
+    profile,
+    ...(sourceId === undefined ? {} : { source_id: sourceId }),
+  })
+  return (await selectPlaybackSource(preview, prefs, mediaType, profile, sourceId)).item
+}
 
 /// Start a session for an item, with everything the hub needs to negotiate.
 ///
 /// `prefs: 'read'` fetches preferences when a caller has none in hand.
-/// This is the only reader of `bandwidth_kbps` in the app, so a default of `[]`
-/// is the cap silently dropped with nothing said anywhere — and four of the
-/// five callers had no preferences to pass: every recovery, every hand-pressed
-/// Try again, the capability restart and the stand-by resume. A viewer who set
-/// a cap lost it the first time the session was reaped, on the metered link the
-/// setting exists for.
+/// Recovery, Try again, capability restart and stand-by resume may have no
+/// preferences to pass. Reading them here preserves the viewer's bandwidth
+/// cap whenever a session is recreated.
 export async function startPlaybackSession(
   item: ItemQueryResponse,
   {
@@ -40,7 +126,8 @@ export async function startPlaybackSession(
     prefs = 'read',
     sourceFingerprint,
     resume = true,
-    sourceId = item.negotiated?.source?.source_id,
+    sourceId,
+    profile: selectedProfile,
   }: {
     startMs?: number
     audioTrack?: number
@@ -48,7 +135,8 @@ export async function startPlaybackSession(
     prefs?: Preference[] | 'read'
     sourceFingerprint?: string
     resume?: boolean
-    sourceId?: number
+    sourceId?: number | undefined
+    profile?: CapabilityProfile
   } = {},
 ): Promise<StartSessionResponse> {
   // Swallowed, and only here: these callers are automatic — a recovery, a
@@ -61,11 +149,9 @@ export async function startPlaybackSession(
           () => [],
         )
       : prefs
-  const cap = known.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
   // Source-aware precision: probe the exact strings the announced streams call
   // for, with the profile and level from the hub's own probing.
-  const announced = item.sources.flatMap((source) => source.streams?.video ?? [])
-  const profile: CapabilityProfile = buildProfile(cap ? Number(cap) : undefined, announced)
+  const profile = selectedProfile ?? playbackProfile(item, known)
   return startSession({
     item_id: item.id,
     source_id: sourceId ?? null,
