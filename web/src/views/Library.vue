@@ -85,7 +85,7 @@ const artists = useArtists(library, query, artistSort, music)
 const me = whoAmI()
 const matchable = (_item: ItemRowI64) => me.admin
 
-const matching = ref<{ item: ItemRowI64; at: number } | null>(null)
+const matching = ref<ItemRowI64 | null>(null)
 
 /// Pressing the library's name drops the filter, which is the other half of
 /// the ✕ in the box — the heading is where somebody looks when the page is
@@ -395,18 +395,13 @@ function retryPage() {
             :item="loaded.get(at)"
             :matchable="!!loaded.get(at) && matchable(loaded.get(at)!)"
             @open="open"
-            @match="matching = { item: loaded.get(at)!, at }"
+            @match="matching = loaded.get(at)!"
           />
         </li>
       </ul>
     </div>
 
-    <MatchDialog
-      v-if="matching"
-      :item="matching.item"
-      @close="matching = null"
-      @applied="refresh(matching!.at)"
-    />
+    <MatchDialog v-if="matching" :item="matching" @close="matching = null" @applied="refresh()" />
   </main>
 </template>
 

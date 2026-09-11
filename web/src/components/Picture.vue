@@ -57,7 +57,7 @@ import {
 } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
 import { pipPhase, pipSupported } from '../domain/pip.ts'
-import { deliveryPlan, sourceStreams } from '../domain/source.ts'
+import { deliveryPlan, sourcePreferenceScope, sourceStreams } from '../domain/source.ts'
 import { forgetRecoveries, isSessionGone, mayRecover, startCeiling } from '../domain/recovery.ts'
 import {
   initialHealth,
@@ -81,7 +81,12 @@ import { putPref as writePref } from '../composables/prefs.ts'
 import { playerPhase } from '../domain/player-phase.ts'
 import { resolveTracks, subtitleLabel } from '../domain/tracks.ts'
 import { saveAs } from '../api/download.ts'
-import { seekSession, startPlaybackSession, subtitleFileUrl } from '../api/playback.ts'
+import {
+  seekSession,
+  selectPlaybackSource,
+  startPlaybackSession,
+  subtitleFileUrl,
+} from '../api/playback.ts'
 import { seLabel } from '../domain/label.ts'
 import { sentence } from '../domain/refusal.ts'
 import { subtitleRoute } from '../domain/subtitle-route.ts'
@@ -254,6 +259,9 @@ let goneAway = false
 
 /// HUB-33 memory scope, and the wishlists the opening choice came from.
 const seriesId = props.item.parent_id ?? props.item.id
+const exactScope = computed(() =>
+  sourcePreferenceScope(props.item.sources, props.session.source_id),
+)
 let subsWish: string[] = []
 let subTrackWish: number | null = null
 /// A remembered burn that could not be applied yet, because the viewer was
@@ -309,12 +317,11 @@ function resolve() {
     const resolved = resolveTracks(
       props.prefs,
       seriesId,
-      props.item.id,
       props.mediaType,
       detail.metadata?.original_language,
       audio,
 
-      `source:${props.session.source_id}`,
+      exactScope.value,
     )
     // A restart carries BOTH axes: the session was started on the carried
     // video track, and a selector left reading zero would hand track 0 back
@@ -345,10 +352,9 @@ function resolve() {
     // pick below is for a FIRST mount, resolved from a snapshot that
     // predates anything chosen mid-episode.
     if (props.carried?.subKey === '') return
-    // A carried key the new session's list no longer resolves (nothing does
-    // this today — the item is not refetched on restart — but ids are only
-    // as stable as that stays true) falls back to the wishlist rather than
-    // silently landing on subtitles-off.
+    // A newly registered copy may give an embedded subtitle a different row
+    // ID. Its stream index still identifies it within the same fingerprint;
+    // otherwise fall back to the wishlist with an explanation.
     const carried = props.carried
       ? (subs.find((s) => String(s.id) === props.carried?.subKey) ??
         (props.carried.sourceFingerprint === props.session.source_fingerprint &&
@@ -781,10 +787,10 @@ async function switchTracks(audio: number, videoTrack: number) {
     // pin the exact index: "the commentary track of THIS film" has no language
     // representation, and there is no series intent to follow. Episodes
     // deliberately do NOT pin, so one episode never freezes on an old choice.
-    const value = trk.value.audioList[audio]?.language?.toLowerCase() ?? `#${audio}`
-    remember(seriesId, 'audio', value)
-    if (props.item.kind === 'movie')
-      remember(`source:${props.session.source_id}`, 'audio.track', `#${audio}`)
+    const language = trk.value.audioList[audio]?.language?.toLowerCase()
+    if (language) remember(seriesId, 'audio', language)
+    if (props.item.kind === 'movie' && exactScope.value)
+      remember(exactScope.value, 'audio.track', `#${audio}`)
   }
   if (!owned(outcome)) settle(mine)
 }
@@ -1367,9 +1373,11 @@ watch(
     // The duration of what is PLAYING: the session's, not the item's
     // minimum across renditions — it picks the release version on their
     // side and resolves null ends on ours.
-    void introdbSegments(props.item, durationMs.value).then((found) => {
-      remoteSegments.value = found
-    })
+    void introdbSegments(props.item, durationMs.value, props.session.library_item_ids).then(
+      (found) => {
+        remoteSegments.value = found
+      },
+    )
   },
   { immediate: true },
 )
@@ -1454,19 +1462,16 @@ async function playNext() {
       return { prefs: props.prefs }
     })
     const cap = prefs.prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
-    after = await itemQuery(after.id, { profile: buildProfile(cap ? Number(cap) : undefined) })
-    const resolved = resolveTracks(
-      prefs.prefs,
-      seriesId,
-      after.id,
-      props.mediaType,
-      after.metadata?.original_language,
-      sourceStreams(after.sources, after.negotiated?.source?.source_id)?.audio ?? [],
-      `source:${after.negotiated?.source?.source_id}`,
-    )
+    const previewProfile = buildProfile(cap ? Number(cap) : undefined)
+    after = await itemQuery(after.id, { profile: previewProfile })
+    const selected = await selectPlaybackSource(after, prefs.prefs, props.mediaType, previewProfile)
+    if (goneAway) return
+    after = selected.item
     const fresh = await startPlaybackSession(after, {
-      audioTrack: resolved.audioTrack,
+      audioTrack: selected.audioTrack,
       prefs: prefs.prefs,
+      sourceId: selected.sourceId,
+      profile: selected.profile,
     })
     // Back was pressed while the hub was answering. Handing this up would
     // navigate them into the next episode against the thing they just did.
@@ -1556,7 +1561,7 @@ function chooseSubtitle(key: string) {
   // item remembers the exact row — the only spelling that can name a downloaded
   // or OCR track.
   remember(seriesId, 'subs', key === '' ? 'off' : (picked?.language ?? 'any').toLowerCase())
-  remember(`source:${props.session.source_id}`, 'subs.track', key)
+  if (exactScope.value) remember(exactScope.value, 'subs.track', key)
   // Burn transitions live server-side: a track whose delivery IS burn restarts
   // the pipeline with it, and leaving one withdraws it. The tier comes from the
   // ass_fallback preference, never from this list — picking says WHICH

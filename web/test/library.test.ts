@@ -41,6 +41,7 @@ const { itemDetail, adminApplyMatch, adminReviewSearch, listArtists, listItems, 
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
 const Card = (await import('../src/components/Card.vue')).default
+const MatchDialog = (await import('../src/components/MatchDialog.vue')).default
 const { DEBOUNCE_MS, useSearch } = await import('../src/composables/search.ts')
 
 const item = (id: string, over: Record<string, unknown> = {}) =>
@@ -545,6 +546,7 @@ describe('hand-matching from the grid (HUB-8)', () => {
               title: 'Heat',
               year: 1995,
               paths: [],
+              match_confidence: 'weak',
               assignment: { revision: 4, library_item_ids: [id] },
             },
           ],
@@ -592,10 +594,7 @@ describe('hand-matching from the grid (HUB-8)', () => {
     expect(vi.mocked(listItems).mock.calls.length).toBe(reads)
   })
 
-  test('and applying one re-reads that row’s chunk', async () => {
-    // A match rewrites the title, the year and the artwork of exactly one row.
-    // Re-reading the library would throw away every chunk that had been
-    // scrolled through.
+  test('and applying one re-reads the visible result set', async () => {
     hub(1, { match_confidence: 'weak' })
     vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
     const { wrapper } = await grid()
@@ -613,5 +612,35 @@ describe('hand-matching from the grid (HUB-8)', () => {
       expect.objectContaining({ action: 'confirm' }),
     )
     expect(vi.mocked(listItems).mock.calls.length).toBe(reads + 1)
+  })
+
+  test('a match preserves a deep viewport and reloads only its shifted visible rows', async () => {
+    laidOut({ viewport: 400 })
+    const rows = Array.from({ length: 250 }, (_, n) => item(`i${n}`))
+    vi.mocked(listItems).mockImplementation(async (params) => {
+      const offset = params?.offset ?? 0
+      return { items: rows.slice(offset, offset + CHUNK), total: rows.length, offset, limit: CHUNK }
+    })
+    const { wrapper } = await grid()
+    Object.defineProperty(window, 'scrollY', { value: 4600, configurable: true })
+    window.dispatchEvent(new Event('scroll'))
+    await flushPromises()
+    expect(wrapper.findComponent(Card).props('item')?.id).toBe('i200')
+    await wrapper.find('[aria-label*="match"]').trigger('click')
+    await flushPromises()
+    vi.mocked(listItems).mockClear()
+
+    // Assigning the last copy to another work removes this library row. Every
+    // match action reports through the same applied event, including reset.
+    rows.splice(200, 1)
+    wrapper.findComponent(MatchDialog).vm.$emit('applied', ['i201'])
+    wrapper.findComponent(MatchDialog).vm.$emit('close')
+    await flushPromises()
+    expect(window.scrollY).toBe(4600)
+    expect(vi.mocked(listItems).mock.calls.map(([params]) => params?.offset)).toEqual([200])
+    expect(wrapper.findComponent(Card).props('item')?.id).toBe('i201')
+    expect(wrapper.findAllComponents(Card).at(-1)?.props('item')?.id).toBe('i249')
+    expect(wrapper.findAll('li')).toHaveLength(49)
+    wrapper.unmount()
   })
 })

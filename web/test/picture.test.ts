@@ -106,7 +106,14 @@ const film = (over: Record<string, unknown> = {}) => {
     sources: [{ streams: { audio: [{ language: 'eng', codec: 'aac', channels: 2 }], video: [] } }],
     ...over,
   }
-  return { ...item, sources: item.sources.map((source) => ({ source_id: 1, ...source })) }
+  return {
+    ...item,
+    sources: item.sources.map((source) => ({
+      source_id: 1,
+      collection_item_id: 'heat-copy',
+      ...source,
+    })),
+  }
 }
 
 const session = (id = 's1', over: Record<string, unknown> = {}) => ({
@@ -1043,7 +1050,7 @@ describe('choosing a track', () => {
     const movie = await switching()
     await pick(movie.wrapper, '1')
     expect(api.putPref).toHaveBeenCalledWith({
-      scope: 'source:1',
+      scope: 'source:heat-copy:1',
       key: 'audio.track',
       value: '#1',
     })
@@ -1069,6 +1076,39 @@ describe('choosing a track', () => {
     await pick(wrapper, '1')
     expect(api.putPref).not.toHaveBeenCalled()
   })
+
+  test.each(['movie', 'episode'])(
+    'an untagged %s track cannot write a shared numeric preference',
+    async (kind) => {
+      const { wrapper, element } = await watching({
+        item: dualAudio({
+          kind,
+          sources: [
+            {
+              streams: {
+                audio: [
+                  { language: 'eng', codec: 'aac', channels: 2 },
+                  { language: null, codec: 'aac', channels: 2 },
+                ],
+                video: [],
+              },
+            },
+          ],
+        }) as never,
+        session: withTracks() as never,
+      })
+      starts(element)
+      await pick(wrapper, '1')
+      expect(api.putPref).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'audio' }))
+      if (kind === 'movie')
+        expect(api.putPref).toHaveBeenCalledWith({
+          scope: 'source:heat-copy:1',
+          key: 'audio.track',
+          value: '#1',
+        })
+      wrapper.unmount()
+    },
+  )
 
   test('and the selector goes back to the track that IS playing', async () => {
     vi.mocked(api.seekSession).mockRejectedValue(new ApiError(409, 'no such track'))
@@ -1288,7 +1328,11 @@ describe('choosing subtitles', () => {
     const { wrapper } = await withSubs([listing()])
     await choose(wrapper, '7')
     expect(api.putPref).toHaveBeenCalledWith({ scope: 'heat', key: 'subs', value: 'eng' })
-    expect(api.putPref).toHaveBeenCalledWith({ scope: 'source:1', key: 'subs.track', value: '7' })
+    expect(api.putPref).toHaveBeenCalledWith({
+      scope: 'source:heat-copy:1',
+      key: 'subs.track',
+      value: '7',
+    })
   })
 
   test('and turning them off is a choice, not an absence of one', async () => {
@@ -1355,7 +1399,7 @@ describe('choosing subtitles', () => {
     const queued = held<{ part_base_ms: number }>({ part_base_ms: 0 })
     void queued
     const { wrapper } = await withSubs([listing({ id: 9, delivery: 'burn' })], {
-      prefs: [{ scope: 'source:1', key: 'subs.track', value: '9' }] as never,
+      prefs: [{ scope: 'source:heat-copy:1', key: 'subs.track', value: '9' }] as never,
     })
     void wrapper
     // The burn was wanted the moment the tracks resolved, and the pipeline was
@@ -1627,6 +1671,44 @@ describe('chapter marks on the bar', () => {
     // cut's times.
     const url = String(wire.mock.calls.find((c) => String(c[0]).includes('theintrodb'))![0])
     expect(url).toContain('duration_ms=600000')
+  })
+
+  test.each([
+    { covered: ['ep1'], offered: true },
+    { covered: ['ep1', 'ep2'], offered: false },
+  ])('community skips follow the session coverage $covered', async ({ covered, offered }) => {
+    const wire = vi.fn(async (url: RequestInfo | URL) => {
+      if (!String(url).includes('api.theintrodb.org')) return new Response('', { status: 404 })
+      return new Response(JSON.stringify({ intro: [{ start_ms: 5_000, end_ms: 65_000 }] }), {
+        status: 200,
+      })
+    })
+    vi.stubGlobal('fetch', wire)
+    const { wrapper, element } = await watching({
+      item: film({
+        id: 'ep1',
+        kind: 'episode',
+        season: 1,
+        episode: 1,
+        segments: [],
+        metadata: { tmdb_id: 1403 },
+        copies: [
+          { assignment: { library_item_ids: ['ep1'] } },
+          { assignment: { library_item_ids: ['ep1', 'ep2'] } },
+        ],
+      }) as never,
+      session: session('s1', { library_item_ids: covered }) as never,
+      prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
+    })
+    starts(element)
+    await flushPromises()
+    at(element, 10)
+    await flushPromises()
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Skip intro')).toBe(offered)
+    expect(wire.mock.calls.some((args) => String(args[0]).includes('api.theintrodb.org'))).toBe(
+      offered,
+    )
+    wrapper.unmount()
   })
 
   test('the hub-measured boundary outranks a cached community one', async () => {

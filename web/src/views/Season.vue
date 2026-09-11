@@ -24,6 +24,7 @@ import {
 } from '../domain/label.ts'
 import { parseSeason } from '../domain/routes.ts'
 import { sentence } from '../domain/refusal.ts'
+import { groupSources } from '../domain/source.ts'
 import { notify } from '../composables/notices.ts'
 import { useChildrenOf, useItem, useWatched } from '../composables/item.ts'
 import { useScreenName } from '../composables/title.ts'
@@ -126,7 +127,13 @@ const pickedNumber = computed(() => {
     ? seLabel(seasonOf(row, projected.value), episodeOf(row, projected.value), row.episode_end)
     : seLabel(open.season, open.episode, open.episode_end)
 })
-const pickedPlayable = computed(() => picked.data.value?.sources?.[0]?.available ?? false)
+const pickedPlayable = computed(() => {
+  const detail = picked.data.value
+  const selected = groupSources(detail?.sources ?? []).find(
+    (work) => work.id === detail?.negotiated?.source?.source_id,
+  )
+  return !!selected?.whole && selected.parts.every((part) => part.available)
+})
 
 function goUp() {
   void router.push({ name: 'detail', params: { library: library.value, id: showId.value } })
@@ -263,7 +270,7 @@ function play(id: string, fromStart = false) {
           <Btn
             v-if="resumeMs(picked.data.value) > 0"
             ghost
-            :disabled="busy.has(picked.data.value.id)"
+            :disabled="busy.has(picked.data.value.id) || !pickedPlayable"
             @click="play(picked.data.value.id, true)"
           >
             Play from start

@@ -37,6 +37,8 @@ export function useLibraryItems(
   /// The generation whose first reply REPLACES what is on screen rather than
   /// merging into it.
   let replacing = 0
+  let anchor = 0
+  let needed = [0]
   const asked = new Set<number>()
   /// Chunks that failed and have not since succeeded. The error line is about
   /// this set being non-empty.
@@ -46,9 +48,10 @@ export function useLibraryItems(
   /// displayed. Blanking here empties the page for the length of a round trip,
   /// and the old results are still true of the screen you are leaving until
   /// the new ones arrive.
-  function reset() {
+  function reset(firstChunk = 0) {
     generation += 1
     replacing = generation
+    anchor = firstChunk
     asked.clear()
     // The failures belonged to the result set being replaced. Left standing,
     // the line stays on screen over results that loaded perfectly — the only
@@ -72,12 +75,9 @@ export function useLibraryItems(
         offset: chunk * CHUNK,
       })
       if (mine !== generation) return
-      // Only the FIRST page replaces what is on screen. Keyed on the
-      // generation alone, whichever reply landed first did it — so a chunk 3
-      // that overtook chunk 0 cleared the map and re-seeded it with rows
-      // 300–399, turning "the old results stay up until the new ones arrive"
-      // into a screen of placeholders.
-      const swap = replacing === mine && chunk === 0
+      // The visible anchor replaces the old result set. Search/sort changes
+      // start at zero; membership changes keep the viewer's current range.
+      const swap = replacing === mine && chunk === anchor
       if (swap) replacing = 0
       total.value = answer.total
       if (!query.value) libraryTotal.value = answer.total
@@ -90,6 +90,7 @@ export function useLibraryItems(
       // red line over a grid that has been complete for minutes.
       failed.delete(chunk)
       if (failed.size === 0) failure.value = ''
+      if (swap) need(needed)
     } catch (cause) {
       if (mine !== generation) return
       // A failed chunk must be askable again.
@@ -107,19 +108,25 @@ export function useLibraryItems(
   /// new one had never fetched — a re-sort re-fetched offset 0 and left
   /// ninety cells as permanent placeholders, because nothing re-asks.
   function need(chunks: number[]) {
+    needed = chunks
     if (enabled && !enabled.value) return
-    for (const chunk of chunks) void load(chunk)
+    // Wait for the replacement before filling other holes: a faster later
+    // page would otherwise be wiped by the anchor but remain marked asked.
+    if (replacing === generation) return
+    for (const chunk of chunks) {
+      if (total.value === null || chunk * CHUNK < total.value) void load(chunk)
+    }
   }
 
-  /// One item's chunk, read again — after something changed it.
+  /// Matching can remove, insert or reorder works, invalidating EVERY offset.
   ///
-  /// A hand-match rewrites the title, the year and the artwork of exactly one
-  /// row, and nothing else on the page has changed: re-reading the library
-  /// would throw away every other chunk that had been scrolled through.
-  function refresh(index: number) {
-    const chunk = Math.floor(index / CHUNK)
-    asked.delete(chunk)
-    void load(chunk)
+  /// Rebuild cost is local paged API reads; latency matters at the visible
+  /// viewport. Keep it in place until its anchor arrives, then fetch only the
+  /// needed range. Historical pages become askable again as they are visited.
+  function refresh() {
+    reset(needed[0] ?? 0)
+    libraryTotal.value = null
+    void load(anchor)
   }
 
   /// Everything that failed, asked again — including the very first chunk,
@@ -145,6 +152,7 @@ export function useLibraryItems(
   watch(
     [library, query, sort, () => enabled?.value ?? true],
     () => {
+      needed = [0]
       reset()
       if (enabled && !enabled.value) {
         total.value = null
