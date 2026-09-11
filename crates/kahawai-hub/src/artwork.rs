@@ -65,6 +65,7 @@ struct ArtistCollageManifest {
 
 struct ArtistCollageAlbum {
     id: String,
+    library_item_id: String,
     art_version: Option<i64>,
     poster: String,
 }
@@ -336,11 +337,18 @@ impl Artwork {
             return Ok(None);
         }
         let mut albums = manifest.albums.iter().map(String::as_str);
-        let visible: i64 = sqlx::query_scalar(
-            "SELECT COUNT(DISTINCT i.id) FROM collection_items i
+        let rows = sqlx::query(
+            "SELECT i.id,li.id AS library_item_id,md.poster_path,md.updated_at FROM collection_items i
+               JOIN collection_item_library_items a ON a.collection_item_id=i.id
+               JOIN library_items li ON li.id=a.library_item_id
+               JOIN resolved_metadata md ON md.item_id=i.id
                JOIN library_collections lc
                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
-              WHERE lc.library_id=?1 AND i.kind='album' AND i.artist_key=?2
+              WHERE lc.library_id=?1 AND li.kind='album' AND li.artist_key=?2
+                AND li.merged_into IS NULL AND i.metadata_eligible=1
+                AND EXISTS(SELECT 1 FROM provider_metadata pm WHERE pm.item_id=i.id AND pm.poster_path=md.poster_path
+                    AND (pm.provider_id='' OR EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=i.id AND m.provider=pm.provider AND m.provider_id=pm.provider_id))
+                    AND NOT EXISTS(SELECT 1 FROM rejected_matches r WHERE r.item_id=i.id AND r.provider=pm.provider AND r.provider_id=pm.provider_id))
                 AND i.id IN (?3,?4,?5,?6)",
         )
         .bind(library)
@@ -349,9 +357,38 @@ impl Artwork {
         .bind(albums.next())
         .bind(albums.next())
         .bind(albums.next())
-        .fetch_one(registry.db())
+        .fetch_all(registry.db())
         .await?;
-        if visible as usize != manifest.albums.len() {
+        if rows.len() != manifest.albums.len() {
+            return Ok(None);
+        }
+        let mut current: HashMap<String, ArtistCollageAlbum> = rows
+            .into_iter()
+            .map(|row| {
+                let id: String = row.get("id");
+                (
+                    id.clone(),
+                    ArtistCollageAlbum {
+                        id,
+                        library_item_id: row.get("library_item_id"),
+                        art_version: row.get("updated_at"),
+                        poster: row.get("poster_path"),
+                    },
+                )
+            })
+            .collect();
+        let Some(current): Option<Vec<_>> = manifest
+            .albums
+            .iter()
+            .map(|id| current.remove(id))
+            .collect()
+        else {
+            return Ok(None);
+        };
+        // The revision already records every exact donor, URL and version.
+        // Validate that provenance rather than trusting another current cover
+        // on the same copy to authorize the image in this older composite.
+        if artist_collage_revision(library, artist_key, &current) != manifest.revision {
             return Ok(None);
         }
         let key = artist_collage_cache_key(library, artist_key);
@@ -375,18 +412,25 @@ impl Artwork {
         sessions: &Sessions,
     ) -> Result<()> {
         let rows = sqlx::query(
-            "SELECT lc.library_id,i.artist_key,i.id,md.poster_path,md.updated_at,
-                    COALESCE(i.year,CAST(substr(md.premiered,1,4) AS INTEGER)) AS release_year
-               FROM collection_items i
+            "SELECT lc.library_id,li.artist_key,i.id,li.id AS library_item_id,
+                    CASE WHEN EXISTS(SELECT 1 FROM provider_metadata pm WHERE pm.item_id=i.id AND pm.poster_path=md.poster_path
+                        AND (pm.provider_id='' OR EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=i.id AND m.provider=pm.provider AND m.provider_id=pm.provider_id))
+                        AND NOT EXISTS(SELECT 1 FROM rejected_matches r WHERE r.item_id=i.id AND r.provider=pm.provider AND r.provider_id=pm.provider_id))
+                      THEN md.poster_path END AS poster_path,
+                    md.updated_at,li.year AS release_year
+               FROM library_items li
+               JOIN collection_item_library_items a ON a.library_item_id=li.id
+               JOIN collection_items i ON i.id=a.collection_item_id
                JOIN library_collections lc
                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
-               LEFT JOIN resolved_metadata md ON md.item_id=i.id
-               LEFT JOIN artist_artwork aa ON aa.artist_key=i.artist_key
-              WHERE i.kind='album' AND i.artist_key IS NOT NULL
+               LEFT JOIN resolved_metadata md ON md.item_id=i.id AND i.metadata_eligible=1
+               LEFT JOIN artist_artwork aa ON aa.artist_key=li.artist_key
+              WHERE li.kind='album' AND li.merged_into IS NULL AND li.artist_key IS NOT NULL
+                AND EXISTS(SELECT 1 FROM libraries l WHERE l.id=lc.library_id AND l.media_type='music')
                 AND (aa.outcome IS NULL OR aa.outcome<>'ready')
-              ORDER BY lc.library_id,i.artist_key,
+              ORDER BY lc.library_id,li.artist_key,
                        release_year IS NULL,release_year DESC,
-                       COALESCE(i.sort_title,i.title) COLLATE NOCASE,i.id",
+                       COALESCE(li.sort_title,li.title) COLLATE NOCASE,li.id,i.id",
         )
         .fetch_all(registry.db())
         .await?;
@@ -398,6 +442,7 @@ impl Artwork {
             if let Some(poster) = row.get("poster_path") {
                 albums.push(ArtistCollageAlbum {
                     id: row.get("id"),
+                    library_item_id: row.get("library_item_id"),
                     art_version: row.get("updated_at"),
                     poster,
                 });
@@ -411,12 +456,28 @@ impl Artwork {
         for ((library, artist_key), albums) in artists {
             let mut selected = Vec::new();
             let mut covers = Vec::new();
+            let mut covered_albums = std::collections::HashSet::new();
             for album in albums {
-                match self
-                    .get_at(registry, sessions, &album.id, Some("card"))
-                    .await
-                {
+                // Several collection copies can support one displayed album.
+                // Try each eligible local cover, but use that album only once.
+                if covered_albums.contains(&album.library_item_id) {
+                    continue;
+                }
+                let cover = async {
+                    let Some((bytes, ctype, key)) = self
+                        .original_for_poster(registry, sessions, &album.id, &album.poster)
+                        .await?
+                    else {
+                        return Ok(None);
+                    };
+                    self.at_from_original(bytes, ctype, key, Some("card"), CacheWrite::BestEffort)
+                        .await
+                        .map(Some)
+                }
+                .await;
+                match cover {
                     Ok(Some((bytes, _))) => {
+                        covered_albums.insert(album.library_item_id.clone());
                         selected.push(album);
                         covers.push(bytes);
                         if covers.len() == 4 {
@@ -585,8 +646,19 @@ impl Artwork {
         let Some(poster) = resolved_poster(registry, item_id).await? else {
             return Ok(None);
         };
+        self.original_for_poster(registry, sessions, item_id, &poster)
+            .await
+    }
+
+    async fn original_for_poster(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item_id: &str,
+        poster: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str, String)>> {
         if !poster.starts_with(LOCAL) {
-            return self.remote_poster(&poster).await;
+            return self.remote_poster(poster).await;
         }
         // The answer names the file; which mediahost serves it is decided
         // now, since a collection can be reachable through more than one
@@ -868,7 +940,8 @@ pub const LOCAL: &str = "local://";
 async fn resolved_poster(registry: &Registry, item_id: &str) -> Result<Option<String>> {
     Ok(sqlx::query_scalar(
         "SELECT m.poster_path FROM collection_items i
-         JOIN resolved_metadata m ON m.item_id IN (i.id, i.parent_id)
+         LEFT JOIN collection_items eligible_parent ON eligible_parent.id=i.parent_id AND eligible_parent.metadata_eligible=1
+         JOIN resolved_metadata m ON m.item_id IN (i.id, eligible_parent.id)
          WHERE i.id = ? AND m.poster_path IS NOT NULL
          ORDER BY m.item_id = i.id DESC LIMIT 1",
     )
@@ -993,6 +1066,7 @@ mod tests {
 
     #[tokio::test]
     async fn artist_collage_uses_the_newest_four_covered_albums_inside_one_library() {
+        let key = crate::enrich::artist_key("Artist");
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::open(tmp.path()).await.unwrap();
         let registry = Registry::new(db.clone(), Default::default());
@@ -1070,13 +1144,14 @@ mod tests {
             .unwrap();
             sqlx::query(
                 "INSERT INTO provider_metadata
-                   (item_id,provider,provider_id,poster_path,confidence,updated_at)
-                 VALUES(?,'musicbrainz',?,?, 'auto',?)",
+                   (item_id,provider,provider_id,poster_path,confidence,updated_at,premiered)
+                 VALUES(?,'musicbrainz',?,?, 'auto',?,?)",
             )
             .bind(&id)
             .bind(format!("release-{number}"))
             .bind(&poster)
             .bind(2000 + number as i64)
+            .bind(format!("{}-01-01", 2000 + number))
             .execute(&db)
             .await
             .unwrap();
@@ -1094,8 +1169,8 @@ mod tests {
         .unwrap();
         sqlx::query(
             "INSERT INTO provider_metadata
-               (item_id,provider,provider_id,poster_path,confidence,updated_at)
-             VALUES('private-album','musicbrainz','private-release',?,'auto',2099)",
+               (item_id,provider,provider_id,poster_path,confidence,updated_at,premiered)
+             VALUES('private-album','musicbrainz','private-release',?,'auto',2099,'2099-01-01')",
         )
         .bind(private_poster)
         .execute(&db)
@@ -1115,41 +1190,35 @@ mod tests {
             .await
             .unwrap();
 
-        let manifest = artwork
-            .read_artist_collage_manifest("music", "artist-key")
-            .unwrap();
+        let manifest = artwork.read_artist_collage_manifest("music", &key).unwrap();
         assert_eq!(
             manifest.albums,
             ["album-5", "album-4", "album-3", "album-2"]
         );
         assert_eq!(
             artwork
-                .read_artist_collage_manifest("private", "artist-key")
+                .read_artist_collage_manifest("private", &key)
                 .unwrap()
                 .albums,
             ["private-album"]
         );
         assert_ne!(
-            artist_collage_cache_key("music", "artist-key"),
-            artist_collage_cache_key("private", "artist-key")
+            artist_collage_cache_key("music", &key),
+            artist_collage_cache_key("private", &key)
         );
-        assert!(
-            artwork
-                .artist_collage_version("music", "artist-key")
-                .is_some()
-        );
+        assert!(artwork.artist_collage_version("music", &key).is_some());
         for (name, px) in SIZES {
             assert!(
                 cache
                     .join(variant_dir(name, *px))
-                    .join(artist_collage_cache_key("music", "artist-key"))
+                    .join(artist_collage_cache_key("music", &key))
                     .is_file()
             );
         }
 
         assert!(
             artwork
-                .get_cached_artist_collage_at(&registry, "music", "artist-key", Some("card"),)
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"),)
                 .await
                 .unwrap()
                 .is_some()
@@ -1160,11 +1229,258 @@ mod tests {
             .unwrap();
         assert!(
             artwork
-                .get_cached_artist_collage_at(&registry, "music", "artist-key", Some("card"),)
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"),)
                 .await
                 .unwrap()
                 .is_none(),
             "a cached cover from a detached collection crossed the library boundary"
+        );
+    }
+
+    #[tokio::test]
+    async fn corrected_artist_collage_uses_compatible_distinct_library_albums() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry = Registry::new(db.clone(), Default::default());
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','host','fp');
+            INSERT INTO collections(module_id,collection_id,media_type) VALUES('host','music','music'),('host','private','music');
+            INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music'),('private','Private','music');
+            INSERT INTO library_collections VALUES('music','host','music'),('private','host','private');")
+            .execute(&db).await.unwrap();
+        let cache = tmp.path().join("artwork");
+        std::fs::create_dir_all(&cache).unwrap();
+        let enricher = Arc::new(crate::enrich::Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Artwork::new(cache.clone(), enricher);
+        let sessions = Sessions::new(tmp.path().join("sessions"));
+        let key = crate::enrich::artist_key("Correct artist");
+        let detected_key = crate::enrich::artist_key("Detected artist");
+        let mut target = String::new();
+        for (copy, artist, title, year, collection) in [
+            ("wrong", "Detected artist", "Album", 2000, "music"),
+            ("good", "Correct artist", "Album", 2000, "music"),
+            ("good-copy", "Correct artist", "Album", 2000, "music"),
+            ("older", "Correct artist", "Older album", 1999, "music"),
+            (
+                "private",
+                "Correct artist",
+                "Private album",
+                2100,
+                "private",
+            ),
+        ] {
+            sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,year,artist,artist_key,module_id,collection_id) VALUES(?,'album',?,lower(?),?,?,?,'host',?)")
+                .bind(copy).bind(title).bind(title).bind(year).bind(artist).bind(crate::enrich::artist_key(artist)).bind(collection).execute(&db).await.unwrap();
+            let poster = format!("https://covers.example/{copy}.jpg");
+            crate::providers::store_answer(
+                &db,
+                copy,
+                "musicbrainz",
+                copy,
+                "auto",
+                crate::providers::Fields {
+                    title: Some(title.into()),
+                    premiered: Some(format!("{year}-01-01")),
+                    poster_path: Some(poster.clone()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            std::fs::write(
+                cache.join(remote_cache_key(&poster)),
+                solid_png([40, 80, 120]),
+            )
+            .unwrap();
+            if copy == "wrong" {
+                let mut tx = db.begin().await.unwrap();
+                target = crate::library::create(
+                    &mut tx,
+                    crate::library::NewItem {
+                        kind: "album".into(),
+                        title: "Album".into(),
+                        year: Some(2000),
+                        artist: Some("Correct artist".into()),
+                        parent_id: None,
+                        season: None,
+                        episode: None,
+                        edition: None,
+                    },
+                )
+                .await
+                .unwrap();
+                crate::library::assign(&mut tx, copy, std::slice::from_ref(&target))
+                    .await
+                    .unwrap();
+                tx.commit().await.unwrap();
+                artwork
+                    .prefetch_artist_collages(&registry, &sessions)
+                    .await
+                    .unwrap();
+                assert!(
+                    artwork
+                        .read_artist_collage_manifest("music", &detected_key)
+                        .is_none(),
+                    "an artist absent from browse must not be scheduled"
+                );
+                assert!(
+                    artwork
+                        .read_artist_collage_manifest("music", &key)
+                        .is_none(),
+                    "incompatible artwork cannot follow the corrected assignment"
+                );
+            }
+        }
+        let good_target: String = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='good'").fetch_one(&db).await.unwrap();
+        assert_eq!(good_target, target);
+        crate::providers::store_answer(
+            &db,
+            "older",
+            "local",
+            "",
+            "auto",
+            crate::providers::Fields {
+                poster_path: Some("https://covers.example/older.jpg".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        artwork
+            .prefetch_artist_collages(&registry, &sessions)
+            .await
+            .unwrap();
+        let manifest = artwork.read_artist_collage_manifest("music", &key).unwrap();
+        assert_eq!(
+            manifest.albums,
+            ["good", "older"],
+            "one eligible cover per canonical album, confined to its library"
+        );
+        assert_eq!(
+            artwork
+                .read_artist_collage_manifest("private", &key)
+                .unwrap()
+                .albums,
+            ["private"]
+        );
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+
+        // Removing the precise donor's answer invalidates authorization of that
+        // manifest. A duplicate may replace it during the next background pass.
+        crate::providers::reject_matches(&db, "good").await.unwrap();
+        crate::providers::reject_matches(&db, "older")
+            .await
+            .unwrap();
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"))
+                .await
+                .unwrap()
+                .is_none()
+        );
+        artwork
+            .prefetch_artist_collages(&registry, &sessions)
+            .await
+            .unwrap();
+        assert_eq!(
+            artwork
+                .read_artist_collage_manifest("music", &key)
+                .unwrap()
+                .albums,
+            ["good-copy", "older"],
+            "a local cover-only answer remains valid when a provider record was rejected"
+        );
+        let revision = artwork
+            .read_artist_collage_manifest("music", &key)
+            .unwrap()
+            .revision;
+        artwork
+            .prefetch_artist_collages(&registry, &sessions)
+            .await
+            .unwrap();
+        assert_eq!(
+            artwork
+                .read_artist_collage_manifest("music", &key)
+                .unwrap()
+                .revision,
+            revision
+        );
+        let replacement_poster = "https://covers.example/replacement.jpg";
+        std::fs::write(
+            cache.join(remote_cache_key(replacement_poster)),
+            solid_png([120, 80, 40]),
+        )
+        .unwrap();
+        crate::providers::store_answer(
+            &db,
+            "good-copy",
+            "musicbrainz",
+            "good-copy",
+            "auto",
+            crate::providers::Fields {
+                title: Some("Album".into()),
+                premiered: Some("2000-01-01".into()),
+                poster_path: Some(replacement_poster.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a different valid URL cannot authorize the old cached composite"
+        );
+        artwork
+            .prefetch_artist_collages(&registry, &sessions)
+            .await
+            .unwrap();
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"))
+                .await
+                .unwrap()
+                .is_some()
+        );
+        let mut tx = db.begin().await.unwrap();
+        let other = crate::library::create(
+            &mut tx,
+            crate::library::NewItem {
+                kind: "album".into(),
+                title: "Other".into(),
+                year: Some(2000),
+                artist: Some("Other artist".into()),
+                parent_id: None,
+                season: None,
+                episode: None,
+                edition: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::library::assign(&mut tx, "good-copy", &[other])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        assert!(
+            artwork
+                .get_cached_artist_collage_at(&registry, "music", &key, Some("card"))
+                .await
+                .unwrap()
+                .is_none(),
+            "a reassigned donor must not keep serving its former artist"
+        );
+        assert!(
+            cache.join(artist_collage_cache_key("music", &key)).exists(),
+            "cached images remain retained"
         );
     }
 
