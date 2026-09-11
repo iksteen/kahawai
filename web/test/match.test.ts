@@ -68,6 +68,9 @@ const open = async (over: Record<string, unknown> = {}) => {
         id: 'i1',
         title: source.file_title ?? source.title,
         year: source.file_year,
+        match_confidence: source.match_confidence,
+        matched_title: source.matched_title,
+        matched_year: source.year,
         paths: [],
         assignment: { revision: 4, library_item_ids: ['i1'] },
       },
@@ -100,6 +103,127 @@ beforeEach(() => {
 afterEach(() => vi.resetAllMocks())
 
 describe('the dialog', () => {
+  const selectYearlessCopy = async (initialCopy?: string) => {
+    vi.mocked(api.itemDetail).mockResolvedValue({
+      copies: [
+        {
+          id: 'dated',
+          title: 'Heat',
+          year: 1995,
+          paths: ['Heat (1995).mkv'],
+          assignment: { revision: 4, library_item_ids: ['i1'] },
+        },
+        {
+          id: 'yearless',
+          title: 'Heat',
+          year: null,
+          paths: ['Heat.mkv'],
+          assignment: { revision: 7, library_item_ids: ['i1'] },
+        },
+      ],
+    } as never)
+    const wrapper = mount(MatchDialog, {
+      props: { item: item({ collection_item_id: initialCopy }) },
+    })
+    await flushPromises()
+    if (initialCopy === undefined) {
+      expect(api.adminReviewSearch).toHaveBeenLastCalledWith({
+        kind: 'movie',
+        query: 'Heat',
+        year: 1995,
+        item: 'dated',
+      })
+      await wrapper.find('#match-copy').setValue('yearless')
+      await flushPromises()
+    }
+    return wrapper
+  }
+
+  test.each([undefined, 'yearless'])(
+    'a selected yearless copy searches without the representative year (initial copy %s)',
+    async (initialCopy) => {
+      const wrapper = await selectYearlessCopy(initialCopy)
+      try {
+        expect(api.adminReviewSearch).toHaveBeenLastCalledWith({
+          kind: 'movie',
+          query: 'Heat',
+          year: null,
+          item: 'yearless',
+        })
+        expect(wrapper.find('#match-title').text()).toBe('Match “Heat”')
+      } finally {
+        wrapper.unmount()
+      }
+    },
+  )
+
+  test.each([undefined, 'yearless'])(
+    'a selected yearless copy initializes a new item without a year (initial copy %s)',
+    async (initialCopy) => {
+      const wrapper = await selectYearlessCopy(initialCopy)
+      try {
+        const creation = wrapper.find('details')
+        creation.element.setAttribute('open', '')
+        expect
+          .soft((creation.find('input[type="number"]').element as HTMLInputElement).value)
+          .toBe('')
+        await creation.find('button').trigger('click')
+        await flushPromises()
+        expect(api.adminApplyMatch).toHaveBeenCalledWith(
+          'yearless',
+          expect.objectContaining({
+            action: 'new',
+            expected_revision: 7,
+            new_item: expect.objectContaining({ title: 'Heat', year: null }),
+          }),
+        )
+      } finally {
+        wrapper.unmount()
+      }
+    },
+  )
+
+  test.each([undefined, 'copy-b'])(
+    'identifies the host of identical collection paths (copy %s)',
+    async (selectedCopy) => {
+      vi.mocked(api.itemDetail).mockResolvedValue({
+        copies: ['a', 'b'].map((suffix) => ({
+          id: `copy-${suffix}`,
+          module_id: `host-${suffix}`,
+          collection_id: 'movies',
+          title: 'Heat',
+          year: 1995,
+          paths: ['Heat (1995).mkv'],
+          assignment: { revision: 4, library_item_ids: ['i1'] },
+        })),
+      } as never)
+      const wrapper = mount(MatchDialog, {
+        props: { item: item({ collection_item_id: selectedCopy }) },
+      })
+      await flushPromises()
+      if (selectedCopy === undefined) {
+        expect(wrapper.findAll('#match-copy option').map((option) => option.text())).toEqual([
+          'host-a · movies · Heat (1995).mkv',
+          'host-b · movies · Heat (1995).mkv',
+        ])
+        await wrapper.find('#match-copy').setValue('copy-b')
+        await flushPromises()
+      } else {
+        expect(wrapper.text()).toContain('host-b · movies')
+        expect(wrapper.text()).not.toContain('host-a')
+      }
+      await wrapper
+        .findAll('button')
+        .find((button) => button.text() === 'Reject current')!
+        .trigger('click')
+      expect(api.adminApplyMatch).toHaveBeenCalledWith(
+        'copy-b',
+        expect.objectContaining({ action: 'reject' }),
+      )
+      wrapper.unmount()
+    },
+  )
+
   test('searches the FILE’s title and year, not the match being judged', async () => {
     // The display title is the (possibly wrong) match. Searching for it finds
     // the wrong film again, and confirms it.
@@ -151,6 +275,114 @@ describe('the dialog', () => {
     await flushPromises()
     expect(wrapper.find('[role="alert"]').text()).toContain('no such candidate')
     expect(wrapper.emitted('close')).toBeUndefined()
+  })
+
+  test.each([false, true])(
+    'a pending save keeps the selected copy locked until it settles (refused=%s)',
+    async (refused) => {
+      const pending = held(undefined)
+      vi.mocked(api.adminApplyMatch).mockImplementation(async () => {
+        await pending.promise
+        if (refused) throw new ApiError(409, 'The assignment changed')
+        return { library_item_ids: ['saved-work'], revision: 5 } as never
+      })
+      vi.mocked(api.itemDetail).mockResolvedValue({
+        copies: ['copy-a', 'copy-b'].map((id) => ({
+          id,
+          title: id,
+          year: null,
+          paths: [],
+          assignment: { revision: 4, library_item_ids: ['i1'] },
+        })),
+      } as never)
+      const wrapper = mount(MatchDialog, { props: { item: item() } })
+      await flushPromises()
+      const copy = wrapper.find('#match-copy')
+      const reject = wrapper.findAll('button').find((button) => button.text() === 'Reject current')!
+      try {
+        await reject.trigger('click')
+        expect.soft((copy.element as HTMLSelectElement).disabled).toBe(true)
+        expect(api.adminApplyMatch).toHaveBeenCalledWith(
+          'copy-a',
+          expect.objectContaining({ action: 'reject', expected_revision: 4 }),
+        )
+        // Enter can submit even when the Search button is disabled. Finishing
+        // that search used to clear the shared busy flag while saving continued.
+        await wrapper.find('#match-query').setValue('another title')
+        await wrapper.find('form').trigger('submit')
+        await flushPromises()
+        expect.soft(api.adminReviewSearch).toHaveBeenCalledTimes(1)
+        expect.soft((copy.element as HTMLSelectElement).disabled).toBe(true)
+        expect.soft(reject.attributes('disabled')).toBeDefined()
+        expect(wrapper.emitted('applied')).toBeUndefined()
+        expect(wrapper.emitted('close')).toBeUndefined()
+        pending.settle()
+        await flushPromises()
+        if (refused) {
+          expect(wrapper.find('[role="alert"]').text()).toContain('The assignment changed')
+          expect((copy.element as HTMLSelectElement).disabled).toBe(false)
+          expect(reject.attributes('disabled')).toBeUndefined()
+          expect(wrapper.emitted('close')).toBeUndefined()
+          await copy.setValue('copy-b')
+          await flushPromises()
+          expect(api.adminReviewSearch).toHaveBeenLastCalledWith(
+            expect.objectContaining({ item: 'copy-b' }),
+          )
+        } else {
+          expect(wrapper.emitted('applied')).toEqual([[['saved-work']]])
+          expect(wrapper.emitted('close')).toHaveLength(1)
+        }
+        expect(api.adminApplyMatch).toHaveBeenCalledTimes(1)
+      } finally {
+        wrapper.unmount()
+      }
+    },
+  )
+
+  test('copy changes still supersede a pending search without disturbing a later save', async () => {
+    const oldSearch = held({ candidates: [candidate({ title: 'Old copy result' })] })
+    const save = held({ library_item_ids: ['saved-work'], revision: 5 })
+    vi.mocked(api.adminReviewSearch)
+      .mockReturnValueOnce(oldSearch.promise as never)
+      .mockResolvedValue({ candidates: [candidate({ title: 'New copy result' })] } as never)
+    vi.mocked(api.adminApplyMatch).mockReturnValue(save.promise as never)
+    vi.mocked(api.itemDetail).mockResolvedValue({
+      copies: ['copy-a', 'copy-b'].map((id) => ({
+        id,
+        title: id,
+        year: null,
+        paths: [],
+        assignment: { revision: 4, library_item_ids: ['i1'] },
+      })),
+    } as never)
+    const wrapper = mount(MatchDialog, { props: { item: item() } })
+    await flushPromises()
+    try {
+      const copy = wrapper.find('#match-copy')
+      expect((copy.element as HTMLSelectElement).disabled).toBe(false)
+      await copy.setValue('copy-b')
+      await flushPromises()
+      expect(wrapper.text()).toContain('New copy result')
+      await wrapper.find('ul button').trigger('click')
+      oldSearch.settle()
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('Old copy result')
+      expect((copy.element as HTMLSelectElement).value).toBe('copy-b')
+      expect((copy.element as HTMLSelectElement).disabled).toBe(true)
+      expect(wrapper.emitted('close')).toBeUndefined()
+      expect(api.adminApplyMatch).toHaveBeenCalledWith(
+        'copy-b',
+        expect.objectContaining({
+          candidate: expect.objectContaining({ title: 'New copy result' }),
+        }),
+      )
+      save.settle()
+      await flushPromises()
+      expect(wrapper.emitted('applied')).toEqual([[['saved-work']]])
+      expect(wrapper.emitted('close')).toHaveLength(1)
+    } finally {
+      wrapper.unmount()
+    }
   })
 
   test('a failed search says so instead of showing an empty grid', async () => {
@@ -235,6 +467,153 @@ describe('the dialog', () => {
 })
 
 describe('an uncertain match', () => {
+  test.each([undefined, 'selected-copy'])(
+    'confirmation names the selected copy’s record (initial copy %s)',
+    async (initialCopy) => {
+      vi.mocked(api.itemDetail).mockResolvedValue({
+        copies: [
+          {
+            id: 'representative-copy',
+            title: 'Episode 1',
+            year: 2000,
+            paths: ['show/S01E01.mkv'],
+            match_confidence: 'weak',
+            matched_title: 'Representative episode',
+            matched_year: 2000,
+            assignment: { revision: 3, library_item_ids: ['i1'] },
+          },
+          {
+            id: 'selected-copy',
+            title: 'Episode 1',
+            year: 2000,
+            paths: ['show/S01E01.mp4'],
+            match_confidence: 'weak',
+            matched_title: 'Selected episode',
+            matched_year: 2001,
+            assignment: { revision: 7, library_item_ids: ['i1'] },
+          },
+        ],
+      } as never)
+      const wrapper = mount(MatchDialog, {
+        props: {
+          item: item({
+            kind: 'episode',
+            collection_item_id: initialCopy,
+            matched_title: 'Representative episode',
+            year: 2000,
+          }),
+        },
+      })
+      await flushPromises()
+      if (initialCopy === undefined) {
+        expect(wrapper.text()).toMatch(/Representative episode\s+\(2000\)/)
+        await wrapper.find('#match-copy').setValue('selected-copy')
+        await flushPromises()
+      }
+      try {
+        expect(wrapper.text()).toMatch(/Selected episode\s+\(2001\)/)
+        expect(wrapper.text()).not.toContain('Representative episode')
+        await wrapper
+          .findAll('button')
+          .find((button) => button.text() === 'Confirm current')!
+          .trigger('click')
+        await flushPromises()
+        expect(api.adminApplyMatch).toHaveBeenCalledWith(
+          'selected-copy',
+          expect.objectContaining({ action: 'confirm', expected_revision: 7 }),
+        )
+      } finally {
+        wrapper.unmount()
+      }
+    },
+  )
+
+  test('missing selected match fields cannot borrow the representative title or year', async () => {
+    vi.mocked(api.itemDetail).mockResolvedValue({
+      copies: [
+        {
+          id: 'selected-copy',
+          title: 'Episode 1',
+          year: 2000,
+          paths: [],
+          match_confidence: 'weak',
+          matched_title: null,
+          matched_year: null,
+          assignment: { revision: 7, library_item_ids: ['i1'] },
+        },
+      ],
+    } as never)
+    const wrapper = mount(MatchDialog, {
+      props: { item: item({ collection_item_id: 'selected-copy' }) },
+    })
+    await flushPromises()
+    try {
+      expect(wrapper.text()).toContain('Match title unavailable')
+      expect(wrapper.text()).not.toContain('Heat 2 (fan edit)')
+      expect(wrapper.text()).not.toContain('2022')
+    } finally {
+      wrapper.unmount()
+    }
+  })
+
+  test.each(['auto', 'weak'])(
+    'the selected copy controls confirmation when the library item confidence is %s',
+    async (confidence) => {
+      vi.mocked(api.itemDetail).mockResolvedValue({
+        copies: [
+          {
+            id: 'certain',
+            title: 'Heat',
+            year: 1995,
+            paths: [],
+            match_confidence: 'auto',
+            assignment: { revision: 3, library_item_ids: ['i1'] },
+          },
+          {
+            id: 'uncertain',
+            title: 'Heat',
+            year: 1995,
+            paths: [],
+            match_confidence: 'weak',
+            assignment: { revision: 4, library_item_ids: ['i1'] },
+          },
+          {
+            id: 'unmatched',
+            title: 'Heat',
+            year: 1995,
+            paths: [],
+            match_confidence: null,
+            assignment: { revision: 5, library_item_ids: ['i1'] },
+          },
+        ],
+      } as never)
+      const wrapper = mount(MatchDialog, {
+        props: { item: item({ match_confidence: confidence }) },
+      })
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('Uncertain match')
+      await wrapper.find('#match-copy').setValue('unmatched')
+      await flushPromises()
+      expect(wrapper.text()).not.toContain('Uncertain match')
+      await wrapper.find('#match-copy').setValue('uncertain')
+      await flushPromises()
+      expect(wrapper.text()).toContain('Uncertain match')
+      await wrapper
+        .findAll('button')
+        .find((b) => b.text() === 'Confirm current')!
+        .trigger('click')
+      await flushPromises()
+      expect(api.adminApplyMatch).toHaveBeenCalledWith(
+        'uncertain',
+        expect.objectContaining({
+          action: 'confirm',
+          expected_revision: 4,
+        }),
+      )
+      wrapper.unmount()
+    },
+  )
+
   test('offers confirm and reject, naming what would be confirmed', async () => {
     const wrapper = await open({ match_confidence: 'weak' })
     expect(wrapper.text()).toContain('Uncertain match')
@@ -261,6 +640,34 @@ describe('an uncertain match', () => {
 })
 
 describe('the dialog’s keyboard', () => {
+  test.each([false, true])(
+    'Tab wraps around the visible controls with creation open=%s',
+    async (expanded) => {
+      vi.mocked(api.adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
+      const wrapper = await open({ kind: 'episode' })
+      const details = wrapper.find('details')
+      if (expanded) details.element.setAttribute('open', '')
+      const first = wrapper.find('[aria-label="Close"]').element as HTMLElement
+      const last = (expanded ? details.find('button') : details.find('summary'))
+        .element as HTMLElement
+      last.focus()
+      const forward = new KeyboardEvent('keydown', { key: 'Tab', bubbles: true, cancelable: true })
+      last.dispatchEvent(forward)
+      expect(forward.defaultPrevented).toBe(true)
+      expect(document.activeElement).toBe(first)
+      first.dispatchEvent(
+        new KeyboardEvent('keydown', {
+          key: 'Tab',
+          shiftKey: true,
+          bubbles: true,
+          cancelable: true,
+        }),
+      )
+      expect(document.activeElement).toBe(last)
+      wrapper.unmount()
+    },
+  )
+
   test('Escape closes it', async () => {
     const wrapper = await open()
     await wrapper.find('[role="dialog"]').trigger('keydown', { key: 'Escape' })
@@ -310,6 +717,131 @@ describe('the dialog’s keyboard', () => {
     wrapper.unmount()
     expect(document.activeElement).toBe(opener)
     opener.remove()
+  })
+})
+
+describe('local assignment pages', () => {
+  const episode = (id: string, parent: string, title = 'Pilot') => ({
+    id,
+    kind: 'episode',
+    title,
+    parent_title: parent,
+    season: 1,
+    episode: 1,
+    episode_end: null,
+  })
+
+  test('a first page of other kinds cannot hide eligible episodes on later pages', async () => {
+    vi.mocked(api.listItems).mockImplementation(
+      async (params) =>
+        ({
+          items:
+            params?.offset === 200
+              ? [episode('wanted', 'The target series')]
+              : Array.from({ length: 200 }, (_, i) => ({
+                  id: `movie-${i}`,
+                  kind: 'movie',
+                  title: 'Pilot',
+                })),
+          total: 201,
+          offset: params?.offset ?? 0,
+          limit: 200,
+        }) as never,
+    )
+    const wrapper = await open({ kind: 'episode' })
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Load more library items')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.listItems).toHaveBeenLastCalledWith({ q: 'Heat', limit: 200, offset: 200 })
+    expect(wrapper.text()).toContain('The target series · S01E01 · Pilot')
+    await wrapper.find('input[type="checkbox"]').setValue(true)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Assign selected episodes')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.adminApplyMatch).toHaveBeenCalledWith(
+      'i1',
+      expect.objectContaining({ action: 'assign', library_item_ids: ['wanted'] }),
+    )
+    wrapper.unmount()
+  })
+
+  test('episode choices retain playback order across pages and title searches', async () => {
+    vi.mocked(api.listItems).mockImplementation(
+      async (params) =>
+        ({
+          items:
+            params?.q === 'Finale'
+              ? [episode('finale', 'Chosen series', 'Finale')]
+              : params?.offset === 200
+                ? [episode('later', 'Chosen series')]
+                : Array.from({ length: 200 }, (_, i) => episode(`episode-${i}`, `Series ${i}`)),
+          total: params?.q === 'Finale' ? 1 : 201,
+          offset: params?.offset ?? 0,
+          limit: 200,
+        }) as never,
+    )
+    const wrapper = await open({ kind: 'episode' })
+    await wrapper.find('input[type="checkbox"]').setValue(true)
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Load more library items')!
+      .trigger('click')
+    await flushPromises()
+    await wrapper.findAll('input[type="checkbox"]').at(-1)!.setValue(true)
+    await wrapper.find('#match-query').setValue('Finale')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+    await wrapper.find('input[type="checkbox"]').setValue(true)
+    expect(wrapper.findAll('ol li').map((entry) => entry.text())).toEqual([
+      expect.stringContaining('Series 0 · S01E01 · Pilot'),
+      expect.stringContaining('Chosen series · S01E01 · Pilot'),
+      expect.stringContaining('Chosen series · S01E01 · Finale'),
+    ])
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Assign selected episodes')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.adminApplyMatch).toHaveBeenCalledWith(
+      'i1',
+      expect.objectContaining({ library_item_ids: ['episode-0', 'later', 'finale'] }),
+    )
+    wrapper.unmount()
+  })
+
+  test('a page arriving after a new query cannot append old candidates', async () => {
+    const old = held({ items: [episode('old', 'Old series')], offset: 1, limit: 200, total: 2 })
+    vi.mocked(api.listItems).mockImplementation(async (params) => {
+      if (params?.offset === 1) return old.promise as never
+      return {
+        items: [
+          episode(
+            params?.q === 'New' ? 'new' : 'first',
+            params?.q === 'New' ? 'New series' : 'First series',
+          ),
+        ],
+        offset: 0,
+        limit: 200,
+        total: params?.q === 'New' ? 1 : 2,
+      } as never
+    })
+    const wrapper = await open({ kind: 'episode' })
+    await wrapper
+      .findAll('button')
+      .find((button) => button.text() === 'Load more library items')!
+      .trigger('click')
+    await wrapper.find('#match-query').setValue('New')
+    await wrapper.find('form').trigger('submit')
+    await flushPromises()
+    old.settle()
+    await flushPromises()
+    expect(wrapper.text()).toContain('New series')
+    expect(wrapper.text()).not.toContain('Old series')
+    wrapper.unmount()
   })
 })
 

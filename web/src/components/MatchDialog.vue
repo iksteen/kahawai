@@ -18,6 +18,8 @@ import {
 import type { CollectionCopy } from '../api/generated/model/collectionCopy.ts'
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 import { sentence } from '../domain/refusal.ts'
+import { seLabel } from '../domain/label.ts'
+import { sourceLocation } from '../domain/source.ts'
 
 const props = defineProps<{
   item: {
@@ -38,19 +40,27 @@ const copies = ref<CollectionCopy[]>([])
 const selected = ref('')
 const copy = computed(() => copies.value.find((c) => c.id === selected.value))
 const local = ref<ItemRowI64[]>([])
-const picked = ref<string[]>([])
+const localMore = ref(false)
+const localBusy = ref(false)
+const picked = ref<ItemRowI64[]>([])
 const newYear = ref<string>('')
 
 const fileTitle = computed(() => copy.value?.title ?? props.item.file_title ?? props.item.title)
-const fileYear = computed(() => copy.value?.year ?? props.item.file_year ?? null)
-const weak = computed(() => props.item.match_confidence === 'weak')
+// A loaded copy's missing year is its identity, not a cue to borrow another copy's year.
+const fileYear = computed(() =>
+  copy.value ? (copy.value.year ?? null) : (props.item.file_year ?? null),
+)
+const weak = computed(() => copy.value?.match_confidence === 'weak')
 
 const query = ref(fileTitle.value)
 const results = ref<ProviderCandidate[] | null>(null)
 /// Posters the provider named and the browser could not fetch. Without this a
 /// dead URL renders the browser's broken-image glyph in a grid of posters.
 const broken = ref(new Set<string>())
-const busy = ref(false)
+// Searches can be superseded; a save keeps its selected copy until it settles.
+const searching = ref(false)
+const saving = ref(false)
+const busy = computed(() => searching.value || saving.value)
 const failure = ref('')
 
 /// Which search this is. Two of them in flight and the older one landing last
@@ -61,16 +71,69 @@ let asked = 0
 /// request. Provider search is rate-limited upstream; a held Enter key should
 /// not be what finds that out.
 let inflight = ''
+let localOffset = 0
+let localQuery = ''
+
+async function localPage(what: string, offset: number, mine: number) {
+  localBusy.value = true
+  try {
+    const entries = await listItems({ q: what, limit: 200, offset })
+    if (mine !== asked) return
+    const matches = entries.items.filter((item) => item.kind === props.item.kind)
+    const seen = new Set(local.value.map((item) => item.id))
+    local.value =
+      offset === 0 ? matches : [...local.value, ...matches.filter((item) => !seen.has(item.id))]
+    localQuery = what
+    // Advance through every returned kind: filtering must not skip pages or
+    // hide the next page when this page contains no assignable items.
+    localOffset = offset + entries.items.length
+    localMore.value =
+      entries.items.length > 0 &&
+      (entries.total == null ? entries.items.length === 200 : localOffset < entries.total)
+  } finally {
+    if (mine === asked) localBusy.value = false
+  }
+}
+
+async function moreLocal() {
+  if (busy.value || localBusy.value || !localMore.value) return
+  const mine = asked
+  failure.value = ''
+  try {
+    await localPage(localQuery, localOffset, mine)
+  } catch (cause) {
+    if (mine === asked) failure.value = sentence(cause)
+  }
+}
+
+function chooseEpisode(entry: ItemRowI64, checked: boolean) {
+  picked.value = checked
+    ? [...picked.value, entry]
+    : picked.value.filter((item) => item.id !== entry.id)
+}
+
+const localLabel = (entry: ItemRowI64) =>
+  [
+    entry.parent_title,
+    entry.kind === 'episode' ? seLabel(entry.season, entry.episode, entry.episode_end) : '',
+    entry.title,
+    entry.year,
+    entry.artist,
+  ]
+    .filter(Boolean)
+    .join(' · ')
 
 async function search(what: string) {
   const mine = ++asked
   inflight = what
-  busy.value = true
+  searching.value = true
   failure.value = ''
+  local.value = []
+  localMore.value = false
+  localOffset = 0
   try {
-    const entries = await listItems({ q: what, limit: 200 })
+    await localPage(what, 0, mine)
     if (mine !== asked) return
-    local.value = entries.items.filter((item) => item.kind === props.item.kind)
     if (!['movie', 'series'].includes(props.item.kind)) {
       results.value = []
       return
@@ -87,7 +150,7 @@ async function search(what: string) {
     if (mine !== asked) return
     failure.value = sentence(cause)
   } finally {
-    if (mine === asked) busy.value = false
+    if (mine === asked) searching.value = false
   }
 }
 
@@ -95,7 +158,7 @@ async function search(what: string) {
 /// A DIFFERENT query supersedes the one in flight — the sequence guard above
 /// makes that safe — and the same one again is nothing to ask twice.
 function again() {
-  if (busy.value && inflight === query.value) return
+  if (saving.value || (searching.value && inflight === query.value)) return
   void search(query.value)
 }
 
@@ -104,11 +167,12 @@ async function apply(
   candidate?: ProviderCandidate,
   libraryItemIds?: string[],
 ) {
-  if (!copy.value) return
-  busy.value = true
+  const target = copy.value
+  if (!target || busy.value) return
+  saving.value = true
   try {
-    const changed = await adminApplyMatch(copy.value.id, {
-      expected_revision: copy.value.assignment.revision,
+    const changed = await adminApplyMatch(target.id, {
+      expected_revision: target.assignment.revision,
       library_item_ids: libraryItemIds ?? null,
       new_item:
         action === 'new'
@@ -116,10 +180,10 @@ async function apply(
               kind: props.item.kind,
               title: query.value,
               year: newYear.value ? Number(newYear.value) : null,
-              artist: copy.value.artist ?? null,
-              parent_id: copy.value.parent_library_item_id ?? null,
-              season: copy.value.season ?? null,
-              episode: copy.value.episode ?? null,
+              artist: target.artist ?? null,
+              parent_id: target.parent_library_item_id ?? null,
+              season: target.season ?? null,
+              episode: target.episode ?? null,
               edition: null,
             }
           : null,
@@ -131,7 +195,8 @@ async function apply(
     emit('close')
   } catch (cause) {
     failure.value = sentence(cause)
-    busy.value = false
+  } finally {
+    saving.value = false
   }
 }
 
@@ -149,8 +214,26 @@ function keys(event: KeyboardEvent) {
   }
   if (event.key !== 'Tab' || !box.value) return
   const stops = [
-    ...box.value.querySelectorAll<HTMLElement>('button, input, select, [tabindex="0"]'),
-  ].filter((el) => !el.hasAttribute('disabled'))
+    ...box.value.querySelectorAll<HTMLElement>(
+      'button, input, select, summary, a[href], [tabindex]',
+    ),
+  ].filter((el) => {
+    if (
+      (el.hasAttribute('tabindex') && el.tabIndex < 0) ||
+      el.hasAttribute('disabled') ||
+      el.closest('[hidden], [inert]')
+    )
+      return false
+    for (let ancestor = el.parentElement; ancestor; ancestor = ancestor.parentElement) {
+      if (
+        ancestor.tagName === 'DETAILS' &&
+        !ancestor.hasAttribute('open') &&
+        !ancestor.querySelector(':scope > summary')?.contains(el)
+      )
+        return false
+    }
+    return true
+  })
   const edge = event.shiftKey ? stops[0] : stops.at(-1)
   if (document.activeElement !== edge) return
   event.preventDefault()
@@ -185,6 +268,7 @@ onMounted(async () => {
   }
 })
 onBeforeUnmount(() => {
+  asked++
   window.removeEventListener('keydown', keys)
   restore?.focus()
 })
@@ -218,15 +302,16 @@ const format = (candidate: ProviderCandidate) =>
         <select
           id="match-copy"
           v-model="selected"
+          :disabled="saving"
           class="w-full rounded border border-line bg-bg px-2 py-1"
         >
           <option v-for="entry in copies" :key="entry.id" :value="entry.id">
-            {{ entry.collection_id }} · {{ entry.paths.join(' + ') || entry.title }}
+            {{ sourceLocation(entry) }} · {{ entry.paths.join(' + ') || entry.title }}
           </option>
         </select>
       </template>
       <div v-else-if="copy" class="mt-3 font-mono text-[12px] text-dim">
-        <div>{{ copy.collection_id }}</div>
+        <div>{{ sourceLocation(copy) }}</div>
         <div v-for="path in copy.paths" :key="path" class="break-all">{{ path }}</div>
       </div>
       <p v-if="copy?.assignment.conflict" class="mt-2 text-warn">{{ copy.assignment.conflict }}</p>
@@ -246,8 +331,9 @@ const format = (candidate: ProviderCandidate) =>
       >
         <span>
           Uncertain match:
-          <b>{{ props.item.matched_title ?? props.item.title }}</b>
-          {{ props.item.year ? ` (${props.item.year})` : '' }} — confirm it or pick a better one.
+          <b>{{ copy?.matched_title || 'Match title unavailable' }}</b>
+          {{ copy?.matched_year ? ` (${copy.matched_year})` : '' }} — confirm it or pick a better
+          one.
         </span>
         <span class="ml-auto flex gap-2">
           <Btn small :disabled="busy" @click="apply('confirm')">Confirm current</Btn>
@@ -268,7 +354,7 @@ const format = (candidate: ProviderCandidate) =>
       </form>
 
       <p class="mt-2 text-warn" role="alert">{{ failure }}</p>
-      <section v-if="local.length" class="mt-3">
+      <section v-if="local.length || localMore || picked.length" class="mt-3">
         <h3>Existing library items</h3>
         <p v-if="props.item.kind === 'episode'" class="text-dim">
           Select the episodes in playback order.
@@ -276,23 +362,60 @@ const format = (candidate: ProviderCandidate) =>
         <ul class="mt-2 flex flex-col gap-2">
           <li v-for="entry in local" :key="entry.id">
             <label v-if="props.item.kind === 'episode'"
-              ><input v-model="picked" type="checkbox" :value="entry.id" />
-              {{ entry.parent_title }} · {{ entry.title }} · {{ entry.season }}/{{
-                entry.episode
-              }}</label
+              ><input
+                type="checkbox"
+                :checked="picked.some((item) => item.id === entry.id)"
+                @change="chooseEpisode(entry, ($event.target as HTMLInputElement).checked)"
+              />
+              {{ localLabel(entry) }}</label
             >
-            <Btn v-else ghost small :disabled="busy" @click="apply('assign', undefined, [entry.id])"
-              >{{ entry.title }}{{ entry.year ? ` (${entry.year})` : ''
-              }}{{ entry.artist ? ` · ${entry.artist}` : '' }}</Btn
+            <Btn
+              v-else
+              ghost
+              small
+              :disabled="busy"
+              @click="apply('assign', undefined, [entry.id])"
+              >{{ localLabel(entry) }}</Btn
             >
           </li>
         </ul>
+        <Btn
+          v-if="localMore"
+          ghost
+          small
+          class="mt-2"
+          :disabled="busy || localBusy"
+          @click="moreLocal"
+        >
+          {{ localBusy ? 'Loading library items…' : 'Load more library items' }}
+        </Btn>
+        <template v-if="picked.length">
+          <h4 class="mt-3">Selected episodes in playback order</h4>
+          <ol class="list-decimal pl-6">
+            <li v-for="entry in picked" :key="entry.id">
+              {{ localLabel(entry) }}
+              <Btn
+                ghost
+                small
+                :aria-label="`Remove selected episode: ${localLabel(entry)}`"
+                @click="chooseEpisode(entry, false)"
+                >Remove</Btn
+              >
+            </li>
+          </ol>
+        </template>
         <Btn
           v-if="props.item.kind === 'episode'"
           class="mt-2"
           small
           :disabled="busy || !picked.length"
-          @click="apply('assign', undefined, picked)"
+          @click="
+            apply(
+              'assign',
+              undefined,
+              picked.map((item) => item.id),
+            )
+          "
           >Assign selected episodes</Btn
         >
       </section>
