@@ -2,6 +2,24 @@
 //! This reads stored paths, never media. Only matching pending at startup is
 //! considered; migration 78 queues existing episodes once. Explicit assignments
 //! and files whose parsed start disagrees with the stored start are left intact.
+//!
+//! Migration 81 repairs episode identities that incorrectly adopted a provider's
+//! season projection. When every copy is automatic, has one episode, and agrees
+//! on the native parent and number, its projected key is unidentified once.
+//! Normal matching then keeps that ID or promotes its history and descriptions
+//! to an existing native episode. A manual choice or
+//! conflicting copy prevents this promotion; established history is not guessed
+//! onto one of several possible episodes. Provider season/episode fields remain
+//! available for presentation and do not define the native episode identity.
+//!
+//! Migration 82 preserves previously public collection IDs: an already matched
+//! copy gets a permanent alias to its current first library item; an unmatched
+//! legacy copy starts with its own unidentified ID, which normal matching keeps
+//! or promotes. Existing work IDs and aliases are never retargeted. This costs
+//! one local row per missing public ID, with no media or provider work. It also
+//! queues children of metadata-ineligible parents and their destination copies,
+//! so inherited answers stop describing a different show and valid descriptions
+//! can repair previously overwritten episode titles.
 use super::*;
 use kahawai_core::names;
 
@@ -62,9 +80,14 @@ pub(super) async fn repair_episode_copies(c: &mut SqliteConnection) -> Result<()
                 .bind(&new).bind(&copy).execute(&mut *c).await?;
             let tracks = copy_subtitles(c, &copy, &new).await?;
             for source in sources {
+                let scope = format!("source:{new}:{source}");
+                // These rows name the copy that owns this source before the
+                // split. Bare source IDs cannot prove that ownership.
+                sqlx::query("INSERT INTO user_prefs(user_id,scope,key,value) SELECT user_id,?,key,value FROM user_prefs WHERE scope=? ON CONFLICT DO NOTHING")
+                    .bind(&scope).bind(format!("source:{copy}:{source}")).execute(&mut *c).await?;
                 for (old_track, new_track) in &tracks {
                     sqlx::query("UPDATE user_prefs SET value=? WHERE scope=? AND key='subs.track' AND value=?")
-                        .bind(new_track.to_string()).bind(format!("source:{source}")).bind(old_track.to_string()).execute(&mut *c).await?;
+                        .bind(new_track.to_string()).bind(&scope).bind(old_track.to_string()).execute(&mut *c).await?;
                 }
                 sqlx::query("UPDATE playable_sources SET item_id=? WHERE id=?")
                     .bind(&new)

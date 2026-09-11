@@ -1,7 +1,34 @@
 //! Preserve library history when an unidentified copy first joins a known item.
+//! Refusals follow permanent aliases when read, keeping their recorded IDs.
+//! Promotion queues the copies refusing any predecessor alias. The partial
+//! alias-target index stores only aliases; the refusal-target index stores only
+//! human refusals, so this invalidation uses their keys rather than rebuilding
+//! a lookup over the whole library for each newly identified item. Migration 84
+//! queues existing alias refusals once, including derived music conflicts.
 use super::*;
 
+/// Retained items keep their identity and history when coverage is reordered.
+/// Only removed unidentified items can be promoted into newly added targets.
+pub(super) async fn promote_replaced_state(
+    c: &mut SqliteConnection,
+    old: &[String],
+    new: &[String],
+) -> Result<()> {
+    let old_set: std::collections::HashSet<_> = old.iter().collect();
+    let new_set: std::collections::HashSet<_> = new.iter().collect();
+    for (old, new) in old
+        .iter()
+        .filter(|id| !new_set.contains(id))
+        .zip(new.iter().filter(|id| !old_set.contains(id)))
+    {
+        promote_state(c, old, new).await?;
+    }
+    Ok(())
+}
+
 pub(super) async fn promote_state(c: &mut SqliteConnection, old: &str, new: &str) -> Result<()> {
+    let resolved = canonical_id(c, new).await?;
+    let new = resolved.as_str();
     if old == new {
         return Ok(());
     }
@@ -24,6 +51,13 @@ pub(super) async fn promote_state(c: &mut SqliteConnection, old: &str, new: &str
         .bind(new).bind(old).execute(&mut *c).await?;
     // First identification promotes the parent itself. Typed child references
     // follow it even when a child copy has an explicit assignment.
+    sqlx::query(
+        "UPDATE provider_metadata SET parent_library_item_id=? WHERE parent_library_item_id=?",
+    )
+    .bind(new)
+    .bind(old)
+    .execute(&mut *c)
+    .await?;
     sqlx::query("UPDATE episode_details SET series_id=? WHERE series_id=?")
         .bind(new)
         .bind(old)
@@ -44,10 +78,9 @@ pub(super) async fn promote_state(c: &mut SqliteConnection, old: &str, new: &str
                 .bind(position)
                 .execute(&mut *c)
                 .await?;
-            sqlx::query("DELETE FROM album_tracks WHERE id=?")
-                .bind(position)
-                .execute(&mut *c)
-                .await?;
+            // Queues may already carry this numeric position. Keep its original
+            // album/song/coordinates so playback can resolve the permanent
+            // library aliases while current copies use the surviving position.
         } else {
             sqlx::query("UPDATE album_tracks SET album_id=? WHERE id=?")
                 .bind(new)
@@ -89,11 +122,28 @@ pub(super) async fn promote_state(c: &mut SqliteConnection, old: &str, new: &str
         .bind(old)
         .execute(&mut *c)
         .await?;
+    // This identification also changes the meaning of refusals recorded under
+    // the old ID or an earlier alias. Revisit those copies now, including copies
+    // already linked to the target, using reverse alias/refusal key lookups.
+    sqlx::query(
+        "WITH RECURSIVE aliases(id) AS (
+        SELECT ? UNION SELECT previous.id FROM library_items previous
+        JOIN aliases target ON previous.merged_into=target.id
+      ) INSERT INTO library_pending(collection_item_id)
+      SELECT DISTINCT r.collection_item_id FROM rejected_library_matches r
+      WHERE r.library_item_id IN(SELECT id FROM aliases)
+      ON CONFLICT DO NOTHING",
+    )
+    .bind(old)
+    .execute(&mut *c)
+    .await?;
     Ok(())
 }
 
 /// Keep an existing library preference on conflicts. Original source preferences
 /// remain stored, so ambiguous legacy choices are retained rather than guessed.
+/// Exact track choices name both their collection copy and physical source;
+/// a reused numeric source ID cannot carry another copy's previous selection.
 pub(super) async fn import_preferences(
     c: &mut SqliteConnection,
     copy: &str,
@@ -103,7 +153,7 @@ pub(super) async fn import_preferences(
         sqlx::query("INSERT INTO user_prefs(user_id,scope,key,value) SELECT user_id,?1,key,value FROM user_prefs WHERE scope=?2 AND key NOT IN('audio.track','subs.track') AND NOT(key='audio' AND value LIKE '#%') ON CONFLICT DO NOTHING")
             .bind(item).bind(copy).execute(&mut *c).await?;
     }
-    sqlx::query("INSERT INTO user_prefs(user_id,scope,key,value) SELECT user_id,'source:' || ps.id,CASE WHEN key='audio' THEN 'audio.track' ELSE key END,value FROM user_prefs JOIN playable_sources ps ON ps.item_id=scope WHERE scope=? AND (key IN('audio.track','subs.track') OR (key='audio' AND value LIKE '#%')) AND (SELECT COUNT(*) FROM playable_sources WHERE item_id=scope)=1 ON CONFLICT DO NOTHING")
+    sqlx::query("INSERT INTO user_prefs(user_id,scope,key,value) SELECT user_id,'source:' || ps.item_id || ':' || ps.id,CASE WHEN key='audio' THEN 'audio.track' ELSE key END,value FROM user_prefs JOIN playable_sources ps ON ps.item_id=scope WHERE scope=? AND (key IN('audio.track','subs.track') OR (key='audio' AND value LIKE '#%')) AND (SELECT COUNT(*) FROM playable_sources WHERE item_id=scope)=1 ON CONFLICT DO NOTHING")
         .bind(copy).execute(&mut *c).await?;
     Ok(())
 }
@@ -140,7 +190,17 @@ pub(super) async fn import_state(c: &mut SqliteConnection) -> Result<()> {
 /// Resolve only permanent unidentified promotions. Established reassignment never
 /// creates an alias, so a session cannot move history to a newly selected work.
 pub async fn canonical_id(c: &mut SqliteConnection, id: &str) -> Result<String> {
-    Ok(sqlx::query_scalar("WITH RECURSIVE chain(id,merged_into) AS (SELECT id,merged_into FROM library_items WHERE id=? UNION ALL SELECT c.id,c.merged_into FROM library_items c JOIN chain a ON c.id=a.merged_into) SELECT id FROM chain WHERE merged_into IS NULL").bind(id).fetch_optional(c).await?.unwrap_or_else(|| id.to_owned()))
+    let canonical = sqlx::query_scalar("WITH RECURSIVE chain(id,merged_into) AS (SELECT id,merged_into FROM library_items WHERE id=? UNION SELECT c.id,c.merged_into FROM library_items c JOIN chain a ON c.id=a.merged_into) SELECT id FROM chain WHERE merged_into IS NULL")
+        .bind(id).fetch_optional(&mut *c).await?;
+    if let Some(canonical) = canonical {
+        return Ok(canonical);
+    }
+    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM library_items WHERE id=?)")
+        .bind(id)
+        .fetch_one(c)
+        .await?;
+    anyhow::ensure!(!exists, "cyclic library item alias for {id}");
+    Ok(id.to_owned())
 }
 
 pub async fn canonical_ids(c: &mut SqliteConnection, ids: &[String]) -> Result<Vec<String>> {
@@ -152,6 +212,41 @@ pub async fn canonical_ids(c: &mut SqliteConnection, ids: &[String]) -> Result<V
         }
     }
     Ok(out)
+}
+
+/// Refusals keep their recorded ID, but compare against the permanently
+/// identified work. Return both IDs so an explicit correction can remove only
+/// equivalent refusals without rewriting or discarding unrelated decisions.
+pub(super) async fn resolved_rejections(
+    c: &mut SqliteConnection,
+    copy: &str,
+) -> Result<Vec<(String, String)>> {
+    let stored: Vec<String> = sqlx::query_scalar(
+        "SELECT library_item_id FROM rejected_library_matches WHERE collection_item_id=?",
+    )
+    .bind(copy)
+    .fetch_all(&mut *c)
+    .await?;
+    let mut resolved = Vec::with_capacity(stored.len());
+    for id in stored {
+        let canonical = canonical_id(c, &id).await?;
+        resolved.push((id, canonical));
+    }
+    Ok(resolved)
+}
+
+pub(super) async fn clear_equivalent_rejections(
+    c: &mut SqliteConnection,
+    copy: &str,
+    ids: &[String],
+) -> Result<()> {
+    for (stored, canonical) in resolved_rejections(c, copy).await? {
+        if ids.contains(&canonical) {
+            sqlx::query("DELETE FROM rejected_library_matches WHERE collection_item_id=? AND library_item_id=?")
+                .bind(copy).bind(stored).execute(&mut *c).await?;
+        }
+    }
+    Ok(())
 }
 
 /// Existing choices on the identified item win; fill only unset fields.

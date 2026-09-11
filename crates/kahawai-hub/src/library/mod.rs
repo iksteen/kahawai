@@ -17,9 +17,14 @@
 //! Descriptive provider answers stay on the copy; `metadata_eligible` prevents an
 //! answer for the previous item from describing a manually selected different one.
 //!
-//! `episode_details` contains series/numbering/season/episode. `album_tracks` is
+//! `episode_details` contains series/native numbering/season/episode. Provider
+//! season projections are read for presentation and never rekey an episode.
+//! `album_tracks` is
 //! the stable album position of a recording. `collection_items.album_track_id`
 //! selects the position occupied by this copy; only current copies grant access.
+//! Creating a song also stores its supplied album position here, independently
+//! of the assigning copy's detected position. A supplied track defaults to disc 1;
+//! a song created without a track remains available for explicit assignment.
 //! A recording can occur on several albums. Both child kinds remain
 //! ordinary, globally searchable library items. Anime is a classification.
 //!
@@ -37,8 +42,9 @@ mod history;
 mod matching;
 mod playback;
 mod upgrade;
-use history::promote_state;
 pub use history::{canonical_id, canonical_ids};
+use history::{clear_equivalent_rejections, promote_replaced_state, resolved_rejections};
+pub(crate) use matching::copy_regroup_conflict;
 pub use matching::{create, initialize, reconcile};
 pub use playback::{
     PlaybackSnapshot, SourceBoundary, playback_snapshot, resume_fingerprint, same_resume_version,
@@ -124,22 +130,12 @@ pub async fn assign(c: &mut SqliteConnection, copy: &str, ids: &[String]) -> Res
     let old: Vec<String> = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=? ORDER BY ordinal")
         .bind(copy).fetch_all(&mut *c).await?;
     replace_links(c, copy, ids).await?;
-    for (old, new) in old.iter().zip(ids) {
-        promote_state(c, old, new).await?;
-    }
+    promote_replaced_state(c, &old, ids).await?;
     sqlx::query("UPDATE collection_items SET assignment_manual=1 WHERE id=?")
         .bind(copy)
         .execute(&mut *c)
         .await?;
-    for id in ids {
-        sqlx::query(
-            "DELETE FROM rejected_library_matches WHERE collection_item_id=? AND library_item_id=?",
-        )
-        .bind(copy)
-        .bind(id)
-        .execute(&mut *c)
-        .await?;
-    }
+    clear_equivalent_rejections(c, copy, ids).await?;
     Ok(())
 }
 

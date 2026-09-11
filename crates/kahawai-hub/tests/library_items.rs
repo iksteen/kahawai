@@ -45,6 +45,111 @@ async fn assign(db: &Database, id: &str, year: &str) {
 }
 
 #[tokio::test]
+async fn anime_bridge_describes_native_episode_without_moving_identity_or_history() {
+    let db = fixture().await;
+    sqlx::query("UPDATE collections SET media_type='anime' WHERE collection_id='one'")
+        .execute(&db)
+        .await
+        .unwrap();
+    copy(&db, "show", "show", "Anime", Some(2000), None, None).await;
+    providers::store_answer(
+        &db,
+        "show",
+        "anilist",
+        "1",
+        "auto",
+        Fields {
+            title: Some("Anime".into()),
+            premiered: Some("2000-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    copy(
+        &db,
+        "episode",
+        "episode",
+        "Episode 27",
+        None,
+        Some("show"),
+        Some(27),
+    )
+    .await;
+    sqlx::query("UPDATE collection_items SET season=NULL WHERE id='episode'")
+        .execute(&db)
+        .await
+        .unwrap();
+    let original = target(&db, "episode").await;
+    sqlx::query("INSERT INTO user_item_state(user_id,item_id,position_ms,duration_ms,played,play_count) VALUES('user',?,60000,120000,1,3)")
+        .bind(&original).execute(&db).await.unwrap();
+    providers::store_answer(
+        &db,
+        "episode",
+        "tvdb",
+        "201",
+        "auto",
+        Fields {
+            title: Some("The bridge title".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    sqlx::query("UPDATE provider_metadata SET proj_season=2,proj_episode=1 WHERE item_id='episode' AND provider='tvdb'").execute(&db).await.unwrap();
+    assert_eq!(target(&db, "episode").await, original);
+    let row: (String,Option<i64>,Option<i64>) = sqlx::query_as("SELECT li.title,ed.season,ed.episode FROM library_items li JOIN episode_details ed ON ed.item_id=li.id WHERE li.id=?")
+        .bind(&original).fetch_one(&db).await.unwrap();
+    assert_eq!(row, ("The bridge title".into(), None, Some(27)));
+    let state: (i64, i64, i64) =
+        sqlx::query_as("SELECT position_ms,played,play_count FROM user_item_state WHERE item_id=?")
+            .bind(&original)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+    assert_eq!(state, (60000, 1, 3));
+    providers::assign_manual(
+        &db,
+        "show",
+        "tvdb",
+        "10",
+        Fields {
+            title: Some("Anime".into()),
+            premiered: Some("2000-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        target(&db, "episode").await,
+        original,
+        "choosing the bridge provider for the parent must not move episode history"
+    );
+    providers::store_answer(
+        &db,
+        "episode",
+        "tmdb",
+        "999",
+        "weak",
+        Fields {
+            title: Some("Unchosen weak title".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT title FROM library_items WHERE id=?")
+            .bind(&original)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        "The bridge title"
+    );
+}
+
+#[tokio::test]
 async fn collection_reannouncement_keeps_assignments_until_media_type_changes() {
     use kahawai_hub::registry::Registry;
     let db = fixture().await;
@@ -277,6 +382,157 @@ async fn recording_evidence_joins_albums_but_equal_song_names_do_not() {
     );
     copy(&db, "third", "track", "Song", None, Some("Second"), Some(2)).await;
     assert_ne!(target(&db, "one").await, target(&db, "third").await);
+}
+
+async fn song_waiting_for_recording_id() -> Database {
+    let db = fixture().await;
+    for album in ["First", "Second"] {
+        copy(&db, album, "album", album, Some(2000), None, None).await;
+        sqlx::query("UPDATE collection_items SET artist='Artist' WHERE id=?")
+            .bind(album)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    let mut tx = db.begin().await.unwrap();
+    for (song, album, tags) in [
+        (
+            "one",
+            "First",
+            r#"{"tags":{"MUSICBRAINZ_TRACKID":"recording-1"}}"#,
+        ),
+        ("two", "Second", "{}"),
+    ] {
+        sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id) VALUES(?,'track','Song','song',?,1,1,'host','one')")
+            .bind(song).bind(album).execute(&mut *tx).await.unwrap();
+        let file: i64 = sqlx::query_scalar("INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json) VALUES('host','one',?,1,1,1,1,1,?) RETURNING id")
+            .bind(song).bind(tags).fetch_one(&mut *tx).await.unwrap();
+        let source: i64 = sqlx::query_scalar("INSERT INTO playable_sources(module_id,collection_id,item_id,family_key,expected_parts) VALUES('host','one',?,?,1) RETURNING id")
+            .bind(song).bind(song).fetch_one(&mut *tx).await.unwrap();
+        sqlx::query("INSERT INTO playable_source_parts VALUES(?,'host','one',1,?)")
+            .bind(source)
+            .bind(file)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    db
+}
+
+#[tokio::test]
+async fn learning_recording_id_joins_the_known_song_without_moving_established_history() {
+    let db = song_waiting_for_recording_id().await;
+    assert_eq!(target(&db, "one").await, "one");
+    assert_eq!(target(&db, "two").await, "two");
+    sqlx::raw_sql("INSERT INTO user_item_state(user_id,item_id,position_ms,played,play_count,updated_at)
+        VALUES('user','one',10000,1,3,100),('user','two',20000,0,1,200);
+        INSERT INTO library_overrides(library_item_id,fields) VALUES('two','{\"overview\":\"Description of the previously identified work\"}');")
+        .execute(&db).await.unwrap();
+    // The newly learned ID outranks the old untagged album position, including
+    // subsequent reconciliations after that historical position still exists.
+    for _ in 0..2 {
+        sqlx::query("UPDATE files SET streams_json='{\"tags\":{\"MUSICBRAINZ_TRACKID\":\"recording-1\"}}' WHERE path_rel='two'")
+            .execute(&db).await.unwrap();
+        assert_eq!(target(&db, "two").await, "one");
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT match_mode FROM collection_items WHERE id='two'"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            "automatic"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT song_id FROM album_copies WHERE collection_item_id='two'"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            "one"
+        );
+    }
+    assert_eq!(
+        sqlx::query_as::<_, (String, i64, i64, i64)>(
+            "SELECT item_id,position_ms,played,play_count FROM user_item_state ORDER BY item_id"
+        )
+        .fetch_all(&db)
+        .await
+        .unwrap(),
+        [("one".into(), 10000, 1, 3), ("two".into(), 20000, 0, 1)]
+    );
+    assert_eq!(
+        sqlx::query_as::<_, (bool, Option<String>, Option<String>)>(
+            "SELECT unidentified,merged_into,recording_id FROM library_items WHERE id='two'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        (false, None, None)
+    );
+    assert!(
+        sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM library_overrides WHERE library_item_id='two')"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap()
+    );
+    assert!(
+        !sqlx::query_scalar::<_, bool>(
+            "SELECT EXISTS(SELECT 1 FROM library_overrides WHERE library_item_id='one')"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn recording_match_does_not_bypass_conflicts_or_rejections() {
+    for scenario in ["sources", "candidates", "rejected"] {
+        let db = song_waiting_for_recording_id().await;
+        let mut tx = db.begin().await.unwrap();
+        match scenario {
+            "sources" => {
+                let file: i64 = sqlx::query_scalar("INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json) VALUES('host','one','alternate',2,1,2,2,2,'{\"tags\":{\"MUSICBRAINZ_TRACKID\":\"recording-2\"}}') RETURNING id")
+                    .fetch_one(&mut *tx).await.unwrap();
+                let source: i64 = sqlx::query_scalar("INSERT INTO playable_sources(module_id,collection_id,item_id,family_key,expected_parts) VALUES('host','one','two','alternate',1) RETURNING id")
+                    .fetch_one(&mut *tx).await.unwrap();
+                sqlx::query("INSERT INTO playable_source_parts VALUES(?,'host','one',1,?)")
+                    .bind(source)
+                    .bind(file)
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+            "candidates" => {
+                sqlx::query("INSERT INTO library_items(id,kind,title,norm_title,sort_title,recording_id,unidentified,added_id) VALUES('another','song','Another','another','another','recording-1',0,'another')")
+                    .execute(&mut *tx).await.unwrap();
+            }
+            _ => {
+                sqlx::query("INSERT INTO rejected_library_matches VALUES('two','one')")
+                    .execute(&mut *tx)
+                    .await
+                    .unwrap();
+            }
+        }
+        sqlx::query("UPDATE files SET streams_json='{\"tags\":{\"MUSICBRAINZ_TRACKID\":\"recording-1\"}}' WHERE path_rel='two'")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        let selected = target(&db, "two").await;
+        assert_ne!(selected, "one", "{scenario}");
+        assert!(
+            sqlx::query_scalar::<_, bool>("SELECT unidentified FROM library_items WHERE id=?")
+                .bind(&selected)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            "{scenario}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -836,4 +1092,132 @@ async fn rescanning_corrected_song_tags_refreshes_the_library_title() {
         .await
         .unwrap();
     assert_eq!(title, "Correct title");
+}
+
+#[tokio::test]
+async fn overlapping_episode_assignments_preserve_retained_items_and_history() {
+    for change in ["reorder", "replace", "shrink"] {
+        let db = fixture().await;
+        copy(&db, "parent", "show", "Unknown series", None, None, None).await;
+        copy(
+            &db,
+            "span",
+            "episode",
+            "Episode 1",
+            None,
+            Some("parent"),
+            Some(1),
+        )
+        .await;
+        sqlx::query("UPDATE collection_items SET episode_end=2 WHERE id='span'")
+            .execute(&db)
+            .await
+            .unwrap();
+        copy(
+            &db,
+            "third",
+            "episode",
+            "Episode 3",
+            None,
+            Some("parent"),
+            Some(3),
+        )
+        .await;
+        let old: Vec<String> = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='span' ORDER BY ordinal")
+            .fetch_all(&db).await.unwrap();
+        assert_eq!(old.len(), 2);
+        let third = target(&db, "third").await;
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM library_items WHERE kind='episode' AND unidentified=1"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            3
+        );
+        for (n, id) in old.iter().enumerate() {
+            sqlx::query("INSERT INTO user_item_state(user_id,item_id,position_ms,play_count) VALUES('user',?,?,?)")
+                .bind(id).bind((n as i64 + 1) * 111).bind(n as i64 + 1).execute(&db).await.unwrap();
+        }
+        let next = match change {
+            "reorder" => vec![old[1].clone(), old[0].clone()],
+            "replace" => vec![old[1].clone(), third.clone()],
+            _ => vec![old[1].clone()],
+        };
+        let mut tx = db.begin().await.unwrap();
+        kahawai_hub::library::assign(&mut tx, "span", &next)
+            .await
+            .unwrap();
+        // Inspect before commit: the old implementation creates the cycle here,
+        // and only then hangs in the before-commit reconciliation hook.
+        let actual: Vec<String> = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='span' ORDER BY ordinal")
+            .fetch_all(&mut *tx).await.unwrap();
+        assert_eq!(actual, next, "{change}: no retained target can collapse");
+        for id in &next {
+            let alias: Option<String> =
+                sqlx::query_scalar("SELECT merged_into FROM library_items WHERE id=?")
+                    .bind(id)
+                    .fetch_one(&mut *tx)
+                    .await
+                    .unwrap();
+            assert!(
+                alias.is_none(),
+                "{change}: retained/new target {id} became an alias"
+            );
+        }
+        tx.commit().await.unwrap();
+        let state: (i64, i64) =
+            sqlx::query_as("SELECT position_ms,play_count FROM user_item_state WHERE item_id=?")
+                .bind(&old[1])
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            state,
+            (222, 2),
+            "{change}: retained episode keeps its own history"
+        );
+        let first_target = if change == "replace" { &third } else { &old[0] };
+        let state: (i64, i64) =
+            sqlx::query_as("SELECT position_ms,play_count FROM user_item_state WHERE item_id=?")
+                .bind(first_target)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(state, (111, 1));
+        let mut tx = db.begin().await.unwrap();
+        assert_eq!(
+            kahawai_hub::library::canonical_id(&mut tx, &old[0])
+                .await
+                .unwrap(),
+            *first_target
+        );
+        tx.rollback().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn corrupt_alias_cycles_return_an_error_without_blocking_the_writer() {
+    let db = fixture().await;
+    copy(&db, "a", "movie", "Unknown a", None, None, None).await;
+    copy(&db, "b", "movie", "Unknown b", None, None, None).await;
+    let mut tx = db.begin().await.unwrap();
+    sqlx::query("UPDATE library_items SET merged_into=CASE id WHEN 'a' THEN 'b' ELSE 'a' END WHERE id IN ('a','b')")
+        .execute(&mut *tx).await.unwrap();
+    let result = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        kahawai_hub::library::canonical_id(&mut tx, "a"),
+    )
+    .await;
+    assert!(result.expect("alias traversal must terminate").is_err());
+    tx.rollback().await.unwrap();
+    let mut tx = db.begin().await.unwrap();
+    assert_eq!(
+        kahawai_hub::library::canonical_id(&mut tx, "a")
+            .await
+            .unwrap(),
+        "a"
+    );
+    tx.commit().await.unwrap();
 }

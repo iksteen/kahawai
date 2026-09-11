@@ -1,9 +1,11 @@
 //! Registry (HUB-1): connection state in memory, everything else in SQLite
 //! so a hub restart recovers without a rescan (NFR-3).
 //!
-//! Item identity is `(module_id, collection_id, item_id)`: a library composes
-//! collections and never changes, clones, or merges their items. A physical file
-//! has one stable integer id and one optional `collection_roots` reference.
+//! Collection copies belong to one `(module_id, collection_id)` namespace and
+//! keep their own detected metadata and physical renditions. Shared library
+//! identity and history live in [`crate::library`]; correcting one copy leaves
+//! the other copies' choices intact. A physical file has one stable integer id
+//! and one optional `collection_roots` reference.
 //! Exact-root adoption assigns that reference without rewriting paths or any
 //! dependent row. Protocol values still use `(root_token, path_rel)` and are
 //! translated only at the database boundary.
@@ -2604,7 +2606,7 @@ impl Registry {
                         let existing: Option<String> = sqlx::query_scalar(
                             "SELECT id FROM collection_items
                              WHERE module_id=? AND collection_id=? AND kind='album'
-                               AND norm_title=? AND artist_key=?",
+                               AND norm_title=? AND artist_key=? ORDER BY id LIMIT 1",
                         )
                         .bind(module_id)
                         .bind(collection_id)
@@ -2612,7 +2614,7 @@ impl Registry {
                         .bind(&album_artist_key)
                         .fetch_optional(&mut *tx)
                         .await?;
-                        let album_id = match existing {
+                        let mut album_id = match existing {
                             Some(id) => id,
                             None => {
                                 // Keep one existing identity when a mapper
@@ -2684,16 +2686,6 @@ impl Registry {
                         // recording's item id. Only a genuine slot collision
                         // (same disc/track already exists in the target album)
                         // needs the merge path below.
-                        let existing_track: Option<String> = sqlx::query_scalar(
-                            "SELECT id FROM collection_items
-                             WHERE kind = 'track' AND parent_id = ?
-                               AND season IS ? AND episode = ?",
-                        )
-                        .bind(&album_id)
-                        .bind(disc)
-                        .bind(track)
-                        .fetch_optional(&mut *tx)
-                        .await?;
                         let previous_track: Option<(String, Option<String>)> = if let Some(
                             previous_item,
                         ) =
@@ -2713,9 +2705,37 @@ impl Registry {
                         };
                         if let Some((_, Some(previous_album))) = previous_track.as_ref()
                             && previous_album != &album_id
+                            && !Self::preserve_copy_decisions(&mut tx, previous_album, &album_id)
+                                .await?
                         {
-                            Self::preserve_manual_album_match(&mut tx, previous_album, &album_id)
-                                .await?;
+                            // A tag correction cannot decide between conflicting
+                            // human choices. Correct the credit, keeping each
+                            // physical album and its decisions until resolved.
+                            Self::invalidate_automatic_musicbrainz(&mut tx, previous_album).await?;
+                            sqlx::query("UPDATE collection_items SET artist=?,norm_artist=?,artist_key=? WHERE id=?")
+                                .bind(&album_artist).bind(&album_artist_norm).bind(&album_artist_key)
+                                .bind(previous_album).execute(&mut *tx).await?;
+                            album_id = previous_album.clone();
+                        }
+                        let mut existing_track: Option<String> = sqlx::query_scalar(
+                            "SELECT id FROM collection_items
+                             WHERE kind = 'track' AND parent_id = ?
+                               AND season IS ? AND episode = ? ORDER BY id LIMIT 1",
+                        )
+                        .bind(&album_id)
+                        .bind(disc)
+                        .bind(track)
+                        .fetch_optional(&mut *tx)
+                        .await?;
+                        if let (Some((previous, _)), Some(candidate)) =
+                            (previous_track.as_ref(), existing_track.as_ref())
+                            && previous != candidate
+                            && !Self::preserve_copy_decisions(&mut tx, previous, candidate).await?
+                        {
+                            // Keep this file's prior copy when the slot holds an
+                            // incompatible human decision. Repeated tag refreshes
+                            // take the same path until those decisions agree.
+                            existing_track = None;
                         }
                         Some(match existing_track {
                             Some(id) => {
@@ -3120,37 +3140,56 @@ impl Registry {
         Ok(())
     }
 
-    /// Carry an explicit album match when duplicate pre-Album-Artist albums
-    /// converge. Automatic answers are deliberately not copied: they answered
-    /// the old recording-artist question. Two different human pins cannot
-    /// both describe the one surviving album, so retain its existing pin and
-    /// make the conflict visible instead of silently replacing it.
-    async fn preserve_manual_album_match(
+    /// Carry compatible human decisions when physical albums or song slots merge.
+    /// False retains both copies: one merged copy cannot preserve incompatible
+    /// choices. Automatic answers describe the old question; only a pinned
+    /// provider answer follows a surviving human decision.
+    async fn preserve_copy_decisions(
         tx: &mut sqlx::SqliteConnection,
         from_item: &str,
         to_item: &str,
-    ) -> Result<()> {
+    ) -> Result<bool> {
+        if crate::library::copy_regroup_conflict(tx, from_item, to_item).await? {
+            return Ok(false);
+        }
+        let from_manual: bool =
+            sqlx::query_scalar("SELECT assignment_manual FROM collection_items WHERE id=?")
+                .bind(from_item)
+                .fetch_one(&mut *tx)
+                .await?;
+        let to_manual: bool =
+            sqlx::query_scalar("SELECT assignment_manual FROM collection_items WHERE id=?")
+                .bind(to_item)
+                .fetch_one(&mut *tx)
+                .await?;
+        if from_manual && !to_manual {
+            let ids: Vec<String> = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=? ORDER BY ordinal")
+                .bind(from_item).fetch_all(&mut *tx).await?;
+            let ids = crate::library::canonical_ids(tx, &ids).await?;
+            crate::library::assign(tx, to_item, &ids).await?;
+        }
+        sqlx::query("INSERT INTO rejected_library_matches(collection_item_id,library_item_id)
+            SELECT ?,library_item_id FROM rejected_library_matches WHERE collection_item_id=? ON CONFLICT DO NOTHING")
+            .bind(to_item).bind(from_item).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO rejected_matches(item_id,provider,provider_id,rejected_at)
+            SELECT ?,provider,provider_id,rejected_at FROM rejected_matches WHERE item_id=?
+            ON CONFLICT(item_id,provider,provider_id) DO UPDATE SET rejected_at=MAX(rejected_matches.rejected_at,excluded.rejected_at)")
+            .bind(to_item).bind(from_item).execute(&mut *tx).await?;
         let from: Option<(String, String)> =
             sqlx::query_as("SELECT provider,provider_id FROM manual_match WHERE item_id=?")
                 .bind(from_item)
                 .fetch_optional(&mut *tx)
                 .await?;
         let Some((provider, provider_id)) = from else {
-            return Ok(());
+            return Ok(true);
         };
         let to: Option<(String, String)> =
             sqlx::query_as("SELECT provider,provider_id FROM manual_match WHERE item_id=?")
                 .bind(to_item)
                 .fetch_optional(&mut *tx)
                 .await?;
-        if let Some(to) = to {
-            if to != (provider.clone(), provider_id.clone()) {
-                tracing::warn!(from_item, to_item,
-                    from_provider = %provider, from_provider_id = %provider_id,
-                    to_provider = %to.0, to_provider_id = %to.1,
-                    "conflicting manual album matches converged; retaining survivor's pin");
-            }
-            return Ok(());
+        if to.is_some() {
+            return Ok(true);
         }
         let has_answer: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM provider_metadata
@@ -3163,20 +3202,19 @@ impl Registry {
         .await?;
         if !has_answer {
             tracing::warn!(from_item, to_item, %provider, %provider_id,
-                "manual album match has no backing answer; not transferring it");
-            return Ok(());
-        }
-        sqlx::query("DELETE FROM provider_metadata WHERE item_id=? AND provider=?")
-            .bind(to_item)
-            .bind(&provider)
-            .execute(&mut *tx)
-            .await?;
-        sqlx::query(
+                "manual match has no backing answer; retaining its pin");
+        } else {
+            sqlx::query("DELETE FROM provider_metadata WHERE item_id=? AND provider=?")
+                .bind(to_item)
+                .bind(&provider)
+                .execute(&mut *tx)
+                .await?;
+            sqlx::query(
             "INSERT INTO provider_metadata
                (item_id,provider,provider_id,title,overview,poster_path,rating,premiered,
-                original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json)
+                original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json,provider_artist_id)
              SELECT ?1,provider,provider_id,title,overview,poster_path,rating,premiered,
-                    original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json
+                    original_language,genres,confidence,updated_at,proj_season,proj_episode,cast_json,provider_artist_id
                FROM provider_metadata
               WHERE item_id=?2 AND provider=?3 AND provider_id=?4",
         )
@@ -3186,6 +3224,7 @@ impl Registry {
         .bind(&provider_id)
         .execute(&mut *tx)
         .await?;
+        }
         sqlx::query(
             "INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
              SELECT ?1,provider,provider_id,pinned_at FROM manual_match WHERE item_id=?2",
@@ -3194,7 +3233,7 @@ impl Registry {
         .bind(from_item)
         .execute(&mut *tx)
         .await?;
-        Ok(())
+        Ok(true)
     }
 
     /// Carry durable user state across automatic identity correction.
