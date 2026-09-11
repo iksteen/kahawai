@@ -387,6 +387,125 @@ async fn an_offline_sole_source_still_lists_its_chapters() {
     assert_eq!(item["unavailable"]["request_id"], request_id);
 }
 
+/// Preferred languages can occupy different indices in each rendition. Rank
+/// their actual selected streams, while an explicit source still wins.
+#[tokio::test]
+async fn automatic_source_ranking_uses_each_renditions_audio_choice() {
+    for swapped in [false, true] {
+        let mut first = info(&[]);
+        first.audio = [("eng", "aac"), ("jpn", "dts")]
+            .into_iter()
+            .map(|(language, codec)| kahawai_core::media::AudioStream {
+                language: Some(language.into()),
+                codec: codec.into(),
+                channels: 2,
+                sample_rate: 48_000,
+                ..Default::default()
+            })
+            .collect();
+        let mut second = first.clone();
+        second.audio[0].codec = "dts".into();
+        second.audio[1].codec = "aac".into();
+        if swapped {
+            second.audio.swap(0, 1);
+        }
+        let a = FileUpsertRecord {
+            streams_json: serde_json::to_string(&first).unwrap(),
+            ..rec("Heat (1995).mkv", 400)
+        };
+        let fx = fixture_with(FileUpsertRecord {
+            streams_json: a.streams_json.clone(),
+            ..rec("Heat (1995).mkv", 400)
+        })
+        .await;
+        sqlx::query(
+            "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
+            VALUES('01H','mediahost','mh','fp') ON CONFLICT(module_id) DO UPDATE SET name='mh'",
+        )
+        .execute(&fx.db)
+        .await
+        .unwrap();
+        fx.reg
+            .upsert_files(
+                "01H",
+                "movies",
+                vec![
+                    a,
+                    FileUpsertRecord {
+                        streams_json: serde_json::to_string(&second).unwrap(),
+                        ..rec("Heat (1995) [1080p].mkv", 100)
+                    },
+                ],
+            )
+            .await
+            .unwrap();
+        let profile = serde_json::json!({
+            "containers": ["mp4"], "video": [{"codec":"h264"}], "audio": ["aac"],
+            "hdr": false, "graphics_overlay": false, "ass_render": false,
+            "target_duration": {"mode":"ignore"}
+        });
+        let ask = |body: serde_json::Value| {
+            query(
+                &format!("/api/v1/items/{}", fx.id),
+                Some(&fx.bearer),
+                Some("application/json"),
+                &body.to_string(),
+            )
+        };
+        let initial = json_of(
+            fx.api
+                .clone()
+                .oneshot(ask(serde_json::json!({"profile":profile})))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let sources = initial["sources"].as_array().unwrap();
+        let source_id = |path: &str| {
+            sources
+                .iter()
+                .find(|source| source["path_rel"] == path)
+                .unwrap()["source_id"]
+                .as_i64()
+                .unwrap()
+        };
+        let a_id = source_id("Heat (1995).mkv");
+        let b_id = source_id("Heat (1995) [1080p].mkv");
+        assert_eq!(initial["negotiated"]["source"]["source_id"], a_id);
+        assert_eq!(sources[0]["host_name"], "mh");
+        assert_eq!(initial["copies"][0]["host_name"], "mh");
+        let tracks =
+            serde_json::json!({a_id.to_string(): 1, b_id.to_string(): if swapped {0} else {1}});
+        let response = fx
+            .api
+            .clone()
+            .oneshot(ask(serde_json::json!({
+                "profile":profile, "source_audio_tracks":tracks
+            })))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        let chosen = json_of(response).await;
+        assert_eq!(
+            chosen["negotiated"]["source"]["source_id"], b_id,
+            "swapped={swapped}"
+        );
+        assert_eq!(chosen["negotiated"]["cost"], "copy");
+        let explicit = json_of(
+            fx.api
+                .clone()
+                .oneshot(ask(serde_json::json!({
+                    "profile":profile, "source_audio_tracks":tracks, "source_id":a_id
+                })))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(explicit["negotiated"]["source"]["source_id"], a_id);
+        assert_ne!(explicit["negotiated"]["cost"], "copy");
+    }
+}
+
 /// QUERY's ticks must describe the file the client will PLAY. Ranking says
 /// 4K HEVC; an h264-only client negotiates the 1080p — and the chapters
 /// follow the negotiation, not the rank.

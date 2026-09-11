@@ -12,9 +12,14 @@ pub(super) struct CollectionCopy {
     pub episode: Option<i64>,
     pub parent_library_item_id: Option<String>,
     pub module_id: Option<String>,
+    pub host_name: Option<String>,
     pub collection_id: Option<String>,
     pub paths: Vec<String>,
     pub match_confidence: Option<String>,
+    /// The selected provider record's title, without display-field fallbacks.
+    pub matched_title: Option<String>,
+    /// The selected provider record's release year, if supplied.
+    pub matched_year: Option<i64>,
     pub assignment: crate::library::Assignment,
 }
 
@@ -23,11 +28,20 @@ pub(super) async fn apply_match(
     id: &str,
     body: ApplyMatch,
 ) -> Result<crate::library::Assignment, ApiError> {
+    apply_decision(state, id, Some(body.expected_revision), body.decision).await
+}
+
+pub(super) async fn apply_decision(
+    state: &AppState,
+    id: &str,
+    expected_revision: Option<i64>,
+    body: MatchDecision,
+) -> Result<crate::library::Assignment, ApiError> {
     let mut tx = state.registry.db().begin().await.map_err(internal)?;
     let current = crate::library::assignment(&mut tx, id)
         .await
         .map_err(|_| hidden("collection item"))?;
-    if current.revision != body.expected_revision {
+    if expected_revision.is_some_and(|revision| current.revision != revision) {
         return Err(ApiError::new(
             ErrorCode::StaleWrite,
             "This copy's assignment changed. Reload it before applying a match.",
@@ -78,12 +92,6 @@ pub(super) async fn apply_match(
                 .execute(&mut *tx)
                 .await
                 .map_err(internal)?;
-            // A new explicit decision supersedes library item rejections too.
-            sqlx::query("DELETE FROM rejected_library_matches WHERE collection_item_id=?")
-                .bind(id)
-                .execute(&mut *tx)
-                .await
-                .map_err(internal)?;
             crate::providers::assign_manual_in(
                 &mut tx,
                 id,
@@ -103,6 +111,9 @@ pub(super) async fn apply_match(
         }
         "assign" | "confirm" => {
             let ids = if body.action == "confirm" {
+                crate::providers::confirm_assignment_in(&mut tx, id)
+                    .await
+                    .map_err(internal)?;
                 current.library_item_ids
             } else {
                 body.library_item_ids.ok_or_else(|| {
@@ -125,7 +136,9 @@ pub(super) async fn apply_match(
                     .await
                     .map_err(internal)?;
                 }
-                sqlx::query("INSERT INTO rejected_matches SELECT item_id,provider,provider_id,unixepoch() FROM provider_metadata WHERE item_id=? AND provider_id<>'' ON CONFLICT DO NOTHING").bind(id).execute(&mut *tx).await.map_err(internal)?;
+                crate::providers::reject_matches_in(&mut tx, id)
+                    .await
+                    .map_err(internal)?;
             }
             sqlx::query("UPDATE collection_items SET assignment_manual=0 WHERE id=?")
                 .bind(id)
@@ -164,6 +177,37 @@ pub(super) fn album_child(alias: &str, parent: &str) -> String {
     )
 }
 
+// The artwork route tries each eligible, authorized copy. Capture those stored
+// inputs on the returned page only: no artwork reads, provider calls or changes
+// to cache retention. Parent metadata supplies an episode's fallback poster.
+const ARTWORK_INPUTS: &str = "(SELECT json_group_array(json_array(id,assignment_revision,matched,updated_at,poster_path,parent_updated_at,parent_poster_path))
+    FROM (SELECT ci.id,ci.assignment_revision,EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=ci.id) AS matched,
+        md.updated_at,md.poster_path,pmd.updated_at AS parent_updated_at,pmd.poster_path AS parent_poster_path
+      FROM collection_item_library_items a JOIN collection_items ci ON ci.id=a.collection_item_id
+      LEFT JOIN resolved_metadata md ON md.item_id=ci.id
+      LEFT JOIN collection_items eligible_parent ON eligible_parent.id=ci.parent_id AND eligible_parent.metadata_eligible=1
+      LEFT JOIN resolved_metadata pmd ON pmd.item_id=eligible_parent.id
+      WHERE a.library_item_id=c.id AND a.ordinal=1 AND ci.metadata_eligible=1
+        AND (EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1)) OR EXISTS(
+          SELECT 1 FROM library_collections lc JOIN user_libraries ul ON ul.library_id=lc.library_id
+          WHERE ul.user_id=?1 AND (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id)))
+      ORDER BY ci.id))";
+
+pub(super) fn artwork_version(row: &sqlx::sqlite::SqliteRow) -> Option<i64> {
+    if let Ok(inputs) = row.try_get::<String, _>("artwork_inputs") {
+        let revision: i64 = row.get("artwork_revision");
+        // Keep the existing numeric API shape and exact JavaScript integer
+        // representation. A fingerprint catches changes below another donor's
+        // maximum timestamp, same-second replacements and donor removal.
+        Some(
+            (xxhash_rust::xxh3::xxh3_64(format!("{revision}:{inputs}").as_bytes())
+                & ((1_u64 << 53) - 1)) as i64,
+        )
+    } else {
+        row.try_get("art_version").ok().flatten()
+    }
+}
+
 pub(super) fn page(inner: &str, order: &str) -> String {
     page_context(inner, order, false)
 }
@@ -176,17 +220,26 @@ fn page_context(inner: &str, order: &str, album: bool) -> String {
     let copy_scope = if album {
         " AND (c.kind<>'song' OR EXISTS(SELECT 1 FROM album_copies ac WHERE ac.album_id=?2 AND ac.collection_item_id=src.id))"
     } else {
-        ""
+        " AND (?2='' OR EXISTS(SELECT 1 FROM library_collections lc WHERE lc.library_id=?2 AND (lc.module_id,lc.collection_id)=(src.module_id,src.collection_id)))"
     };
-    format!("SELECT c.id,c.kind,c.title,c.year,c.artist,CASE WHEN c.kind='song' THEN ci.season ELSE c.season END AS season,CASE WHEN c.kind='song' THEN ci.episode ELSE c.episode END AS episode,COALESCE(c.parent_id,(SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1)) AS parent_id,c.episode_end,
+    let projection_scope = format!(
+        "{} AND (EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1)) OR EXISTS(SELECT 1 FROM library_collections lc JOIN user_libraries ul ON ul.library_id=lc.library_id WHERE ul.user_id=?1 AND (lc.module_id,lc.collection_id)=(pc.module_id,pc.collection_id)))",
+        copy_scope.replace("src.", "pc.")
+    );
+    let projection =
+        crate::providers::library_episode_projection_sql("c.id", &projection_scope, false);
+    format!("SELECT c.id,c.kind,c.title,c.year,c.artist,CASE WHEN c.kind='song' THEN ci.album_track_id END AS album_track_id,CASE WHEN c.kind='song' THEN ci.season ELSE c.season END AS season,CASE WHEN c.kind='song' THEN ci.episode ELSE c.episode END AS episode,COALESCE(c.parent_id,(SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1)) AS parent_id,c.episode_end,
         (SELECT title FROM library_items WHERE id=COALESCE(c.parent_id,(SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1))) AS parent_title,
         ci.title AS file_title,ci.year AS file_year,md.title AS matched_title,CASE WHEN ci.match_mode='manual' THEN 'manual' ELSE md.confidence END AS match_confidence,
-        MAX(COALESCE(md.updated_at,0),c.revision) AS art_version,
+        CASE WHEN c.kind='episode' THEN json_extract({projection},'$[0]') END AS proj_season,
+        CASE WHEN c.kind='episode' THEN json_extract({projection},'$[1]') END AS proj_episode,
+        {ARTWORK_INPUTS} AS artwork_inputs,c.revision AS artwork_revision,
         (SELECT COUNT(*) FROM library_sources ps WHERE ps.item_id=c.id {source_scope} AND
           (EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1)) OR EXISTS(
           SELECT 1 FROM library_collections lc JOIN user_libraries ul ON ul.library_id=lc.library_id
           WHERE ul.user_id=?1 AND (lc.module_id,lc.collection_id)=(ps.module_id,ps.collection_id)))) AS sources,
-        (SELECT lc.library_id FROM library_membership lc WHERE lc.item_id=c.id AND
+        (SELECT lc.library_id FROM library_membership lc WHERE lc.item_id=c.id
+          AND (c.kind<>'song' OR (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id)) AND
           (EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1)) OR EXISTS(
             SELECT 1 FROM user_libraries ul WHERE ul.library_id=lc.library_id AND ul.user_id=?1))
           ORDER BY lc.library_id<>?2,lc.library_id LIMIT 1) AS library_id,
@@ -411,10 +464,13 @@ pub(super) async fn item_body(
         }
     }
     for copy in &copies {
-        let row=sqlx::query("SELECT ci.title,ci.year,ci.artist,ci.season,ci.episode,ci.module_id,ci.collection_id,
+        let row=sqlx::query("SELECT ci.title,ci.year,ci.artist,ci.season,ci.episode,ci.module_id,s.name AS host_name,ci.collection_id,
             CASE WHEN ci.match_mode='manual' THEN 'manual' ELSE md.confidence END AS match_confidence,
+            matched.title AS matched_title,matched.premiered AS matched_premiered,
             (SELECT library_item_id FROM collection_item_library_items a WHERE a.collection_item_id=ci.parent_id AND a.ordinal=1) AS parent_library_item_id
-            FROM collection_items ci LEFT JOIN resolved_metadata md ON md.item_id=ci.id WHERE ci.id=?").bind(copy).fetch_one(db).await.map_err(internal)?;
+            FROM collection_items ci LEFT JOIN resolved_metadata md ON md.item_id=ci.id
+            LEFT JOIN provider_metadata matched ON matched.item_id=ci.id AND matched.provider=md.provider AND matched.provider_id=md.provider_id
+            LEFT JOIN satellites s ON s.module_id=ci.module_id WHERE ci.id=?").bind(copy).fetch_one(db).await.map_err(internal)?;
         let paths=sqlx::query_scalar("SELECT f.path_rel FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id JOIN files f ON f.id=p.file_id WHERE ps.item_id=? ORDER BY ps.id,p.ordinal").bind(copy).fetch_all(db).await.map_err(internal)?;
         let mut read = db.read_pool().acquire().await.map_err(internal)?;
         let assignment = crate::library::assignment(&mut read, copy)
@@ -429,9 +485,14 @@ pub(super) async fn item_body(
             episode: row.get("episode"),
             parent_library_item_id: row.get("parent_library_item_id"),
             module_id: row.get("module_id"),
+            host_name: row.get("host_name"),
             collection_id: row.get("collection_id"),
             paths,
             match_confidence: row.get("match_confidence"),
+            matched_title: row.get("matched_title"),
+            matched_year: row
+                .get::<Option<String>, _>("matched_premiered")
+                .and_then(|date| date.get(..4).and_then(|year| year.parse().ok())),
             assignment,
         });
     }
@@ -442,7 +503,8 @@ pub(super) async fn item_body(
     {
         out.item.match_confidence = Some("manual".into());
     }
-    let r=sqlx::query("SELECT c.*,w.position_ms,w.duration_ms,w.played,w.play_count FROM library_entries c LEFT JOIN user_item_state w ON w.item_id=c.id AND w.user_id=? WHERE c.id=?").bind(user).bind(id).fetch_one(db).await.map_err(internal)?;
+    let r=sqlx::query(sqlx::AssertSqlSafe(format!("SELECT c.*,{ARTWORK_INPUTS} AS artwork_inputs,c.revision AS artwork_revision,w.position_ms,w.duration_ms,w.played,w.play_count FROM library_entries c LEFT JOIN user_item_state w ON w.item_id=c.id AND w.user_id=?1 WHERE c.id=?2"))).bind(user).bind(id).fetch_one(db).await.map_err(internal)?;
+    out.item.art_version = artwork_version(&r);
     out.library_revision = r.get("revision");
     if let Some(fields) = sqlx::query_scalar::<_, String>(
         "SELECT fields FROM library_overrides WHERE library_item_id=?",
@@ -484,6 +546,43 @@ pub(super) async fn item_body(
     if out.item.kind == "song" {
         out.item.season = out.copies.first().and_then(|c| c.season);
         out.item.episode = out.copies.first().and_then(|c| c.episode);
+    }
+    if out.item.kind == "episode" {
+        // A secondary work receives only its own numbering and the matching
+        // parent provider ID. The primary copy's title/overview remain gated.
+        let scope = "AND pc.id IN (SELECT value FROM json_each(?2))";
+        let projection = crate::providers::library_episode_projection_sql("?1", scope, false);
+        let keyed = crate::providers::library_episode_projection_sql("?1", scope, true);
+        let (display, keyed): (Option<String>, Option<String>) =
+            sqlx::query_as(sqlx::AssertSqlSafe(format!("SELECT {projection},{keyed}")))
+                .bind(id)
+                .bind(serde_json::to_string(&copies).map_err(internal)?)
+                .fetch_one(db)
+                .await
+                .map_err(internal)?;
+        out.item.proj_season = None;
+        out.item.proj_episode = None;
+        if let Some(metadata) = &mut out.metadata {
+            metadata.proj_season = None;
+            metadata.proj_episode = None;
+        }
+        if let Some(pair) = display.and_then(|json| serde_json::from_str::<(i64, i64)>(&json).ok())
+        {
+            out.item.proj_season = Some(pair.0);
+            out.item.proj_episode = Some(pair.1);
+        }
+        if let Some((provider, raw_id, season, episode)) =
+            keyed.and_then(|json| serde_json::from_str::<(String, String, i64, i64)>(&json).ok())
+            && let Ok(provider_id) = raw_id.parse::<i64>()
+            && provider_id > 0
+            && provider_id.to_string() == raw_id
+        {
+            let metadata = out.metadata.get_or_insert_with(ItemMetadata::default);
+            metadata.tmdb_id = (provider == "tmdb").then_some(provider_id);
+            metadata.tvdb_id = (provider == "tvdb").then_some(provider_id);
+            metadata.proj_season = Some(season);
+            metadata.proj_episode = Some(episode);
+        }
     }
     out.item.episode_end = None;
     out.item.played = r.get::<Option<i64>, _>("played").unwrap_or(0) != 0;

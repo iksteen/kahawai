@@ -217,6 +217,54 @@ async fn an_unknown_item_is_404_not_a_foreign_key_500() {
 }
 
 #[tokio::test]
+async fn watched_marks_follow_first_identification_aliases_without_double_counting() {
+    let (api, token, db) = harness().await;
+    sqlx::raw_sql(
+        "INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
+         VALUES('known','movie','Heat','heat',1995,'fixture','default'),
+               ('bare','movie','Heat','heat',NULL,'fixture','default');",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    kahawai_hub::providers::assign_manual(
+        &db,
+        "bare",
+        "tmdb",
+        "949",
+        kahawai_hub::providers::Fields {
+            title: Some("Heat".into()),
+            premiered: Some("1995-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        kahawai_hub::library::resolve_id(&db, "bare").await.unwrap(),
+        "known"
+    );
+
+    let (status, body) = mark(&api, &token, "bare", true).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(only(&body)["item_id"], "known");
+    assert_eq!(state(&db, "known").await, (0, None, 1, 1));
+
+    let (status, body) = mark_many(&api, &token, "bare", false, Some(&["bare", "known"])).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(only(&body)["item_id"], "known");
+    assert_eq!(state(&db, "known").await, (0, None, 0, 1));
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_item_state")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        1,
+        "the permanent alias must not acquire a second history row"
+    );
+}
+
+#[tokio::test]
 async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
     let (api, token, db) = harness().await;
     // Two shows, so the boundary has something to keep out.

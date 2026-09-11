@@ -27,5 +27,5 @@ case "${1:-test}" in
             curl --fail-with-body --silent --show-error -X "$method" -H "Authorization: Bearer $KAHAWAI_TOKEN" -H 'Content-Type: application/json' --data-binary "@$3" "$api$route"
         fi
         ;;
-    *) KAHAWAI_SKIP_WEB_BUILD=1 cargo test -p kahawai-hub --test library_items --test library_api --test library_playback "$@" ;;
+    *) KAHAWAI_SKIP_WEB_BUILD=1 cargo test -p kahawai-hub --test admin_api --test library_items --test library_api --test library_playback --test library_session_resources --test library_preferences --test library_identity_upgrade --test library_rejection_aliases --test library_grants --test up_next --test music_album_identity --test music_song_identity --test library_provider_rank_bridge "$@" ;;
 esac

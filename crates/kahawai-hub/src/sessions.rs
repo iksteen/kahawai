@@ -623,6 +623,9 @@ pub(crate) struct Negotiation<'a> {
     /// some tier could actually burn.
     burn_row: Option<crate::tracks::Track>,
     audio_track: u32,
+    /// QUERY resolves each rendition's preference before ranking. Keyed by
+    /// first-part file ID after resolving the public source IDs once.
+    source_audio_tracks: std::collections::HashMap<i64, u32>,
     video_track: u32,
     /// The chosen source has a current measurement and force may therefore
     /// turn only its audio copy/direct path into an encode.
@@ -718,6 +721,7 @@ impl<'a> Negotiation<'a> {
             ocr_set,
             burn_row,
             audio_track,
+            source_audio_tracks: Default::default(),
             video_track,
             force_audio_encode: false,
             force_measurement: None,
@@ -726,6 +730,40 @@ impl<'a> Negotiation<'a> {
 
     pub(crate) fn profile(&self) -> &kahawai_core::media::CapabilityProfile {
         &self.profile
+    }
+
+    /// QUERY can compare each rendition on its own resolved audio preference.
+    /// Resolve public source IDs once; all later planning and loudness lookups
+    /// use the same first-part file identity as the candidate being judged.
+    pub(crate) async fn set_source_audio_tracks(
+        &mut self,
+        tracks: &std::collections::BTreeMap<i64, u32>,
+    ) -> Result<()> {
+        self.source_audio_tracks.clear();
+        if tracks.is_empty() {
+            return Ok(());
+        }
+        let ids = serde_json::to_string(&tracks.keys().collect::<Vec<_>>())?;
+        let parts: Vec<(i64, i64)> = sqlx::query_as(
+            "SELECT playable_source_id,file_id FROM playable_source_parts
+             WHERE ordinal=1 AND playable_source_id IN (SELECT value FROM json_each(?))",
+        )
+        .bind(ids)
+        .fetch_all(self.registry.db())
+        .await?;
+        for (source_id, file_id) in parts {
+            if let Some(track) = tracks.get(&source_id) {
+                self.source_audio_tracks.insert(file_id, *track);
+            }
+        }
+        Ok(())
+    }
+
+    fn audio_track_for(&self, parts: &[PartSource]) -> u32 {
+        parts
+            .first()
+            .and_then(|part| self.source_audio_tracks.get(&part.file_id).copied())
+            .unwrap_or(self.audio_track)
     }
 
     /// The burn pick, but only when it belongs to THESE parts — a pick
@@ -858,7 +896,7 @@ impl<'a> Negotiation<'a> {
             kahawai_media::negotiate::negotiate_for_executors(
                 &self.profile,
                 info,
-                self.audio_track as usize,
+                self.audio_track_for(parts) as usize,
                 self.video_track as usize,
                 parts.len() == 1,
                 est_kbps,
@@ -1000,7 +1038,7 @@ impl<'a> Negotiation<'a> {
         if !self.loudness.force() || parts.len() != 1 || info.audio.is_empty() {
             return Ok(None);
         }
-        let audio_track = (self.audio_track as usize).min(info.audio.len() - 1);
+        let audio_track = (self.audio_track_for(parts) as usize).min(info.audio.len() - 1);
         self.registry
             .audio_loudness(parts[0].file_id, audio_track)
             .await
@@ -1028,18 +1066,44 @@ impl<'a> Negotiation<'a> {
     )> {
         let mut copies = crate::library::copies(self.registry.db(), &self.user_id, item_id).await?;
         if let Some(track) = album_track {
-            let allowed: Vec<String> =
-                sqlx::query_scalar("SELECT id FROM collection_items WHERE album_track_id=?")
-                    .bind(track)
-                    .fetch_all(self.registry.db())
-                    .await?;
+            let mut c = self.registry.db().read_pool().acquire().await?;
+            let position: Option<(String, String, i64, i64)> = sqlx::query_as(
+                "SELECT album_id,song_id,disc_number,track_number FROM album_tracks WHERE id=?",
+            )
+            .bind(track)
+            .fetch_optional(&mut *c)
+            .await?;
+            let allowed: Vec<String> = if let Some((album, song, disc, number)) = position {
+                // A queue can outlive first identification of its album or song.
+                // The stored position keeps its context; only permanent aliases
+                // may redirect it, with both coordinates and song still exact.
+                let album = crate::library::canonical_id(&mut c, &album).await?;
+                let song = crate::library::canonical_id(&mut c, &song).await?;
+                sqlx::query_scalar("SELECT ci.id FROM album_tracks position JOIN collection_items ci ON ci.album_track_id=position.id
+                    WHERE position.album_id=? AND position.song_id=? AND position.disc_number=? AND position.track_number=?")
+                    .bind(album).bind(song).bind(disc).bind(number).fetch_all(&mut *c).await?
+            } else {
+                Vec::new()
+            };
+            // Intersect with the caller's authorized copies of the requested song.
             copies.retain(|copy| allowed.contains(copy));
         }
+        if let Some(source) = source_id.filter(|_| recovery_fingerprint.is_none()) {
+            let owner: Option<String> =
+                sqlx::query_scalar("SELECT item_id FROM playable_sources WHERE id=?")
+                    .bind(source)
+                    .fetch_optional(self.registry.db())
+                    .await?;
+            copies.retain(|copy| owner.as_ref() == Some(copy));
+            anyhow::ensure!(
+                !copies.is_empty(),
+                "selected source is no longer available for this item"
+            );
+        }
         let mut eligible = Vec::new();
-        let mut offline = false;
         let mut incomplete = false;
         for copy in &copies {
-            match self.sessions.candidate_sources(self.registry, copy).await {
+            match self.sessions.complete_sources(self.registry, copy).await {
                 Ok(sources) => eligible.extend(sources),
                 Err(error) if error.downcast_ref::<IncompleteSource>().is_some() => {
                     incomplete = true;
@@ -1047,39 +1111,42 @@ impl<'a> Negotiation<'a> {
                 }
                 Err(error) => return Err(error),
             }
-            offline |= self.sessions.has_any_source(self.registry, copy).await;
         }
-        if let Some(source) = source_id {
+        if let Some(expected) = recovery_fingerprint {
+            // Recovery may use identical bytes on another host, but a missing
+            // version cannot recover by waiting for unrelated sources. Filter
+            // complete retained renditions before checking host connectivity.
+            let expected = expected.split(":bounds:").next().unwrap_or(expected);
+            eligible.retain(|(parts, _)| {
+                crate::registry::source_fingerprint(
+                    &parts
+                        .iter()
+                        .map(|p| (p.size as i64, p.head_xxh3, p.tail_xxh3))
+                        .collect::<Vec<_>>(),
+                ) == expected
+            });
+        } else if let Some(source) = source_id {
             let files: Vec<i64> = sqlx::query_scalar(
                 "SELECT file_id FROM playable_source_parts WHERE playable_source_id=?",
             )
             .bind(source)
             .fetch_all(self.registry.db())
             .await?;
-            eligible.retain(|(parts, _)| {
-                if let Some(expected) = recovery_fingerprint {
-                    // Another host may hold identical bytes and stream order.
-                    // Coverage is checked again in the playback snapshot.
-                    let expected = expected.split(":bounds:").next().unwrap_or(expected);
-                    crate::registry::source_fingerprint(
-                        &parts
-                            .iter()
-                            .map(|p| (p.size as i64, p.head_xxh3, p.tail_xxh3))
-                            .collect::<Vec<_>>(),
-                    ) == expected
-                } else {
-                    parts.first().is_some_and(|p| files.contains(&p.file_id))
-                }
-            });
+            eligible.retain(|(parts, _)| parts.first().is_some_and(|p| files.contains(&p.file_id)));
         }
         if eligible.is_empty() {
-            if offline {
-                bail!(SourceOffline);
-            }
             if incomplete {
                 bail!(IncompleteSource);
             }
             bail!("no sources for item");
+        }
+        eligible.retain(|(parts, _)| {
+            parts
+                .iter()
+                .all(|p| self.registry.is_connected(&p.module_id))
+        });
+        if eligible.is_empty() {
+            bail!(SourceOffline);
         }
         // Whole renditions stay intact; quality only breaks an equal playback cost.
         eligible.sort_by_key(|(_, info)| {
@@ -1105,23 +1172,6 @@ impl<'a> Negotiation<'a> {
             // path wins, rank breaks ties.
             None => {
                 let mut candidates = eligible;
-                // Nothing at all first. This is the host being away, and it
-                // has to be told apart from the burn refusal below: one is a
-                // moment (503, stand by), the other is this item (409, give
-                // up). Checked in the other order, an offline host reached
-                // the burn arm — `retain` on an empty set stays empty — so
-                // the one condition stand-by exists for was the one told to
-                // give up.
-                if candidates.is_empty() {
-                    // Only "the rows exist and every host holding them is
-                    // away" is a wait. An item with no sources at all is a
-                    // permanent refusal, and telling the client to stand by
-                    // for it produced an unbounded retry.
-                    if offline {
-                        bail!(SourceOffline);
-                    }
-                    bail!("no sources for item");
-                }
                 // A burn pick pins the source it binds to: judging the
                 // others would let a cheaper copy win and silently drop
                 // the burn the user explicitly selected. Reaching here means
@@ -1980,102 +2030,6 @@ impl Sessions {
         });
     }
 
-    /// Pick the best available source for an item and open a read lease
-    /// on its mediahost. Used at session start and on seek-restarts of
-    /// local remux sessions (whose lease died with the old worker).
-    /// Single-part only (subtitle extraction and friends).
-    pub(crate) async fn open_source(
-        &self,
-        registry: &Registry,
-        item_id: &str,
-        reader: Reader,
-    ) -> Result<(String, String, u64, kahawai_core::media::MediaInfo, Lease)> {
-        let (parts, info) = self.source_parts(registry, item_id).await?;
-        let p = &parts[0];
-        let lease = self
-            .open_lease(
-                registry,
-                &p.module_id,
-                &p.collection_id,
-                &p.root_token,
-                &p.path_rel,
-                reader,
-            )
-            .await?;
-        Ok((p.module_id.clone(), p.path_rel.clone(), p.size, info, lease))
-    }
-
-    /// All parts of the item's best available source in timeline order:
-    /// a complete single-file source wins; otherwise the CD1/CD2-style
-    /// part set (with cumulative timeline bases from per-part durations).
-    pub(crate) async fn source_parts(
-        &self,
-        registry: &Registry,
-        item_id: &str,
-    ) -> Result<(Vec<PartSource>, kahawai_core::media::MediaInfo)> {
-        let rows = self.playable_rows(registry, item_id).await?;
-        if rows.is_empty() {
-            bail!("no sources for item");
-        }
-        let parse_info = |r: &sqlx::sqlite::SqliteRow| -> kahawai_core::media::MediaInfo {
-            serde_json::from_str(r.get::<String, _>("streams_json").as_str()).unwrap_or_default()
-        };
-        let mut any_complete = false;
-        for group in rows.chunk_by(|a, b| {
-            a.get::<i64, _>("playable_source_id") == b.get::<i64, _>("playable_source_id")
-        }) {
-            let expected = group[0].get::<i64, _>("expected_parts");
-            let ordinals: Vec<i64> = group.iter().map(|r| r.get("part")).collect();
-            let complete =
-                group.len() as i64 == expected && ordinals.iter().copied().eq(1..=expected);
-            if !complete {
-                continue;
-            }
-            any_complete = true;
-            if !group
-                .iter()
-                .all(|r| registry.is_connected(&r.get::<String, _>("module_id")))
-            {
-                continue;
-            }
-            if expected > 1 && group.iter().any(|r| parse_info(r).duration_ms.is_none()) {
-                continue;
-            }
-            let mut parts = Vec::with_capacity(group.len());
-            let mut base = 0;
-            let mut first_info = None;
-            for r in group {
-                let info = parse_info(r);
-                let duration_ms = if expected > 1 {
-                    info.duration_ms
-                        .context("multi-part source with unknown part duration")?
-                } else {
-                    info.duration_ms.unwrap_or(0)
-                };
-                parts.push(PartSource {
-                    file_id: r.get("file_id"),
-                    head_xxh3: r.get("head_xxh3"),
-                    tail_xxh3: r.get("tail_xxh3"),
-                    module_id: r.get("module_id"),
-                    collection_id: r.get("collection_id"),
-                    root_token: r.get("root_token"),
-                    path_rel: r.get("source_path"),
-                    mtime_unix: r.get("mtime_unix"),
-                    size: r.get::<i64, _>("size") as u64,
-                    base_ms: base,
-                    duration_ms,
-                });
-                base += duration_ms;
-                first_info.get_or_insert(info);
-            }
-            return Ok((parts, first_info.unwrap()));
-        }
-        if any_complete {
-            bail!(SourceOffline);
-        }
-        bail!("every playable rendition is incomplete or ambiguous")
-    }
-
     async fn playable_rows(
         &self,
         registry: &Registry,
@@ -2107,12 +2061,23 @@ impl Sessions {
         .await?)
     }
 
-    /// HUB-16: EVERY playable candidate, in the established rank order —
-    /// each connected complete file is one candidate, plus at most one
-    /// part-set candidate at the end. `source_parts` remains "the best
-    /// by rank"; negotiation instead judges each candidate by COST and
-    /// only falls back to rank as the tiebreak.
+    /// HUB-16: every complete, connected rendition in the established rank
+    /// order. Negotiation judges each candidate by cost and uses rank as the
+    /// tiebreak; the returned parts always belong to one physical rendition.
     pub async fn candidate_sources(
+        &self,
+        registry: &Registry,
+        item_id: &str,
+    ) -> Result<Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>> {
+        let mut sources = self.complete_sources(registry, item_id).await?;
+        sources.retain(|(parts, _)| parts.iter().all(|p| registry.is_connected(&p.module_id)));
+        Ok(sources)
+    }
+
+    /// Complete retained renditions, including disconnected hosts. A recovery
+    /// request must establish that its physical version still exists before
+    /// interpreting a missing connection as a temporary refusal.
+    async fn complete_sources(
         &self,
         registry: &Registry,
         item_id: &str,
@@ -2135,15 +2100,6 @@ impl Sessions {
                 continue;
             }
             any_complete = true;
-            if !group
-                .iter()
-                .all(|r| registry.is_connected(&r.get::<String, _>("module_id")))
-            {
-                continue;
-            }
-            if expected > 1 && group.iter().any(|r| parse_info(r).duration_ms.is_none()) {
-                continue;
-            }
             let mut parts = Vec::with_capacity(group.len());
             let mut base_ms = 0;
             let mut first_info = None;
@@ -3868,8 +3824,18 @@ impl Sessions {
             // Switching tracks re-plans: the new track's codec decides
             // copy vs encode, not the old one's — and a burn-pick
             // change re-plans even with the same tracks.
-            let (_, _, _, _, info) =
-                crate::subtitles::source_row(registry, &session.collection_item_id).await?;
+            let file = session
+                .parts
+                .first()
+                .context("session has no parts")?
+                .file_id;
+            let streams: String = sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
+                .bind(file)
+                .fetch_one(registry.db())
+                .await?;
+            // These indexes belong to the session's selected rendition. A
+            // collection-level lookup can pick another file with fewer tracks.
+            let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
             // HUB-15a: the executor is already chosen here — ask IT.
             // Plain hub-local audio work is not a video executor.
             let tonemap = match &session.mode {
@@ -4914,6 +4880,7 @@ mod tests {
             ocr_set: Default::default(),
             burn_row: None,
             audio_track: 0,
+            source_audio_tracks: Default::default(),
             video_track: 0,
             force_audio_encode: false,
             force_measurement: None,

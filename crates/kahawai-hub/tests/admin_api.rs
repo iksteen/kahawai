@@ -600,6 +600,15 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
 /// confirm promotes, reject clears and stays out of auto-retries.
 #[tokio::test]
 async fn review_queue_flow() {
+    review_queue_flow_impl(false).await;
+}
+
+#[tokio::test]
+async fn legacy_review_queue_flow() {
+    review_queue_flow_impl(true).await;
+}
+
+async fn review_queue_flow_impl(legacy: bool) {
     let dir = tempfile::tempdir().unwrap();
     let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(db.clone(), Default::default()));
@@ -718,22 +727,78 @@ async fn review_queue_flow() {
             .fetch_one(&db)
             .await
             .unwrap();
+    let match_path = |id: &str| {
+        if legacy {
+            format!("/admin/v1/items/{id}/match")
+        } else {
+            format!("/admin/v1/collection-items/{id}/match")
+        }
+    };
+    let match_body = |mut body: serde_json::Value, revision: i64| {
+        if !legacy {
+            body["expected_revision"] = revision.into();
+        }
+        body
+    };
+    // The additive endpoint still requires optimistic concurrency, while the
+    // legacy endpoint retains its old actions and mandatory candidate fields.
+    let invalid = if legacy {
+        serde_json::json!({"action": "pick", "provider": "tmdb"})
+    } else {
+        serde_json::json!({"action": "confirm"})
+    };
+    let response = api
+        .clone()
+        .oneshot(authed("POST", match_path(&miss_id), Some(invalid)))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+    if legacy {
+        let response = api
+            .clone()
+            .oneshot(authed(
+                "POST",
+                match_path(&miss_id),
+                Some(serde_json::json!({"action": "reset"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::BAD_REQUEST);
+        let response = api
+            .clone()
+            .oneshot(
+                axum::http::Request::builder()
+                    .method("POST")
+                    .uri(match_path(&miss_id))
+                    .header("content-type", "application/json")
+                    .body(axum::body::Body::from(r#"{"action":"confirm"}"#))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::UNAUTHORIZED);
+    }
     // Pick a candidate for the miss.
     let resp = api
         .clone()
         .oneshot(authed(
             "POST",
-            format!("/admin/v1/collection-items/{miss_id}/match"),
-            Some(serde_json::json!({
-                "action": "pick",
-                "expected_revision":revision,
-                "provider": "tmdb",
-                "candidate": {"id": 603, "title": "The Matrix", "release_date": "1999-03-30"}
-            })),
+            match_path(&miss_id),
+            Some(match_body(
+                serde_json::json!({
+                    "action": "pick",
+                    "provider": "tmdb",
+                    "candidate": {"id": 603, "title": "The Matrix", "release_date": "1999-03-30"}
+                }),
+                revision,
+            )),
         ))
         .await
         .unwrap();
     assert_eq!(resp.status(), axum::http::StatusCode::OK);
+    if legacy {
+        assert_eq!(body_json(resp).await, serde_json::json!({"ok": true}));
+    }
     // Confirm the weak one; then reject it again.
     for action in ["confirm", "reject"] {
         let revision: i64 =
@@ -746,12 +811,18 @@ async fn review_queue_flow() {
             .clone()
             .oneshot(authed(
                 "POST",
-                format!("/admin/v1/collection-items/{weak_id}/match"),
-                Some(serde_json::json!({ "action": action,"expected_revision":revision })),
+                match_path(&weak_id),
+                Some(match_body(
+                    serde_json::json!({ "action": action }),
+                    revision,
+                )),
             ))
             .await
             .unwrap();
         assert_eq!(resp.status(), axum::http::StatusCode::OK, "{action}");
+        if legacy {
+            assert_eq!(body_json(resp).await, serde_json::json!({"ok": true}));
+        }
         if action == "confirm" {
             let review = body_json(
                 api.clone()
@@ -831,4 +902,109 @@ async fn review_queue_flow() {
     .await;
     assert_eq!(v["title"], "The Matrix");
     assert_eq!(v["year"], 1999);
+    if legacy {
+        // A second physical copy coalesces into the first copy's library item.
+        // An old client must still be able to review and correct that copy alone.
+        registry
+            .announce_collection("01HOST", "second", "movies", &[TEST_ROOT.into()])
+            .await
+            .unwrap();
+        registry
+            .upsert_files(
+                "01HOST",
+                "second",
+                vec![rec("The Matrix (1999).mkv", 12, 3, 3)],
+            )
+            .await
+            .unwrap();
+        let second: String =
+            sqlx::query_scalar("SELECT id FROM collection_items WHERE collection_id='second'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let linked: String = sqlx::query_scalar(
+            "SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=?",
+        )
+        .bind(&second)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(linked, miss_id);
+        assert_ne!(second, miss_id);
+        let review = body_json(
+            api.clone()
+                .oneshot(authed("GET", "/admin/v1/enrich/review".into(), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let entry = review["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["collection_item_id"] == second)
+            .unwrap();
+        assert_eq!(
+            entry["item_id"], second,
+            "legacy item_id must name the reviewed copy"
+        );
+        assert_eq!(entry["library_item_id"], miss_id);
+        let response = api.clone().oneshot(authed("POST", format!("/admin/v1/items/{}/match", entry["item_id"].as_str().unwrap()),
+            Some(serde_json::json!({"action":"pick","provider":"tmdb","candidate":{"id":604,"title":"The Matrix Reloaded","release_date":"2003-05-15"}})))).await.unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await, serde_json::json!({"ok":true}));
+        let first_pin: String =
+            sqlx::query_scalar("SELECT provider_id FROM manual_match WHERE item_id=?")
+                .bind(&miss_id)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        let second_pin: String =
+            sqlx::query_scalar("SELECT provider_id FROM manual_match WHERE item_id=?")
+                .bind(&second)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(
+            first_pin, "603",
+            "correcting the second copy must leave the first alone"
+        );
+        assert_eq!(second_pin, "604");
+        let first = body_json(
+            api.clone()
+                .oneshot(authed("GET", format!("/api/v1/items/{miss_id}"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(first["title"], "The Matrix");
+        assert_eq!(first["year"], 1999);
+        registry
+            .announce_collection("01HOST", "shows", "series", &[TEST_ROOT.into()])
+            .await
+            .unwrap();
+        registry
+            .upsert_files(
+                "01HOST",
+                "shows",
+                vec![rec("Example/Season 1/Example.S01E01.mkv", 13, 4, 4)],
+            )
+            .await
+            .unwrap();
+        let review = body_json(
+            api.clone()
+                .oneshot(authed("GET", "/admin/v1/enrich/review".into(), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert!(
+            review["entries"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e["kind"] == "show"),
+            "legacy review kind must remain show: {review}"
+        );
+    }
 }

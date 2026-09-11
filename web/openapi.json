@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "13162c3d7ff9cb2d6d0fefa975dccfa7fda7055565b4c7d7a21380c35e60544a",
+  "x-kahawai-source-sha256": "6fe508665d9ca6ccdb7db65a8625af6b4bba33a81f8ee09d400e85999dd9299b",
   "paths": {
     "/admin/v1/collection-items/{id}/match": {
       "post": {
@@ -483,7 +483,7 @@
           "Admin enrichment"
         ],
         "summary": "List items needing match review",
-        "description": "Admin only. Returns movies, shows and albums whose metadata match is a\nmiss, weak or rejected, with the current guess where there is one.\nEpisodes and tracks are excluded because they inherit their parent's\nmatch.",
+        "description": "Admin only. Returns unresolved library assignments and conflicting choices,\nindependently of provider confidence. Top-level items also appear for weak\nor missing provider matches; children inherit those provider answers.",
         "operationId": "admin_review_list",
         "responses": {
           "200": {
@@ -1026,7 +1026,7 @@
           "Admin sessions"
         ],
         "summary": "Download newest session log for an item",
-        "description": "Admin only. Returns the most recent session diagnostics recorded for the\nitem, by any user, as a plain-text attachment. Returns 404 when no such\nlog has been stored.",
+        "description": "Admin only. Returns the most recent session diagnostics recorded for the\nitem or any permanent alias, by any user, as a plain-text attachment.\nReturns 404 when no such log has been stored.",
         "operationId": "admin_item_log",
         "parameters": [
           {
@@ -1114,6 +1114,199 @@
             }
           },
           "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "500": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/items/{id}/match": {
+      "post": {
+        "tags": [
+          "Admin enrichment"
+        ],
+        "summary": "Apply a legacy provider match decision to one collection item.",
+        "description": "Retains the original v1 request and response for existing clients. The ID\nidentifies the original collection copy, including its grouped files; it\nnever chooses an arbitrary copy of a shared library item. New clients use\nthe collection-items route with an assignment revision to detect stale edits.",
+        "operationId": "admin_apply_legacy_match",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LegacyApplyMatch"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "413": {
+            "description": "The body is past the hub's buffer limit",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "415": {
+            "description": "The body needs Content-Type: application/json",
             "headers": {
               "X-Request-Id": {
                 "schema": {
@@ -11227,56 +11420,23 @@
         }
       },
       "ApplyMatch": {
-        "type": "object",
-        "required": [
-          "expected_revision",
-          "action"
-        ],
-        "properties": {
-          "action": {
-            "type": "string",
-            "description": "\"pick\": store the supplied candidate; \"confirm\": promote the\ncurrent weak match; \"reject\": clear the match, excluded from\nauto-retries."
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/MatchDecision"
           },
-          "candidate": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/ManualMatchCandidate"
-              },
-              {
-                "type": "null"
-              }
-            ]
-          },
-          "expected_revision": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "library_item_ids": {
-            "type": [
-              "array",
-              "null"
+          {
+            "type": "object",
+            "required": [
+              "expected_revision"
             ],
-            "items": {
-              "type": "string"
-            }
-          },
-          "new_item": {
-            "oneOf": [
-              {
-                "$ref": "#/components/schemas/NewItem"
-              },
-              {
-                "type": "null"
+            "properties": {
+              "expected_revision": {
+                "type": "integer",
+                "format": "int64"
               }
-            ]
-          },
-          "provider": {
-            "type": [
-              "string",
-              "null"
-            ]
+            }
           }
-        }
+        ]
       },
       "ApproveRequest": {
         "type": "object",
@@ -12124,6 +12284,12 @@
             ],
             "format": "int64"
           },
+          "host_name": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "id": {
             "type": "string"
           },
@@ -12132,6 +12298,21 @@
               "string",
               "null"
             ]
+          },
+          "matched_title": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "The selected provider record's title, without display-field fallbacks."
+          },
+          "matched_year": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "The selected provider record's release year, if supplied."
           },
           "module_id": {
             "type": [
@@ -12795,6 +12976,18 @@
               }
             ]
           },
+          "source_audio_tracks": {
+            "type": "object",
+            "description": "Per-rendition audio preferences for automatic ranking: source ID to\naudio stream index. Missing sources use audio_track. START still takes\nthe chosen source and its resolved index, never a cross-source index.",
+            "additionalProperties": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "source_id": {
             "type": [
               "integer",
@@ -13075,6 +13268,12 @@
                 "collection_item_id": {
                   "type": "string",
                   "description": "Assignment owner shared by every file part of this source."
+                },
+                "host_name": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
                 },
                 "module_id": {
                   "type": "string"
@@ -13364,6 +13563,33 @@
           }
         }
       },
+      "LegacyApplyMatch": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string"
+          },
+          "candidate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManualMatchCandidate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
+          }
+        }
+      },
       "LibrariesResponse": {
         "type": "object",
         "required": [
@@ -13522,6 +13748,53 @@
               "null"
             ],
             "format": "double"
+          }
+        }
+      },
+      "MatchDecision": {
+        "type": "object",
+        "required": [
+          "action"
+        ],
+        "properties": {
+          "action": {
+            "type": "string",
+            "description": "\"pick\": store the supplied candidate; \"confirm\": promote the\ncurrent weak match; \"reject\": clear the match, excluded from\nauto-retries."
+          },
+          "candidate": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ManualMatchCandidate"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "library_item_ids": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "type": "string"
+            }
+          },
+          "new_item": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/NewItem"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "provider": {
+            "type": [
+              "string",
+              "null"
+            ]
           }
         }
       },
@@ -14172,6 +14445,7 @@
         "required": [
           "item_id",
           "collection_item_id",
+          "library_item_id",
           "kind",
           "title",
           "year",
@@ -14189,10 +14463,16 @@
             "type": "string"
           },
           "item_id": {
-            "type": "string"
+            "type": "string",
+            "description": "The reviewed collection copy; retained for original v1 clients."
           },
           "kind": {
-            "type": "string"
+            "type": "string",
+            "description": "Detected collection kind, using the original v1 show/track vocabulary."
+          },
+          "library_item_id": {
+            "type": "string",
+            "description": "Shared library identity for navigation, never an implicit mutation target."
           },
           "matched_title": {
             "type": [

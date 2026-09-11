@@ -31,6 +31,227 @@ async fn call(h: &common::Harness, method: &str, path: &str, body: Value) -> Val
 }
 
 #[tokio::test]
+async fn queued_album_position_survives_repeated_album_promotions() {
+    let h = common::harness(
+        "Queued (2000).mp4",
+        kahawai_media::testutil::render_h264_aac_mp4,
+    )
+    .await;
+    let copy: String = sqlx::query_scalar(
+        "SELECT collection_item_id FROM collection_item_library_items WHERE library_item_id=?",
+    )
+    .bind(&h.item_id)
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let mut tx = h.db.begin().await.unwrap();
+    for (id, year) in [
+        ("old-album", None),
+        ("middle-album", None),
+        ("known-album", Some(2000)),
+    ] {
+        sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,year,artist,module_id,collection_id) SELECT ?,'album',?,?,?,'Artist',module_id,collection_id FROM collection_items WHERE id=?")
+            .bind(id).bind(id).bind(id).bind(year).bind(&copy).execute(&mut *tx).await.unwrap();
+    }
+    sqlx::query("UPDATE collection_items SET kind='track',parent_id='old-album',season=1,episode=1 WHERE id=?")
+        .bind(&copy).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    let original_queue: (String, i64) = sqlx::query_as("SELECT a.library_item_id,ci.album_track_id FROM collection_items ci JOIN collection_item_library_items a ON a.collection_item_id=ci.id WHERE ci.id=?")
+        .bind(&copy).fetch_one(&h.db).await.unwrap();
+    let mut tx = h.db.begin().await.unwrap();
+    let song = kahawai_hub::library::create(
+        &mut tx,
+        kahawai_hub::library::NewItem {
+            kind: "song".into(),
+            title: "Chosen Song".into(),
+            year: None,
+            artist: None,
+            parent_id: Some("known-album".into()),
+            season: Some(1),
+            episode: Some(1),
+            edition: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Both destination albums already have this recording at the same slot.
+    for album in ["middle-album", "known-album"] {
+        sqlx::query("INSERT INTO album_tracks(album_id,song_id,disc_number,track_number) VALUES(?,?,1,1) ON CONFLICT DO NOTHING")
+            .bind(album).bind(&song).execute(&mut *tx).await.unwrap();
+    }
+    kahawai_hub::library::assign(&mut tx, &copy, std::slice::from_ref(&song))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    let queued_position: i64 =
+        sqlx::query_scalar("SELECT album_track_id FROM collection_items WHERE id=?")
+            .bind(&copy)
+            .fetch_one(&h.db)
+            .await
+            .unwrap();
+    for (source, target) in [
+        ("old-album", "middle-album"),
+        ("middle-album", "known-album"),
+    ] {
+        let mut tx = h.db.begin().await.unwrap();
+        kahawai_hub::library::assign(&mut tx, source, &[target.into()])
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+    }
+    for (queued_song, position) in [
+        (&song, queued_position),
+        (&original_queue.0, original_queue.1),
+    ] {
+        let started = call(
+            &h,
+            "POST",
+            "/api/v1/playback/sessions",
+            json!({"item_id":queued_song,"album_track_id":position,"mode":"direct"}),
+        )
+        .await;
+        let session_id = started["session_id"].as_str().unwrap();
+        assert_eq!(h.sessions.get(session_id).unwrap().collection_item_id, copy);
+        call(
+            &h,
+            "DELETE",
+            &format!("/api/v1/playback/sessions/{session_id}"),
+            json!({}),
+        )
+        .await;
+    }
+    let children = call(&h, "GET", "/api/v1/items/old-album/children", json!({})).await;
+    assert_eq!(
+        children["children"].as_array().unwrap().len(),
+        1,
+        "retained historical slots cannot create duplicate browse entries"
+    );
+    assert_eq!(children["children"][0]["id"], song);
+    let mut tx = h.db.begin().await.unwrap();
+    let other_album = kahawai_hub::library::create(
+        &mut tx,
+        kahawai_hub::library::NewItem {
+            kind: "album".into(),
+            title: "Different album".into(),
+            year: Some(2002),
+            artist: Some("Artist".into()),
+            parent_id: None,
+            season: None,
+            episode: None,
+            edition: None,
+        },
+    )
+    .await
+    .unwrap();
+    let other_song = kahawai_hub::library::create(
+        &mut tx,
+        kahawai_hub::library::NewItem {
+            kind: "song".into(),
+            title: "Different song".into(),
+            year: None,
+            artist: None,
+            parent_id: Some("known-album".into()),
+            season: Some(1),
+            episode: Some(1),
+            edition: None,
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    for (album, recording, disc, track) in [
+        ("known-album", song.as_str(), 2, 1),
+        ("known-album", song.as_str(), 1, 2),
+        (other_album.as_str(), song.as_str(), 1, 1),
+        ("known-album", other_song.as_str(), 1, 1),
+    ] {
+        let wrong_position: i64 = sqlx::query_scalar("INSERT INTO album_tracks(album_id,song_id,disc_number,track_number) VALUES(?,?,?,?) ON CONFLICT(album_id,disc_number,track_number,song_id) DO UPDATE SET song_id=excluded.song_id RETURNING id")
+            .bind(album).bind(recording).bind(disc).bind(track).fetch_one(&h.db).await.unwrap();
+        let response = h
+            .api
+            .clone()
+            .oneshot(
+                Request::post("/api/v1/playback/sessions")
+                    .header("authorization", &h.bearer)
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({"item_id":song,"album_track_id":wrong_position,"mode":"direct"})
+                            .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            !response.status().is_success(),
+            "position mismatch must not fall back to another slot containing the song"
+        );
+    }
+}
+
+#[tokio::test]
+async fn recovery_refuses_a_replaced_version_but_waits_for_a_retained_offline_version() {
+    let h = common::harness(
+        "Recovery (2000).mp4",
+        kahawai_media::testutil::render_h264_aac_mp4,
+    )
+    .await;
+    let started = call(
+        &h,
+        "POST",
+        "/api/v1/playback/sessions",
+        json!({"item_id":h.item_id,"mode":"direct"}),
+    )
+    .await;
+    let sid = started["session_id"].as_str().unwrap();
+    let source = started["source_id"].as_i64().unwrap();
+    let fingerprint = started["source_fingerprint"].as_str().unwrap();
+    let session = h.sessions.get(sid).unwrap();
+    let file = session.parts[0].file_id;
+    let module = session.parts[0].module_id.clone();
+    call(
+        &h,
+        "DELETE",
+        &format!("/api/v1/playback/sessions/{sid}"),
+        json!({}),
+    )
+    .await;
+    sqlx::query("UPDATE files SET head_xxh3=head_xxh3+1 WHERE id=?")
+        .bind(file)
+        .execute(&h.db)
+        .await
+        .unwrap();
+    for selected in [Some(source), None] {
+        let response = h.api.clone().oneshot(Request::post("/api/v1/playback/sessions")
+            .header("authorization", &h.bearer)
+            .header("content-type", "application/json")
+            .body(Body::from(json!({"item_id":h.item_id,"mode":"direct","source_id":selected,"resume_source_fingerprint":fingerprint,"start_ms":1000}).to_string())).unwrap()).await.unwrap();
+        assert_eq!(
+            response.status(),
+            axum::http::StatusCode::CONFLICT,
+            "no retained bytes match the recovery fingerprint (source_id={selected:?})"
+        );
+    }
+    sqlx::query("UPDATE files SET head_xxh3=head_xxh3-1 WHERE id=?")
+        .bind(file)
+        .execute(&h.db)
+        .await
+        .unwrap();
+    h.registry.unregister_link(&module);
+    h.registry.disconnected(&module);
+    let response = h.api.clone().oneshot(Request::post("/api/v1/playback/sessions")
+        .header("authorization", &h.bearer)
+        .header("content-type", "application/json")
+        .body(Body::from(json!({"item_id":h.item_id,"mode":"direct","source_id":source,"resume_source_fingerprint":fingerprint,"start_ms":1000}).to_string())).unwrap()).await.unwrap();
+    assert_eq!(
+        response.status(),
+        axum::http::StatusCode::SERVICE_UNAVAILABLE,
+        "an unchanged retained rendition becomes playable when its host returns"
+    );
+    assert_eq!(common::json_body(response).await["code"], "source_offline");
+}
+
+#[tokio::test]
 async fn exact_episode_boundaries_drive_resume_and_history_without_splitting_files() {
     let h = common::harness(
         "Combined (2000).mp4",
@@ -348,6 +569,25 @@ async fn source_choices_stay_bound_and_recovery_can_use_an_identical_copy() {
         .await
         .unwrap();
     tx.commit().await.unwrap();
+    let removed_choice = h
+        .api
+        .clone()
+        .oneshot(
+            Request::post("/api/v1/playback/sessions")
+                .header("authorization", &h.bearer)
+                .header("content-type", "application/json")
+                .body(Body::from(
+                    json!({"item_id":h.item_id,"mode":"direct","source_id":original}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        removed_choice.status(),
+        axum::http::StatusCode::CONFLICT,
+        "a removed explicit choice needs another choice, not indefinite offline retries"
+    );
     let recovered=call(&h,"POST","/api/v1/playback/sessions",json!({"item_id":h.item_id,"mode":"direct","source_id":original,"resume_source_fingerprint":fingerprint,"start_ms":1000})).await;
     assert_eq!(recovered["source_id"], alternate);
     assert_eq!(recovered["effective_start_ms"], 1000);
@@ -424,6 +664,110 @@ async fn playback_and_source_access_follow_only_first_identification_aliases() {
             "/api/v1/playback/sessions/{}",
             started["session_id"].as_str().unwrap()
         ),
+        json!({}),
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn switching_audio_uses_the_selected_renditions_stream_metadata() {
+    if !kahawai_media::testutil::require_h264_aac_fixture() {
+        return;
+    }
+    fn render_versions(path: &std::path::Path) {
+        let aac = kahawai_media::remux::aac_encoder().unwrap();
+        kahawai_media::testutil::render(&format!(
+            "videotestsrc num-buffers=100 ! video/x-raw,format=I420,width=320,height=240,framerate=25/1 ! x264enc key-int-max=25 ! h264parse ! matroskamux name=m \
+             audiotestsrc num-buffers=172 freq=440 ! audioconvert ! {aac} ! m. \
+             audiotestsrc num-buffers=172 freq=880 ! audioconvert ! flacenc ! m. \
+             m. ! filesink location=\"{}\"",
+            path.display()
+        ));
+        kahawai_media::testutil::render_h264_aac_mkv(&path.with_file_name("larger.mkv"));
+    }
+    let h = common::harness("Versions (2000).mkv", render_versions).await;
+    let (source, file, copy): (i64, i64, String) = sqlx::query_as(
+        "SELECT ps.id,p.file_id,ps.item_id FROM playable_sources ps
+         JOIN playable_source_parts p ON p.playable_source_id=ps.id",
+    )
+    .fetch_one(&h.db)
+    .await
+    .unwrap();
+    let chosen_json: String = sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
+        .bind(file)
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    let chosen: kahawai_core::media::MediaInfo = serde_json::from_str(&chosen_json).unwrap();
+    assert_eq!(chosen.audio.len(), 2);
+    assert_eq!(chosen.audio[1].codec, "flac");
+    let root: String = sqlx::query_scalar("SELECT normalized_path FROM collection_roots LIMIT 1")
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    let larger = std::path::Path::new(&root).join("larger.mkv");
+    let size = std::fs::metadata(&larger).unwrap().len();
+    let info = tokio::task::spawn_blocking(move || {
+        kahawai_media::discover(&larger, std::time::Duration::from_secs(15)).unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(info.audio.len(), 1);
+    let chosen_size: i64 = sqlx::query_scalar("SELECT size FROM files WHERE id=?")
+        .bind(file)
+        .fetch_one(&h.db)
+        .await
+        .unwrap();
+    assert!(
+        size > chosen_size as u64,
+        "the other rendition must sort first by size"
+    );
+    let mut tx = h.db.begin().await.unwrap();
+    let other: i64 = sqlx::query_scalar(
+        "INSERT INTO files(module_id,collection_id,root_id,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json)
+         SELECT module_id,collection_id,root_id,'larger.mkv',?2,1,3,4,5,?3 FROM files WHERE id=?1 RETURNING id",
+    )
+    .bind(file)
+    .bind(size as i64)
+    .bind(serde_json::to_string(&info).unwrap())
+    .fetch_one(&mut *tx)
+    .await
+    .unwrap();
+    kahawai_hub::registry::bind_file_to_item(&mut tx, other, &copy)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+
+    let started = call(
+        &h,
+        "POST",
+        "/api/v1/playback/sessions",
+        json!({
+            "item_id":h.item_id,"source_id":source,"mode":"remux","audio_track":0
+        }),
+    )
+    .await;
+    assert_eq!(started["source_id"], source);
+    let sid = started["session_id"].as_str().unwrap();
+    let switched = call(
+        &h,
+        "POST",
+        &format!("/api/v1/playback/sessions/{sid}/seek"),
+        json!({"position_ms":1000,"audio_track":1}),
+    )
+    .await;
+    assert!(
+        switched["streams"]["audio"]
+            .as_str()
+            .unwrap()
+            .to_lowercase()
+            .contains("flac"),
+        "the selected rendition's second track is FLAC, not the larger rendition's sole AAC track: {switched}"
+    );
+    call(
+        &h,
+        "DELETE",
+        &format!("/api/v1/playback/sessions/{sid}"),
         json!({}),
     )
     .await;

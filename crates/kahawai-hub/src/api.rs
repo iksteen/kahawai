@@ -181,6 +181,7 @@ pub struct NetOptions {
         admin_review_search,
         candidate_artwork,
         admin_apply_match,
+        admin_apply_legacy_match,
         admin_catalog_metadata,
         admin_sessions,
         admin_end_session,
@@ -340,7 +341,6 @@ pub fn router(
             "/api/v1/items/{id}/subtitles/download",
             post(subtitle_download),
         )
-        .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_item_access,
@@ -351,11 +351,6 @@ pub fn router(
         ));
     let media_items = Router::new()
         .route("/api/v1/items/{id}/artwork", get(item_artwork))
-        .route(
-            "/api/v1/items/{id}/subtitles/{file}",
-            get(item_subtitle_file),
-        )
-        .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_item_access,
@@ -394,6 +389,10 @@ pub fn router(
             require_bearer_or_media,
         ));
     let bearer = Router::new()
+        // Resource resolvers check current links or an owned session's captured
+        // copy and current collection grant. The item gate cannot run first:
+        // an established item may have lost its final copy to a correction.
+        .route("/api/v1/items/{id}/fonts", get(item_fonts))
         .route("/api/v1/collections", get(list_collections))
         .route("/api/v1/libraries", get(list_libraries))
         .route("/api/v1/artists", get(list_artists))
@@ -418,6 +417,11 @@ pub fn router(
             require_bearer,
         ));
     let media = Router::new()
+        .route(
+            "/api/v1/items/{id}/subtitles/{file}",
+            get(item_subtitle_file),
+        )
+        .route("/api/v1/items/{id}/fonts/{n}", get(item_font))
         .route("/api/v1/events", get(events))
         .route("/api/v1/artists/{key}/artwork", get(artist_artwork))
         .route_layer(axum::middleware::from_fn_with_state(
@@ -495,6 +499,7 @@ pub fn router(
             "/admin/v1/collection-items/{id}/match",
             post(admin_apply_match),
         )
+        .route("/admin/v1/items/{id}/match", post(admin_apply_legacy_match))
         .route(
             "/admin/v1/library-items/{id}/metadata",
             axum::routing::put(admin_catalog_metadata),
@@ -762,8 +767,12 @@ struct RefreshResponse {
 
 #[derive(Serialize, ToSchema)]
 struct ReviewEntry {
+    /// The reviewed collection copy; retained for original v1 clients.
     item_id: String,
     collection_item_id: String,
+    /// Shared library identity for navigation, never an implicit mutation target.
+    library_item_id: String,
+    /// Detected collection kind, using the original v1 show/track vocabulary.
     kind: String,
     title: String,
     #[schema(required)]
@@ -1685,6 +1694,112 @@ async fn source_copy(
     ))
 }
 
+/// A rematch changes current catalogue links, while playback keeps its captured
+/// copy. Resource fallback is limited to that user's active session coverage
+/// and requires a current grant for every captured physical collection.
+async fn captured_resource_sessions(
+    state: &AppState,
+    user: &str,
+    item: &str,
+) -> Result<Vec<Arc<crate::sessions::Session>>, ApiError> {
+    let canonical = crate::library::resolve_id(state.registry.db(), item)
+        .await
+        .map_err(internal)?;
+    let mut allowed = Vec::new();
+    for session in state.sessions.list().into_iter().filter(|s| {
+        s.user_id == user
+            && (s.item_id == item
+                || s.item_id == canonical
+                || s.library_item_ids
+                    .iter()
+                    .any(|id| id == item || id == &canonical))
+    }) {
+        let mut granted = !session.parts.is_empty();
+        for part in &session.parts {
+            let visible: bool = sqlx::query_scalar(
+                "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1))
+                    OR EXISTS(SELECT 1 FROM library_collections lc JOIN user_libraries ul ON ul.library_id=lc.library_id
+                        WHERE ul.user_id=?1 AND (lc.module_id,lc.collection_id)=(?2,?3))",
+            )
+            .bind(user)
+            .bind(&part.module_id)
+            .bind(&part.collection_id)
+            .fetch_one(state.registry.db())
+            .await
+            .map_err(internal)?;
+            if !visible {
+                granted = false;
+                break;
+            }
+        }
+        if granted {
+            allowed.push(session);
+        }
+    }
+    Ok(allowed)
+}
+
+async fn resource_track(
+    state: &AppState,
+    user: &str,
+    item: &str,
+    track_id: i64,
+) -> Result<crate::tracks::Track, ApiError> {
+    if let Some(track) =
+        crate::tracks::get_for_library_item(state.registry.db(), user, item, track_id)
+            .await
+            .map_err(internal)?
+    {
+        return Ok(track);
+    }
+    for session in captured_resource_sessions(state, user, item).await? {
+        if let Some(track) =
+            crate::tracks::get_for_item(state.registry.db(), &session.collection_item_id, track_id)
+                .await
+                .map_err(internal)?
+            && track
+                .source_id
+                .is_none_or(|file| session.parts.iter().any(|p| p.file_id == file))
+        {
+            return Ok(track);
+        }
+    }
+    Err(hidden("track"))
+}
+
+async fn resource_source_copy(
+    state: &AppState,
+    user: &str,
+    item: &str,
+    source: Option<i64>,
+) -> Result<(String, i64), ApiError> {
+    let error = match source_copy(state, user, item, source).await {
+        Ok(copy) => return Ok(copy),
+        Err(error) if error.code() == ErrorCode::NotFound && source.is_some() => error,
+        Err(error) => return Err(error),
+    };
+    for session in captured_resource_sessions(state, user, item).await? {
+        if Some(session.playable_source_id) != source {
+            continue;
+        }
+        let Some(part) = session.parts.first() else {
+            continue;
+        };
+        let bound: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id
+                WHERE ps.id=? AND ps.item_id=? AND p.ordinal=1 AND p.file_id=?)",
+        ).bind(session.playable_source_id).bind(&session.collection_item_id).bind(part.file_id)
+            .fetch_one(state.registry.db()).await.map_err(internal)?;
+        if bound {
+            return Ok((
+                session.collection_item_id.clone(),
+                session.playable_source_id,
+            ));
+        }
+    }
+    Err(error)
+}
+
 #[derive(Deserialize, ToSchema)]
 struct SubtitleSearchRequest {
     source_id: Option<i64>,
@@ -2436,10 +2551,9 @@ async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) ->
 
 /// List items needing match review
 ///
-/// Admin only. Returns movies, shows and albums whose metadata match is a
-/// miss, weak or rejected, with the current guess where there is one.
-/// Episodes and tracks are excluded because they inherit their parent's
-/// match.
+/// Admin only. Returns unresolved library assignments and conflicting choices,
+/// independently of provider confidence. Top-level items also appear for weak
+/// or missing provider matches; children inherit those provider answers.
 #[utoipa::path(
     get, path = "/admin/v1/enrich/review", tag = "Admin enrichment",
     security(("bearer_auth" = [])),
@@ -2455,15 +2569,16 @@ async fn admin_review_list(
     State(state): State<AppState>,
 ) -> Result<Json<ReviewEntriesResponse>, ApiError> {
     let rows = sqlx::query(
-        "SELECT i.id,a.library_item_id,CASE i.kind WHEN 'show' THEN 'series' WHEN 'track' THEN 'song' ELSE i.kind END AS kind, i.title, i.year, COALESCE(m.confidence,'miss') AS confidence,
+        "SELECT i.id,a.library_item_id,i.kind, i.title, i.year, COALESCE(m.confidence,'miss') AS confidence,
                 m.title AS matched_title, m.premiered, m.provider, m.provider_id,
                 (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id
                   WHERE fb.item_id=i.id LIMIT 1) AS path
          FROM collection_items i
          JOIN collection_item_library_items a ON a.collection_item_id=i.id AND a.ordinal=1
          LEFT JOIN resolved_metadata m ON m.item_id = i.id
-         WHERE i.kind IN ('movie','show','album')
-           AND (m.confidence IS NULL OR m.confidence IN ('miss', 'weak', 'rejected'))
+         WHERE (i.match_mode='unmatched' OR i.match_conflict IS NOT NULL
+           OR (i.kind IN ('movie','show','album')
+             AND (m.confidence IS NULL OR m.confidence IN ('miss', 'weak', 'rejected'))))
            AND NOT (i.match_mode='manual' AND i.match_conflict IS NULL)
          ORDER BY m.confidence != 'miss', i.title",
     )
@@ -2473,8 +2588,9 @@ async fn admin_review_list(
     let entries = rows
         .iter()
         .map(|row| ReviewEntry {
-            item_id: row.get("library_item_id"),
+            item_id: row.get("id"),
             collection_item_id: row.get("id"),
+            library_item_id: row.get("library_item_id"),
             kind: row.get("kind"),
             title: row.get("title"),
             year: row.get("year"),
@@ -2642,6 +2758,12 @@ async fn admin_catalog_metadata(
 #[derive(Deserialize, ToSchema)]
 struct ApplyMatch {
     expected_revision: i64,
+    #[serde(flatten)]
+    decision: MatchDecision,
+}
+
+#[derive(Deserialize, ToSchema)]
+struct MatchDecision {
     library_item_ids: Option<Vec<String>>,
     new_item: Option<crate::library::NewItem>,
     /// "pick": store the supplied candidate; "confirm": promote the
@@ -2681,6 +2803,60 @@ async fn admin_apply_match(
     ApiJson(body): ApiJson<ApplyMatch>,
 ) -> Result<Json<crate::library::Assignment>, ApiError> {
     library_api::apply_match(&state, &id, body).await.map(Json)
+}
+
+#[derive(Deserialize, ToSchema)]
+struct LegacyApplyMatch {
+    action: String,
+    provider: Option<String>,
+    candidate: Option<ManualMatchCandidate>,
+}
+
+/// Apply a legacy provider match decision to one collection item.
+///
+/// Retains the original v1 request and response for existing clients. The ID
+/// identifies the original collection copy, including its grouped files; it
+/// never chooses an arbitrary copy of a shared library item. New clients use
+/// the collection-items route with an assignment revision to detect stale edits.
+#[utoipa::path(
+    post, path = "/admin/v1/items/{id}/match", tag = "Admin enrichment",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = LegacyApplyMatch,
+    responses(
+        (status = 200, body = OkResponse),
+        (status = 400, body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
+    )
+)]
+async fn admin_apply_legacy_match(
+    State(state): State<AppState>,
+    ApiPath(id): ApiPath<String>,
+    ApiJson(body): ApiJson<LegacyApplyMatch>,
+) -> Result<Json<OkResponse>, ApiError> {
+    if !matches!(body.action.as_str(), "pick" | "confirm" | "reject") {
+        return Err(ApiError::new(ErrorCode::BadRequest, "Unknown match action"));
+    }
+    library_api::apply_decision(
+        &state,
+        &id,
+        None,
+        MatchDecision {
+            action: body.action,
+            provider: body.provider,
+            candidate: body.candidate,
+            library_item_ids: None,
+            new_item: None,
+        },
+    )
+    .await?;
+    Ok(Json(OkResponse { ok: true }))
 }
 
 /// List users
@@ -3458,8 +3634,8 @@ async fn admin_session_log(
 /// Download newest session log for an item
 ///
 /// Admin only. Returns the most recent session diagnostics recorded for the
-/// item, by any user, as a plain-text attachment. Returns 404 when no such
-/// log has been stored.
+/// item or any permanent alias, by any user, as a plain-text attachment.
+/// Returns 404 when no such log has been stored.
 #[utoipa::path(
     get, path = "/admin/v1/items/{id}/log", tag = "Admin sessions",
     security(("bearer_auth" = [])),
@@ -3483,7 +3659,19 @@ async fn admin_item_log(
         .sessions
         .data_dir()
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no data dir"))?;
-    let path = crate::sessionlog::newest_for_item(data_dir, &id)
+    let canonical = crate::library::resolve_id(state.registry.db(), &id)
+        .await
+        .map_err(internal)?;
+    let family: Vec<String> = sqlx::query_scalar(
+        "WITH RECURSIVE family(id) AS (
+        SELECT ? UNION SELECT l.id FROM library_items l JOIN family f ON l.merged_into=f.id
+      ) SELECT id FROM family",
+    )
+    .bind(&canonical)
+    .fetch_all(state.registry.db())
+    .await
+    .map_err(internal)?;
+    let path = crate::sessionlog::newest_for_items(data_dir, &family)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no session logs for this item"))?;
     let body = std::fs::read_to_string(&path).map_err(internal)?;
     Ok(log_attachment(format!("kahawai-item-{id}.log"), body))
@@ -4441,7 +4629,7 @@ async fn start_session(
             // Additive (HUB-32a/b); [] on explicit-mode sessions.
             subtitles: session.sub_verdicts.lock().unwrap().clone(),
         });
-    let subtitle_listing = match session.parts.first() {
+    let mut subtitle_listing = match session.parts.first() {
         Some(p) => state
             .subtitles
             .list(
@@ -4457,6 +4645,11 @@ async fn start_session(
             .map_err(internal)?,
         None => Vec::new(),
     };
+    // Extraction uses the captured physical owner; public resource URLs use
+    // the canonical requested member, including a member of combined coverage.
+    for listing in &mut subtitle_listing {
+        listing.track.item_id.clone_from(&session.item_id);
+    }
     Ok((
         StatusCode::CREATED,
         Json(StartSessionResponse {
@@ -4833,8 +5026,7 @@ async fn artist_artwork(
     music_library(state.registry.db(), &claims, &q.library).await?;
     let belongs: i64 = sqlx::query_scalar(
         "SELECT EXISTS(
-             SELECT 1 FROM collection_items i JOIN library_collections lc
-               ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
+             SELECT 1 FROM library_entries i JOIN library_membership lc ON lc.item_id=i.id
               WHERE lc.library_id=? AND i.kind='album' AND i.artist_key=?)",
     )
     .bind(&q.library)
@@ -4931,36 +5123,47 @@ async fn item_artwork(
     let library_item_id = crate::library::resolve_id(state.registry.db(), &id)
         .await
         .map_err(internal)?;
-    let id = crate::library::copies(state.registry.db(), &claims.sub, &id)
+    let copies = crate::library::copies(state.registry.db(), &claims.sub, &id)
         .await
-        .map_err(internal)?
-        .into_iter()
-        .next()
-        .ok_or_else(|| hidden("item"))?;
-    let eligible: bool =
-        sqlx::query_scalar("SELECT metadata_eligible AND EXISTS(SELECT 1 FROM collection_item_library_items WHERE collection_item_id=ci.id AND library_item_id=?2 AND ordinal=1) FROM collection_items ci WHERE id=?1")
-            .bind(&id).bind(&library_item_id)
-            .fetch_one(state.registry.db())
-            .await
-            .map_err(internal)?;
-    if !eligible {
-        return Err(hidden("artwork"));
+        .map_err(internal)?;
+    if copies.is_empty() {
+        return Err(hidden("item"));
     }
     // The detail goes to the log, not to the caller: what fails here is
     // usually a fetch from a metadata provider, and its error names the
     // upstream URL. SEC-WEB-7 — a provider's address is not the client's
     // business, and "the poster did not load" is all an <img> can use.
-    let found = match state
-        .artwork
-        .get_at(&state.registry, &state.sessions, &id, q.size.as_deref())
-        .await
-    {
-        Ok(found) => found,
-        Err(e) => {
-            tracing::warn!(item = %id, error = %e, "artwork could not be served");
-            return Err(ApiError::new(ErrorCode::Internal, "artwork unavailable"));
+    let mut found = None;
+    let mut failed = false;
+    for copy in copies {
+        let eligible: bool =
+            sqlx::query_scalar("SELECT metadata_eligible AND EXISTS(SELECT 1 FROM collection_item_library_items WHERE collection_item_id=ci.id AND library_item_id=?2 AND ordinal=1) FROM collection_items ci WHERE id=?1")
+                .bind(&copy).bind(&library_item_id)
+                .fetch_one(state.registry.db())
+                .await
+                .map_err(internal)?;
+        if !eligible {
+            continue;
         }
-    };
+        match state
+            .artwork
+            .get_at(&state.registry, &state.sessions, &copy, q.size.as_deref())
+            .await
+        {
+            Ok(Some(artwork)) => {
+                found = Some(artwork);
+                break;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                tracing::warn!(item = %library_item_id, collection_item = %copy, error = %e, "artwork could not be served");
+                failed = true;
+            }
+        }
+    }
+    if found.is_none() && failed {
+        return Err(ApiError::new(ErrorCode::Internal, "artwork unavailable"));
+    }
     match found {
         Some((bytes, ctype)) => Ok((
             [
@@ -5049,10 +5252,8 @@ async fn item_subtitle_file(
         .next()
         .and_then(|v| v.parse::<i64>().ok())
         .ok_or_else(|| ApiError::new(ErrorCode::BadRequest, "bad track id"))?;
-    let id = crate::tracks::get_for_library_item(state.registry.db(), &claims.sub, &id, track_id)
-        .await
-        .map_err(internal)?
-        .ok_or_else(|| hidden("track"))?
+    let id = resource_track(&state, &claims.sub, &id, track_id)
+        .await?
         .item_id;
 
     // The public keyspace is TRACK IDS ({id}.vtt / {id}.ass); the
@@ -5276,7 +5477,7 @@ async fn item_fonts(
     ApiPath(id): ApiPath<String>,
     ApiQuery(q): ApiQuery<SourceQuery>,
 ) -> Result<Json<FontsResponse>, ApiError> {
-    let (id, source_id) = source_copy(&state, &claims.sub, &id, q.source_id).await?;
+    let (id, source_id) = resource_source_copy(&state, &claims.sub, &id, q.source_id).await?;
     let fonts = state
         .subtitles
         .fonts(&state.registry, &state.sessions, &id, Some(source_id))
@@ -5316,7 +5517,7 @@ async fn item_font(
     ApiPath((id, n)): ApiPath<(String, usize)>,
     ApiQuery(q): ApiQuery<SourceQuery>,
 ) -> Result<Response, ApiError> {
-    let (id, source_id) = source_copy(&state, &claims.sub, &id, q.source_id).await?;
+    let (id, source_id) = resource_source_copy(&state, &claims.sub, &id, q.source_id).await?;
     let fonts = state
         .subtitles
         .fonts(&state.registry, &state.sessions, &id, Some(source_id))
@@ -6086,7 +6287,7 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
     let played = r.get::<Option<i64>, _>("played").unwrap_or(0) != 0;
     ItemRow {
         id: r.get("id"),
-        album_track_id: None,
+        album_track_id: r.try_get("album_track_id").ok().flatten(),
         kind: r.get("kind"),
         title: r.get("title"),
         artist: r.try_get("artist").ok().flatten(),
@@ -6094,7 +6295,7 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
         // Artwork is cached hard by the browser (a day), so the URL has
         // to change when the metadata does — otherwise re-matching an
         // item leaves yesterday's poster on the card.
-        art_version: r.try_get("art_version").ok().flatten(),
+        art_version: library_api::artwork_version(r),
         premiered: r.try_get("premiered").ok().flatten(),
         file_title: r.try_get("file_title").ok().flatten(),
         file_year: r.try_get("file_year").ok().flatten(),
@@ -6161,6 +6362,7 @@ struct ItemSource {
     /// Assignment owner shared by every file part of this source.
     collection_item_id: String,
     module_id: String,
+    host_name: Option<String>,
     collection_id: String,
     /// Collection-relative media path. This is intentional client data: the
     /// release name often carries rendition facts that discovery cannot
@@ -6605,12 +6807,13 @@ async fn collection_body(
     .ok_or(ApiError::new(ErrorCode::NotFound, "no such item"))?;
 
     let sources = sqlx::query(
-        "SELECT f.module_id,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
+        "SELECT f.module_id,s.name AS host_name,f.collection_id,f.path_rel AS source_path,f.size,f.streams_json,
                 COALESCE(f.revision,1) AS revision,
                 ps.id AS source_id, p.ordinal AS part, ps.expected_parts AS parts
          FROM playable_sources ps
          JOIN playable_source_parts p ON p.playable_source_id=ps.id
          JOIN files f ON f.id=p.file_id
+         LEFT JOIN satellites s ON s.module_id=f.module_id
          WHERE ps.item_id=?
          -- Playback's own order, from `sessions::playable_rows`, which this
          -- claimed to match and did not: that one ranks whole SOURCES by their
@@ -6656,6 +6859,7 @@ async fn collection_body(
                 collection_item_id: id.to_string(),
                 available: state.registry.is_connected(&module_id),
                 module_id,
+                host_name: r.get("host_name"),
                 collection_id: r.get("collection_id"),
                 path_rel: r.get("source_path"),
                 size: r.get("size"),
@@ -6671,15 +6875,17 @@ async fn collection_body(
 
     let show_title = item.get("show_title");
     // Enrichment (own metadata, or the parent show's for episodes).
-    let meta = sqlx::query(
+    let primary_projection =
+        crate::providers::episode_projection_pair_sql("p3", "i.episode", "i.episode");
+    let meta = sqlx::query(sqlx::AssertSqlSafe(format!(
         "SELECT m.overview, m.rating, m.premiered, m.confidence, m.provider,
                 -- The ids a third-party lookup keys on. An episode's own
                 -- provider_id names the EPISODE's record; services that
                 -- key TV on the show (season/episode alongside) need the
                 -- parent's id, so an item with a parent answers only from
                 -- the parent — its own id would be the wrong namespace.
-                -- Read from provider_metadata directly, not from the
-                -- CHOSEN provider: a `.nfo` library elects `local` as its
+                -- Read all answers eligible for the current parent context.
+                -- A `.nfo` library elects `local` as its
                 -- describing provider while the tmdb answer sits stored
                 -- beside it, and each id stands on its own row (the same
                 -- shape the OpenSubtitles lookup uses).
@@ -6689,10 +6895,12 @@ async fn collection_body(
                 -- a human confirmed it (`manual_match`, which is all the
                 -- confirm action writes) — and a rejected id was rejected
                 -- by a human.
-                (SELECT p2.provider_id FROM provider_metadata p2
+                -- Retained answers from an earlier parent context cannot
+                -- donate these external ids.
+                (SELECT p2.provider_id FROM answer_priority p2
                   WHERE p2.item_id = COALESCE(
                           (SELECT sh.id FROM collection_items sh
-                            WHERE sh.id = i.parent_id AND sh.kind = 'show'),
+                            WHERE sh.id = i.parent_id AND sh.kind = 'show' AND sh.metadata_eligible=1),
                           CASE WHEN i.parent_id IS NULL THEN i.id END)
                     AND p2.provider = 'tmdb' AND p2.provider_id != ''
                     AND (p2.confidence = 'auto'
@@ -6704,10 +6912,10 @@ async fn collection_body(
                                      WHERE rj.item_id = p2.item_id
                                        AND rj.provider = p2.provider
                                        AND rj.provider_id = p2.provider_id)) AS keyed_tmdb,
-                (SELECT p2.provider_id FROM provider_metadata p2
+                (SELECT p2.provider_id FROM answer_priority p2
                   WHERE p2.item_id = COALESCE(
                           (SELECT sh.id FROM collection_items sh
-                            WHERE sh.id = i.parent_id AND sh.kind = 'show'),
+                            WHERE sh.id = i.parent_id AND sh.kind = 'show' AND sh.metadata_eligible=1),
                           CASE WHEN i.parent_id IS NULL THEN i.id END)
                     AND p2.provider = 'tvdb' AND p2.provider_id != ''
                     AND (p2.confidence = 'auto'
@@ -6725,7 +6933,7 @@ async fn collection_body(
                 -- into another episode's boundaries.
                 -- The same trust filters as the ids: a rejected or weak
                 -- episode record must not donate its numbering either.
-                (SELECT p3.proj_season FROM provider_metadata p3
+                (SELECT json_extract(({primary_projection}),'$[0]') FROM answer_priority p3
                   WHERE p3.item_id = i.id AND p3.provider = 'tmdb'
                     AND (p3.confidence = 'auto'
                          OR EXISTS (SELECT 1 FROM manual_match mm
@@ -6736,7 +6944,7 @@ async fn collection_body(
                                      WHERE rj.item_id = p3.item_id
                                        AND rj.provider = p3.provider
                                        AND rj.provider_id = p3.provider_id)) AS tmdb_proj_season,
-                (SELECT p3.proj_episode FROM provider_metadata p3
+                (SELECT json_extract(({primary_projection}),'$[1]') FROM answer_priority p3
                   WHERE p3.item_id = i.id AND p3.provider = 'tmdb'
                     AND (p3.confidence = 'auto'
                          OR EXISTS (SELECT 1 FROM manual_match mm
@@ -6747,7 +6955,7 @@ async fn collection_body(
                                      WHERE rj.item_id = p3.item_id
                                        AND rj.provider = p3.provider
                                        AND rj.provider_id = p3.provider_id)) AS tmdb_proj_episode,
-                (SELECT p3.proj_season FROM provider_metadata p3
+                (SELECT json_extract(({primary_projection}),'$[0]') FROM answer_priority p3
                   WHERE p3.item_id = i.id AND p3.provider = 'tvdb'
                     AND (p3.confidence = 'auto'
                          OR EXISTS (SELECT 1 FROM manual_match mm
@@ -6758,7 +6966,7 @@ async fn collection_body(
                                      WHERE rj.item_id = p3.item_id
                                        AND rj.provider = p3.provider
                                        AND rj.provider_id = p3.provider_id)) AS tvdb_proj_season,
-                (SELECT p3.proj_episode FROM provider_metadata p3
+                (SELECT json_extract(({primary_projection}),'$[1]') FROM answer_priority p3
                   WHERE p3.item_id = i.id AND p3.provider = 'tvdb'
                     AND (p3.confidence = 'auto'
                          OR EXISTS (SELECT 1 FROM manual_match mm
@@ -6776,11 +6984,12 @@ async fn collection_body(
                 COALESCE(NULLIF(m.original_language, ''),
                          NULLIF(pm.original_language, '')) AS original_language
          FROM collection_items i
-         JOIN resolved_metadata m ON m.item_id IN (i.id, i.parent_id)
-         LEFT JOIN resolved_metadata pm ON pm.item_id = i.parent_id
+         LEFT JOIN collection_items eligible_parent ON eligible_parent.id=i.parent_id AND eligible_parent.metadata_eligible=1
+         JOIN resolved_metadata m ON m.item_id IN (i.id, eligible_parent.id)
+         LEFT JOIN resolved_metadata pm ON pm.item_id = eligible_parent.id
          WHERE i.id = ? AND m.provider_id != ''
-         ORDER BY m.item_id = i.id DESC LIMIT 1",
-    )
+         ORDER BY m.item_id = i.id DESC LIMIT 1"
+    )))
     .bind(id)
     .fetch_optional(state.registry.db())
     .await
@@ -7019,6 +7228,12 @@ struct ItemQuery {
     profile: Option<kahawai_core::media::CapabilityProfile>,
     #[serde(default)]
     audio_track: u32,
+    /// Per-rendition audio preferences for automatic ranking: source ID to
+    /// audio stream index. Missing sources use audio_track. START still takes
+    /// the chosen source and its resolved index, never a cross-source index.
+    #[serde(default)]
+    #[schema(value_type = std::collections::BTreeMap<String, u32>)]
+    source_audio_tracks: std::collections::BTreeMap<i64, u32>,
     #[serde(default)]
     video_track: u32,
     #[serde(default)]
@@ -7123,6 +7338,9 @@ async fn item_query(
             None => internal(e),
         }
     })?;
+    neg.set_source_audio_tracks(&q.source_audio_tracks)
+        .await
+        .map_err(internal)?;
     // Nothing to negotiate is an ANSWER, not a failure: a show or an
     // album has no sources of its own, and a movie whose mediahost is
     // offline has none right now. Both are ordinary items whose detail
@@ -7194,7 +7412,7 @@ async fn item_query(
     // chose. Asking `source_row` instead — as the old listing endpoint
     // did — can name a different file on a multi-source item, and then
     // every delivery describes something that will not be played.
-    let subtitles = match parts.first() {
+    let mut subtitles = match parts.first() {
         Some(p) => state
             .subtitles
             .list(
@@ -7210,6 +7428,11 @@ async fn item_query(
             .map_err(internal)?,
         None => Vec::new(),
     };
+    // Keep the physical owner inside the track subsystem. A listed track's
+    // public item_id must resolve through the same library item as this QUERY.
+    for listing in &mut subtitles {
+        listing.track.item_id.clone_from(&id);
+    }
 
     // The chapters must describe the file about to PLAY. `item_body` folded
     // the rank-first eligible source's; negotiation picks by COST with rank
@@ -7540,12 +7763,19 @@ async fn item_set_watched(
             format!("at most {WATCHED_BATCH_MAX} items per mark"),
         ));
     }
+    // Resolve permanent first-identification aliases in the same transaction
+    // as the mark, so a concurrent merge cannot strand a bookmarked item ID.
+    let mut tx = state.registry.db().begin().await.map_err(internal)?;
+    let id = crate::library::canonical_id(&mut tx, &id)
+        .await
+        .map_err(internal)?;
+    let ids = crate::library::canonical_ids(&mut tx, &ids)
+        .await
+        .map_err(internal)?;
     let list = serde_json::to_string(&ids).map_err(internal)?;
 
-    // One statement, so the whole mark is atomic without a transaction to
-    // manage. `json_each` unrolls the id list from a single bound
-    // parameter — no placeholder building, and nothing of the caller's
-    // ever reaches the SQL text.
+    // `json_each` unrolls the id list from a single bound parameter — no
+    // placeholder building, and none of the caller's text reaches SQL.
     //
     // The join onto `items` is what enforces the boundary: an id that is
     // neither this item nor one of its children simply is not selected, so
@@ -7577,9 +7807,10 @@ async fn item_set_watched(
     .bind(&list)
     .bind(body.played)
     .bind(&id)
-    .fetch_all(state.registry.db())
+    .fetch_all(&mut *tx)
     .await
     .map_err(internal)?;
+    tx.commit().await.map_err(internal)?;
 
     if rows.is_empty() {
         // Nothing matched: either the item does not exist, or none of the
@@ -7846,6 +8077,26 @@ mod tests {
         refusal_or_internal, retire_deleted_segment_link, same_fields,
     };
     use std::collections::BTreeMap;
+
+    #[test]
+    fn source_audio_track_schema_accepts_json_property_names() {
+        let document = serde_json::to_value(openapi_document()).unwrap();
+        let schema =
+            &document["components"]["schemas"]["ItemQuery"]["properties"]["source_audio_tracks"];
+        assert_eq!(schema["type"], "object");
+        assert!(
+            schema.get("propertyNames").is_none() || schema["propertyNames"]["type"] == "string",
+            "JSON object keys are strings, including source IDs: {schema}"
+        );
+        let request: super::ItemQuery = serde_json::from_value(serde_json::json!({
+            "source_audio_tracks": {"1":1,"2":0}
+        }))
+        .unwrap();
+        assert_eq!(
+            request.source_audio_tracks,
+            BTreeMap::from([(1, 1), (2, 0)])
+        );
+    }
 
     #[tokio::test]
     async fn deleting_a_satellite_wakes_its_segment_waiter() {
@@ -8216,6 +8467,7 @@ mod tests {
             ("get", "/admin/v1/enrich/review"),
             ("post", "/admin/v1/enrich/search"),
             ("post", "/admin/v1/collection-items/{id}/match"),
+            ("post", "/admin/v1/items/{id}/match"),
             ("put", "/admin/v1/library-items/{id}/metadata"),
             ("get", "/admin/v1/sessions"),
             ("delete", "/admin/v1/sessions/{id}"),

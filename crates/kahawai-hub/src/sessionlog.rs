@@ -118,24 +118,31 @@ pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
 /// The newest bundle for an item, whoever played it — the point is
 /// debugging somebody else's report.
 pub fn newest_for_item(data_dir: &Path, item_id: &str) -> Option<PathBuf> {
-    newest_matching(&dir(data_dir), &format!("-{item_id}-"))
+    newest_matching(&dir(data_dir), &[format!("-{item_id}-")])
+}
+
+/// A shared item's permanent aliases may name older bundles. Search their
+/// family in one directory pass, preserving the existing retention policy.
+pub fn newest_for_items(data_dir: &Path, item_ids: &[String]) -> Option<PathBuf> {
+    let needles: Vec<String> = item_ids.iter().map(|id| format!("-{id}-")).collect();
+    newest_matching(&dir(data_dir), &needles)
 }
 
 /// A specific session's bundle, if one was kept.
 pub fn for_session(data_dir: &Path, session_id: &str) -> Option<PathBuf> {
-    newest_matching(&dir(data_dir), &format!("-{session_id}.log"))
+    newest_matching(&dir(data_dir), &[format!("-{session_id}.log")])
 }
 
 /// Names lead with a unix stamp, so lexical order is chronological and
 /// the last match is the newest.
-fn newest_matching(dir: &Path, needle: &str) -> Option<PathBuf> {
+fn newest_matching(dir: &Path, needles: &[String]) -> Option<PathBuf> {
     let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
-                .is_some_and(|n| n.contains(needle))
+                .is_some_and(|n| needles.iter().any(|needle| n.contains(needle)))
         })
         .collect();
     hits.sort();

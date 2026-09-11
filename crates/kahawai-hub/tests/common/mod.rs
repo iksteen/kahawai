@@ -35,6 +35,7 @@ pub struct Harness {
     pub item_id: String,
     pub registry: Arc<Registry>,
     pub sessions: Arc<kahawai_hub::sessions::Sessions>,
+    pub subtitles: Arc<kahawai_hub::subtitles::Subtitles>,
     pub db: kahawai_hub::library::Database,
     /// Held so the collection root and PKI outlive the test.
     _root: tempfile::TempDir,
@@ -245,7 +246,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         auth,
         sessions.clone(),
         enrollments,
-        subtitles,
+        subtitles.clone(),
         Arc::new(kahawai_hub::artwork::Artwork::new(
             tempfile::tempdir().unwrap().keep(),
             enricher.clone(),
@@ -288,6 +289,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         item_id,
         registry,
         sessions,
+        subtitles,
         db,
         _root: root,
         _pki: pki,

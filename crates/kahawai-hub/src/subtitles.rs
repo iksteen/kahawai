@@ -418,7 +418,7 @@ impl Subtitles {
             let ex = self.load(registry, sessions, track).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let TrackSource {
+        let FileSource {
             module_id,
             collection_id,
             root_token,
@@ -567,7 +567,7 @@ impl Subtitles {
                 .context("downloaded subtitle missing from cache — download it again")?;
             return Ok(serde_json::from_slice(&bytes)?);
         }
-        let TrackSource {
+        let FileSource {
             module_id,
             collection_id,
             root_token,
@@ -1892,8 +1892,14 @@ impl Subtitles {
         item_id: &str,
         source_id: Option<i64>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
-        let (module_id, collection_id, root_token, path_rel, info) =
-            source_row_for(registry, item_id, source_id).await?;
+        let FileSource {
+            module_id,
+            collection_id,
+            root_token,
+            path_rel,
+            size,
+            info,
+        } = font_source(registry, item_id, source_id).await?;
         let cache_key = format!(
             "fonts-{:016x}",
             xxhash_rust::xxh3::xxh3_64(
@@ -1941,8 +1947,15 @@ impl Subtitles {
                     Vec::new()
                 } else {
                     use tokio_stream::StreamExt;
-                    let (_, _, _, _, lease) = sessions
-                        .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+                    let lease = sessions
+                        .open_lease(
+                            registry,
+                            &module_id,
+                            &collection_id,
+                            &root_token,
+                            &path_rel,
+                            crate::sessions::Reader::Viewer,
+                        )
                         .await?;
                     let mut out = Vec::with_capacity(declared.len());
                     for a in declared {
@@ -1967,8 +1980,15 @@ impl Subtitles {
                 }
             }
             None => {
-                let (_, _, size, _, lease) = sessions
-                    .open_source(registry, item_id, crate::sessions::Reader::Viewer)
+                let lease = sessions
+                    .open_lease(
+                        registry,
+                        &module_id,
+                        &collection_id,
+                        &root_token,
+                        &path_rel,
+                        crate::sessions::Reader::Viewer,
+                    )
                     .await?;
                 let source = crate::sessions::LeaseSource {
                     lease,
@@ -2090,7 +2110,7 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
 /// Metadata and byte reads must use the physical file named by the track.
 /// A stream index such as e0 is only meaningful within that file; selecting a
 /// collection's default source here substitutes another release's timestamps.
-struct TrackSource {
+struct FileSource {
     module_id: String,
     collection_id: String,
     root_token: String,
@@ -2099,7 +2119,7 @@ struct TrackSource {
     info: kahawai_core::media::MediaInfo,
 }
 
-async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Result<TrackSource> {
+async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Result<FileSource> {
     let source_id = track
         .source_id
         .context("subtitle track has no physical source")?;
@@ -2110,7 +2130,7 @@ async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Resu
     .bind(source_id)
     .fetch_one(registry.db())
     .await?;
-    Ok(TrackSource {
+    Ok(FileSource {
         module_id: row.get("module_id"),
         collection_id: row.get("collection_id"),
         root_token: row.get("root_token"),
@@ -2120,38 +2140,20 @@ async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Resu
     })
 }
 
-/// The item's source the way `Sessions::open_source` picks it, without
-/// opening a lease: (module, collection, path, streams info).
-pub(crate) async fn source_row(
-    registry: &Registry,
-    item_id: &str,
-) -> Result<(
-    String,
-    String,
-    String,
-    String,
-    kahawai_core::media::MediaInfo,
-)> {
-    source_row_for(registry, item_id, None).await
-}
-
-async fn source_row_for(
+/// Fonts describe the first part of the selected rendition, matching the
+/// subtitle track list captured when playback starts.
+async fn font_source(
     registry: &Registry,
     item_id: &str,
     source_id: Option<i64>,
-) -> Result<(
-    String,
-    String,
-    String,
-    String,
-    kahawai_core::media::MediaInfo,
-)> {
+) -> Result<FileSource> {
     let rows = sqlx::query(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                f.streams_json
-         FROM files f JOIN collection_roots r ON r.id=f.root_id
-         JOIN file_bindings fb ON fb.file_id=f.id
-         WHERE fb.item_id=?1 AND (?2 IS NULL OR EXISTS(SELECT 1 FROM playable_source_parts p WHERE p.playable_source_id=?2 AND p.file_id=f.id)) ORDER BY f.size DESC",
+                f.size,f.streams_json
+         FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id
+         JOIN files f ON f.id=p.file_id JOIN collection_roots r ON r.id=f.root_id
+         WHERE ps.item_id=?1 AND (?2 IS NULL OR ps.id=?2)
+         ORDER BY CASE WHEN ?2 IS NOT NULL THEN p.ordinal END,f.size DESC",
     )
     .bind(item_id)
     .bind(source_id)
@@ -2164,13 +2166,14 @@ async fn source_row_for(
         .context("no sources for item")?;
     let info: kahawai_core::media::MediaInfo =
         serde_json::from_str(row.get::<String, _>("streams_json").as_str()).unwrap_or_default();
-    Ok((
-        row.get("module_id"),
-        row.get("collection_id"),
-        row.get("root_token"),
-        row.get("source_path"),
+    Ok(FileSource {
+        module_id: row.get("module_id"),
+        collection_id: row.get("collection_id"),
+        root_token: row.get("root_token"),
+        path_rel: row.get("source_path"),
+        size: row.get::<i64, _>("size") as u64,
         info,
-    ))
+    })
 }
 
 /// Drain a whole (small) file through a lease in chunks.
