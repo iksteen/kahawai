@@ -36,7 +36,8 @@
 //! correct depended on someone remembering to call something. Triggers
 //! remove the someone. That is why `set_chain` is one INSERT and
 //! `store_answer` is one upsert — reordering the chain re-decides
-//! source assignment for a whole media type, and neither function knows it.
+//! source assignment for a whole media type. Answer writers additionally bind
+//! the parent description context before replacing a parent provider record.
 //!
 //! It also means a derivation must not carry an input as a column. The
 //! human pin used to be `item_match.manual`, which forced the pick to
@@ -80,6 +81,52 @@
 //!   nothing, always paired with `confidence = "miss"`. A miss is
 //!   PRESENTATION ("consulted, nothing found"), never a gate: the walk
 //!   skips a provider only on a real answer.
+//!   `parent_library_item_id` captures the parent work described by an inherited
+//!   child answer. A different current parent makes that answer ineligible; an
+//!   exact independent child pin remains eligible. First identification redirects
+//!   the captured work along with its other typed references. Legacy NULL answers
+//!   remain usable; a future correction away from an established parent binds
+//!   only its unbound child answers to that departing work. No historical origin
+//!   is guessed on upgrade and no answer is deleted or broadly refetched.
+//!   A nullable ID and partial reverse index support bounded parent correction
+//!   and identification writes. Reads compare existing assignment keys. Async
+//!   episode requests capture the parent before I/O and atomically validate it
+//!   before storing their answer and projection, so an old reply cannot become
+//!   a new parent's description.
+//!   `collection_items.provider_identity_revision` advances for a show/album
+//!   when an existing provider record is replaced or a human picks a different
+//!   record. A provider-order change or refresh of the same ID does not advance
+//!   it. Empty-ID withdrawal and refreshing an already ineligible answer do not
+//!   advance it either. This describes provider-answer context, never canonical library identity:
+//!   movies and series still match by title and year.
+//!   `provider_metadata.identity_revision` captures that context: its owner
+//!   is the answer's own show/album for parent answers, or its collection parent
+//!   for child answers. Movies have no such context. Only answers from the
+//!   current revision can supply an inherited episode request; an exact human
+//!   pin remains authoritative. NULL revisions are legacy answers, bound before
+//!   the next correction. The cost is one integer per collection item and one
+//!   nullable integer per answer, keyed reads per write, and indexed writes to
+//!   that parent's answers/children only when its record changes. There is no
+//!   catalogue scan, answer duplication or upgrade-triggered provider traffic.
+//!   `covered_episode_projections` is an optional JSON object on that same
+//!   answer: native absolute episode numbers map to provider [season, episode]
+//!   pairs, or null when the requested projection was unavailable. It describes
+//!   only the copy's bounded native coverage, never library identity. Legacy
+//!   scalar projections still describe only the first episode. Combined files
+//!   with missing map entries receive the normal paced episode pass; recorded
+//!   gaps retain its weekly retry interval. The answer owns context, trust and
+//!   provider ordering, so a correction invalidates the map with its answer.
+//!   Storage and JSON work scale with covered episodes (normally one or two,
+//!   bounded by the same 1,000-episode limit as matching). Reads visit indexed
+//!   supporting copies and their providers, without catalogue scans or I/O.
+//!   An unchanged stale NFO claim stays ineligible when read again; an explicit
+//!   local pin or changed identity-bearing claim can replace it. In correction
+//!   contexts, provider questions use the assigned work's title/year (album
+//!   artist/title), without the old filename alternate. Selectors and the walker
+//!   use the same keys. A stored but ineligible answer cannot settle its current
+//!   question: it is refreshed once despite an older query-log row. A current
+//!   answer or miss settles that exception. All checks are local keyed reads;
+//!   provider pacing and the question log remain in force.
 //! * `provider_queries` — never-ask-twice, keyed on the QUESTION: one
 //!   row per (item, provider, query_type, query) a provider actually
 //!   sent over the network. A provider is due while its CURRENT
@@ -290,8 +337,10 @@ pub async fn set_chain(db: &SqlitePool, media_type: &str, order: &[String]) -> R
     Ok(())
 }
 
-/// Drop an assignment whose backing answer no longer qualifies —
-/// downgraded to a miss, or since refused.
+/// Drop an assignment whose backing answer no longer qualifies, or a child's
+/// independent assignment after its pin is removed. Children then inherit their
+/// parent's provider again. The eligibility checks use the item and pin keys;
+/// replacing these trigger definitions also repairs saved rows at startup.
 ///
 /// This applies to pinned assignments too. A pin lives in `manual_match`
 /// and says which RECORD the owner chose; it cannot keep an `item_match`
@@ -303,11 +352,17 @@ DELETE FROM item_match
  WHERE (?1 IS NULL OR item_id = ?1)
    AND (?2 IS NULL OR media_type = ?2)
    AND (NOT EXISTS (
+          SELECT 1 FROM collection_items i WHERE i.id=item_match.item_id
+            AND (i.kind IN ('movie','show','album') OR EXISTS (
+                 SELECT 1 FROM manual_match pin WHERE pin.item_id=i.id)))
+        OR NOT EXISTS (
           SELECT 1 FROM provider_metadata pm
            WHERE pm.item_id = item_match.item_id
              AND pm.provider = item_match.provider
              AND pm.provider_id <> ''
-             AND pm.confidence IN ('auto', 'weak'))
+             AND pm.confidence IN ('auto', 'weak')
+             AND (pm.identity_revision IS NULL OR pm.identity_revision=(SELECT provider_identity_revision FROM collection_items WHERE id=pm.item_id)
+               OR EXISTS(SELECT 1 FROM manual_match pin WHERE pin.item_id=pm.item_id AND pin.provider=pm.provider AND pin.provider_id=pm.provider_id)))
         OR EXISTS (
           SELECT 1 FROM rejected_matches rj
            WHERE rj.item_id = item_match.item_id
@@ -345,13 +400,13 @@ SELECT item_id, provider, provider_id, media_type, pinned, unixepoch() FROM (
              COALESCE(r.rank, 99),
              pm.provider) AS n
     FROM (
-      SELECT i.id AS item_id,
+      SELECT i.id AS item_id, i.provider_identity_revision,
              CASE WHEN c.media_type IN ('movies','series','anime','music')
                   THEN c.media_type ELSE 'movies' END AS media_type
         FROM collection_items i JOIN collections c
           ON (c.module_id,c.collection_id)=(i.module_id,i.collection_id)
-       -- Top level only. Episodes and tracks follow their parent, and this
-       -- filter is the only thing enforcing that.
+       -- Episodes and tracks follow their parent unless explicitly pinned.
+       -- DROP_STALE_ASSIGNMENT clears their own result when that pin goes.
        WHERE (i.kind IN ('movie','show','album') OR EXISTS(SELECT 1 FROM manual_match pin WHERE pin.item_id=i.id))
          AND (?1 IS NULL OR i.id = ?1)
     ) t
@@ -365,6 +420,7 @@ SELECT item_id, provider, provider_id, media_type, pinned, unixepoch() FROM (
            ON r.media_type = t.media_type
           AND r.provider = CASE pm.provider WHEN 'anilist' THEN 'anime' ELSE pm.provider END
    WHERE pm.confidence IN ('auto', 'weak') AND pm.provider_id <> ''
+     AND (pm.identity_revision IS NULL OR pm.identity_revision=t.provider_identity_revision OR mm.item_id IS NOT NULL)
      AND (?2 IS NULL OR t.media_type = ?2)
      AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
                       WHERE rj.item_id = pm.item_id
@@ -475,7 +531,7 @@ pub fn repick_triggers() -> Vec<(String, String)> {
     );
     add(
         "repick_answer_upd",
-        "UPDATE OF provider_id, confidence",
+        "UPDATE OF provider_id, confidence, identity_revision",
         "provider_metadata",
         None,
         by_new_item.clone(),
@@ -707,7 +763,7 @@ pub async fn media_type_of_item(db: &SqlitePool, item_id: &str) -> String {
 /// chain name, so the anime composite's `anilist` row counts as `anime`.
 async fn answered(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
     let providers: Vec<String> =
-        sqlx::query_scalar("SELECT provider FROM provider_metadata WHERE item_id = ?")
+        sqlx::query_scalar("SELECT provider FROM answer_priority WHERE item_id = ?")
             .bind(item_id)
             .fetch_all(db)
             .await
@@ -720,13 +776,34 @@ async fn answered(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
 /// Declined arm still uses so a re-walk does not refresh a miss row.
 async fn has_real_answer(db: &SqlitePool, item_id: &str, chain_entry: &str) -> bool {
     let providers: Vec<String> = sqlx::query_scalar(
-        "SELECT provider FROM provider_metadata WHERE item_id = ? AND provider_id <> ''",
+        "SELECT provider FROM answer_priority WHERE item_id = ? AND provider_id <> ''",
     )
     .bind(item_id)
     .fetch_all(db)
     .await
     .unwrap_or_default();
     providers.iter().any(|p| chain_name(p) == chain_entry)
+}
+
+/// After a provider correction, new questions describe the selected work;
+/// the old filename and its alternate are not another identity claim.
+async fn current_question_item(db: &SqlitePool, item: &ItemRef) -> Result<ItemRef> {
+    let mut item = item.clone();
+    type Identity = (String, String, Option<i64>, Option<String>, Option<String>);
+    let current: Option<Identity> = sqlx::query_as("SELECT l.title,l.norm_title,l.year,l.artist,l.norm_artist
+        FROM collection_items i JOIN collection_item_library_items a ON a.collection_item_id=i.id AND a.ordinal=1
+        JOIN library_items l ON l.id=a.library_item_id
+        WHERE i.id=? AND i.provider_identity_revision>0 AND i.metadata_eligible=1")
+        .bind(&item.id).fetch_optional(db).await?;
+    if let Some((title, norm_title, year, artist, norm_artist)) = current {
+        item.title = title;
+        item.norm_title = norm_title;
+        item.year = year;
+        item.artist = artist;
+        item.norm_artist = norm_artist;
+        item.alt = None;
+    }
+    Ok(item)
 }
 
 /// Bump when query DERIVATION changes — a fold/parser/ladder fix that
@@ -754,6 +831,8 @@ pub fn music_anchor(norm_artist: Option<&str>, norm_title: &str) -> String {
 
 /// Is this question still owed? `rev >=` (not `=`) so a binary
 /// downgrade does not re-open everything a newer rev already asked.
+/// A chain's stored but ineligible answer owes a current response; either a
+/// current answer or miss restores ordinary query-log suppression.
 pub async fn question_pending(
     db: &SqlitePool,
     item_id: &str,
@@ -763,7 +842,11 @@ pub async fn question_pending(
 ) -> bool {
     !sqlx::query_scalar::<_, i64>(
         "SELECT EXISTS (SELECT 1 FROM provider_queries
-          WHERE item_id = ? AND provider = ? AND query_type = ? AND query = ? AND rev >= ?)",
+          WHERE item_id = ?1 AND provider = ?2 AND query_type = ?3 AND query = ?4 AND rev >= ?5)
+          AND NOT (EXISTS(SELECT 1 FROM provider_metadata pm WHERE pm.item_id=?1
+              AND CASE pm.provider WHEN 'anilist' THEN 'anime' ELSE pm.provider END=?2)
+            AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=?1
+              AND CASE ap.provider WHEN 'anilist' THEN 'anime' ELSE ap.provider END=?2))",
     )
     .bind(item_id)
     .bind(provider)
@@ -843,13 +926,17 @@ pub async fn store_answer(
     confidence: &str,
     fields: Fields,
 ) -> Result<()> {
-    // One statement, no transaction. The assignment follows from the
-    // trigger on this write, inside the same implicit transaction, so
-    // the window where an item briefly has no assignment cannot be
-    // observed — a guarantee the previous two-statement transaction
-    // provided by convention and this provides by construction. It also
-    // takes one multi-statement transaction off the path seven writers
-    // share.
+    let mut tx = db.begin().await?;
+    if provider == LOCAL && !provider_id.is_empty() {
+        let unchanged_stale: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM provider_metadata pm
+            WHERE pm.item_id=?1 AND pm.provider='local' AND pm.provider_id=?2 AND pm.title IS ?3 AND pm.premiered IS ?4
+              AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=pm.item_id AND ap.provider=pm.provider))")
+            .bind(item_id).bind(provider_id).bind(&fields.title).bind(&fields.premiered).fetch_one(&mut *tx).await?;
+        if unchanged_stale {
+            return Ok(());
+        }
+    }
+    advance_provider_identity(&mut tx, item_id, provider, provider_id, false).await?;
     bind_answer(
         sqlx::query(STORE_ANSWER),
         item_id,
@@ -858,9 +945,279 @@ pub async fn store_answer(
         confidence,
         &fields,
     )
-    .execute(db)
+    .execute(&mut *tx)
     .await?;
+    tx.commit().await?;
     Ok(())
+}
+
+/// A different remote parent record starts a new description context. Ranking
+/// and updates to the same record do not: their already stored answers remain
+/// reusable. Bind legacy answers before advancing, without guessing on upgrade.
+async fn advance_provider_identity(
+    c: &mut sqlx::SqliteConnection,
+    item: &str,
+    provider: &str,
+    provider_id: &str,
+    explicit: bool,
+) -> Result<()> {
+    // Losing an identity-bearing answer (for example .nfo -> cover only) is
+    // withdrawal, not a claim that the other providers describe a different work.
+    if provider_id.is_empty() {
+        return Ok(());
+    }
+    let changed: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collection_items i
+        WHERE i.id=?1 AND i.kind IN ('show','album') AND (
+          EXISTS(SELECT 1 FROM answer_priority pm WHERE pm.item_id=i.id AND pm.provider=?2 AND pm.provider_id<>'' AND pm.provider_id<>?3)
+          OR (?4 AND EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=i.id AND (m.provider<>?2 OR m.provider_id<>?3)))))")
+        .bind(item).bind(provider).bind(provider_id).bind(explicit).fetch_one(&mut *c).await?;
+    if !changed {
+        return Ok(());
+    }
+    sqlx::query("UPDATE provider_metadata SET identity_revision=(SELECT provider_identity_revision FROM collection_items WHERE id=?1)
+        WHERE identity_revision IS NULL AND (item_id=?1 OR item_id IN(SELECT id FROM collection_items WHERE parent_id=?1))")
+        .bind(item).execute(&mut *c).await?;
+    sqlx::query("UPDATE collection_items SET provider_identity_revision=provider_identity_revision+1 WHERE id=?")
+        .bind(item).execute(&mut *c).await?;
+    Ok(())
+}
+
+/// Retain inherited answers under the established work they described before
+/// replacing a parent copy's assignment. Unknown-work identification keeps its
+/// answers; `promote_state` redirects captured references when that ID aliases.
+pub(crate) async fn bind_departing_parent_answers(
+    c: &mut sqlx::SqliteConnection,
+    copy: &str,
+    targets: &[String],
+) -> Result<()> {
+    let old: Option<String> = sqlx::query_scalar(
+        "SELECT a.library_item_id FROM collection_item_library_items a
+         JOIN collection_items i ON i.id=a.collection_item_id
+         JOIN library_items l ON l.id=a.library_item_id
+         WHERE a.collection_item_id=? AND a.ordinal=1 AND i.kind IN ('show','album')
+           AND l.unidentified=0 AND l.merged_into IS NULL",
+    )
+    .bind(copy)
+    .fetch_optional(&mut *c)
+    .await?;
+    if let Some(old) = old.filter(|old| !targets.contains(old)) {
+        sqlx::query(
+            "UPDATE provider_metadata SET parent_library_item_id=?
+            WHERE parent_library_item_id IS NULL AND item_id IN
+              (SELECT id FROM collection_items WHERE parent_id=?)",
+        )
+        .bind(old)
+        .bind(copy)
+        .execute(&mut *c)
+        .await?;
+    }
+    Ok(())
+}
+
+/// The parent and remote series record an episode request is answering.
+/// Capture before I/O; commit checks both the current work (including aliases)
+/// and the requested record before writing description and projection together.
+pub(crate) struct EpisodeAnswerContext {
+    parent: String,
+    work: String,
+    provider: String,
+    provider_id: String,
+    revision: i64,
+    anidb_id: Option<u32>,
+}
+
+/// Exact provider projections of this copy's requested native coverage.
+/// An absent key was never requested; a present null is a recorded gap.
+#[derive(Default, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub(crate) struct CoveredEpisodeProjections(
+    pub(crate) std::collections::BTreeMap<i64, Option<(i64, i64)>>,
+);
+
+/// Keep malformed filename ranges bounded exactly as library matching does.
+pub(crate) fn covered_episodes(first: i64, end: Option<i64>) -> std::ops::RangeInclusive<i64> {
+    let end = end
+        .filter(|end| *end >= first && end.saturating_sub(first) < 1000)
+        .unwrap_or(first);
+    first..=end
+}
+
+/// One inseparable projection pair. Legacy scalars apply only to the primary
+/// native episode; a queried null never falls back to a different episode.
+pub(crate) fn episode_projection_pair_sql(answer: &str, native: &str, first: &str) -> String {
+    let path = format!("'$.\"' || {native} || '\"'");
+    format!("CASE WHEN json_type({answer}.covered_episode_projections,{path}) IS NOT NULL
+        THEN json_extract({answer}.covered_episode_projections,{path})
+        WHEN {answer}.covered_episode_projections IS NULL AND {native}={first} AND {answer}.proj_season IS NOT NULL AND {answer}.proj_episode IS NOT NULL
+        THEN json_array({answer}.proj_season,{answer}.proj_episode) END")
+}
+
+/// Resolve presentation using only this work's accessible supporting copies.
+/// `scope` filters the `pc` copy alias; callers supply their existing grants.
+/// `keyed` additionally pairs the projection with a trusted parent record ID.
+pub(crate) fn library_episode_projection_sql(item: &str, scope: &str, keyed: bool) -> String {
+    let pair = episode_projection_pair_sql("ap", "pe.episode", "pc.episode");
+    let (value, parent_join, trust, order) = if keyed {
+        (format!("json_array(ap.provider,sp.provider_id,json_extract(({pair}),'$[0]'),json_extract(({pair}),'$[1]'))"),
+         "JOIN collection_items parent ON parent.id=pc.parent_id AND parent.metadata_eligible=1
+          JOIN provider_metadata sp ON sp.item_id=parent.id AND sp.provider=ap.provider",
+         "AND ap.provider IN ('tmdb','tvdb')
+          AND (ap.parent_library_item_id IS NULL OR ap.parent_library_item_id=parent_work.library_item_id)
+          AND (ap.identity_revision IS NULL OR ap.identity_revision=parent.provider_identity_revision)
+          AND (ap.confidence='auto' OR ap.covered_episode_projections IS NOT NULL OR EXISTS(
+              SELECT 1 FROM manual_match mm WHERE mm.item_id=ap.item_id AND mm.provider=ap.provider AND mm.provider_id=ap.provider_id))
+          AND sp.provider_id<>'' AND (sp.confidence='auto' OR EXISTS(
+              SELECT 1 FROM manual_match mm WHERE mm.item_id=sp.item_id AND mm.provider=sp.provider AND mm.provider_id=sp.provider_id))
+          AND EXISTS(SELECT 1 FROM answer_priority eligible WHERE eligible.item_id=sp.item_id AND eligible.provider=sp.provider)
+          AND NOT EXISTS(SELECT 1 FROM rejected_matches rj WHERE rj.item_id=sp.item_id AND rj.provider=sp.provider AND rj.provider_id=sp.provider_id)",
+         "ap.provider<>'tmdb',pc.id")
+    } else {
+        (
+            pair.clone(),
+            "",
+            "",
+            "(ap.provider_id<>'' AND ap.not_chosen),ap.provider<>'local',ap.rank,ap.not_chosen,pc.id",
+        )
+    };
+    format!("(SELECT {value} FROM episode_details pe
+        JOIN collection_item_library_items coverage ON coverage.library_item_id=pe.item_id
+        JOIN collection_items pc ON pc.id=coverage.collection_item_id
+        JOIN collection_item_library_items parent_work ON parent_work.collection_item_id=pc.parent_id AND parent_work.ordinal=1
+        JOIN answer_priority ap ON ap.item_id=pc.id
+        {parent_join}
+        WHERE pe.item_id={item} AND pc.metadata_eligible=1 AND pc.season IS pe.season
+          AND parent_work.library_item_id=pe.series_id
+          AND pe.episode BETWEEN pc.episode AND CASE WHEN pc.episode_end>=pc.episode AND pc.episode_end-pc.episode<1000 THEN pc.episode_end ELSE pc.episode END
+          AND (ap.confidence<>'weak' OR ap.not_chosen=0)
+          AND NOT EXISTS(SELECT 1 FROM rejected_matches rj WHERE rj.item_id=ap.item_id AND rj.provider=ap.provider AND rj.provider_id=ap.provider_id)
+          AND ({pair}) IS NOT NULL {trust} {scope}
+        ORDER BY {order} LIMIT 1)")
+}
+
+impl EpisodeAnswerContext {
+    pub(crate) async fn capture(
+        db: &SqlitePool,
+        parent: &str,
+        provider: &str,
+        provider_id: &str,
+        anidb_id: Option<u32>,
+    ) -> Result<Option<Self>> {
+        let mut tx = db.begin().await?;
+        let work: Option<String> = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id=? AND ordinal=1")
+            .bind(parent).fetch_optional(&mut *tx).await?;
+        let Some(work) = work else { return Ok(None) };
+        let revision = sqlx::query_scalar(
+            "SELECT provider_identity_revision FROM collection_items WHERE id=?",
+        )
+        .bind(parent)
+        .fetch_one(&mut *tx)
+        .await?;
+        let context = Self {
+            parent: parent.into(),
+            work,
+            provider: provider.into(),
+            provider_id: provider_id.into(),
+            revision,
+            anidb_id,
+        };
+        Ok(context.source_is_current(&mut tx).await?.then_some(context))
+    }
+
+    async fn source_is_current(&self, c: &mut sqlx::SqliteConnection) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM collection_items i
+            LEFT JOIN anime_ids a ON a.item_id=i.id AND (i.provider_identity_revision=0 OR EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider IN ('anidb','anilist')))
+            WHERE i.id=?1 AND i.metadata_eligible=1 AND i.provider_identity_revision=?4 AND (?5 IS NULL OR a.anidb_id=?5)
+              AND COALESCE((SELECT NULLIF(ap.provider_id,'') FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider=?2),CAST(CASE ?2 WHEN 'tmdb' THEN a.mapped_tmdb WHEN 'tvdb' THEN a.mapped_tvdb END AS TEXT))=?3)")
+            .bind(&self.parent).bind(&self.provider).bind(&self.provider_id).bind(self.revision).bind(self.anidb_id.map(i64::from)).fetch_one(c).await?)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn store(
+        &self,
+        db: &SqlitePool,
+        item: &str,
+        provider_id: &str,
+        confidence: &str,
+        fields: Fields,
+        projection: Option<(i64, i64)>,
+    ) -> Result<bool> {
+        self.store_coverage(db, item, provider_id, confidence, fields, projection, None)
+            .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn store_coverage(
+        &self,
+        db: &SqlitePool,
+        item: &str,
+        provider_id: &str,
+        confidence: &str,
+        fields: Fields,
+        projection: Option<(i64, i64)>,
+        projections: Option<&CoveredEpisodeProjections>,
+    ) -> Result<bool> {
+        let mut tx = db.begin().await?;
+        let current: Option<String> = sqlx::query_scalar("SELECT a.library_item_id FROM collection_items child JOIN collection_item_library_items a ON a.collection_item_id=child.parent_id AND a.ordinal=1 WHERE child.id=? AND child.parent_id=?")
+            .bind(item).bind(&self.parent).fetch_optional(&mut *tx).await?;
+        let Some(current) = current else {
+            return Ok(false);
+        };
+        if crate::library::canonical_id(&mut tx, &self.work).await?
+            != crate::library::canonical_id(&mut tx, &current).await?
+            || !self.source_is_current(&mut tx).await?
+        {
+            return Ok(false);
+        }
+        let different_pin: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM manual_match WHERE item_id=? AND provider=? AND provider_id<>?)")
+            .bind(item).bind(&self.provider).bind(provider_id).fetch_one(&mut *tx).await?;
+        if different_pin {
+            return Ok(false);
+        }
+        let current: (Option<i64>, i64, Option<i64>) =
+            sqlx::query_as("SELECT season,episode,episode_end FROM collection_items WHERE id=?")
+                .bind(item)
+                .fetch_one(&mut *tx)
+                .await?;
+        // The primary description/scalar belongs to the requested first
+        // episode. Trimming the map cannot make an old first answer current.
+        if let Some(projections) = projections
+            && (current.0.is_some()
+                || projections.0.first_key_value().map(|(first, _)| *first) != Some(current.1))
+        {
+            return Ok(false);
+        }
+        bind_answer(
+            sqlx::query(STORE_ANSWER),
+            item,
+            &self.provider,
+            provider_id,
+            confidence,
+            &fields,
+        )
+        .execute(&mut *tx)
+        .await?;
+        // Coverage may change while the request is in flight. Retain only
+        // currently covered native numbers; newly added numbers remain missing.
+        let projections = projections
+            .filter(|_| current.0.is_none())
+            .map(|projections| {
+                let coverage = covered_episodes(current.1, current.2);
+                CoveredEpisodeProjections(
+                    projections
+                        .0
+                        .iter()
+                        .filter(|(episode, _)| coverage.contains(*episode))
+                        .map(|(episode, projection)| (*episode, *projection))
+                        .collect(),
+                )
+            });
+        sqlx::query("UPDATE provider_metadata SET proj_season=?,proj_episode=?,covered_episode_projections=? WHERE item_id=? AND provider=?")
+            .bind(projection.map(|p|p.0)).bind(projection.map(|p|p.1))
+            .bind(projections.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(item).bind(&self.provider).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
 }
 
 /// One provider's answer, upserted. Standalone so a caller that already
@@ -870,9 +1227,13 @@ const STORE_ANSWER: &str = "\
 INSERT INTO provider_metadata
            (item_id, provider, provider_id, title, overview, poster_path, rating,
             premiered, original_language, genres, cast_json, provider_artist_id,
-            confidence, updated_at)
-         SELECT ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, unixepoch()
-          WHERE EXISTS (SELECT 1 FROM collection_items WHERE id = ?)
+            confidence, updated_at, parent_library_item_id, identity_revision)
+         SELECT ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, unixepoch(),
+           (SELECT a.library_item_id FROM collection_items child JOIN collection_item_library_items a
+              ON a.collection_item_id=child.parent_id AND a.ordinal=1 WHERE child.id=?1),
+           (SELECT parent.provider_identity_revision FROM collection_items i JOIN collection_items parent
+              ON parent.id=COALESCE(i.parent_id,CASE WHEN i.kind IN ('show','album') THEN i.id END) WHERE i.id=?1)
+          WHERE EXISTS (SELECT 1 FROM collection_items WHERE id = ?14)
          ON CONFLICT (item_id, provider) DO UPDATE SET
            provider_id = excluded.provider_id,
            title = excluded.title,
@@ -893,9 +1254,31 @@ INSERT INTO provider_metadata
                ELSE COALESCE(excluded.cast_json, provider_metadata.cast_json)
            END,
            confidence = excluded.confidence,
+           covered_episode_projections = CASE
+               WHEN excluded.provider_id IS provider_metadata.provider_id
+                AND (provider_metadata.parent_library_item_id IS NULL OR excluded.parent_library_item_id IS provider_metadata.parent_library_item_id)
+                AND (provider_metadata.identity_revision IS NULL OR excluded.identity_revision IS provider_metadata.identity_revision)
+                AND provider_metadata.covered_episode_projections IS NOT NULL
+               THEN (SELECT json_group_object(coverage.key,json(coverage.value))
+                 FROM json_each(provider_metadata.covered_episode_projections) coverage
+                 JOIN collection_items copy ON copy.id=excluded.item_id
+                 WHERE copy.season IS NULL AND CAST(coverage.key AS INTEGER) BETWEEN copy.episode
+                   AND CASE WHEN copy.episode_end>=copy.episode AND copy.episode_end-copy.episode<1000 THEN copy.episode_end ELSE copy.episode END) END,
+           proj_season = CASE
+               WHEN excluded.provider_id IS provider_metadata.provider_id
+                AND (provider_metadata.parent_library_item_id IS NULL OR excluded.parent_library_item_id IS provider_metadata.parent_library_item_id)
+                AND (provider_metadata.identity_revision IS NULL OR excluded.identity_revision IS provider_metadata.identity_revision)
+               THEN provider_metadata.proj_season END,
+           proj_episode = CASE
+               WHEN excluded.provider_id IS provider_metadata.provider_id
+                AND (provider_metadata.parent_library_item_id IS NULL OR excluded.parent_library_item_id IS provider_metadata.parent_library_item_id)
+                AND (provider_metadata.identity_revision IS NULL OR excluded.identity_revision IS provider_metadata.identity_revision)
+               THEN provider_metadata.proj_episode END,
+           parent_library_item_id = excluded.parent_library_item_id,
+           identity_revision = excluded.identity_revision,
            updated_at = excluded.updated_at";
 
-/// The thirteen binds [`STORE_ANSWER`] wants, in its order.
+/// The answer fields and existence guard [`STORE_ANSWER`] binds, in order.
 fn bind_answer<'a>(
     q: sqlx::query::Query<'a, sqlx::Sqlite, sqlx::sqlite::SqliteArguments>,
     item_id: &'a str,
@@ -946,6 +1329,7 @@ pub(crate) async fn assign_manual_in(
     provider_id: &str,
     fields: Fields,
 ) -> Result<()> {
+    advance_provider_identity(tx, item_id, provider, provider_id, true).await?;
     bind_answer(
         sqlx::query(STORE_ANSWER),
         item_id,
@@ -975,6 +1359,7 @@ pub(crate) async fn assign_manual_in(
         .bind(provider_id)
         .execute(&mut *tx)
         .await?;
+    crate::library::reconcile_provider_pick(tx, item_id).await?;
     Ok(())
 }
 
@@ -993,6 +1378,16 @@ ON CONFLICT (item_id) DO UPDATE SET
 /// difference from [`assign_manual`] is where the record comes from: what
 /// is already assigned, rather than a click on a search result.
 pub async fn confirm_assignment(db: &SqlitePool, item_id: &str) -> Result<()> {
+    let mut tx = db.begin().await?;
+    confirm_assignment_in(&mut tx, item_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+pub(crate) async fn confirm_assignment_in(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO manual_match (item_id, provider, provider_id, pinned_at)
          SELECT item_id, provider, provider_id, unixepoch() FROM item_match
@@ -1003,7 +1398,7 @@ pub async fn confirm_assignment(db: &SqlitePool, item_id: &str) -> Result<()> {
            pinned_at = excluded.pinned_at",
     )
     .bind(item_id)
-    .execute(db)
+    .execute(tx)
     .await?;
     Ok(())
 }
@@ -1016,6 +1411,17 @@ pub async fn confirm_assignment(db: &SqlitePool, item_id: &str) -> Result<()> {
 /// automatically, so a provider offering something new is picked up.
 pub async fn reject_matches(db: &SqlitePool, item_id: &str) -> Result<()> {
     let mut tx = db.begin().await?;
+    reject_matches_in(&mut tx, item_id).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Reject stored answers and retain the retry debt in the caller's assignment
+/// transaction, so the assignment and its future provider check commit together.
+pub(crate) async fn reject_matches_in(
+    tx: &mut sqlx::SqliteConnection,
+    item_id: &str,
+) -> Result<()> {
     sqlx::query(
         "INSERT INTO rejected_matches (item_id, provider, provider_id, rejected_at)
          SELECT item_id, provider, provider_id, unixepoch() FROM provider_metadata
@@ -1048,7 +1454,6 @@ pub async fn reject_matches(db: &SqlitePool, item_id: &str) -> Result<()> {
     .bind(item_id)
     .execute(&mut *tx)
     .await?;
-    tx.commit().await?;
     Ok(())
 }
 
@@ -1166,7 +1571,19 @@ impl ProviderSet {
             if !owns && has_real_answer(db, &item.id, name).await {
                 continue;
             }
-            let mut ctx = item.clone();
+            let mut ctx = match current_question_item(db, item).await {
+                Ok(context) => context,
+                Err(error) => {
+                    reschedule(
+                        db,
+                        &item.id,
+                        name,
+                        &format!("current question identity: {error:#}"),
+                    )
+                    .await;
+                    continue;
+                }
+            };
             ctx.owner = owner;
             match p.enrich(db, &ctx).await {
                 Ok(Outcome::Matched(conf)) => {
@@ -1292,6 +1709,7 @@ CREATE VIEW answer_priority AS
 SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
        pm.title, pm.overview, pm.poster_path, pm.rating, pm.premiered,
        pm.original_language, pm.genres, pm.cast_json, pm.proj_season, pm.proj_episode,
+       pm.covered_episode_projections, pm.parent_library_item_id, pm.identity_revision,
        pm.updated_at,
        -- The effective assignment: this item's own, else its parent's.
        -- Episodes and tracks never carry one, so they render as their show
@@ -1306,10 +1724,15 @@ SELECT i.id AS item_id, pm.provider, pm.provider_id, pm.confidence,
   JOIN provider_metadata pm ON pm.item_id = i.id
   LEFT JOIN item_match own ON own.item_id = i.id
   LEFT JOIN item_match par ON par.item_id = i.parent_id
+  LEFT JOIN collection_items context ON context.id=COALESCE(i.parent_id,i.id)
+  LEFT JOIN collection_item_library_items parent_work ON parent_work.collection_item_id=i.parent_id AND parent_work.ordinal=1
   LEFT JOIN provider_ranks r
          ON r.media_type = COALESCE(own.media_type, par.media_type)
         AND r.provider = CASE WHEN pm.provider = 'anilist' THEN 'anime'
-                              ELSE pm.provider END;
+                              ELSE pm.provider END
+ WHERE ((pm.parent_library_item_id IS NULL OR pm.parent_library_item_id=parent_work.library_item_id)
+        AND (pm.identity_revision IS NULL OR pm.identity_revision=context.provider_identity_revision))
+    OR (own.manual=1 AND own.provider=pm.provider AND own.provider_id=pm.provider_id);
 ";
     // Identity is the assignment's to state, so the chosen answer first.
     let order = "ORDER BY ap.not_chosen, ap.rank LIMIT 1";
@@ -1523,5 +1946,168 @@ mod tests {
         .unwrap();
         assert_eq!(attempts, seeded.1 + 1);
         assert_eq!(reason, "ordinary outage");
+    }
+}
+
+#[cfg(test)]
+mod episode_context_tests {
+    use super::*;
+
+    async fn fixture(year: Option<i64>) -> SqlitePool {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','host','fp');
+            INSERT INTO collections(module_id,collection_id,media_type) VALUES('host','one','series');
+            INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id) VALUES('parent','show','Parent','parent','host','one');
+            INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id) VALUES('child','episode','Episode 1','episode 1','parent',1,1,'host','one');")
+            .execute(&db).await.unwrap();
+        store_answer(
+            &db,
+            "parent",
+            "tmdb",
+            "1",
+            "auto",
+            Fields {
+                title: Some("Parent".into()),
+                premiered: year.map(|y| format!("{y}-01-01")),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        db
+    }
+
+    #[tokio::test]
+    async fn late_episode_reply_cannot_replace_a_corrected_answer_or_projection() {
+        for same_work in [true, false] {
+            let db = fixture(Some(2000)).await;
+            let old = EpisodeAnswerContext::capture(&db, "parent", "tmdb", "1", None)
+                .await
+                .unwrap()
+                .unwrap();
+            // Same-ID provider correction is a revision change; changing the
+            // established library work with the same provider ID is a work change.
+            let (pid, title, year) = if same_work {
+                ("2", "Parent", 2000)
+            } else {
+                ("1", "Other parent", 2010)
+            };
+            assign_manual(
+                &db,
+                "parent",
+                "tmdb",
+                pid,
+                Fields {
+                    title: Some(title.into()),
+                    premiered: Some(format!("{year}-01-01")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let current = EpisodeAnswerContext::capture(&db, "parent", "tmdb", pid, None)
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(
+                current
+                    .store(
+                        &db,
+                        "child",
+                        "22",
+                        "auto",
+                        Fields {
+                            title: Some("Current answer".into()),
+                            ..Default::default()
+                        },
+                        Some((2, 3))
+                    )
+                    .await
+                    .unwrap()
+            );
+            assert!(
+                !old.store(
+                    &db,
+                    "child",
+                    "11",
+                    "auto",
+                    Fields {
+                        title: Some("Late old answer".into()),
+                        ..Default::default()
+                    },
+                    Some((9, 9))
+                )
+                .await
+                .unwrap()
+            );
+            let answer:(String,i64,i64)=sqlx::query_as("SELECT title,proj_season,proj_episode FROM provider_metadata WHERE item_id='child'").fetch_one(&db).await.unwrap();
+            assert_eq!(answer, ("Current answer".into(), 2, 3));
+        }
+    }
+
+    #[tokio::test]
+    async fn first_identification_alias_keeps_the_same_episode_request_current() {
+        let db = fixture(None).await;
+        let old = EpisodeAnswerContext::capture(&db, "parent", "tmdb", "1", None)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(
+            old.store(
+                &db,
+                "child",
+                "11",
+                "auto",
+                Fields {
+                    title: Some("Before identification".into()),
+                    ..Default::default()
+                },
+                None
+            )
+            .await
+            .unwrap()
+        );
+        sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES('known','show','Parent','parent',2000,'host','one')").execute(&db).await.unwrap();
+        store_answer(
+            &db,
+            "parent",
+            "tmdb",
+            "1",
+            "auto",
+            Fields {
+                title: Some("Parent".into()),
+                premiered: Some("2000-01-01".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let work:String=sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='parent'").fetch_one(&db).await.unwrap();
+        assert_eq!(work, "known");
+        let captured: String = sqlx::query_scalar(
+            "SELECT parent_library_item_id FROM provider_metadata WHERE item_id='child'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(
+            captured, work,
+            "stored contexts follow first-identification aliases"
+        );
+        assert!(
+            old.store(
+                &db,
+                "child",
+                "11",
+                "auto",
+                Fields {
+                    title: Some("Completed same request".into()),
+                    ..Default::default()
+                },
+                Some((1, 1))
+            )
+            .await
+            .unwrap()
+        );
     }
 }

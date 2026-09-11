@@ -2001,3 +2001,283 @@ async fn an_unreadable_tvdb_credential_does_not_stop_enrichment() {
         "the run returned Ok without reaching its end"
     );
 }
+
+struct CurrentQuestionProvider {
+    name: &'static str,
+    matched: bool,
+    requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+#[async_trait::async_trait]
+impl kahawai_hub::providers::Provider for CurrentQuestionProvider {
+    fn name(&self) -> &'static str {
+        self.name
+    }
+    async fn enrich(
+        &self,
+        db: &SqlitePool,
+        item: &kahawai_hub::providers::ItemRef,
+    ) -> anyhow::Result<kahawai_hub::providers::Outcome> {
+        use kahawai_hub::providers::{Outcome, question_pending, record_question, title_anchor};
+        assert_eq!((&*item.title, item.year), ("New show", Some(2010)));
+        assert!(
+            item.alt.is_none(),
+            "the old filename alternate must not answer the corrected question"
+        );
+        let anchor = title_anchor(&item.norm_title, item.year);
+        if !question_pending(db, &item.id, self.name, "title", &anchor).await {
+            return Ok(Outcome::NotApplicable);
+        }
+        self.requests
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        record_question(db, &item.id, self.name, "title", &anchor).await;
+        if self.matched {
+            store_answer(
+                db,
+                &item.id,
+                if self.name == "anime" {
+                    "anilist"
+                } else {
+                    self.name
+                },
+                "new-record",
+                "auto",
+                Fields {
+                    title: Some("New show".into()),
+                    premiered: Some("2010-01-01".into()),
+                    ..Default::default()
+                },
+            )
+            .await?;
+            Ok(Outcome::Contributed)
+        } else {
+            Ok(Outcome::Declined)
+        }
+    }
+}
+
+#[tokio::test]
+async fn an_invalidated_answer_refreshes_the_current_work_once_then_settles() {
+    use kahawai_hub::providers::{ProviderSet, assign_manual, question_pending, record_question};
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
+    for provider in ["tvdb", "anime"] {
+        for matched in [false, true] {
+            let db = kahawai_hub::db::open_in_memory().await.unwrap();
+            item(&db, "show").await;
+            sqlx::query("UPDATE collection_items SET kind='show',title='Old filename',norm_title='old filename',year=2000 WHERE id='show'").execute(&db).await.unwrap();
+            let media_type = if provider == "anime" {
+                "anime"
+            } else {
+                "series"
+            };
+            sqlx::query("UPDATE collections SET media_type=?")
+                .bind(media_type)
+                .execute(&db)
+                .await
+                .unwrap();
+            for p in [
+                "tmdb",
+                if provider == "anime" {
+                    "anilist"
+                } else {
+                    provider
+                },
+            ] {
+                store_answer(
+                    &db,
+                    "show",
+                    p,
+                    "old-record",
+                    "auto",
+                    Fields {
+                        title: Some("Old filename".into()),
+                        premiered: Some("2000-01-01".into()),
+                        ..Default::default()
+                    },
+                )
+                .await
+                .unwrap();
+            }
+            // Both questions already existed before this parent correction.
+            for anchor in ["old filename|2000", "new show|2010"] {
+                record_question(&db, "show", provider, "title", anchor).await;
+            }
+            assign_manual(
+                &db,
+                "show",
+                "tmdb",
+                "chosen",
+                Fields {
+                    title: Some("New show".into()),
+                    premiered: Some("2010-01-01".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            assert!(question_pending(&db, "show", provider, "title", "new show|2010").await);
+            let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+            let dir = tempfile::tempdir().unwrap();
+            let enricher = kahawai_hub::enrich::Enricher::new(dir.path().to_owned());
+            let before = if provider == "anime" {
+                enricher.select_anime_items(&registry).await.unwrap().len()
+            } else {
+                sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+                    .bind(kahawai_hub::providers::QUERY_REV)
+                    .bind(r#"["tvdb"]"#)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(before, 1);
+            let requests = Arc::new(AtomicUsize::new(0));
+            let mut providers = ProviderSet::default();
+            providers.add(Box::new(CurrentQuestionProvider {
+                name: provider,
+                matched,
+                requests: requests.clone(),
+            }));
+            let mut item = item_ref("show");
+            item.kind = "show".into();
+            item.title = "Old filename".into();
+            item.norm_title = "old filename".into();
+            item.year = Some(2000);
+            item.alt = Some(kahawai_core::names::MovieGuess {
+                title: "Old alternate".into(),
+                year: Some(2000),
+                part: None,
+            });
+            providers.run_chain(media_type, &db, &item).await;
+            assert_eq!(requests.load(Ordering::SeqCst), 1);
+            assert!(!question_pending(&db, "show", provider, "title", "new show|2010").await);
+            providers.run_chain(media_type, &db, &item).await;
+            assert_eq!(
+                requests.load(Ordering::SeqCst),
+                1,
+                "the current answer or miss must settle the old ledger override"
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(
+                    "SELECT provider_identity_revision FROM collection_items WHERE id='show'"
+                )
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+                1,
+                "refreshing stale answers must not start another correction"
+            );
+            assert_eq!(sqlx::query_scalar::<_,String>("SELECT provider_id FROM answer_priority WHERE item_id='show' AND provider='tmdb'").fetch_one(&db).await.unwrap(),"chosen");
+            let after = if provider == "anime" {
+                enricher.select_anime_items(&registry).await.unwrap().len()
+            } else {
+                sqlx::query(kahawai_hub::enrich::GENERIC_SELECTION_SQL)
+                    .bind(kahawai_hub::providers::QUERY_REV)
+                    .bind(r#"["tvdb"]"#)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .len()
+            };
+            assert_eq!(after, 0, "{provider}, matched={matched}");
+        }
+    }
+}
+
+#[tokio::test]
+async fn unchanged_stale_nfo_cannot_reassert_itself_during_recovery() {
+    use kahawai_hub::providers::assign_manual;
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    item(&db, "show").await;
+    sqlx::query("UPDATE collection_items SET kind='show',title='Old show',norm_title='old show',year=2000 WHERE id='show'").execute(&db).await.unwrap();
+    let old = || Fields {
+        title: Some("Old show".into()),
+        premiered: Some("2000-01-01".into()),
+        ..Default::default()
+    };
+    store_answer(&db, "show", "local", "show.nfo", "auto", old())
+        .await
+        .unwrap();
+    assign_manual(
+        &db,
+        "show",
+        "tmdb",
+        "2",
+        Fields {
+            title: Some("New show".into()),
+            premiered: Some("2010-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    store_answer(&db, "show", "local", "show.nfo", "auto", old())
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM answer_priority WHERE item_id='show' AND provider='local'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        0
+    );
+    // Editing the NFO's identity-bearing claim is new input, not a repeat read.
+    store_answer(
+        &db,
+        "show",
+        "local",
+        "show.nfo",
+        "auto",
+        Fields {
+            title: Some("New show".into()),
+            premiered: Some("2010-01-01".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT title FROM answer_priority WHERE item_id='show' AND provider='local'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        "New show"
+    );
+    store_answer(
+        &db,
+        "show",
+        "local",
+        "",
+        "auto",
+        Fields {
+            poster_path: Some("local:cover.jpg".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT provider_id FROM answer_priority WHERE item_id='show' AND provider='tmdb'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        "2"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT provider_identity_revision FROM collection_items WHERE id='show'"
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap(),
+        1
+    );
+}

@@ -45,6 +45,7 @@ mod upgrade;
 pub use history::{canonical_id, canonical_ids};
 use history::{clear_equivalent_rejections, promote_replaced_state, resolved_rejections};
 pub(crate) use matching::copy_regroup_conflict;
+pub(crate) use matching::reconcile_provider_pick;
 pub use matching::{create, initialize, reconcile};
 pub use playback::{
     PlaybackSnapshot, SourceBoundary, playback_snapshot, resume_fingerprint, same_resume_version,
@@ -94,6 +95,7 @@ pub(super) async fn replace_links(
     copy: &str,
     ids: &[String],
 ) -> Result<()> {
+    crate::providers::bind_departing_parent_answers(c, copy, ids).await?;
     sqlx::query("DELETE FROM collection_item_library_items WHERE collection_item_id=?")
         .bind(copy)
         .execute(&mut *c)

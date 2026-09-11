@@ -234,6 +234,55 @@ struct ArtistEvidence {
     albums: Vec<ArtistAlbumEvidence>,
 }
 
+// The same canonical album artists are displayed by public browse. Supporting
+// collection answers are evidence only while they still describe that album.
+async fn artist_evidence(
+    db: &crate::library::Database,
+) -> Result<BTreeMap<String, ArtistEvidence>> {
+    artist_evidence_for(db, None).await
+}
+
+async fn artist_evidence_for(
+    db: &crate::library::Database,
+    key: Option<&str>,
+) -> Result<BTreeMap<String, ArtistEvidence>> {
+    let mut sql = String::from("SELECT DISTINCT i.artist_key,i.artist,
+          NULLIF(pm.provider_id,'') AS release_group_id,pm.provider_artist_id
+        FROM library_items i JOIN collection_item_library_items a ON a.library_item_id=i.id
+        JOIN collection_items ci ON ci.id=a.collection_item_id
+        LEFT JOIN provider_metadata pm ON pm.item_id=ci.id AND pm.provider='musicbrainz'
+          AND ci.metadata_eligible=1
+          AND (pm.provider_id='' OR EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=ci.id AND m.provider=pm.provider AND m.provider_id=pm.provider_id))
+          AND NOT EXISTS(SELECT 1 FROM rejected_matches r WHERE r.item_id=ci.id AND r.provider=pm.provider AND r.provider_id=pm.provider_id)
+        WHERE i.kind='album' AND i.merged_into IS NULL AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
+          AND EXISTS(SELECT 1 FROM library_collections lc JOIN libraries l ON l.id=lc.library_id
+            WHERE (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id) AND l.media_type='music')");
+    if key.is_some() {
+        sql.push_str(" AND i.artist_key=?");
+    }
+    sql.push_str(" ORDER BY i.artist_key,i.artist");
+    let mut query = sqlx::query(sqlx::AssertSqlSafe(sql));
+    if let Some(key) = key {
+        query = query.bind(key);
+    }
+    let rows = query.fetch_all(db).await?;
+    let mut artists: BTreeMap<String, ArtistEvidence> = BTreeMap::new();
+    for row in rows {
+        artists
+            .entry(row.get("artist_key"))
+            .or_insert_with(|| ArtistEvidence {
+                name: row.get("artist"),
+                albums: Vec::new(),
+            })
+            .albums
+            .push(ArtistAlbumEvidence {
+                release_group_id: row.get("release_group_id"),
+                artist_id: row.get("provider_artist_id"),
+            });
+    }
+    Ok(artists)
+}
+
 fn unresolved_artist_release_groups(evidence: &ArtistEvidence) -> BTreeSet<String> {
     evidence
         .albums
@@ -390,7 +439,14 @@ async fn store_backfilled_artist_identity(
         "UPDATE provider_metadata SET provider_artist_id=?
           WHERE provider='musicbrainz' AND provider_id=?
             AND provider_artist_id IS NULL
-            AND item_id IN (SELECT id FROM collection_items WHERE artist_key=?)",
+            AND item_id IN (
+              SELECT ci.id FROM library_items li JOIN collection_item_library_items a ON a.library_item_id=li.id
+              JOIN collection_items ci ON ci.id=a.collection_item_id
+              WHERE li.kind='album' AND li.merged_into IS NULL AND li.artist_key=? AND ci.metadata_eligible=1
+                AND EXISTS(SELECT 1 FROM library_collections lc JOIN libraries l ON l.id=lc.library_id
+                  WHERE (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id) AND l.media_type='music'))
+            AND (provider_id='' OR EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=provider_metadata.item_id AND m.provider=provider_metadata.provider AND m.provider_id=provider_metadata.provider_id))
+            AND NOT EXISTS(SELECT 1 FROM rejected_matches r WHERE r.item_id=provider_metadata.item_id AND r.provider=provider_metadata.provider AND r.provider_id=provider_metadata.provider_id)",
     )
     .bind(artist_id)
     .bind(release_group)
@@ -411,7 +467,14 @@ async fn store_direct_artist_identity(
     sqlx::query(
         "UPDATE provider_metadata SET provider_artist_id=?
           WHERE provider='musicbrainz' AND provider_artist_id IS NULL
-            AND item_id IN (SELECT id FROM collection_items WHERE artist_key=?)",
+            AND item_id IN (
+              SELECT ci.id FROM library_items li JOIN collection_item_library_items a ON a.library_item_id=li.id
+              JOIN collection_items ci ON ci.id=a.collection_item_id
+              WHERE li.kind='album' AND li.merged_into IS NULL AND li.artist_key=? AND ci.metadata_eligible=1
+                AND EXISTS(SELECT 1 FROM library_collections lc JOIN libraries l ON l.id=lc.library_id
+                  WHERE (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id) AND l.media_type='music'))
+            AND (provider_id='' OR EXISTS(SELECT 1 FROM item_match m WHERE m.item_id=provider_metadata.item_id AND m.provider=provider_metadata.provider AND m.provider_id=provider_metadata.provider_id))
+            AND NOT EXISTS(SELECT 1 FROM rejected_matches r WHERE r.item_id=provider_metadata.item_id AND r.provider=provider_metadata.provider AND r.provider_id=provider_metadata.provider_id)",
     )
     .bind(artist_id)
     .bind(artist_key)
@@ -837,11 +900,14 @@ pub fn pick_candidate<'c>(
 /// nothing in the chain could ever clear that debt — a permanent
 /// full-catalogue re-select against the one statement whose cost this
 /// doc calls a standing tax.
-pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title,i.year,
+pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,CASE WHEN current_work.id IS NOT NULL THEN current_work.title ELSE i.title END AS title,CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END AS norm_title,CASE WHEN current_work.id IS NOT NULL THEN current_work.year ELSE i.year END AS year,
                     (SELECT f.path_rel FROM files f JOIN file_bindings fb ON fb.file_id=f.id WHERE fb.item_id=i.id LIMIT 1) AS src_path,
                     c0.media_type AS media_type
              FROM collection_items i JOIN collections c0
                ON (c0.module_id,c0.collection_id)=(i.module_id,i.collection_id)
+
+             LEFT JOIN collection_item_library_items current_assignment ON current_assignment.collection_item_id=i.id AND current_assignment.ordinal=1 AND i.provider_identity_revision>0
+             LEFT JOIN library_items current_work ON current_work.id=current_assignment.library_item_id AND i.metadata_eligible=1
              WHERE i.kind IN ('movie', 'show')
                AND (
                     -- HUB-5: a searcher is owed work while its CURRENT
@@ -856,15 +922,17 @@ pub const GENERIC_SELECTION_SQL: &str = "SELECT i.id,i.kind,i.title,i.norm_title
                     EXISTS (
                       SELECT 1 FROM json_each(?2) sp
                       WHERE NOT EXISTS (
-                          SELECT 1 FROM provider_metadata pm
+                          SELECT 1 FROM answer_priority pm
                           WHERE pm.item_id = i.id AND pm.provider = sp.value
                             AND pm.provider_id <> '')
-                        AND NOT EXISTS (
+                        AND (NOT EXISTS (
                           SELECT 1 FROM provider_queries q
                           WHERE q.item_id = i.id AND q.provider = sp.value
                             AND q.query_type = 'title'
-                            AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
-                            AND q.rev >= ?1))
+                            AND q.query = (CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END) || '|' || COALESCE((CASE WHEN current_work.id IS NOT NULL THEN current_work.year ELSE i.year END), '')
+                            AND q.rev >= ?1)
+                          OR (EXISTS(SELECT 1 FROM provider_metadata held WHERE held.item_id=i.id AND held.provider=sp.value)
+                            AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider=sp.value))))
                     -- HUB-9: local owes an answer. Gated on there
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
@@ -2067,22 +2135,27 @@ impl Enricher {
         providers: &Arc<crate::providers::ProviderSet>,
     ) -> Result<()> {
         let albums = sqlx::query(
-            "SELECT i.id, i.title, i.norm_title, i.artist, i.norm_artist FROM collection_items i
+            "SELECT i.id, CASE WHEN current_work.id IS NOT NULL THEN current_work.title ELSE i.title END AS title, CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END AS norm_title, CASE WHEN current_work.id IS NOT NULL THEN current_work.artist ELSE i.artist END AS artist, CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_artist ELSE i.norm_artist END AS norm_artist FROM collection_items i
+
+             LEFT JOIN collection_item_library_items current_assignment ON current_assignment.collection_item_id=i.id AND current_assignment.ordinal=1 AND i.provider_identity_revision>0
+             LEFT JOIN library_items current_work ON current_work.id=current_assignment.library_item_id AND i.metadata_eligible=1
              WHERE i.kind = 'album' AND i.artist IS NOT NULL
                AND (
                     -- Same rule as the video pass: MusicBrainz is owed
                     -- work while its CURRENT question has no
                     -- provider_queries row and no real answer stands.
                     (NOT EXISTS (
-                       SELECT 1 FROM provider_metadata pm
+                       SELECT 1 FROM answer_priority pm
                        WHERE pm.item_id = i.id AND pm.provider = 'musicbrainz'
                          AND pm.provider_id <> '')
-                     AND NOT EXISTS (
+                     AND (NOT EXISTS (
                        SELECT 1 FROM provider_queries q
                        WHERE q.item_id = i.id AND q.provider = 'musicbrainz'
                          AND q.query_type = 'title'
-                         AND q.query = COALESCE(i.norm_artist, '') || '|' || i.norm_title
-                         AND q.rev >= ?1))
+                         AND q.query = COALESCE((CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_artist ELSE i.norm_artist END), '') || '|' || (CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END)
+                         AND q.rev >= ?1)
+                       OR (EXISTS(SELECT 1 FROM provider_metadata held WHERE held.item_id=i.id AND held.provider='musicbrainz')
+                         AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider='musicbrainz'))))
                     -- HUB-9: local owes an answer. Gated on there
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
@@ -2381,36 +2454,7 @@ impl Enricher {
         let Some(artwork) = self.artwork.get().and_then(std::sync::Weak::upgrade) else {
             return Ok(());
         };
-        let rows = sqlx::query(
-            "SELECT DISTINCT i.artist_key,i.artist,
-                    NULLIF(pm.provider_id,'') AS release_group_id,
-                    pm.provider_artist_id
-               FROM collection_items i
-               LEFT JOIN provider_metadata pm
-                 ON pm.item_id=i.id AND pm.provider='musicbrainz'
-              WHERE i.kind='album' AND i.artist_key IS NOT NULL AND i.artist IS NOT NULL
-                AND EXISTS (
-                    SELECT 1 FROM library_collections lc
-                     WHERE (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id))
-              ORDER BY i.artist_key,i.id",
-        )
-        .fetch_all(registry.db())
-        .await?;
-        let mut artists: BTreeMap<String, ArtistEvidence> = BTreeMap::new();
-        for row in rows {
-            let artist_key: String = row.get("artist_key");
-            artists
-                .entry(artist_key)
-                .or_insert_with(|| ArtistEvidence {
-                    name: row.get("artist"),
-                    albums: Vec::new(),
-                })
-                .albums
-                .push(ArtistAlbumEvidence {
-                    release_group_id: row.get("release_group_id"),
-                    artist_id: row.get("provider_artist_id"),
-                });
-        }
+        let artists = artist_evidence(registry.db()).await?;
         let mut artists: Vec<_> = artists.into_iter().collect();
         // Artist artwork with an established identity has no dependency on
         // MusicBrainz. Finish it first so a transient MusicBrainz backoff in
@@ -2454,6 +2498,7 @@ impl Enricher {
             }
             let unresolved_release_groups = unresolved_artist_release_groups(&evidence);
             let mut unresolved_identity = false;
+            let mut identity_written = false;
             let mut transient_backfill_failure = false;
             for release_group in unresolved_release_groups {
                 if identities.len() > 1 {
@@ -2496,6 +2541,7 @@ impl Enricher {
                 };
                 store_backfilled_artist_identity(registry.db(), &artist_key, &release_group, &id)
                     .await?;
+                identity_written = true;
                 for album in &mut evidence.albums {
                     if album.release_group_id.as_deref() == Some(&release_group)
                         && album.artist_id.is_none()
@@ -2529,6 +2575,7 @@ impl Enricher {
                 if let Some(id) = direct {
                     if identities.is_empty() || identities.contains(&id) {
                         store_direct_artist_identity(registry.db(), &artist_key, &id).await?;
+                        identity_written = true;
                         for album in &mut evidence.albums {
                             if album.artist_id.is_none() {
                                 album.artist_id = Some(id.clone());
@@ -2541,7 +2588,18 @@ impl Enricher {
                     }
                 }
             }
-            let revision = artist_art_revision(&artist_key, &evidence.name, &evidence);
+            // A corrected artist may have no compatible provider row to retain
+            // a direct identity. Revision the persisted inputs, not the temporary
+            // lookup result, so the next pass can reuse this completed artwork.
+            let revision = if identity_written {
+                let persisted = artist_evidence_for(registry.db(), Some(&artist_key)).await?;
+                let Some(persisted) = persisted.get(&artist_key) else {
+                    continue;
+                };
+                artist_art_revision(&artist_key, &persisted.name, persisted)
+            } else {
+                initial_revision
+            };
             let Some(artist_id) = (identities.len() == 1 && !unresolved_identity)
                 .then(|| identities.iter().next().cloned())
                 .flatten()
@@ -2784,8 +2842,8 @@ impl Enricher {
         registry: &Registry,
     ) -> Result<Vec<crate::providers::ItemRef>> {
         let rows = sqlx::query(
-            "SELECT DISTINCT i.id, i.kind, i.title, i.norm_title, i.year,
-                    i.artist, i.norm_artist,
+            "SELECT DISTINCT i.id, i.kind, CASE WHEN current_work.id IS NOT NULL THEN current_work.title ELSE i.title END AS title, CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END AS norm_title, CASE WHEN current_work.id IS NOT NULL THEN current_work.year ELSE i.year END AS year,
+                    CASE WHEN current_work.id IS NOT NULL THEN current_work.artist ELSE i.artist END AS artist, CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_artist ELSE i.norm_artist END AS norm_artist,
                     m.provider, m.provider_id, COALESCE(m.manual, 0) AS manual,
                     a.anidb_id, a.anilist_id
              FROM collection_items i
@@ -2799,42 +2857,51 @@ impl Enricher {
              -- once, off the primary keys.
              JOIN collections own ON (own.module_id,own.collection_id)
                                   =(i.module_id,i.collection_id)
+
+             LEFT JOIN collection_item_library_items current_assignment ON current_assignment.collection_item_id=i.id AND current_assignment.ordinal=1 AND i.provider_identity_revision>0
+             LEFT JOIN library_items current_work ON current_work.id=current_assignment.library_item_id AND i.metadata_eligible=1
              WHERE i.kind IN ('movie','show') AND own.media_type='anime'
                AND (
                  -- The NAME question is owed: no anime identity stands
                  -- and the current title anchor was never asked. A
                  -- repaired title or a QUERY_REV bump re-opens this
                  -- automatically; misses never gate (HUB-5).
-                 (NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                 (NOT EXISTS (SELECT 1 FROM answer_priority pm
                                WHERE pm.item_id = i.id AND pm.provider = 'anilist'
                                  AND pm.provider_id <> '')
-                  AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                  AND (NOT EXISTS (SELECT 1 FROM provider_queries q
                                    WHERE q.item_id = i.id AND q.provider = 'anime'
                                      AND q.query_type = 'title'
-                                     AND q.query = i.norm_title || '|' || COALESCE(i.year, '')
-                                     AND q.rev >= ?1))
+                                     AND q.query = (CASE WHEN current_work.id IS NOT NULL THEN current_work.norm_title ELSE i.norm_title END) || '|' || COALESCE((CASE WHEN current_work.id IS NOT NULL THEN current_work.year ELSE i.year END), '')
+                                     AND q.rev >= ?1)
+                    OR (EXISTS(SELECT 1 FROM provider_metadata held WHERE held.item_id=i.id AND held.provider IN ('anime','anilist'))
+                      AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider IN ('anime','anilist')))))
                  -- A BRIDGE fetch is owed: identity mapped, no real
                  -- tail answer, that mapped id never fetched. (TMDB's
                  -- title-search-while-unowned rides the name branch
                  -- above — both anchors record in the same walk.)
                  OR (a.mapped_tmdb IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                     AND NOT EXISTS (SELECT 1 FROM answer_priority pm
                                       WHERE pm.item_id = i.id AND pm.provider = 'tmdb'
                                         AND pm.provider_id <> '')
-                     AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                     AND (NOT EXISTS (SELECT 1 FROM provider_queries q
                                       WHERE q.item_id = i.id AND q.provider = 'tmdb'
                                         AND q.query_type = 'mapped_id'
                                         AND q.query = CAST(a.mapped_tmdb AS TEXT)
-                                        AND q.rev >= ?1))
+                                        AND q.rev >= ?1)
+                       OR (EXISTS(SELECT 1 FROM provider_metadata held WHERE held.item_id=i.id AND held.provider='tmdb')
+                         AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider='tmdb'))))
                  OR (a.mapped_tvdb IS NOT NULL
-                     AND NOT EXISTS (SELECT 1 FROM provider_metadata pm
+                     AND NOT EXISTS (SELECT 1 FROM answer_priority pm
                                       WHERE pm.item_id = i.id AND pm.provider = 'tvdb'
                                         AND pm.provider_id <> '')
-                     AND NOT EXISTS (SELECT 1 FROM provider_queries q
+                     AND (NOT EXISTS (SELECT 1 FROM provider_queries q
                                       WHERE q.item_id = i.id AND q.provider = 'tvdb'
                                         AND q.query_type = 'mapped_id'
                                         AND q.query = CAST(a.mapped_tvdb AS TEXT)
-                                        AND q.rev >= ?1))
+                                        AND q.rev >= ?1)
+                       OR (EXISTS(SELECT 1 FROM provider_metadata held WHERE held.item_id=i.id AND held.provider='tvdb')
+                         AND NOT EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider='tvdb'))))
                     -- HUB-9: local owes an answer. Gated on there
                     -- actually being something beside the media, or an
                     -- item with no cover and no .nfo would be re-selected
@@ -4149,38 +4216,9 @@ impl Enricher {
         // projection (backfill). ponytail: a show TVDB never curated
         // absolute numbers for re-fetches each run — a few cached-token
         // pages per anime show; revisit if a library full of them appears.
-        let shows = sqlx::query(
-            "SELECT i.id, a.mapped_tvdb, a.mapped_tmdb, a.anidb_id
-             FROM collection_items i
-             JOIN item_match m ON m.item_id = i.id AND m.provider_id != ''
-             LEFT JOIN anime_ids a ON a.item_id = i.id
-             WHERE i.kind = 'show'
-               -- Episode data follows the chain like everything else
-               -- (HUB-5): every provider that identified this show is an
-               -- episode source, so a show whose owner carries no episode
-               -- list still gets one from the other. A provider that has
-               -- answered for an episode is not asked again; a recorded
-               -- miss goes stale after a week so airing shows converge.
-               AND (EXISTS (
-                 SELECT 1 FROM provider_metadata sp
-                 JOIN collection_items e ON e.parent_id = i.id
-                 LEFT JOIN provider_metadata ep
-                        ON ep.item_id = e.id AND ep.provider = sp.provider
-                 WHERE sp.item_id = i.id AND sp.provider_id != ''
-                   AND sp.provider IN ('tmdb', 'tvdb')
-                   AND (ep.item_id IS NULL
-                        OR (ep.confidence = 'miss'
-                            AND ep.updated_at < unixepoch() - 7 * 86400)))
-               OR EXISTS (
-                 SELECT 1 FROM collection_items e
-                 JOIN provider_metadata em ON em.item_id = e.id
-                 WHERE e.parent_id = i.id AND e.season IS NULL
-                   AND em.provider IN ('tmdb', 'tvdb')
-                   AND em.proj_episode IS NULL
-                   AND em.updated_at < unixepoch() - 7 * 86400))",
-        )
-        .fetch_all(registry.db())
-        .await?;
+        let shows = sqlx::query(EPISODE_SHOWS_SQL)
+            .fetch_all(registry.db())
+            .await?;
         if shows.is_empty() {
             return Ok(());
         }
@@ -4194,7 +4232,7 @@ impl Enricher {
             // identified it, plus the anime-lists mapped ids (HUB-29/31)
             // for anime, whose own services carry no episode lists.
             let mut sources: Vec<(String, String)> = sqlx::query(
-                "SELECT provider, provider_id FROM provider_metadata
+                "SELECT provider, provider_id FROM answer_priority
                  WHERE item_id = ? AND provider_id != '' AND provider IN ('tmdb','tvdb')",
             )
             .bind(&show_id)
@@ -4264,10 +4302,16 @@ impl Enricher {
         anidb_id: Option<u32>,
         tmdb_lease: &crate::gate::CredentialLease,
     ) -> Result<()> {
+        let Some(context) =
+            crate::providers::EpisodeAnswerContext::capture(db, show_id, provider, pid, anidb_id)
+                .await?
+        else {
+            return Ok(());
+        };
         // Our episode items: (item_id, season, episode). season NULL =
         // absolute numbering.
         let eps = sqlx::query(
-            "SELECT id, season, episode FROM collection_items WHERE parent_id = ? AND kind = 'episode'",
+            "SELECT id, season, episode, episode_end FROM collection_items WHERE parent_id = ? AND kind = 'episode'",
         )
         .bind(show_id)
         .fetch_all(db)
@@ -4372,14 +4416,16 @@ impl Enricher {
             (_, true) => {
                 // Absolute over TMDB: concatenate seasons in order.
                 let seasons = self.tmdb_seasons(tmdb_key, pid, tmdb_lease).await?;
-                let max_abs = eps
+                let wanted: BTreeSet<i64> = eps
                     .iter()
-                    .map(|r| r.get::<i64, _>("episode"))
-                    .max()
-                    .unwrap_or(0);
+                    .filter(|r| r.get::<Option<i64>, _>("season").is_none())
+                    .flat_map(|r| {
+                        crate::providers::covered_episodes(r.get("episode"), r.get("episode_end"))
+                    })
+                    .collect();
                 let mut fetched: std::collections::HashMap<i64, Vec<EpisodeData>> =
                     Default::default();
-                for abs in 1..=max_abs {
+                for abs in wanted {
                     if let Some((s, n)) = absolute_to_seasoned(&seasons, abs) {
                         proj.insert(abs, (s, n));
                         if let std::collections::hash_map::Entry::Vacant(e) = fetched.entry(s) {
@@ -4415,7 +4461,9 @@ impl Enricher {
             let wanted: Vec<i64> = eps
                 .iter()
                 .filter(|r| r.get::<Option<i64>, _>("season").is_none())
-                .map(|r| r.get::<i64, _>("episode"))
+                .flat_map(|r| {
+                    crate::providers::covered_episodes(r.get("episode"), r.get("episode_end"))
+                })
                 .collect();
             match crate::anime::anidb_episode_titles(&self.http, &self.data_dir, aid, &wanted).await
             {
@@ -4436,78 +4484,7 @@ impl Enricher {
             }
         }
 
-        let mut wrote = 0;
-        for r in &eps {
-            let key = (
-                r.get::<Option<i64>, _>("season"),
-                r.get::<i64, _>("episode"),
-            );
-            let Some(e) = by_key.get(&key) else { continue };
-            let item_id: String = r.get("id");
-            // Season projection applies to absolute-numbered rows only.
-            let p = if key.0.is_none() {
-                proj.get(&key.1)
-            } else {
-                None
-            };
-            // An episode's description is a provider answer like any
-            // other (HUB-5) — one provider supplies it today, but it
-            // goes through the same store, so a merge can never revert
-            // what the episode pass wrote.
-            crate::providers::store_answer(
-                db,
-                &item_id,
-                provider,
-                &e.provider_id,
-                "auto",
-                crate::providers::Fields {
-                    title: e.title.clone(),
-                    overview: e.overview.clone(),
-                    poster_path: e.image.clone(),
-                    rating: e.rating,
-                    premiered: e.aired.clone(),
-                    ..Default::default()
-                },
-            )
-            .await?;
-            // The season/absolute projection is identity, not
-            // description: the merge never touches it (HUB-31).
-            sqlx::query(
-                "UPDATE provider_metadata SET proj_season = ?, proj_episode = ?
-                 WHERE item_id = ? AND provider = ?",
-            )
-            .bind(p.map(|v| v.0))
-            .bind(p.map(|v| v.1))
-            .bind(&item_id)
-            .bind(provider)
-            .execute(db)
-            .await?;
-            wrote += 1;
-        }
-        // Episodes the provider had nothing for: record the attempt, or
-        // this show is selected again on every single run (it was — nine
-        // times in one day, re-fetching whole episode lists each time).
-        let mut unmatched = 0;
-        for r in &eps {
-            let key = (
-                r.get::<Option<i64>, _>("season"),
-                r.get::<i64, _>("episode"),
-            );
-            if by_key.contains_key(&key) {
-                continue;
-            }
-            let item_id: String = r.get("id");
-            crate::providers::store_answer(
-                db,
-                &item_id,
-                provider,
-                "",
-                "miss",
-                crate::providers::Fields::default(),
-            )
-            .await?;
-            unmatched += 1;
-        }
+        let (wrote, unmatched) = store_episode_answers(db, &context, &eps, &by_key, &proj).await?;
         tracing::info!(
             show = show_id,
             episodes = wrote,
@@ -4682,6 +4659,102 @@ pub struct EpisodeData {
     pub rating: Option<f64>,
 }
 
+const EPISODE_SHOWS_SQL: &str = "SELECT i.id, a.mapped_tvdb, a.mapped_tmdb, a.anidb_id
+             FROM collection_items i
+             JOIN item_match m ON m.item_id = i.id AND m.provider_id != ''
+             LEFT JOIN anime_ids a ON a.item_id = i.id AND (i.provider_identity_revision=0 OR EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=i.id AND ap.provider IN ('anidb','anilist')))
+             WHERE i.kind = 'show' AND i.metadata_eligible=1
+               -- Episode data follows the chain like everything else
+               -- (HUB-5): every provider that identified this show is an
+               -- episode source, so a show whose owner carries no episode
+               -- list still gets one from the other. A provider that has
+               -- answered for an episode is not asked again; a recorded
+               -- miss goes stale after a week so airing shows converge.
+               AND (EXISTS (
+                 SELECT 1 FROM answer_priority sp
+                 JOIN collection_items e ON e.parent_id = i.id
+                 LEFT JOIN provider_metadata ep
+                        ON ep.item_id = e.id AND ep.provider = sp.provider
+                       AND EXISTS(SELECT 1 FROM answer_priority ap WHERE ap.item_id=ep.item_id AND ap.provider=ep.provider)
+                 WHERE sp.item_id = i.id AND sp.provider_id != ''
+                   AND sp.provider IN ('tmdb', 'tvdb')
+                   AND (ep.item_id IS NULL
+                        OR (ep.confidence = 'miss'
+                            AND ep.updated_at < unixepoch() - 7 * 86400)
+                        OR (e.season IS NULL AND e.episode_end>e.episode
+                            AND e.episode_end-e.episode<1000
+                            AND (json_type(ep.covered_episode_projections,'$.\"' || e.episode || '\"') IS NULL
+                              OR json_type(ep.covered_episode_projections,'$.\"' || e.episode_end || '\"') IS NULL
+                              OR (ep.updated_at < unixepoch() - 7 * 86400 AND EXISTS(
+                                SELECT 1 FROM json_each(ep.covered_episode_projections) gap
+                                WHERE CAST(gap.key AS INTEGER) BETWEEN e.episode AND e.episode_end AND gap.type='null'))))))
+               OR EXISTS (
+                 SELECT 1 FROM collection_items e
+                 JOIN answer_priority em ON em.item_id = e.id
+                 WHERE e.parent_id = i.id AND e.season IS NULL
+                   AND em.provider IN ('tmdb', 'tvdb')
+                   AND em.proj_episode IS NULL
+                   AND em.updated_at < unixepoch() - 7 * 86400))";
+
+/// Commit the fetched provider response through the same captured-context guard
+/// for every copy. Only the primary episode supplies descriptive fields; each
+/// covered native episode retains its own optional season projection.
+async fn store_episode_answers(
+    db: &crate::library::Database,
+    context: &crate::providers::EpisodeAnswerContext,
+    eps: &[sqlx::sqlite::SqliteRow],
+    by_key: &std::collections::HashMap<(Option<i64>, i64), EpisodeData>,
+    projections: &std::collections::HashMap<i64, (i64, i64)>,
+) -> Result<(usize, usize)> {
+    let (mut wrote, mut unmatched) = (0, 0);
+    for row in eps {
+        let key = (
+            row.get::<Option<i64>, _>("season"),
+            row.get::<i64, _>("episode"),
+        );
+        let covered = key.0.is_none().then(|| {
+            crate::providers::CoveredEpisodeProjections(
+                crate::providers::covered_episodes(key.1, row.get("episode_end"))
+                    .map(|episode| (episode, projections.get(&episode).copied()))
+                    .collect(),
+            )
+        });
+        let episode = by_key.get(&key);
+        let fields = episode
+            .map(|e| crate::providers::Fields {
+                title: e.title.clone(),
+                overview: e.overview.clone(),
+                poster_path: e.image.clone(),
+                rating: e.rating,
+                premiered: e.aired.clone(),
+                ..Default::default()
+            })
+            .unwrap_or_default();
+        if context
+            .store_coverage(
+                db,
+                row.get("id"),
+                episode.map_or("", |e| e.provider_id.as_str()),
+                if episode.is_some() { "auto" } else { "miss" },
+                fields,
+                key.0
+                    .is_none()
+                    .then(|| projections.get(&key.1).copied())
+                    .flatten(),
+                covered.as_ref(),
+            )
+            .await?
+        {
+            if episode.is_some() {
+                wrote += 1;
+            } else {
+                unmatched += 1;
+            }
+        }
+    }
+    Ok((wrote, unmatched))
+}
+
 /// Map an absolute episode number onto (season, episode) given ordered
 /// (season, episode_count) pairs — sequential-numbered shows only, which
 /// is exactly the absolute-numbered-fansub convention.
@@ -4703,6 +4776,309 @@ pub fn absolute_to_seasoned(seasons: &[(i64, i64)], absolute: i64) -> Option<(i6
 mod tests {
     use super::*;
     use std::collections::BTreeMap;
+
+    #[tokio::test]
+    async fn combined_episode_response_keeps_each_projection_and_settles_missing_coverage() {
+        for primary_present in [true, false] {
+            let db = crate::db::open_in_memory().await.unwrap();
+            sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('h','mediahost','h','fp');
+              INSERT INTO collections(module_id,collection_id,media_type) VALUES('h','a','anime');
+              INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES('show','show','Anime','anime',2000,'h','a');
+              INSERT INTO collection_items(id,kind,title,norm_title,parent_id,episode,episode_end,module_id,collection_id) VALUES('combined','episode','Episodes 25-26','episodes 25-26','show',25,26,'h','a');")
+                .execute(&db).await.unwrap();
+            crate::providers::store_answer(
+                &db,
+                "show",
+                "tmdb",
+                "100",
+                "auto",
+                crate::providers::Fields {
+                    title: Some("Anime".into()),
+                    premiered: Some("2000-01-01".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+            let context =
+                crate::providers::EpisodeAnswerContext::capture(&db, "show", "tmdb", "100", None)
+                    .await
+                    .unwrap()
+                    .unwrap();
+            let copies = sqlx::query(
+                "SELECT id,season,episode,episode_end FROM collection_items WHERE id='combined'",
+            )
+            .fetch_all(&db)
+            .await
+            .unwrap();
+            // This is the parsed provider response passed to the real async
+            // writer, including a season boundary that cannot be offset math.
+            let mut by_key = std::collections::HashMap::new();
+            let mut projections = std::collections::HashMap::from([(26, (3, 1))]);
+            for episode in if primary_present {
+                vec![25, 26]
+            } else {
+                vec![26]
+            } {
+                by_key.insert(
+                    (None, episode),
+                    EpisodeData {
+                        provider_id: episode.to_string(),
+                        season: None,
+                        episode,
+                        absolute: Some(episode),
+                        title: Some(format!("Title {episode}")),
+                        overview: None,
+                        image: None,
+                        aired: None,
+                        rating: None,
+                    },
+                );
+            }
+            if primary_present {
+                projections.insert(25, (2, 12));
+            }
+            store_episode_answers(&db, &context, &copies, &by_key, &projections)
+                .await
+                .unwrap();
+            let encoded: String = sqlx::query_scalar("SELECT covered_episode_projections FROM provider_metadata WHERE item_id='combined' AND provider='tmdb'").fetch_one(&db).await.unwrap();
+            let map: crate::providers::CoveredEpisodeProjections =
+                serde_json::from_str(&encoded).unwrap();
+            assert_eq!(map.0[&25], primary_present.then_some((2, 12)));
+            assert_eq!(map.0[&26], Some((3, 1)));
+            let work: String = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='combined' AND ordinal=2").fetch_one(&db).await.unwrap();
+            let read = crate::providers::library_episode_projection_sql("?1", "", true);
+            let pair: Option<String> =
+                sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {read}")))
+                    .bind(&work)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap();
+            assert_eq!(
+                serde_json::from_str::<serde_json::Value>(&pair.unwrap()).unwrap(),
+                serde_json::json!(["tmdb", "100", 3, 1])
+            );
+            assert!(
+                sqlx::query(EPISODE_SHOWS_SQL)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "a recorded gap must settle until its normal retry"
+            );
+            sqlx::query("UPDATE provider_metadata SET updated_at=unixepoch()-8*86400 WHERE item_id='combined'").execute(&db).await.unwrap();
+            assert_eq!(
+                sqlx::query(EPISODE_SHOWS_SQL)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .len(),
+                usize::from(!primary_present)
+            );
+            // Deployed legacy answers retain scalars; only absent secondary
+            // coverage becomes due, with no migration/provider queue needed.
+            sqlx::query("UPDATE provider_metadata SET covered_episode_projections=NULL,updated_at=unixepoch() WHERE item_id='combined'").execute(&db).await.unwrap();
+            assert_eq!(
+                sqlx::query(EPISODE_SHOWS_SQL)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .len(),
+                1
+            );
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM enrichment_queue")
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+                0
+            );
+            store_episode_answers(
+                &db,
+                &context,
+                &copies,
+                &std::collections::HashMap::new(),
+                &std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+            assert!(
+                sqlx::query(EPISODE_SHOWS_SQL)
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .is_empty(),
+                "all missing still settles"
+            );
+        }
+        assert_eq!(
+            crate::providers::covered_episodes(25, Some(i64::MAX)).collect::<Vec<_>>(),
+            vec![25]
+        );
+    }
+
+    #[tokio::test]
+    async fn combined_projection_reply_cannot_follow_a_changed_first_episode_or_parent() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('h','mediahost','h','fp');
+          INSERT INTO collections(module_id,collection_id,media_type) VALUES('h','a','anime');
+          INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id) VALUES('show','show','Anime','anime',2000,'h','a');
+          INSERT INTO collection_items(id,kind,title,norm_title,parent_id,episode,episode_end,module_id,collection_id) VALUES('combined','episode','Episodes 25-26','episodes 25-26','show',25,26,'h','a');")
+            .execute(&db).await.unwrap();
+        crate::providers::store_answer(
+            &db,
+            "show",
+            "tmdb",
+            "100",
+            "auto",
+            crate::providers::Fields {
+                title: Some("Anime".into()),
+                premiered: Some("2000-01-01".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let context =
+            crate::providers::EpisodeAnswerContext::capture(&db, "show", "tmdb", "100", None)
+                .await
+                .unwrap()
+                .unwrap();
+        let old = crate::providers::CoveredEpisodeProjections(BTreeMap::from([
+            (25, Some((2, 12))),
+            (26, Some((3, 1))),
+        ]));
+        assert!(
+            context
+                .store_coverage(
+                    &db,
+                    "combined",
+                    "125",
+                    "auto",
+                    crate::providers::Fields::default(),
+                    Some((2, 12)),
+                    Some(&old)
+                )
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE collection_items SET episode_end=25 WHERE id='combined'")
+            .execute(&db)
+            .await
+            .unwrap();
+        crate::providers::store_answer(
+            &db,
+            "combined",
+            "tmdb",
+            "125",
+            "auto",
+            crate::providers::Fields::default(),
+        )
+        .await
+        .unwrap();
+        let map: String = sqlx::query_scalar("SELECT covered_episode_projections FROM provider_metadata WHERE item_id='combined' AND provider='tmdb'").fetch_one(&db).await.unwrap();
+        assert_eq!(
+            serde_json::from_str::<serde_json::Value>(&map).unwrap(),
+            serde_json::json!({"25":[2,12]}),
+            "same-answer refresh drops removed coverage"
+        );
+        sqlx::query("UPDATE collection_items SET episode=27,episode_end=28 WHERE id='combined'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let unknown: String = sqlx::query_scalar("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='combined' AND ordinal=1").fetch_one(&db).await.unwrap();
+        let projection = crate::providers::library_episode_projection_sql("?1", "", false);
+        let missing: Option<String> =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT {projection}")))
+                .bind(unknown)
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert!(
+            missing.is_none(),
+            "an absent map key must not borrow the previous primary scalar"
+        );
+        sqlx::query("UPDATE collection_items SET episode=26,episode_end=27 WHERE id='combined'")
+            .execute(&db)
+            .await
+            .unwrap();
+        let current = crate::providers::CoveredEpisodeProjections(BTreeMap::from([
+            (26, Some((3, 1))),
+            (27, Some((3, 2))),
+        ]));
+        assert!(
+            context
+                .store_coverage(
+                    &db,
+                    "combined",
+                    "126",
+                    "auto",
+                    crate::providers::Fields {
+                        title: Some("Current first".into()),
+                        ..Default::default()
+                    },
+                    Some((3, 1)),
+                    Some(&current)
+                )
+                .await
+                .unwrap()
+        );
+        assert!(
+            !context
+                .store_coverage(
+                    &db,
+                    "combined",
+                    "125",
+                    "auto",
+                    crate::providers::Fields {
+                        title: Some("Old first".into()),
+                        ..Default::default()
+                    },
+                    Some((2, 12)),
+                    Some(&old)
+                )
+                .await
+                .unwrap()
+        );
+        let answer:(String,i64,i64) = sqlx::query_as("SELECT title,proj_season,proj_episode FROM provider_metadata WHERE item_id='combined' AND provider='tmdb'").fetch_one(&db).await.unwrap();
+        assert_eq!(answer, ("Current first".into(), 3, 1));
+        crate::providers::assign_manual(
+            &db,
+            "show",
+            "tmdb",
+            "200",
+            crate::providers::Fields {
+                title: Some("Other anime".into()),
+                premiered: Some("2010-01-01".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        assert!(
+            !context
+                .store_coverage(
+                    &db,
+                    "combined",
+                    "126",
+                    "auto",
+                    crate::providers::Fields::default(),
+                    Some((3, 1)),
+                    Some(&current)
+                )
+                .await
+                .unwrap()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT COUNT(*) FROM answer_priority WHERE item_id='combined' AND provider='tmdb'"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            0
+        );
+    }
 
     #[test]
     fn fanart_prefers_a_square_thumb_then_likes_and_stable_id() {
@@ -4931,6 +5307,7 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
+        sqlx::raw_sql("INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music'); INSERT INTO library_collections VALUES('music','fixture','music');").execute(&db).await.unwrap();
         for (item, key) in [
             ("same-a", "artist-a"),
             ("same-a-copy", "artist-a"),
@@ -4938,7 +5315,7 @@ mod tests {
         ] {
             sqlx::query(
                 "INSERT INTO collection_items
-                    (id,kind,title,norm_title,artist_key,module_id,collection_id)
+                    (id,kind,title,norm_title,artist,module_id,collection_id)
                  VALUES(?,'album',?,lower(?),?,'fixture','music')",
             )
             .bind(item)
@@ -4959,9 +5336,14 @@ mod tests {
             .unwrap();
         }
 
-        store_backfilled_artist_identity(&db, "artist-a", "shared-release", "credited-a")
-            .await
-            .unwrap();
+        store_backfilled_artist_identity(
+            &db,
+            &artist_key("artist-a"),
+            "shared-release",
+            "credited-a",
+        )
+        .await
+        .unwrap();
 
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
             "SELECT item_id,provider_artist_id FROM provider_metadata ORDER BY item_id",
@@ -4978,7 +5360,7 @@ mod tests {
             ]
         );
 
-        store_direct_artist_identity(&db, "artist-b", "direct-b")
+        store_direct_artist_identity(&db, &artist_key("artist-b"), "direct-b")
             .await
             .unwrap();
         let rows: Vec<(String, Option<String>)> = sqlx::query_as(
@@ -4995,6 +5377,174 @@ mod tests {
                 ("same-b".into(), Some("direct-b".into())),
             ],
             "a direct artist answer must stay within its synthetic group"
+        );
+    }
+
+    #[tokio::test]
+    async fn artist_evidence_follows_the_displayed_artist_and_compatible_copies() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','host','fp');
+            INSERT INTO collections(module_id,collection_id,media_type) VALUES('host','music','music');
+            INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music');
+            INSERT INTO library_collections VALUES('music','host','music');
+            INSERT INTO collection_items(id,kind,title,norm_title,year,artist,module_id,collection_id)
+            VALUES('wrong','album','Album','album',2000,'Detected artist','host','music');
+            UPDATE collection_items SET artist_key='detected-key' WHERE id='wrong';")
+            .execute(&db).await.unwrap();
+        crate::providers::store_answer(
+            &db,
+            "wrong",
+            "musicbrainz",
+            "wrong-release",
+            "auto",
+            crate::providers::Fields {
+                title: Some("Album".into()),
+                premiered: Some("2000-01-01".into()),
+                provider_artist_id: Some("wrong-artist".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let mut tx = db.begin().await.unwrap();
+        let target = crate::library::create(
+            &mut tx,
+            crate::library::NewItem {
+                kind: "album".into(),
+                title: "Album".into(),
+                year: Some(2000),
+                artist: Some("Correct artist".into()),
+                parent_id: None,
+                season: None,
+                episode: None,
+                edition: None,
+            },
+        )
+        .await
+        .unwrap();
+        crate::library::assign(&mut tx, "wrong", std::slice::from_ref(&target))
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        let key: String = sqlx::query_scalar("SELECT artist_key FROM library_items WHERE id=?")
+            .bind(&target)
+            .fetch_one(&db)
+            .await
+            .unwrap();
+        let artists = artist_evidence(&db).await.unwrap();
+        assert_eq!(artists.len(), 1);
+        let evidence = artists
+            .get(&key)
+            .expect("the displayed corrected artist must enter portrait prefetch");
+        assert_eq!(evidence.name, "Correct artist");
+        assert!(
+            evidence
+                .albums
+                .iter()
+                .all(|album| album.release_group_id.is_none() && album.artist_id.is_none()),
+            "the old artist's provider record is incompatible evidence"
+        );
+        let original_revision = artist_art_revision(&key, &evidence.name, evidence);
+        store_direct_artist_identity(&db, &key, "direct-correct-artist")
+            .await
+            .unwrap();
+        let persisted = artist_evidence_for(&db, Some(&key)).await.unwrap();
+        assert_eq!(
+            original_revision,
+            artist_art_revision(&key, &persisted[&key].name, &persisted[&key]),
+            "a direct lookup with no compatible provider row must retain a stable input revision"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT provider_artist_id FROM provider_metadata WHERE item_id='wrong'"
+            )
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            "wrong-artist"
+        );
+
+        // A completed direct lookup remains cached even without a compatible
+        // album provider row. This actual prefetch pass must perform no HTTP.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = Registry::new(db.clone(), Default::default());
+        let enricher = Arc::new(Enricher::new(tmp.path().to_path_buf()));
+        let artwork = Arc::new(crate::artwork::Artwork::new(
+            tmp.path().join("artwork"),
+            enricher.clone(),
+        ));
+        enricher.attach_artwork(&artwork);
+        store_artist_artwork(
+            &db,
+            &key,
+            "Correct artist",
+            Some("direct-correct-artist"),
+            None,
+            None,
+            "missing",
+            &original_revision,
+        )
+        .await
+        .unwrap();
+        let lease = enricher.provider_lease(THEAUDIODB);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            enricher.prefetch_artist_artwork(&registry, None, "unused", false, &lease),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+
+        for copy in ["compatible", "duplicate"] {
+            sqlx::query("INSERT INTO collection_items(id,kind,title,norm_title,year,artist,module_id,collection_id) VALUES(?,'album','Album','album',2000,'Correct artist','host','music')")
+                .bind(copy).execute(&db).await.unwrap();
+            crate::providers::store_answer(
+                &db,
+                copy,
+                "musicbrainz",
+                "correct-release",
+                "auto",
+                crate::providers::Fields {
+                    title: Some("Album".into()),
+                    premiered: Some("2000-01-01".into()),
+                    provider_artist_id: Some("correct-artist".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        let artists = artist_evidence(&db).await.unwrap();
+        let evidence = &artists[&key];
+        assert_eq!(artists.len(), 1);
+        assert_eq!(
+            evidence
+                .albums
+                .iter()
+                .filter(|a| a.artist_id.as_deref() == Some("correct-artist"))
+                .count(),
+            1,
+            "duplicate copies must contribute one distinct provider claim"
+        );
+        assert!(
+            !evidence
+                .albums
+                .iter()
+                .any(|a| a.artist_id.as_deref() == Some("wrong-artist"))
+        );
+        sqlx::raw_sql("INSERT INTO rejected_matches(item_id,provider,provider_id,rejected_at) VALUES('compatible','musicbrainz','correct-release',unixepoch()),('duplicate','musicbrainz','correct-release',unixepoch());").execute(&db).await.unwrap();
+        let artists = artist_evidence(&db).await.unwrap();
+        assert!(
+            artists[&key].albums.iter().all(|a| a.artist_id.is_none()),
+            "rejected provider answers are not portrait evidence"
+        );
+        sqlx::query("DELETE FROM library_collections")
+            .execute(&db)
+            .await
+            .unwrap();
+        assert!(
+            artist_evidence(&db).await.unwrap().is_empty(),
+            "unattached collection artists are not displayed"
         );
     }
 
@@ -6315,6 +6865,134 @@ async fn read_nfo(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 #[cfg(test)]
 mod nfo_tests {
     use super::parse_nfo;
+
+    #[tokio::test]
+    async fn withdrawing_nfo_with_remaining_artwork_keeps_remote_and_episode_answers() {
+        use crate::providers::{Fields, ItemRef, Provider, store_answer};
+        use std::sync::Arc;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open_in_memory().await.unwrap();
+        let registry = Arc::new(crate::registry::Registry::new(
+            db.clone(),
+            Default::default(),
+        ));
+        registry
+            .record_satellite("host", "mediahost", "host", "fp")
+            .await
+            .unwrap();
+        registry
+            .announce_collection("host", "one", "series", &["/media".into()])
+            .await
+            .unwrap();
+        registry
+            .upsert_files(
+                "host",
+                "one",
+                vec![crate::registry::FileUpsertRecord {
+                    root_token: kahawai_core::media::root_token(std::path::Path::new("/media")),
+                    path_rel: "Show (2000)/Show S01E01.mkv".into(),
+                    size: 100,
+                    mtime_unix: 1,
+                    head_xxh3: 10,
+                    tail_xxh3: 11,
+                    oshash: 0,
+                    streams_json: r#"{"artwork":"Show (2000)/cover.jpg"}"#.into(),
+                }],
+            )
+            .await
+            .unwrap();
+        let (episode, parent): (String, String) =
+            sqlx::query_as("SELECT id,parent_id FROM collection_items WHERE kind='episode'")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        for (provider, id) in [("local", "show.nfo"), ("tmdb", "100")] {
+            store_answer(
+                &db,
+                &parent,
+                provider,
+                id,
+                "auto",
+                Fields {
+                    title: Some("Show".into()),
+                    premiered: Some("2000-01-01".into()),
+                    overview: Some(format!("{provider} description")),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        }
+        store_answer(
+            &db,
+            &episode,
+            "tmdb",
+            "101",
+            "auto",
+            Fields {
+                title: Some("Episode title".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let local = super::LocalProvider {
+            registry,
+            sessions: Arc::new(crate::sessions::Sessions::new(dir.path().join("sessions"))),
+        };
+        local
+            .enrich(
+                &db,
+                &ItemRef {
+                    id: parent.clone(),
+                    kind: "show".into(),
+                    title: "Show".into(),
+                    norm_title: "show".into(),
+                    year: Some(2000),
+                    artist: None,
+                    norm_artist: None,
+                    alt: None,
+                    existing: Some(("local".into(), "show.nfo".into())),
+                    manual: false,
+                    known_aid: None,
+                    identified: true,
+                    owner: Some("local".into()),
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>(
+                "SELECT provider_identity_revision FROM collection_items WHERE id=?"
+            )
+            .bind(&parent)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            0
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>("SELECT provider FROM item_match WHERE item_id=?")
+                .bind(&parent)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+            "tmdb"
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT title FROM answer_priority WHERE item_id=? AND provider='tmdb'"
+            )
+            .bind(episode)
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+            "Episode title"
+        );
+        let local:(String,Option<String>)=sqlx::query_as("SELECT provider_id,poster_path FROM provider_metadata WHERE item_id=? AND provider='local'").bind(parent).fetch_one(&db).await.unwrap();
+        assert_eq!(local.0, "");
+        assert!(local.1.is_some());
+    }
 
     /// A Kodi .nfo, and the half-filled ones people actually have.
     #[test]

@@ -46,7 +46,8 @@ WITH truth AS (
                                   'movies')),99),
                pm.provider) AS n
       FROM collection_items i JOIN provider_metadata pm ON pm.item_id = i.id
-     WHERE i.kind IN ('movie', 'show', 'album')
+     WHERE (i.kind IN ('movie', 'show', 'album')
+            OR EXISTS (SELECT 1 FROM manual_match chosen WHERE chosen.item_id=i.id))
        AND pm.confidence IN ('auto', 'weak') AND pm.provider_id <> ''
        AND NOT EXISTS (SELECT 1 FROM rejected_matches rj
                         WHERE rj.item_id = pm.item_id AND rj.provider = pm.provider
@@ -305,6 +306,83 @@ async fn a_pin_whose_answer_disappears_does_not_strand_an_assignment() {
         Some(("tvdb".into(), "414734".into(), true)),
         "the pin is stateless intent; every pick re-applies it"
     );
+    assert_eq!(drifted(&db).await, 0);
+}
+
+async fn pinned_children(db: &SqlitePool) {
+    sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('fixture','mediahost','fixture','fp');
+        INSERT INTO collections(module_id,collection_id,media_type) VALUES('fixture','series','series'),('fixture','music','music');
+        INSERT INTO collection_items(id,kind,title,norm_title,year,artist,module_id,collection_id)
+        VALUES('show','show','Show','show',2000,NULL,'fixture','series'),('album','album','Album','album',2000,'Artist','fixture','music');
+        INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
+        VALUES('episode','episode','Episode 1','episode 1','show',1,1,'fixture','series'),('track','track','Track 1','track 1','album',1,1,'fixture','music');")
+        .execute(db).await.unwrap();
+    for (parent, child) in [("show", "episode"), ("album", "track")] {
+        answer(db, parent, "tmdb", "parent-record", "auto").await;
+        answer(db, child, "tmdb", "inherited-record", "auto").await;
+        answer(db, child, "tvdb", "chosen-record", "auto").await;
+        assert_eq!(assigned(db, child).await, None);
+        sqlx::query("INSERT INTO manual_match(item_id,provider,provider_id,pinned_at) VALUES(?,'tvdb','chosen-record',1)")
+            .bind(child).execute(db).await.unwrap();
+        assert_eq!(
+            assigned(db, child).await,
+            Some(("tvdb".into(), "chosen-record".into(), true))
+        );
+    }
+    assert_eq!(drifted(db).await, 0);
+}
+
+#[tokio::test]
+async fn withdrawing_child_pins_returns_episodes_and_tracks_to_their_parent() {
+    let db = kahawai_hub::db::open_in_memory().await.unwrap();
+    pinned_children(&db).await;
+    // This is the reset endpoint's pin deletion, deliberately exercised as raw
+    // SQL so the database must maintain its own derived assignment.
+    sqlx::query("DELETE FROM manual_match WHERE item_id IN('episode','track')")
+        .execute(&db)
+        .await
+        .unwrap();
+    let remaining: Vec<String> = sqlx::query_scalar(
+        "SELECT item_id FROM item_match WHERE item_id IN('episode','track') ORDER BY item_id",
+    )
+    .fetch_all(&db)
+    .await
+    .unwrap();
+    assert!(
+        remaining.is_empty(),
+        "children still claim an independent choice after reset: {remaining:?}"
+    );
+    assert_eq!(drifted(&db).await, 0);
+    for child in ["episode", "track"] {
+        let title: String = sqlx::query_scalar("SELECT li.title FROM library_items li JOIN collection_item_library_items a ON a.library_item_id=li.id WHERE a.collection_item_id=?")
+            .bind(child).fetch_one(&db).await.unwrap();
+        assert_eq!(
+            title, "tmdb title",
+            "{child} must inherit its parent's provider again"
+        );
+    }
+}
+
+#[tokio::test]
+async fn replacing_old_trigger_definitions_repairs_unpinned_child_assignments() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    pinned_children(&db).await;
+    // A pre-fix trigger left the result behind when the pin was removed.
+    // Removing this one definition models that state and forces the startup
+    // installer to replace the definitions and rebuild their derived results.
+    sqlx::raw_sql(
+        "DROP TRIGGER repick_pin_del;
+        DELETE FROM manual_match WHERE item_id IN('episode','track');",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    assert!(assigned(&db, "episode").await.is_some());
+    db.close().await;
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    assert_eq!(assigned(&db, "episode").await, None);
+    assert_eq!(assigned(&db, "track").await, None);
     assert_eq!(drifted(&db).await, 0);
 }
 

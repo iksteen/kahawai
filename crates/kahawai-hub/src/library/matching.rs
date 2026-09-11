@@ -314,6 +314,20 @@ pub async fn reconcile(connection: &mut SqliteConnection) -> Result<()> {
     reconcile_with_provider_pick(connection, None).await
 }
 
+/// Only an explicit provider choice may supersede a refusal of the one work
+/// identified by its answer. Consume that permission once for this copy;
+/// descendants and subsequent automatic reconciliation retain normal filtering.
+pub(crate) async fn reconcile_provider_pick(
+    connection: &mut SqliteConnection,
+    copy: &str,
+) -> Result<()> {
+    sqlx::query("INSERT INTO library_pending VALUES(?) ON CONFLICT DO NOTHING")
+        .bind(copy)
+        .execute(&mut *connection)
+        .await?;
+    reconcile_with_provider_pick(connection, Some(copy)).await
+}
+
 async fn reconcile_with_provider_pick(
     connection: &mut SqliteConnection,
     mut provider_pick: Option<&str>,
