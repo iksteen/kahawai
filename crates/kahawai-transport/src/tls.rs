@@ -4,6 +4,9 @@
 //! satellite has nothing to pin yet, and the console code — not the channel —
 //! is what defeats substitution. Everything after enrollment is mTLS (SEC-5),
 //! which lands with the link services.
+//!
+//! These sockets bypass Tonic's TCP connector and listener, including their
+//! TCP_NODELAY defaults. Set the option explicitly on both ends.
 
 use std::io;
 use std::sync::{Arc, OnceLock};
@@ -60,6 +63,10 @@ pub fn tls_incoming(
                     continue;
                 }
             };
+            if let Err(error) = stream.set_nodelay(true) {
+                tracing::warn!(%error, %peer, "setting TCP_NODELAY failed");
+                continue;
+            }
             let acceptor = acceptor.clone();
             let tx = tx.clone();
             tokio::spawn(async move {
@@ -97,6 +104,7 @@ pub async fn grpc_channel_with(
         let tls = tls.clone();
         async move {
             let tcp = TcpStream::connect(&addr).await?;
+            tcp.set_nodelay(true)?;
             let host = addr
                 .rsplit_once(':')
                 .map(|(h, _)| h)
