@@ -382,3 +382,215 @@ async fn continue_watching_respects_library_grants() {
         "a browse row names a library it is in"
     );
 }
+
+#[tokio::test]
+async fn continue_watching_paginates_canonical_candidates_with_all_filters() {
+    let (api, auth, db) = harness().await;
+    auth.complete_setup("owner", "hunter22222hunter")
+        .await
+        .unwrap();
+    let token = auth
+        .login("owner", "hunter22222hunter")
+        .await
+        .unwrap()
+        .access_token;
+    for library in ["LA", "LB"] {
+        sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES(?,?,'movies')")
+            .bind(library)
+            .bind(library)
+            .execute(&db)
+            .await
+            .unwrap();
+    }
+    seed(
+        &db,
+        "alias",
+        "movie",
+        "Detected name",
+        Some("LA"),
+        Some((60_000, 120_000, 0, 0)),
+    )
+    .await;
+    seed(
+        &db,
+        "b",
+        "movie",
+        "Bravo",
+        Some("LA"),
+        Some((60_000, 120_000, 0, 0)),
+    )
+    .await;
+    seed(
+        &db,
+        "z",
+        "movie",
+        "Zulu",
+        Some("LB"),
+        Some((60_000, 120_000, 0, 0)),
+    )
+    .await;
+    seed(
+        &db,
+        "finished",
+        "movie",
+        "Finished",
+        Some("LA"),
+        Some((60_000, 120_000, 1, 0)),
+    )
+    .await;
+    seed(
+        &db,
+        "other",
+        "movie",
+        "Another user's film",
+        Some("LA"),
+        None,
+    )
+    .await;
+    seed(&db, "duplicate", "movie", "Another copy", Some("LA"), None).await;
+    let mut tx = db.begin().await.unwrap();
+    let target = kahawai_hub::library::create(
+        &mut tx,
+        kahawai_hub::library::NewItem {
+            kind: "movie".into(),
+            title: "Corrected title".into(),
+            year: Some(2020),
+            artist: None,
+            parent_id: None,
+            season: None,
+            episode: None,
+            edition: None,
+        },
+    )
+    .await
+    .unwrap();
+    kahawai_hub::library::assign(&mut tx, "alias", std::slice::from_ref(&target))
+        .await
+        .unwrap();
+    kahawai_hub::library::assign(&mut tx, "duplicate", std::slice::from_ref(&target))
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(
+        kahawai_hub::library::resolve_id(&db, "alias")
+            .await
+            .unwrap(),
+        target
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_item_state WHERE item_id='alias'")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0,
+        "promotion moves history onto the canonical work"
+    );
+    sqlx::query(
+        "UPDATE user_item_state SET updated_at=CASE item_id WHEN 'z' THEN 600 ELSE 500 END",
+    )
+    .execute(&db)
+    .await
+    .unwrap();
+    sqlx::query("UPDATE user_item_state SET duration_ms=NULL WHERE item_id=?")
+        .bind(&target)
+        .execute(&db)
+        .await
+        .unwrap();
+    let viewer = auth
+        .create_user("viewer", "hunter22222hunter", false)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE users SET all_libraries=0 WHERE id=?")
+        .bind(&viewer)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO user_libraries(user_id,library_id) VALUES(?,'LA')")
+        .bind(&viewer)
+        .execute(&db)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO user_item_state(user_id,item_id,position_ms,duration_ms,updated_at)
+        VALUES(?,'other',60000,120000,700)",
+    )
+    .bind(&viewer)
+    .execute(&db)
+    .await
+    .unwrap();
+
+    let ids = |response: &serde_json::Value| -> Vec<String> {
+        response["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|item| item["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    let mut tied = [target.clone(), "b".to_string()];
+    tied.sort_by(|a, b| b.cmp(a));
+    let expected = vec!["z".to_string(), tied[0].clone(), tied[1].clone()];
+    let complete = browse(&api, &token, "/api/v1/items?in_progress=true&sort=title").await;
+    assert_eq!(
+        ids(&complete),
+        expected,
+        "watch recency and ID ties override ordinary browse sorting"
+    );
+    assert_eq!(
+        complete["total"], 3,
+        "copies do not duplicate a canonical watch candidate and another user's state stays private"
+    );
+    for offset in 0..=3 {
+        let response = browse(
+            &api,
+            &token,
+            &format!("/api/v1/items?in_progress=true&limit=1&offset={offset}"),
+        )
+        .await;
+        assert_eq!(response["total"], 3);
+        assert_eq!(
+            ids(&response),
+            expected
+                .iter()
+                .skip(offset)
+                .take(1)
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+    let scoped = browse(
+        &api,
+        &token,
+        "/api/v1/items?in_progress=true&library=LA&limit=1&offset=1",
+    )
+    .await;
+    assert_eq!(scoped["total"], 2);
+    assert_eq!(ids(&scoped), vec![tied[1].clone()]);
+    for needle in ["Corrected", "Detected"] {
+        let searched = browse(
+            &api,
+            &token,
+            &format!("/api/v1/items?in_progress=true&library=LA&q={needle}&limit=1"),
+        )
+        .await;
+        assert_eq!(searched["total"], 1);
+        assert_eq!(
+            ids(&searched),
+            vec![target.clone()],
+            "both public title and authorized detected title remain searchable"
+        );
+    }
+    let viewer_token = auth
+        .login("viewer", "hunter22222hunter")
+        .await
+        .unwrap()
+        .access_token;
+    let own = browse(
+        &api,
+        &viewer_token,
+        "/api/v1/items?in_progress=true&limit=1",
+    )
+    .await;
+    assert_eq!(ids(&own), vec!["other".to_string()]);
+    assert_eq!(own["total"], 1);
+}

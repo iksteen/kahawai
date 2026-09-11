@@ -253,6 +253,21 @@ fn page_context(inner: &str, order: &str, album: bool) -> String {
         LEFT JOIN user_item_state w ON w.item_id=c.id AND w.user_id=?1 ORDER BY {order}")
 }
 
+fn browse_candidates(filter: &str, in_progress: bool) -> String {
+    if in_progress {
+        // Continue watching visits this user's history, then resolves only its
+        // candidates. Both pagination and totals must use this indexed driver.
+        format!(
+            "FROM user_item_state w JOIN library_entries c ON c.id=w.item_id
+            WHERE w.user_id=?1 AND w.played=0 AND w.position_ms>=60000
+              AND (w.duration_ms IS NULL OR w.position_ms*100>=w.duration_ms)
+              AND c.kind<>'song' AND {filter}"
+        )
+    } else {
+        format!("FROM library_entries c WHERE {filter}")
+    }
+}
+
 pub(super) async fn browse(
     state: &AppState,
     claims: &crate::auth::Claims,
@@ -268,6 +283,7 @@ pub(super) async fn browse(
     }
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
     let offset = q.offset.unwrap_or(0);
+    let in_progress = q.in_progress.unwrap_or(false);
     let needle =
         q.q.as_deref()
             .map(crate::enrich::fold)
@@ -285,12 +301,11 @@ pub(super) async fn browse(
         filter = format!(
             "(c.norm_title LIKE '%'||?3||'%' OR (c.kind='album' AND c.norm_artist LIKE '%'||?3||'%') OR EXISTS(SELECT 1 FROM collection_item_library_items a JOIN collection_items ci ON ci.id=a.collection_item_id WHERE a.library_item_id=c.id AND ci.norm_title LIKE '%'||?3||'%' AND (EXISTS(SELECT 1 FROM users WHERE id=?1 AND (is_admin=1 OR all_libraries=1)) OR EXISTS(SELECT 1 FROM library_collections lc JOIN user_libraries ul ON ul.library_id=lc.library_id WHERE ul.user_id=?1 AND (lc.module_id,lc.collection_id)=(ci.module_id,ci.collection_id))))) AND {filter}"
         );
-    } else if !q.in_progress.unwrap_or(false) {
+    } else if !in_progress {
         filter.push_str(" AND c.kind IN('movie','series','album')");
     }
-    let order = if q.in_progress.unwrap_or(false) {
-        filter.push_str(" AND c.kind<>'song' AND EXISTS(SELECT 1 FROM user_item_state w WHERE w.item_id=c.id AND w.user_id=?1 AND w.played=0 AND w.position_ms>=60000 AND (w.duration_ms IS NULL OR w.position_ms*100>=w.duration_ms))");
-        "(SELECT updated_at FROM user_item_state WHERE item_id=c.id AND user_id=?1) DESC,c.id DESC"
+    let order = if in_progress {
+        "w.updated_at DESC,c.id DESC"
     } else {
         match q.sort.as_deref() {
             Some("year") => "c.year IS NULL,c.year,c.sort_title,c.id",
@@ -301,9 +316,8 @@ pub(super) async fn browse(
             _ => "c.sort_title,c.id",
         }
     };
-    let inner = format!(
-        "SELECT c.id FROM library_entries c WHERE {filter} ORDER BY {order} LIMIT ?4 OFFSET ?5"
-    );
+    let candidates = browse_candidates(&filter, in_progress);
+    let inner = format!("SELECT c.id {candidates} ORDER BY {order} LIMIT ?4 OFFSET ?5");
     let rows = sqlx::query(sqlx::AssertSqlSafe(page(&inner, order)))
         .bind(&claims.sub)
         .bind(q.library.as_deref().unwrap_or(""))
@@ -316,15 +330,13 @@ pub(super) async fn browse(
     let total = if rows.len() < limit as usize && (!rows.is_empty() || offset == 0) {
         offset as i64 + rows.len() as i64
     } else {
-        sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT COUNT(*) FROM library_entries c WHERE {filter}"
-        )))
-        .bind(&claims.sub)
-        .bind(q.library.as_deref().unwrap_or(""))
-        .bind(needle.as_deref().unwrap_or(""))
-        .fetch_one(db)
-        .await
-        .map_err(internal)?
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {candidates}")))
+            .bind(&claims.sub)
+            .bind(q.library.as_deref().unwrap_or(""))
+            .bind(needle.as_deref().unwrap_or(""))
+            .fetch_one(db)
+            .await
+            .map_err(internal)?
     };
     Ok(ItemsResponse {
         items: rows
@@ -337,6 +349,19 @@ pub(super) async fn browse(
     })
 }
 
+fn child_candidates() -> String {
+    let album = album_child("c", "?2");
+    // Limit library lookups to this parent's indexed episode/album positions.
+    // Retained album positions still need the same authorized physical copy
+    // check below; the association alone does not make a song visible here.
+    format!(
+        "SELECT c.id FROM library_entries c WHERE c.id IN (
+        SELECT item_id FROM episode_details WHERE series_id=?2
+        UNION SELECT song_id FROM album_tracks WHERE album_id=?2)
+        AND (c.parent_id=?2 OR {album}) AND {VISIBLE}"
+    )
+}
+
 pub(super) async fn children(
     state: &AppState,
     claims: &crate::auth::Claims,
@@ -346,10 +371,7 @@ pub(super) async fn children(
         .await
         .map_err(internal)?;
     let id = canonical.as_str();
-    let album = album_child("c", "?2");
-    let inner = format!(
-        "SELECT c.id FROM library_entries c WHERE (c.parent_id=?2 OR {album}) AND {VISIBLE}"
-    );
+    let inner = child_candidates();
     let rows = sqlx::query(sqlx::AssertSqlSafe(page_context(
         &inner,
         "c.season,c.episode,c.id",
@@ -617,4 +639,85 @@ pub(super) async fn item_body(
         }
     }
     Ok(out)
+}
+
+#[cfg(test)]
+mod browse_query_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn children_use_parent_association_indexes_instead_of_scanning_the_catalogue() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let inner = child_candidates();
+        for query in [
+            inner.clone(),
+            page_context(&inner, "c.season,c.episode,c.id", true),
+        ] {
+            let details: Vec<String> =
+                sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+                    .bind("viewer")
+                    .bind("parent")
+                    .fetch_all(&db)
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .map(|row| row.get("detail"))
+                    .collect();
+            assert!(
+                !details
+                    .iter()
+                    .any(|step| step == "SCAN c" || step.starts_with("SCAN c ")),
+                "unrelated library items must not be visited: {details:?}"
+            );
+            assert!(
+                details
+                    .iter()
+                    .any(|step| step.contains("SEARCH episode_details ")
+                        && step.contains("series_id=?")),
+                "episodes must use their indexed parent: {details:?}"
+            );
+            assert!(
+                details.iter().any(
+                    |step| step.contains("SEARCH album_tracks ") && step.contains("album_id=?")
+                ),
+                "songs must use indexed album positions: {details:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn continue_watching_page_and_count_use_the_users_history_index() {
+        let db = crate::db::open_in_memory().await.unwrap();
+        let candidates = browse_candidates(VISIBLE, true);
+        for query in [
+            format!(
+                "SELECT c.id {candidates} ORDER BY w.updated_at DESC,c.id DESC LIMIT ?4 OFFSET ?5"
+            ),
+            format!("SELECT COUNT(*) {candidates}"),
+        ] {
+            let paged = query.contains("LIMIT");
+            let mut plan = sqlx::query(sqlx::AssertSqlSafe(format!("EXPLAIN QUERY PLAN {query}")))
+                .bind("viewer");
+            if paged {
+                plan = plan.bind("").bind("").bind(20_i64).bind(0_i64);
+            }
+            let details: Vec<String> = plan
+                .fetch_all(&db)
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|row| row.get("detail"))
+                .collect();
+            assert!(
+                details
+                    .iter()
+                    .any(|step| step.starts_with("SEARCH w ") && step.contains("user_id=?")),
+                "watch candidates must come from the requesting user's indexed state: {details:?}"
+            );
+            assert!(
+                !details.iter().any(|step| step.starts_with("SCAN c")),
+                "candidate selection must not visit the whole catalogue: {details:?}"
+            );
+        }
+    }
 }

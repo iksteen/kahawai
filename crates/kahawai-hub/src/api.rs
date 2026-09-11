@@ -5984,13 +5984,13 @@ fn up_next_from(member: &str) -> String {
     let next_scope = member.replace("c.id", "n.id");
     let progress_scope = member.replace("c.id", "pe.id");
     format!(
-        "FROM (SELECT e.parent_id AS show_id, MAX(w.updated_at) AS last_watched
+        "FROM (SELECT e.series_id AS show_id, MAX(w.updated_at) AS last_watched
                  FROM user_item_state w
-                 JOIN library_entries e ON e.id = w.item_id
+                 JOIN episode_details e ON e.item_id = w.item_id
                 WHERE w.user_id = ?1 AND w.played = 1
-                  AND e.kind = 'episode' AND e.parent_id IS NOT NULL
-                GROUP BY e.parent_id) seen
-         JOIN library_entries c ON c.id = seen.show_id AND c.kind = 'series'
+                  AND EXISTS(SELECT 1 FROM library_items watched WHERE watched.id=e.item_id
+                              AND watched.kind='episode' AND watched.merged_into IS NULL)
+                GROUP BY e.series_id) seen
          -- What to play next: the first episode, in (season, episode, id)
          -- order, that comes after the last one finished and has not
          -- itself been finished. A series with nothing after it leaves
@@ -6004,36 +6004,44 @@ fn up_next_from(member: &str) -> String {
          -- A null season or episode is ordered, not excluded. SQLite
          -- sorts NULL before every value ascending and after it
          -- descending, which is exactly where COALESCE(...,-1) puts it —
-         -- so the ORDER BYs stay on `items_children` while the row-value
+         -- so the ORDER BYs stay on `episodes_series` while the row-value
          -- comparison, where one NULL makes the whole predicate NULL and
          -- silently drops the row, spells the -1 out.
+         -- Read candidates through their series coordinates. Filtering the
+         -- parent projected by library_entries hides that indexed range and
+         -- scans every episode; active-work and grant checks are keyed to
+         -- each candidate instead.
          JOIN library_entries nx ON nx.id = (
-               SELECT n.id FROM library_entries n
-                WHERE n.parent_id = c.id AND n.kind = 'episode' AND {next_visible} {next_scope}
-                  AND (COALESCE(n.season, -1), COALESCE(n.episode, -1), n.id) >
-                      (SELECT COALESCE(p.season, -1), COALESCE(p.episode, -1), p.id
-                         FROM library_entries p
+               SELECT nd.item_id FROM episode_details nd
+                WHERE nd.series_id = seen.show_id
+                  AND EXISTS(SELECT 1 FROM library_entries n WHERE n.id=nd.item_id
+                              AND n.kind='episode' AND {next_visible} {next_scope})
+                  AND (COALESCE(nd.season, -1), COALESCE(nd.episode, -1), nd.item_id) >
+                      (SELECT COALESCE(pd.season, -1), COALESCE(pd.episode, -1), p.id
+                         FROM episode_details pd JOIN library_entries p ON p.id=pd.item_id
                          JOIN user_item_state pw ON pw.item_id = p.id
                           AND pw.user_id = ?1 AND pw.played = 1
-                        WHERE p.parent_id = c.id AND p.kind = 'episode'
+                        WHERE pd.series_id = seen.show_id AND p.kind = 'episode'
                         -- Last is temporal. The sequence order is only the
                         -- deterministic tie-breaker for a batch mark whose
                         -- rows share one second-resolution timestamp.
                         ORDER BY pw.updated_at DESC,
-                                 p.season DESC, p.episode DESC, p.id DESC LIMIT 1)
+                                 pd.season DESC, pd.episode DESC, p.id DESC LIMIT 1)
                   AND NOT EXISTS (SELECT 1 FROM user_item_state nw
-                                   WHERE nw.user_id = ?1 AND nw.item_id = n.id
+                                   WHERE nw.user_id = ?1 AND nw.item_id = nd.item_id
                                      AND nw.played = 1)
-                ORDER BY n.season, n.episode, n.id LIMIT 1)
+                ORDER BY nd.season, nd.episode, nd.item_id LIMIT 1)
          -- Meaningfully part-way through an episode of this series? Then the
          -- series belongs to continue watching and not here. Deliberately the
          -- same one-minute-and-one-percent predicate that row is made of, so
          -- the two rows partition the series between them instead of both
          -- claiming one or neither offering it. A barely opened next episode
          -- remains eligible here.
-        WHERE NOT EXISTS (SELECT 1 FROM library_entries pe
+        WHERE EXISTS(SELECT 1 FROM library_entries c WHERE c.id=seen.show_id
+                      AND c.kind='series' {member})
+          AND NOT EXISTS (SELECT 1 FROM library_entries pe
                             JOIN user_item_state pw ON pw.item_id = pe.id AND pw.user_id = ?1
-                           WHERE pe.parent_id = c.id AND {progress_visible} {progress_scope}
+                           WHERE pe.parent_id = seen.show_id AND {progress_visible} {progress_scope}
                              AND {meaningful})
           -- Still current, either way round: you watched one lately, or
           -- the one you would watch next arrived lately — the season
@@ -6042,8 +6050,7 @@ fn up_next_from(member: &str) -> String {
           -- ULIDs, which sort lexicographically by the moment they were
           -- minted, and `sort=-added` orders the browse by the same
           -- thing, so the two cannot drift apart.
-          AND (seen.last_watched >= ?3 OR nx.id >= ?4)
-          {member}"
+          AND (seen.last_watched >= ?3 OR nx.id >= ?4)"
     )
 }
 
