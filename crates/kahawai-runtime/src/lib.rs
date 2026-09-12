@@ -486,12 +486,22 @@ pub fn doctor(
 }
 
 /// Startup gate: log warnings, abort on essential failures (OPS-3).
+///
+/// Also where the process leaves App Nap, because this function is what
+/// every service that runs forever passes through and nothing else does.
+/// Putting it at each `run` instead meant remembering four times; the
+/// mediahost was the one that got forgotten.
 pub fn startup_checks(
     cfg: &config::Config,
     roles: Roles,
     extra: Vec<kahawai_media::doctor::Check>,
 ) -> Result<()> {
     use kahawai_media::doctor::Status;
+    // Before anything binds or dials: every one of these holds a link and
+    // then goes quiet, which is the shape macOS parks. No-op elsewhere.
+    if kahawai_core::power::prevent_app_nap() {
+        tracing::info!("macOS App Nap disabled (NSProcessInfo activity assertion)");
+    }
     let checks = doctor_checks(cfg, roles, extra);
     for c in &checks {
         match c.status {

@@ -484,3 +484,9 @@ worker never has — `vtenc` is safe and stays preferred), and App Nap is
 switched off with an NSProcessInfo activity assertion, because macOS
 otherwise defers a session-less process's timers *and* socket wakeups
 until the link heartbeat dies.
+
+That assertion lives in `kahawai_core::power` and is taken from
+`kahawai_runtime::startup_checks`, which is the one thing every service
+passes through on its way up and nothing else calls: hub, mediahost,
+transcoder and all-in-one, without a per-service call to remember. It is
+a no-op off macOS and idempotent.

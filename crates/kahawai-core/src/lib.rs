@@ -2,6 +2,7 @@ pub mod enroll;
 pub mod media;
 pub mod names;
 pub mod pki;
+pub mod power;
 pub mod private;
 pub mod segments;
 
