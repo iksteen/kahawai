@@ -6,6 +6,16 @@
 #   kahawai-mac.sh deploy [host]     # from the dev box: sync, build, sign, restart
 #   kahawai-mac.sh setup             # ON the mac, once: create the signing identity
 #
+# The mac runs TWO launchd daemons from this tree:
+#
+#   all-in-one  its own hub, with the VideoToolbox transcoder in process
+#               and no local collections — the media comes from silence's
+#               mediahost over the LAN, which is why the box sits next to
+#               the NAS.
+#   transcoder  unchanged: still dials the dev box's hub, so that hub
+#               keeps a VideoToolbox encoder. An in-process transcoder
+#               serves only its own hub, so this stays a second process.
+#
 # Why signing at all: the transcoder dials the hub over the LAN, so
 # macOS 15+ gates it behind Local Network privacy. That grant is keyed
 # to the binary's code signature — for an ad-hoc signature that is the
@@ -25,6 +35,9 @@ KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
 PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 BUNDLE_ID=org.thegraveyard.kahawai
 AGENT=org.thegraveyard.kahawai.transcoder
+AIO_AGENT=org.thegraveyard.kahawai.all-in-one
+# Both daemons read it; the all-in-one dies in a KeepAlive loop without one.
+MAC_CONFIG="$HOME/.config/kahawai/kahawai.toml"
 
 # The transcoder runs as a launchd DAEMON, not an agent: daemons are
 # auto-allowed by Local Network privacy (TN3179 — the self-signed
@@ -53,7 +66,10 @@ gst() {
     local before after
     before="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
     echo "==> gstreamer + build tools" >&2
-    brew install gstreamer meson ninja pkg-config >/dev/null 2>&1 || true
+    # tesseract is for the all-in-one, not the transcoder: leptess links
+    # it, and the everything binary's default `ocr` feature fails to
+    # build without it.
+    brew install gstreamer meson ninja pkg-config tesseract >/dev/null 2>&1 || true
     brew upgrade gstreamer >/dev/null 2>&1 || true
     after="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
     [ -n "$after" ] || { echo "no gstreamer after install" >&2; exit 1; }
@@ -154,33 +170,40 @@ gst() {
     done
 }
 
-install_daemon() {
-    local plist="/Library/LaunchDaemons/$AGENT.plist"
+# One launchd daemon. $1 label, $2 log file, $3.. the ProgramArguments.
+#
+# GST_PLUGIN_PATH is the whole reason these are regenerated rather than
+# left alone once present. A daemon inherits nothing from a login
+# shell, so without it the process loads Homebrew's stock plugins and
+# every patch in patches/gstreamer is inert — installed, and doing
+# nothing. An earlier version returned early when the file existed,
+# which meant a satellite could never acquire a setting it did not have
+# on the day it was first provisioned.
+write_daemon() {
+    local label="$1" log="$2"
+    shift 2
+    local plist="/Library/LaunchDaemons/$label.plist"
     # Retire a pre-daemon user agent so two supervisors never race.
-    launchctl bootout "gui/$(id -u)/$AGENT" 2>/dev/null || true
-    rm -f "$HOME/Library/LaunchAgents/$AGENT.plist"
+    launchctl bootout "gui/$(id -u)/$label" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/$label.plist"
+    local tmpd args=""
     tmpd=$(mktemp)
-    # GST_PLUGIN_PATH is the whole reason this is regenerated rather than
-    # left alone once present. A daemon inherits nothing from a login
-    # shell, so without it the transcoder loads Homebrew's stock plugins
-    # and every patch in patches/gstreamer is inert — installed, and
-    # doing nothing. An earlier version returned early when the file
-    # existed, which meant a satellite could never acquire a setting it
-    # did not have on the day it was first provisioned.
+    local a
+    for a in "$@"; do args="$args<string>$a</string>"; done
     cat > "$tmpd" <<PLIST
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-    <key>Label</key><string>$AGENT</string>
+    <key>Label</key><string>$label</string>
     <key>ProgramArguments</key>
-    <array><string>$HOME/kahawai-src/target/release/kahawai-transcoder</string></array>
+    <array>$args</array>
     <key>UserName</key><string>$(id -un)</string>
     <key>WorkingDirectory</key><string>$HOME</string>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>
-    <key>StandardOutPath</key><string>$HOME/kahawai-transcoder.log</string>
-    <key>StandardErrorPath</key><string>$HOME/kahawai-transcoder.log</string>
+    <key>StandardOutPath</key><string>$log</string>
+    <key>StandardErrorPath</key><string>$log</string>
     <key>EnvironmentVariables</key>
     <dict>
         <key>GST_PLUGIN_PATH</key><string>$KAHAWAI_GST/plugins</string>
@@ -189,18 +212,39 @@ install_daemon() {
 </plist>
 PLIST
     if [ -f "$plist" ] && diff -q "$tmpd" "$plist" >/dev/null 2>&1; then
-        echo "daemon plist already current" >&2
+        echo "$label: plist already current" >&2
         rm -f "$tmpd"
         return 0
     fi
-    echo "installing the launchd daemon (sudo)" >&2
+    echo "installing $label (sudo)" >&2
     sudo install -o root -g wheel -m 644 "$tmpd" "$plist"
     # bootout before bootstrap: bootstrap alone refuses a label already
     # loaded, and a plist edit does not reach a running job.
-    sudo launchctl bootout "system/$AGENT" 2>/dev/null || true
+    sudo launchctl bootout "system/$label" 2>/dev/null || true
     sudo launchctl bootstrap system "$plist"
     rm -f "$tmpd"
-    echo "daemon installed and started" >&2
+    echo "$label: installed and started" >&2
+}
+
+install_daemon() {
+    local bin="$HOME/kahawai-src/target/release"
+    # RunAtLoad + KeepAlive in the SYSTEM domain: both come up at boot,
+    # with no login session and no terminal. The all-in-one notices it
+    # has no tty and says so — enrollments are approved through the
+    # admin API instead of by typing a code.
+    # A missing config is a KeepAlive crash loop, so skip that daemon
+    # rather than install one — and say which file is missing. Not fatal:
+    # the transcoder half is independent and must still be provisioned.
+    if [ -f "$MAC_CONFIG" ]; then
+        # --config explicitly: a daemon has no cwd of its own choosing
+        # and XDG resolution is the only other path to this file.
+        write_daemon "$AIO_AGENT" "$HOME/kahawai-all-in-one.log" \
+            "$bin/kahawai" --config "$MAC_CONFIG" all-in-one
+    else
+        echo "no $MAC_CONFIG — skipping the all-in-one daemon" >&2
+    fi
+    write_daemon "$AGENT" "$HOME/kahawai-transcoder.log" \
+        "$bin/kahawai-transcoder"
 }
 
 setup() {
@@ -287,16 +331,51 @@ EOF
     rm -f "$probe"
 }
 
+# Tail one remote log past $3 lines until $4 shows up, then print the
+# lines matching $5. Fails loudly with the new lines when it does not.
+wait_for() {
+    local host="$1" log="$2" mark="$3" needle="$4" show="$5"
+    echo "==> waiting for '$needle' in $log" >&2
+    local fresh
+    for _ in $(seq 1 20); do
+        sleep 2
+        fresh=$(ssh "$host" "tail -n +$((mark + 1)) $log" 2>/dev/null || true)
+        if grep -qE "$needle" <<<"$fresh"; then
+            grep -E "$show" <<<"$fresh" | tail -2
+            return 0
+        fi
+    done
+    echo "no '$needle' since the restart; new lines:" >&2
+    ssh "$host" "tail -n +$((mark + 1)) $log | tail -5" >&2
+    return 1
+}
+
 deploy() {
     local host="${1:-$HOST_DEFAULT}"
     local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
     echo "==> syncing source to $host" >&2
     (cd "$repo" && git ls-files | rsync -a --files-from=- . "$host:kahawai-src/")
 
-    # Where the log ends BEFORE the restart: "link established" is a
-    # line the previous run also wrote, and grepping the tail would
-    # report a successful link that never happened.
-    local mark; mark=$(ssh "$host" 'wc -l < ~/kahawai-transcoder.log 2>/dev/null || echo 0')
+    # The web bundle is a build product, so git ls-files never carries it,
+    # and node_modules is not synced either — which means build.rs on the
+    # mac skips npm entirely and would embed NOTHING, leaving a hub whose
+    # UI 404s. Ship the bundle this box already built, and let
+    # KAHAWAI_REQUIRE_WEB turn a missing one into a build failure rather
+    # than a silently empty UI.
+    [ -d "$repo/web/dist" ] || {
+        echo "no web/dist — run 'npm run build' in web/ first" >&2
+        return 1
+    }
+    rsync -a --delete "$repo/web/dist/" "$host:kahawai-src/web/dist/"
+
+    # Where each log ends BEFORE the restart: "link established" and "hub
+    # up" are lines the previous run also wrote, and grepping the tail
+    # would report a start that never happened.
+    local mark aio_mark
+    mark=$(ssh "$host" 'wc -l < ~/kahawai-transcoder.log 2>/dev/null || echo 0')
+    # The redirection itself fails when the log does not exist yet, and
+    # the shell says so on stderr before `|| echo 0` supplies the answer.
+    aio_mark=$(ssh "$host" '{ wc -l < ~/kahawai-all-in-one.log; } 2>/dev/null || echo 0')
 
     echo "==> building + signing + restarting on $host" >&2
     # Only host-independent values cross the wire: KEYCHAIN and PASSFILE
@@ -309,19 +388,23 @@ deploy() {
     stamp="$(git -C "$repo" rev-parse --short HEAD 2>/dev/null || echo unknown)"
     git -C "$repo" diff --quiet 2>/dev/null || stamp="$stamp+dirty"
     stamp="$stamp $(git -C "$repo" log -1 --format=%cs HEAD 2>/dev/null || true)"
-    ssh "$host" "IDENTITY='$IDENTITY' BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' KAHAWAI_BUILD='$stamp' bash -s" <<'REMOTE'
+    ssh "$host" "IDENTITY='$IDENTITY' BUNDLE_ID='$BUNDLE_ID' AGENT='$AGENT' \
+        AIO_AGENT='$AIO_AGENT' KAHAWAI_BUILD='$stamp' bash -s" <<'REMOTE'
 set -euo pipefail
 export PATH="$PATH:/opt/homebrew/bin:/usr/local/bin:$HOME/.cargo/bin"
 KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
 PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 cd ~/kahawai-src
-# Satellite build: the lean transcoder binary — no hub, no mediahost,
-# no Tesseract (which Homebrew would otherwise have to provide for a
-# tier that executes hub-side).
 export KAHAWAI_BUILD
+# Two binaries, because this box is two things. The lean transcoder (no
+# hub, no mediahost, no Tesseract) still dials the dev box's hub; the
+# everything binary runs this box's own all-in-one hub, and that one does
+# need Homebrew's tesseract for the OCR tier.
+export KAHAWAI_REQUIRE_WEB=1
 cargo build --release -p kahawai-transcoderd \
     --bin kahawai-transcoder 2>&1 | tail -1
-BIN=target/release/kahawai-transcoder
+cargo build --release -p kahawai --bin kahawai 2>&1 | tail -1
+BINS="target/release/kahawai-transcoder target/release/kahawai"
 # The transcoder runs as a launchd DAEMON (system domain): daemons are
 # auto-allowed by Local Network privacy (TN3179) and start at boot.
 # Deploys stay sudo-free: KeepAlive respawns the process we kill.
@@ -337,20 +420,22 @@ if security find-identity -v -p codesigning "$KEYCHAIN" 2>/dev/null | grep -q "$
     # different Team IDs") and the transcoder dies in dyld before main.
     # Hardened Runtime buys notarization, which a LAN satellite does not
     # need; the stable signing identity is the whole point here.
-    codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
-        --identifier "$BUNDLE_ID" "$BIN"
-    # Authority only appears at -dvv. Report the designated requirement
-    # too, because THAT is what decides whether the Local Network grant
-    # survives: an identity-and-identifier requirement does, a cdhash
-    # one (ad-hoc) does not.
-    #
-    # Substitutions, not pipelines: `grep -m1` closes the pipe early,
-    # codesign dies of SIGPIPE, and `pipefail` then aborts this script
-    # between printing the line and restarting the agent.
-    auth=$(codesign -dvv "$BIN" 2>&1 | grep Authority || true)
-    req=$(codesign -d --requirements - "$BIN" 2>&1 | grep designated || true)
-    echo "signed: ${auth:-authority unknown}"
-    echo "requirement: ${req:-unknown}"
+    for BIN in $BINS; do
+        codesign --force --sign "$IDENTITY" --keychain "$KEYCHAIN" \
+            --identifier "$BUNDLE_ID" "$BIN"
+        # Authority only appears at -dvv. Report the designated requirement
+        # too, because THAT is what decides whether the Local Network grant
+        # survives: an identity-and-identifier requirement does, a cdhash
+        # one (ad-hoc) does not.
+        #
+        # Substitutions, not pipelines: `grep -m1` closes the pipe early,
+        # codesign dies of SIGPIPE, and `pipefail` then aborts this script
+        # between printing the line and restarting the agent.
+        auth=$(codesign -dvv "$BIN" 2>&1 | grep Authority || true)
+        req=$(codesign -d --requirements - "$BIN" 2>&1 | grep designated || true)
+        echo "signed $BIN: ${auth:-authority unknown}"
+        echo "requirement: ${req:-unknown}"
+    done
 else
     # Honest about the consequence rather than silently ad-hoc: the
     # Local Network grant will need re-approving after this build.
@@ -360,6 +445,11 @@ else
 fi
 # Daemon: kill and let KeepAlive respawn (kickstart on the system
 # domain would need sudo). Agent fallback: kickstart as before.
+if [ -f "/Library/LaunchDaemons/$AIO_AGENT.plist" ]; then
+    pkill -f "[k]ahawai-src/target/release/kahawai --config" || true
+else
+    echo "WARNING: no all-in-one LaunchDaemon — run 'kahawai-mac.sh provision'" >&2
+fi
 if [ -f "/Library/LaunchDaemons/$AGENT.plist" ]; then
     pkill -f "kahawai-src/target/release/kahawai-transcoder" || true
     pkill -f "kahawai-src/target/release/kahawai transcoder" || true
@@ -368,19 +458,17 @@ else
 fi
 REMOTE
 
-    echo "==> waiting for the link" >&2
-    for _ in $(seq 1 12); do
-        sleep 2
-        local fresh
-        fresh=$(ssh "$host" "tail -n +$((mark + 1)) ~/kahawai-transcoder.log" 2>/dev/null || true)
-        if grep -q "link established" <<<"$fresh"; then
-            grep -E "link established|tone-map" <<<"$fresh" | tail -2
-            return 0
-        fi
-    done
-    echo "link not established since the restart; new lines:" >&2
-    ssh "$host" "tail -n +$((mark + 1)) ~/kahawai-transcoder.log | tail -3" >&2
-    return 1
+    # Both, each from its own log: a deploy that brings the hub up and
+    # leaves the transcoder dead reads as a success if only one is checked.
+    # Waiting for a daemon that is not installed would fail for a reason
+    # the deploy cannot fix, so say which it is.
+    if ssh "$host" "test -f /Library/LaunchDaemons/$AIO_AGENT.plist"; then
+        wait_for "$host" '~/kahawai-all-in-one.log' "$aio_mark" "hub up" "hub up" || return 1
+    else
+        echo "==> all-in-one daemon not installed; skipping its check" >&2
+    fi
+    wait_for "$host" '~/kahawai-transcoder.log' "$mark" "link established" \
+        "link established|tone-map" || return 1
 }
 
 # Everything a fresh satellite needs, in the order the parts depend on
@@ -394,17 +482,22 @@ provision() {
     install_daemon
     echo >&2
     echo "provisioned. From the dev box: scripts/kahawai-mac.sh deploy" >&2
+    echo "First run only, for the all-in-one's own hub:" >&2
+    echo "  kahawai-src/target/release/kahawai --config $MAC_CONFIG hub init-admin" >&2
 }
 
 case "${1:-}" in
     setup) setup ;;
     gst) gst ;;
     provision) provision ;;
+    daemons) [ "$(uname)" = Darwin ] || { echo "run daemons ON the mac" >&2; exit 2; }
+             install_daemon ;;
     deploy) shift; deploy "${1:-}" ;;
-    *) echo "usage: $0 {setup|gst|provision|deploy [host]}" >&2
+    *) echo "usage: $0 {setup|gst|provision|daemons|deploy [host]}" >&2
        echo "  setup      ON the mac, once: signing identity, then provision" >&2
        echo "  gst        ON the mac: GStreamer + the patches/ plugins" >&2
-       echo "  provision  ON the mac: gst, then the launchd daemon (sudo)" >&2
+       echo "  provision  ON the mac: gst, then both launchd daemons (sudo)" >&2
+       echo "  daemons    ON the mac: just the launchd daemons (sudo)" >&2
        echo "  deploy     FROM the dev box: sync, build, sign, restart" >&2
        exit 2 ;;
 esac

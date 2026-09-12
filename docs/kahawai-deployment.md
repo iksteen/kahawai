@@ -279,6 +279,21 @@ should poll — it reports every module, and a satellite being away is
 
 ## macOS satellites
 
+The mac mini runs two launchd daemons from one checkout: an
+**all-in-one** (its own hub, VideoToolbox transcoder in process, no
+local collections) and the **transcoder** it always ran, which still
+dials the dev box's hub. A hub's in-process transcoder serves that hub
+only, so a box that must encode for two hubs runs two processes. The
+all-in-one's media comes from silence's mediahost over the LAN, which
+is the whole reason the box sits beside the NAS.
+
+Two things the all-in-one needs that a transcoder does not: Homebrew's
+`tesseract` (leptess links it, and the `ocr` feature is on by default)
+and a prebuilt `web/dist`. Neither `node_modules` nor the bundle is a
+tracked file, so `build.rs` on the mac skips npm and would embed an
+empty UI; `deploy` rsyncs the dev box's bundle and sets
+`KAHAWAI_REQUIRE_WEB=1` so a missing one fails the build instead.
+
 A macOS transcoder dials the hub over the LAN, so macOS 15+ gates it
 behind **Local Network** privacy: `No route to host` in a reconnect
 loop until someone clicks the dialog. Corrected 2026-07-31, against
@@ -334,11 +349,22 @@ scripts/kahawai-mac.sh setup
 # box). silence: scripts/kahawai-silence.sh builds both satellite
 # binaries here (same arch) and ships + restarts them.
 #
-# from the dev box, per deploy: sync tracked files, build, sign,
-# restart the launchd agent, wait for the link. Satellites do not contain
-# the hub's web UI, so generated web/dist is neither synced nor needed.
+# from the dev box, per deploy: sync tracked files and web/dist, build
+# both binaries, sign both, restart both daemons, wait for "hub up" and
+# for the transcoder's link.
 scripts/kahawai-mac.sh deploy [user@host]
 ```
+
+The all-in-one's hub is independent: its own database, users, watch
+state and enrollments. Create its first administrator once, on the mac:
+
+```sh
+kahawai-src/target/release/kahawai \
+    --config ~/.config/kahawai/kahawai.toml hub init-admin
+```
+
+A daemon has no terminal, so it approves satellites through the admin
+API rather than by typing an enrollment code — it says so at startup.
 
 Deploy without an identity still works; it says plainly that the
 binary stays ad-hoc signed and the Local Network grant will need
