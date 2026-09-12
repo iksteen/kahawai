@@ -331,6 +331,55 @@ EOF
     rm -f "$probe"
 }
 
+# rsync --files-from copies, it never deletes, so a file the repo REMOVED
+# lives on in the satellite tree for ever. Cargo picks up stray files in a
+# bin directory, so the tree eventually builds something nobody wrote:
+# crates/kahawai/src/bin/kahawai-{mediahost,transcoder}d.rs were still
+# there months after those moved into packages of their own, and only a
+# whole-package check ever noticed. Everything in that tree is
+# reproducible from the repo, so anything the manifest does not name and
+# that is not a build product goes.
+#
+# LC_ALL=C on BOTH sides, because `comm` compares by byte order and the
+# two boxes do not sort alike. The first run of this compared a
+# locale-sorted manifest against a macOS sort and called 300 current
+# files orphans, README.md and .gitignore among them. A delete on that
+# list would have emptied the tree.
+prune_orphans() {
+    local host="$1" repo="$2"
+    echo "==> pruning files the repo no longer has" >&2
+    git -C "$repo" ls-files | LC_ALL=C sort \
+        | ssh "$host" 'cat > kahawai-src/.deploy-manifest'
+    ssh "$host" 'bash -s' <<'REMOTE'
+set -euo pipefail
+export LC_ALL=C
+cd ~/kahawai-src
+# Build products, and the manifest itself: everything else is the repo's.
+find . -type f \
+    -not -path './target/*' -not -path './web/dist/*' \
+    -not -path './web/node_modules/*' -not -path './.git/*' \
+    -not -name .deploy-manifest \
+    | sed 's|^\./||' | sort > /tmp/kahawai-remote.$$
+orphans=$(comm -23 /tmp/kahawai-remote.$$ .deploy-manifest)
+rm -f /tmp/kahawai-remote.$$ .deploy-manifest
+if [ -z "$orphans" ]; then
+    echo "    none"
+    exit 0
+fi
+# One name per line, never word-split: a path with a space in it must not
+# become two half-paths handed to rm.
+printf '%s\n' "$orphans" | while IFS= read -r f; do
+    echo "    rm $f"
+    rm -f "$f"
+done
+# A crate whose Cargo.toml is gone leaves a directory that the workspace
+# glob can still match.
+find . -type d -empty \
+    -not -path './target/*' -not -path './web/dist/*' \
+    -not -path './web/node_modules/*' -delete 2>/dev/null || true
+REMOTE
+}
+
 # Tail one remote log past $3 lines until $4 shows up, then print the
 # lines matching $5. Fails loudly with the new lines when it does not.
 wait_for() {
@@ -367,6 +416,7 @@ deploy() {
         return 1
     }
     rsync -a --delete "$repo/web/dist/" "$host:kahawai-src/web/dist/"
+    prune_orphans "$host" "$repo"
 
     # Where each log ends BEFORE the restart: "link established" and "hub
     # up" are lines the previous run also wrote, and grepping the tail
@@ -493,11 +543,15 @@ case "${1:-}" in
     daemons) [ "$(uname)" = Darwin ] || { echo "run daemons ON the mac" >&2; exit 2; }
              install_daemon ;;
     deploy) shift; deploy "${1:-}" ;;
-    *) echo "usage: $0 {setup|gst|provision|daemons|deploy [host]}" >&2
+    prune) shift
+           prune_orphans "${1:-$HOST_DEFAULT}" \
+               "$(cd "$(dirname "$0")/.." && pwd)" ;;
+    *) echo "usage: $0 {setup|gst|provision|daemons|deploy|prune [host]}" >&2
        echo "  setup      ON the mac, once: signing identity, then provision" >&2
        echo "  gst        ON the mac: GStreamer + the patches/ plugins" >&2
        echo "  provision  ON the mac: gst, then both launchd daemons (sudo)" >&2
        echo "  daemons    ON the mac: just the launchd daemons (sudo)" >&2
        echo "  deploy     FROM the dev box: sync, build, sign, restart" >&2
+       echo "  prune      FROM the dev box: delete satellite files the repo dropped" >&2
        exit 2 ;;
 esac

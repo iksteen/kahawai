@@ -412,11 +412,20 @@ scripts/kahawai-mac.sh setup
 # box). silence: scripts/kahawai-silence.sh builds both satellite
 # binaries here (same arch) and ships + restarts them.
 #
-# from the dev box, per deploy: sync tracked files and web/dist, build
-# both binaries, sign both, restart both daemons, wait for "hub up" and
-# for the transcoder's link.
+# from the dev box, per deploy: sync tracked files and web/dist, delete
+# satellite files the repo has dropped, build both binaries, sign both,
+# restart both daemons, wait for "hub up" and for the transcoder's link.
 scripts/kahawai-mac.sh deploy [user@host]
+
+# just that deletion pass, without building or restarting anything
+scripts/kahawai-mac.sh prune [user@host]
 ```
+
+rsync copies but never deletes, so before this existed a file the repo
+removed stayed on the satellite for ever. That is not cosmetic: Cargo
+picks up stray files in a bin directory, and two binaries that had moved
+into packages of their own sat in `crates/kahawai/src/bin` for months,
+breaking any check of the whole package.
 
 The all-in-one's hub is independent: its own database, users, watch
 state and enrollments. Create its first administrator once, on the mac:
