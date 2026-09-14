@@ -50,33 +50,49 @@ USER_PLUGINS="$HOME/.local/share/gstreamer-1.0/plugins"
 # Below this the patches are not known to apply and the ABI is not the
 # one they were written against.
 MIN_GST=1.28.5
+# A reproducer may not run for ever. They finish in seconds; the ones that
+# do not are wedged, and a wedged one used to hang the whole run with no
+# output at all.
+REPRO_TIMEOUT=120
+
+# gst-libs libraries that must come from OUR build, and the ONLY ones.
+#
+# 0004 changes the size of a public struct in codecparsers, so anything
+# holding one must be built against the same header: codecparsers itself,
+# and codecs, whose decoder base classes embed them.
+#
+# Everything else resolves to the system's copy on purpose: a second
+# copy of an UNPATCHED library buys nothing and invites two of it being
+# loaded at once. macOS does not come through here at all — it patches
+# its whole GStreamer instead (HomebrewFormula/kahawai-gstreamer.rb),
+# because there a dylib is identified by path rather than soname, so a
+# staged copy beside the system's is a crash rather than a warning.
+OWNED_LIBS="codecparsers codecs"
 # hlssink3 releases that ship WITHOUT the fixes in patches/gst-plugins-rs.
 # Anything else installed is assumed to be a build that already carries
 # them (0.16.0-alpha-… is what this box has), and is left alone.
 HLSSINK3_STOCK="1.28.5 0.15.3"
-# The gst-plugins-rs release to build hlssink3 from when the system's is
-# too old. Both fixes in patches/gst-plugins-rs landed by here, which is
-# also what the image pins.
-RS_TAG=gstreamer-1.28.6
-
-# Patches in patches/gst-plugins-rs that NO gst-plugins-rs release carries
-# yet. The system's hlssink3 therefore cannot have them however new it is,
-# so a non-empty list means we always build our own — the version check
-# below can only answer "does it have the RELEASED fixes".
+# RS_TAG, RS_UNRELEASED and apply_rs_patches. The other two builds of the
+# same sink — the Dockerfile and HomebrewFormula/kahawai-gstreamer.rb —
+# classify the patches the same way, so every box runs the same hlssink3.
 #
-# Both directions of this claim are verified against $RS_TAG when the
-# patches are applied, so an entry that has landed upstream, or one
-# missing that should be here, stops the build instead of drifting.
-# Move an entry out of here when it lands in $RS_TAG.
-RS_UNRELEASED="0002-hlssink3-EXTINF-must-be-the-distance-to-the-next-frag.patch"
+# $REPO, not $(dirname "$0"): the cd above already happened, so a relative
+# $0 now resolves against the repo root and misses. It failed quietly —
+# `set -u` then killed `build` on an unbound RS_UNRELEASED, but only after
+# the staged directory had been wiped.
+. "$REPO/scripts/kahawai-gst-rs.sh"
 
 src=""
 trap '[ -n "$src" ] && rm -rf "$src"' EXIT
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# pkg-config, not gst-inspect: the .pc file answers the question with no
+# runtime at all, and matched gst-inspect exactly where both were tried.
+# gst-inspect has to load every plugin on the box to print a version, so
+# it can be wedged by one of them; a text file cannot.
 gst_version() {
-    gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}'
+    pkg-config --modversion gstreamer-1.0 2>/dev/null
 }
 
 # sort -V puts the older first; if the older of the pair is not MIN_GST,
@@ -87,7 +103,7 @@ older_than() {
 
 require_version() {
     local v="$1"
-    [ -n "$v" ] || die "no gst-inspect-1.0 on PATH"
+    [ -n "$v" ] || die "no gstreamer-1.0.pc — is pkg-config installed and GStreamer's development data present?"
     if older_than "$v" "$MIN_GST"; then
         die "system GStreamer is $v; these patches target $MIN_GST or newer.
        Building against older libraries would apply patches to sources
@@ -98,7 +114,7 @@ require_version() {
 # ---------------------------------------------------------------- verify
 
 verify() {
-    local version live=0 missing=0 skipped=0
+    local version live=0 missing=0 skipped=0 wedged=0
     export GST_PLUGIN_PATH="$VERIFY_PLUGIN_DIR${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
     export LD_LIBRARY_PATH="$VERIFY_LIBRARY_DIR${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
     if [ -n "$VERIFY_EXCLUSIVE" ]; then
@@ -129,7 +145,7 @@ verify() {
     local patch
     for patch in "$PATCHES"/*.patch "$RS_PATCHES"/*.patch; do
         [ -e "$patch" ] || continue
-        local n name dir patch_failed=0 ran=0 repro out rc
+        local n name dir patch_failed=0 ran=0 repro out rc unrunnable=0
         dir="$(dirname "$patch")"
         n="$(basename "$patch" | cut -c1-4)"
         name="$(basename "$patch" .patch | cut -c6-)"
@@ -141,12 +157,46 @@ verify() {
             # No arguments: the reproducers do not share one. Most take an
             # output directory, 0003 takes a size in MiB, and handing a path
             # to that one crashes it — which then reads as a missing patch.
-            ( cd "$out" && python3 "$repro" ) >"$log" 2>&1
-            rc=$?
+            #
+            # Its OWN process group (set -m), so the kill below takes the
+            # children with it. A reproducer that spawns gst-launch and is
+            # killed on its own leaves that child wedged for ever — which
+            # is how a 34-hour-old gst-inspect turned up on the mac.
+            local repro_pid waited=0 timed_out=0
+            set -m
+            ( cd "$out" && python3 "$repro" ) >"$log" 2>&1 &
+            repro_pid=$!
+            set +m
+            while kill -0 "$repro_pid" 2>/dev/null; do
+                [ "$waited" -ge "$REPRO_TIMEOUT" ] && { timed_out=1; break; }
+                sleep 1
+                waited=$((waited + 1))
+            done
+            if [ "$timed_out" = 1 ]; then
+                kill -9 -"$repro_pid" 2>/dev/null
+                wait "$repro_pid" 2>/dev/null
+                rc=124
+            else
+                wait "$repro_pid"
+                rc=$?
+            fi
             # A reproducer that dies on its own fixture also exits non-zero,
             # which would read as "patch missing". Keep that verdict distinct.
             local crashed=0
             grep -q 'Traceback (most recent call last)' "$log" && crashed=1
+            if [ "$timed_out" = 1 ]; then
+                # Says nothing about the patch: the reproducer never
+                # reached a verdict. Counted apart from live and missing
+                # so nobody reads silence as either.
+                printf '  %s  %-43s %-8s TIMED OUT after %ss\n' \
+                    "$n" "${name:0:43}" \
+                    "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')" \
+                    "$REPRO_TIMEOUT"
+                unrunnable=$((unrunnable + 1))
+                ran=$((ran - 1))
+                rm -rf "$out"
+                continue
+            fi
             if [ "$crashed" = 1 ]; then
                 printf '  %s  %-43s %-8s INCONCLUSIVE (reproducer crashed)\n' \
                     "$n" "${name:0:43}" "$(basename "$repro" | sed -n 's/.*-repro-\([0-9]*\)\.py/repro-\1/p')"
@@ -163,6 +213,14 @@ verify() {
             fi
             rm -rf "$out"
         done
+        # ANY timeout voids the patch, not just an all-timeout patch. A
+        # reproducer that never finished has said nothing about the patch,
+        # and a passing sibling does not answer for it: two reproducers
+        # exist because they test different things.
+        if [ "$unrunnable" -gt 0 ]; then
+            wedged=$((wedged + 1))
+            continue
+        fi
         if [ "$ran" -eq 0 ]; then
             printf '  %s  %-52s no reproducer\n' "$n" "${name:0:52}"
             skipped=$((skipped + 1))
@@ -176,8 +234,20 @@ verify() {
     done
 
     echo
-    echo "live=$live missing=$missing no-reproducer=$skipped"
-    if [ "$missing" -ne 0 ] || [ "$skipped" -ne 0 ]; then
+    if [ "$wedged" -gt 0 ]; then
+        echo "live=$live missing=$missing no-reproducer=$skipped unchecked=$wedged"
+        echo
+        echo "$wedged patch(es) reached no verdict: a reproducer timed out after"
+        echo "${REPRO_TIMEOUT}s. That is a wedged pipeline, not an answer about the"
+        echo "patch — the run above says which."
+    else
+        echo "live=$live missing=$missing no-reproducer=$skipped"
+    fi
+    # `wedged` FAILS. The whole point of verify is that a green run means
+    # the patches were measured; a run that measured nothing and exited 0
+    # let the image ship unverified, which is the drift this exists to
+    # catch. "I could not tell" is not "yes".
+    if [ "$missing" -ne 0 ] || [ "$skipped" -ne 0 ] || [ "$wedged" -ne 0 ]; then
         echo "run '$(basename "$0") build' to rebuild the plugins from patches/" >&2
         return 1
     fi
@@ -203,6 +273,59 @@ plugins_in() {   # $1 = gst-plugins-good | gst-plugins-bad
 # skipped it silently, after the wipe had already removed what it should
 # have replaced.
 touches() { grep -lq "subprojects/$1/" "$PATCHES"/*.patch 2>/dev/null; }
+
+# gst-libs libraries, staged beside the plugins.
+#
+# Narrow on purpose: 0004 changes a public struct in codecparsers, so that
+# library and every plugin holding one of its structs must come from the
+# same build. Every OTHER gst-libs library is ABI-identical to the
+# system's and staging it would shadow a perfectly good copy for no
+# reason.
+#
+# Only real files. A looser glob also matches meson's `.symbols` text
+# artifacts, and naming one as a link target replaced the real library
+# with a pointer to a text file — every plugin that needed it then failed
+# to load, which surfaced as reproducers "crashing" rather than as
+# anything about libraries.
+# Run a build step quietly, but print the tail of its output when it
+# fails. Silence on success, evidence on failure: without this a failing
+# meson or ninja said only "build failed", and the EXIT trap deleted the
+# source tree before it could be rerun by hand.
+run_step() {
+    local what="$1"
+    shift
+    local log
+    log="$(mktemp -t kahawai-gst-step)"
+    if "$@" >"$log" 2>&1; then
+        rm -f "$log"
+        return 0
+    fi
+    # The error lines FIRST, then the tail. A plain tail is not enough:
+    # applemedia emits pages of AVFoundation deprecation notes after the
+    # failure, which pushed the one line that mattered out of view.
+    echo "--- $what: error lines ---" >&2
+    grep -E "FAILED:|fatal error|error:|ld: " "$log" | head -8 >&2
+    echo "--- $what: last 10 lines ---" >&2
+    tail -10 "$log" >&2
+    rm -f "$log"
+    die "$what failed"
+}
+
+stage_libraries() {
+    local build_dir="$1" lib base
+    while IFS= read -r lib; do
+        install -m644 "$lib" "$KAHAWAI_GST/lib/"
+        # libfoo-1.0.so.0.2805.0 -> libfoo-1.0.so.0 -> libfoo-1.0.so
+        base="$(basename "$lib")"; base="${base%%.so.*}"
+        ( cd "$KAHAWAI_GST/lib" \
+          && ln -sf "$(basename "$lib")" "$base.so.0" \
+          && ln -sf "$base.so.0" "$base.so" )
+        echo "    installed $(basename "$lib")"
+    done < <(for n in $OWNED_LIBS; do \
+                 find "$build_dir/gst-libs" -type f -name "libgst$n-*.so.*" \
+                     ! -name '*.symbols' ! -name '*.p'; \
+             done | sort -u)
+}
 
 build() {
     local version
@@ -245,9 +368,9 @@ build() {
         local args=(--buildtype=release -Dauto_features=disabled)
         for p in $good; do args+=("-D$p=enabled"); done
         build_dir="$(mktemp -d)"
-        meson setup "$build_dir" "$src/subprojects/gst-plugins-good" "${args[@]}" >/dev/null \
-            || die "gst-plugins-good: meson setup failed"
-        ninja -C "$build_dir" >/dev/null || die "gst-plugins-good: build failed"
+        run_step "gst-plugins-good: meson setup" \
+            meson setup "$build_dir" "$src/subprojects/gst-plugins-good" "${args[@]}"
+        run_step "gst-plugins-good: build" ninja -C "$build_dir"
         for p in $good; do
             so="$build_dir/gst/$p/libgst$p.so"
             [ -f "$so" ] || die "expected $so, not built"
@@ -264,38 +387,33 @@ build() {
     # (nothing edits them); they are the ones that link codecparsers.
     if touches gst-plugins-bad; then
         echo "==> gst-plugins-bad: codecparsers + the plugins that link it"
+        # NOT the complete set that links codecparsers, deliberately.
+        # Measured 2026-09-14: twelve system plugins link it here;
+        # these are the ones our pipelines load.
+        # Unbuilt, and therefore still holding the system's struct:
+        # closedcaption, codec2json, jpegformat, openjpeg,
+        # smoothstreaming, vulkan. If one of them ever ends up in a
+        # kahawai pipeline it has to move into this list — or the list
+        # has to become "everything that links it", derived rather than
+        # written down, which is the version that needs SDKs for vulkan
+        # and nvcodec on every build box.
         local bad_plugins="nvcodec va v4l2codecs codectimestamper mpegtsdemux videoparsers"
         local args=(--buildtype=release -Dauto_features=disabled)
         for p in $bad_plugins; do args+=("-D$p=enabled"); done
         build_dir="$(mktemp -d)"
-        meson setup "$build_dir" "$src/subprojects/gst-plugins-bad" "${args[@]}" >/dev/null \
-            || die "gst-plugins-bad: meson setup failed"
-        ninja -C "$build_dir" >/dev/null || die "gst-plugins-bad: build failed"
-        # The libraries first: the plugins carry an RPATH to them.
-        #
-        # Only the versioned shared objects. A looser glob also matches
-        # meson's `.symbols` text artifacts, and naming one as a link
-        # target replaced the real library with a pointer to a text file
-        # — every plugin that needed it then failed to load, which
-        # surfaced as reproducers "crashing" rather than as anything
-        # about libraries.
-        local lib
-        while IFS= read -r lib; do
-            install -m644 "$lib" "$KAHAWAI_GST/lib/"
-            # libfoo-1.0.so.0.2805.0 -> libfoo-1.0.so.0 -> libfoo-1.0.so
-            local base
-            base="$(basename "$lib")"; base="${base%%.so.*}"
-            ( cd "$KAHAWAI_GST/lib" \
-              && ln -sf "$(basename "$lib")" "$base.so.0" \
-              && ln -sf "$base.so.0" "$base.so" )
-            echo "    installed $(basename "$lib")"
-        done < <(find "$build_dir/gst-libs" -type f -name 'libgstcodec*.so.*' \
-                     ! -name '*.symbols' ! -name '*.p' | sort)
+        run_step "gst-plugins-bad: meson setup" \
+            meson setup "$build_dir" "$src/subprojects/gst-plugins-bad" "${args[@]}"
+        run_step "gst-plugins-bad: build" ninja -C "$build_dir"
+        stage_libraries "$build_dir"
+        # Plugins only. gst-libs lives under gst-libs/gst/<name>/, so
+        # the */gst/* filter matches it too; without the exclusion every
+        # library landed in plugins/ as well and GStreamer would try to
+        # load each one as a plugin.
         while IFS= read -r so; do
             install -m644 "$so" "$KAHAWAI_GST/plugins/"
             echo "    installed $(basename "$so")"
-        done < <(find "$build_dir" -name 'libgst*.so' -type f -path '*/sys/*' -o \
-                      -name 'libgst*.so' -type f -path '*/gst/*' | sort)
+        done < <(find "$build_dir" \( -path '*/sys/*' -o -path '*/gst/*' \) \
+                      ! -path '*/gst-libs/*' -type f -name 'libgst*.so' | sort)
         rm -rf "$build_dir"
     fi
 
@@ -316,45 +434,17 @@ hlssink3_system_version() {
         gst-inspect-1.0 hlssink3 2>/dev/null | awk '/^  Version/ {print $2}'
 }
 
-# patches/gst-plugins-rs against a $RS_TAG checkout, conditionally: some
-# of those patches are already upstream in the tag and `git apply` refuses
-# a patch that is already in the tree.
-#
-# So each one is classified rather than assumed, and the classification is
-# checked against $RS_UNRELEASED in both directions. A patch that no
-# longer applies for any OTHER reason stops the build: it has been
-# outgrown by the tag and needs rebasing, which is exactly the drift this
-# script exists to end.
-apply_rs_patches() {
-    local rs="$1" p base unreleased
-    for p in "$RS_PATCHES"/*.patch; do
-        [ -e "$p" ] || continue
-        base="$(basename "$p")"
-        case " $RS_UNRELEASED " in *" $base "*) unreleased=1 ;; *) unreleased=0 ;; esac
-        if git -C "$rs" apply --check "$p" 2>/dev/null; then
-            [ "$unreleased" = 1 ] || die \
-                "$base is not listed in RS_UNRELEASED but $RS_TAG does not carry it"
-            echo "    applying $base"
-            git -C "$rs" apply "$p" || die "FAILED to apply $base to $RS_TAG"
-        elif git -C "$rs" apply --reverse --check "$p" 2>/dev/null; then
-            [ "$unreleased" = 0 ] || die \
-                "$base is listed in RS_UNRELEASED but $RS_TAG already carries it — drop it from the list"
-            echo "    already in $RS_TAG: $base"
-        else
-            die "$base neither applies to nor is present in $RS_TAG — rebase it"
-        fi
-    done
-}
-
 build_hlssink3() {
     local sys stock=0 v
-    sys="$(hlssink3_system_version)"
+    # NOT probed up front: hlssink3_system_version runs gst-inspect,
+    # which is slow and needless on the path that builds regardless. Ask
+    # only where the answer is used.
     if [ -n "$RS_UNRELEASED" ]; then
         # No release can carry these, so the system's version tells us
         # nothing: build regardless of what it has.
         echo "==> hlssink3: building ours — unreleased patches to apply:"
         for v in $RS_UNRELEASED; do echo "    $v"; done
-    elif [ -z "$sys" ]; then
+    elif sys="$(hlssink3_system_version)"; [ -z "$sys" ]; then
         echo "==> hlssink3: none on the system — building ours from patches/"
     else
         # Prefix match: the distro calls its build 0.15.3-6302bea23, and
@@ -377,9 +467,8 @@ build_hlssink3() {
     git clone --depth 1 --branch "$RS_TAG" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git "$rs" \
         2>&1 | tail -1 || die "gst-plugins-rs clone failed — is $RS_TAG a tag?"
-    apply_rs_patches "$rs"
-    ( cd "$rs" && cargo build --release -p gst-plugin-hlssink3 ) >/dev/null 2>&1 \
-        || die "hlssink3 build failed"
+    apply_rs_patches "$rs" "$RS_PATCHES"
+    run_step "hlssink3 build" sh -c "cd '$rs' && cargo build --release -p gst-plugin-hlssink3"
     install -m644 "$rs/target/release/libgsthlssink3.so" "$KAHAWAI_GST/plugins/" \
         || die "hlssink3: built but not found"
     echo "    installed libgsthlssink3.so"
