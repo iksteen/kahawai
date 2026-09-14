@@ -449,7 +449,7 @@ marked in that document.
 - [ ] GST-26 Keep one bounded diagnostic ring per worker and include GStreamer
       warnings/errors, state transitions and the pipeline actualisation in the
       session bundle without allowing GST_DEBUG output to exhaust scratch space
-- [~] GST-27 The Dockerfile builds pinned GStreamer 1.28.6, gst-plugins-rs,
+- [~] GST-27 The Dockerfile builds pinned GStreamer 1.28.7, gst-plugins-rs,
       libass and codec dependencies and now makes patch verification plus
       `KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace` a
       mandatory ancestor of every release image. Required prerequisites panic

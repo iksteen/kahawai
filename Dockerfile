@@ -16,14 +16,14 @@ ARG NODE_VERSION=24.19.0
 # on a fragment whose first buffer has no PTS, and on an unwrapped
 # running time when a segment is added. Both panic inside an FFI
 # callback, which cannot unwind.
-ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.6
-ARG GST_PLUGINS_RS_REV=75e46c3a1b868e9a08fd688d091476b76a498df1
+ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.7
+ARG GST_PLUGINS_RS_REV=e9229628528b19e9b42e52620be4e79a2e054363
 # The whole GStreamer stack — core, base, good, bad, ugly, libav —
 # comes from this tag, patched with patches/gstreamer. None of Ubuntu's
 # gstreamer packages are installed: one tree means one version, one ABI,
 # and the fixes in patches/ apply to everything that could load them.
-ARG GSTREAMER_VERSION=1.28.6
-ARG GSTREAMER_REV=2d3e05cbdad68e47d645f548899b432dc9fb4473
+ARG GSTREAMER_VERSION=1.28.7
+ARG GSTREAMER_REV=070125524a8422e29d3b69a372ed4f62fd343ffa
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
 FROM node:${NODE_VERSION}-bookworm-slim AS node-toolchain
@@ -169,15 +169,31 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
 # which gst-plugins-bad provides. Add -p gst-plugin-rav1e for a second
 # software AV1 encoder.
 #
-# patches/gst-plugins-rs is NOT applied: 1.28.6 carries both fixes, and
-# git apply refuses a patch already in the tree. The files stay as the
-# record; each says where it landed.
+# patches/gst-plugins-rs: 0000 and 0001 are IN the tag and git apply
+# refuses a patch already in the tree, but 0002 is in no release at all —
+# without it every playlist this image writes over-declares each segment
+# by ~10ms, and a client's buffered position outruns its playhead until it
+# stops loading with the renderer empty. So each patch is classified
+# rather than assumed, exactly as scripts/kahawai-gst-rs.sh does, and
+# anything that neither applies nor is present fails the build.
 ARG GST_PLUGINS_RS_VERSION
 ARG GST_PLUGINS_RS_REV
 RUN git clone --depth 1 --branch "$GST_PLUGINS_RS_VERSION" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git \
         /tmp/gst-plugins-rs \
-    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV"
+    && test "$(git -C /tmp/gst-plugins-rs rev-parse HEAD)" = "$GST_PLUGINS_RS_REV" \
+    && for p in /usr/src/patches/gst-plugins-rs/*.patch; do \
+           if git -C /tmp/gst-plugins-rs apply --check "$p" 2>/dev/null; then \
+               echo "applying $(basename "$p")"; \
+               git -C /tmp/gst-plugins-rs apply "$p" \
+                   || { echo "FAILED to apply $(basename "$p")" >&2; exit 1; }; \
+           elif git -C /tmp/gst-plugins-rs apply --reverse --check "$p" 2>/dev/null; then \
+               echo "already in $GST_PLUGINS_RS_VERSION: $(basename "$p")"; \
+           else \
+               echo "$(basename "$p") neither applies to nor is present in $GST_PLUGINS_RS_VERSION" >&2; \
+               exit 1; \
+           fi; \
+       done
 
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,id=gst-plugins-rs-target-ubuntu2604,target=/tmp/gst-plugins-rs/target \
