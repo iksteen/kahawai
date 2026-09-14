@@ -21,10 +21,23 @@ p = Gst.parse_launch(
     f"! hlssink3 location={out}/seg%05d.ts playlist-location={out}/list.m3u8 "
     "target-duration=1")
 
+stripped = 0
+
 def strip_pts(pad, info):
+    global stripped
     buf = info.get_buffer()
     if not buf.has_flags(Gst.BufferFlags.DELTA_UNIT):  # keyframes only
+        # A probe does not own its buffer, and PyGObject 3.58 enforces
+        # that: assigning to .pts raises NotWritableMiniObject, where
+        # 3.56 let it through. 3.58 also binds make_writable as an
+        # in-place call returning a bool, not the buffer — and .copy()
+        # does NOT help, the copy is marked immutable too. 3.56 has no
+        # make_writable at all and needs none.
+        if hasattr(buf, "make_writable"):
+            buf.make_writable()
         buf.pts = Gst.CLOCK_TIME_NONE
+        info.set_buffer(buf)
+        stripped += 1
     return Gst.PadProbeReturn.OK
 
 strip = p.get_by_name("strip")
@@ -36,3 +49,11 @@ msg = bus.timed_pop_filtered(30 * Gst.SECOND,
                              Gst.MessageType.EOS | Gst.MessageType.ERROR)
 print("finished without crash:", msg.type if msg else "timeout")
 p.set_state(Gst.State.NULL)
+
+# The fixture is the whole test: if no PTS was actually removed, this
+# reproduced nothing and "no crash" means only that nothing was asked of
+# the sink. Say so rather than pass.
+print("keyframe PTS stripped:", stripped)
+if stripped == 0:
+    print("FIXTURE FAILED: no buffer was modified, so nothing was tested")
+    raise SystemExit(2)
