@@ -123,6 +123,39 @@ Kahawai reads `$XDG_CONFIG_HOME/kahawai/kahawai.toml`, `./kahawai.toml`, or the
 path passed with `--config`. Environment overrides use
 `KAHAWAI_<SECTION>__<KEY>`, such as `KAHAWAI_HUB__DATA_DIR=/srv/kahawai`.
 
+### On macOS, from source
+
+A container on macOS cannot reach VideoToolbox, so a Mac that is meant to
+transcode has to build natively. This repository is a Homebrew tap:
+
+```sh
+brew tap iksteen/kahawai https://github.com/iksteen/kahawai
+brew install --HEAD iksteen/kahawai/kahawai
+```
+
+That pulls in `kahawai-gstreamer` first, which is the upstream GStreamer
+release with Kahawai's media fixes applied, installed keg-only so it cannot
+shadow the stock formula. Building it takes a while; there are no bottles.
+
+A starting config is written to `$(brew --prefix)/etc/kahawai/kahawai.toml`,
+with its data directories under `var` rather than in a home directory. Add
+collections to it, then:
+
+```sh
+brew services start kahawai
+```
+
+Without `sudo` that is a user agent, so it starts at login rather than at
+boot. `sudo brew services start kahawai` installs a system daemon instead.
+
+Satellite roles are not services here, because a formula can only declare
+one. Their binaries are installed and take `--config`.
+
+Both formulae build from source and neither is the supported artifact. The
+container image is. See
+[deployment details](./docs/kahawai-deployment.md) for running these as system
+daemons instead, which is what a Mac that must start at boot wants.
+
 ## Satellites and standalone hub
 
 Expose the hub's satellite listener directly as TCP. Do not send it through the

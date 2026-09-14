@@ -454,14 +454,49 @@ path, no `EnvironmentVariables` key in the plist, nothing for a
 `brew upgrade` to delete.
 
 The repo is itself a Homebrew tap. Homebrew reads formulae from a tap's
-`HomebrewFormula/`, which is where this recipe lives, and tapping clones
-`patches/` along with it, so the recipe can never apply patches from a
+`HomebrewFormula/`, which is where both recipes live, and tapping clones
+`patches/` along with them, so a recipe can never apply patches from a
 different checkout than its own.
 
 ```sh
 brew tap iksteen/kahawai https://github.com/iksteen/kahawai
 brew install --build-from-source iksteen/kahawai/kahawai-gstreamer
 ```
+
+There is a `kahawai` formula beside it for people who only want to run
+the thing. It is HEAD-only, since the supported artifact is the container
+image and macOS is a build-from-source platform:
+
+```sh
+brew install --HEAD iksteen/kahawai/kahawai
+```
+
+It installs all four binaries and sets `PKG_CONFIG_PATH` to the keg
+itself, and its test asserts the result links no GStreamer from outside
+that keg.
+
+It also writes a starting config to `$(brew --prefix)/etc/kahawai/kahawai.toml`
+and declares a `brew services` entry for all-in-one. Kahawai's own default
+config path is XDG, which resolves inside whoever's home the process has;
+a service must not depend on that, so the installed config names its data
+directories outright and every generated plist passes `--config`.
+
+All-in-one is the only service, because Homebrew builds one
+`Homebrew::Service` per formula and `brew services` enumerates formulae
+rather than services: a satellite role managed the same way would have to
+be its own formula. Nothing ships beside it as an unmanaged plist, so
+`brew services` is the whole of what the formula offers.
+
+`brew services start kahawai` without `sudo` installs a **user agent**,
+which starts at login rather than at boot and is asked for Local Network
+permission. `sudo brew services start kahawai` installs a system daemon,
+auto-approved under TN3179 and started at boot.
+
+Either way the binary is signed by the build, so a `brew upgrade`
+re-signs it and the Local Network grant is asked for again.
+`scripts/kahawai-mac.sh` signs with a stable keychain identity, which is
+what keeps that grant across rebuilds, and is still the right tool for
+the satellite roles.
 
 For a working tree rather than a clone, point the tap at the tree and set
 `HOMEBREW_KAHAWAI_PATCHES` to its `patches/`.
