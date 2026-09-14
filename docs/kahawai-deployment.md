@@ -442,49 +442,56 @@ Deploy without an identity still works; it says plainly that the
 binary stays ad-hoc signed and the Local Network grant will need
 re-approving, rather than leaving a silent reconnect loop to diagnose.
 
-### GStreamer on the mac: `provision`, and two traps
+### GStreamer on the mac: a patched keg
 
-Homebrew ships GStreamer as one formula, and says on upgrade what to do
-with anything of ours: *"Do not install plugins into GStreamer's prefix.
-They will be deleted by `brew upgrade`."* So the patched plugins live in
-`~/.local/lib/kahawai-gst`, and the daemon is pointed at them —
-**`GST_PLUGIN_PATH` in the plist's `EnvironmentVariables`**, because a
-launchd daemon inherits nothing from a login shell. Without that key the
-transcoder loads Homebrew's stock plugins and every patch in
-`patches/gstreamer` is inert: installed, and doing nothing.
+The mac does not stage patched plugins beside Homebrew's GStreamer. It
+replaces the whole stack with a patched build of it, shipped as a
+keg-only Homebrew formula: Homebrew's own `gstreamer` recipe, plus every
+patch in `patches/` applied at build time, installed under its own prefix
+so nothing else on the box sees it. Kahawai is then built with
+`PKG_CONFIG_PATH` pointing there, and links it directly. No plugin search
+path, no `EnvironmentVariables` key in the plist, nothing for a
+`brew upgrade` to delete.
 
-`scripts/kahawai-mac.sh provision` (ON the mac) does the lot — installs
-or upgrades GStreamer and the build tools, clones the tag matching the
-installed version, applies every patch or stops, builds and stages the
-plugins, then writes the plist and bootstraps the daemon. It is
-idempotent, and it is the whole of what used to be done by hand.
+The repo is itself a Homebrew tap. Homebrew reads formulae from a tap's
+`HomebrewFormula/`, which is where this recipe lives, and tapping clones
+`patches/` along with it, so the recipe can never apply patches from a
+different checkout than its own.
 
-Two failures are worth knowing because neither says what is wrong.
+```sh
+brew tap iksteen/kahawai https://github.com/iksteen/kahawai
+brew install --build-from-source iksteen/kahawai/kahawai-gstreamer
+```
 
-**Upgrading GStreamer requires `cargo clean`.** Cargo caches build-script
-output containing the *version-stamped* Cellar path
-(`Cellar/gstreamer/1.28.5/lib`), which the upgrade deletes. The next
-build fails in the linker pointing at a directory that is not there, with
-nothing to connect it to the upgrade. `provision` does the clean itself
-when the version moved. Note the side effect: the clean removes the
-transcoder binary for half a minute, and `KeepAlive` will spend that
-time failing to spawn a program that does not exist —
+For a working tree rather than a clone, point the tap at the tree and set
+`HOMEBREW_KAHAWAI_PATCHES` to its `patches/`.
+
+`scripts/kahawai-mac.sh provision` (ON the mac) checks the keg is there,
+then writes the plist and bootstraps the daemon; `deploy` builds against
+the keg and restarts.
+
+**Why the whole stack rather than a few plugins.** Patch 0004 changes the
+size of a public struct in `libgstcodecparsers`, so every binary holding
+one must come from the same build. On Linux that is containable: a `.so`
+is identified by its soname, so a staged copy shadows the system's and
+there is one of it in the process. A macOS dylib is identified by its
+**path**, so a patched copy staged beside Homebrew's means both are
+mapped, both register the same GObject types, and the loser dies on a
+null vtable. That was measured — an episode crashed the worker with
+`EXC_BAD_ACCESS` the moment our `mpegtsdemux` and Homebrew's `mpegtsmux`
+were loaded together. Patching the prefix removes the second copy
+instead of trying to arrange which one wins.
+
+**Upgrading the keg requires `cargo clean`.** Cargo caches build-script
+output containing the version-stamped Cellar path, which an upgrade
+deletes. The next build fails in the linker pointing at a directory that
+is not there, with nothing to connect it to the upgrade. Note the side
+effect: the clean removes the binary for half a minute, and `KeepAlive`
+spends that time failing to spawn a program that does not exist —
 `last exit code = 78: EX_CONFIG` and a wedged job needing
-`sudo launchctl bootout` and `bootstrap`. Provision before deploy, not
-during.
+`sudo launchctl bootout` and `bootstrap`.
 
-**Staged plugins need `install_name_tool`, not a copy.** A plugin
-resolves `@rpath/libgstcodecparsers-1.0.0.dylib` through rpaths recorded
-at build time: first the build tree, then Homebrew's Cellar. Once the
-build tree is gone the second one answers — so a copied plugin loads
-**Homebrew's unpatched library** while looking perfectly installed.
-Patch 0004 in particular is then silently absent. `provision` repoints
-the dependency to an absolute path in `~/.local/lib/kahawai-gst/lib` and
-re-signs, since `install_name_tool` voids the signature.
-
-Two of the nine reproducers cannot run on macOS and this is not a
-missing patch: `0004`'s wants an NVIDIA decoder, and `0008` reads
-`/proc/self/io`. The other seven verify normally.
+`scripts/kahawai-gst-plugins.sh` is Linux-only and does not run here.
 
 Two macOS-only behaviours are already handled in code and worth knowing
 about: `vtdec`/`vtdec_hw` are demoted at startup (they build a GL

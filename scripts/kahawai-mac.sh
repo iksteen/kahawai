@@ -8,6 +8,12 @@
 #
 # The mac runs TWO launchd daemons from this tree:
 #
+# GStreamer here is a PATCHED Homebrew keg, not plugins staged beside the
+# system's: see HomebrewFormula/kahawai-gstreamer.rb. Staging was tried
+# and cannot work on macOS, where a dylib is identified by its path, so a
+# patched copy beside Homebrew's means both are mapped and one dies on a
+# null vtable.
+#
 #   all-in-one  its own hub, with the VideoToolbox transcoder in process
 #               and no local collections — the media comes from silence's
 #               mediahost over the LAN, which is why the box sits next to
@@ -46,139 +52,21 @@ MAC_CONFIG="$HOME/.config/kahawai/kahawai.toml"
 # start at boot without a login session. VideoToolbox hw encode and the
 # GL tone-map segment both verified under the daemon (2026-07-31).
 # Sudo happens here, once; deploys just pkill and KeepAlive respawns.
-# Where the patched plugins live. Homebrew says it plainly on upgrade:
-# "Do not install plugins into GStreamer's prefix. They will be deleted
-# by `brew upgrade`." So they go somewhere brew will never touch, and the
-# daemon is pointed at it explicitly.
-KAHAWAI_GST="$HOME/.local/lib/kahawai-gst"
+# The patched GStreamer is a keg-only Homebrew formula, built from
+# HomebrewFormula/kahawai-gstreamer.rb — see that file for why the
+# whole stack is patched rather than a handful of plugins staged beside
+# Homebrew's. The binaries link it directly, so nothing here has to put
+# a plugin path in front of a daemon.
+KEG="/opt/homebrew/opt/kahawai-gstreamer"
 
-# GStreamer and the patched plugins, from nothing. Run ON the mac.
-gst() {
-    [ "$(uname)" = Darwin ] || { echo "run gst ON the mac" >&2; exit 2; }
-    local brew_bin
-    for brew_bin in /opt/homebrew/bin /usr/local/bin; do
-        [ -x "$brew_bin/brew" ] && break
-    done
-    [ -x "$brew_bin/brew" ] || { echo "Homebrew not found" >&2; exit 1; }
-    export PATH="$brew_bin:$PATH"
-    export HOMEBREW_NO_AUTO_UPDATE=1
-
-    local before after
-    before="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
-    echo "==> gstreamer + build tools" >&2
-    # tesseract is for the all-in-one, not the transcoder: leptess links
-    # it, and the everything binary's default `ocr` feature fails to
-    # build without it.
-    brew install gstreamer meson ninja pkg-config tesseract >/dev/null 2>&1 || true
-    brew upgrade gstreamer >/dev/null 2>&1 || true
-    after="$(gst-inspect-1.0 --version 2>/dev/null | awk '/^gst-inspect-1.0 version/ {print $3}')"
-    [ -n "$after" ] || { echo "no gstreamer after install" >&2; exit 1; }
-    echo "    gstreamer ${before:-none} -> $after" >&2
-
-    # A GStreamer upgrade moves the version-stamped Cellar path that
-    # cargo baked into its cached build-script output, and the next build
-    # then links against a directory that no longer exists — an error
-    # that names the missing path and never mentions the upgrade. So the
-    # cache goes whenever the version moved.
-    if [ -n "$before" ] && [ "$before" != "$after" ] && [ -d "$HOME/kahawai-src" ]; then
-        echo "==> gstreamer moved: cargo clean (stale Cellar paths)" >&2
-        ( cd "$HOME/kahawai-src" && cargo clean >/dev/null 2>&1 ) || true
-    fi
-
-    local patches="$HOME/kahawai-src/patches/gstreamer"
-    [ -d "$patches" ] || { echo "no $patches — run 'deploy' first" >&2; exit 1; }
-
-    local src; src=$(mktemp -d -t kahawai-gst-src)
-    echo "==> source: gstreamer $after" >&2
-    git clone --depth 1 --branch "$after" \
-        https://gitlab.freedesktop.org/gstreamer/gstreamer.git "$src" >/dev/null 2>&1 \
-        || { echo "clone of tag $after failed" >&2; exit 1; }
-    local p
-    for p in "$patches"/*.patch; do
-        echo "    applying $(basename "$p")" >&2
-        git -C "$src" apply "$p" || {
-            echo "FAILED to apply $(basename "$p") to $after" >&2; exit 1; }
-    done
-
-    # Which plugins, read from the patches. gst-plugins-bad is different:
-    # 0004 edits gst-libs/codecparsers, and what needs rebuilding is
-    # every plugin that LINKS it — which no patch names because none
-    # edits them. nvcodec/va/v4l2codecs are Linux-only and absent here.
-    local good bad_plugins="videoparsers codectimestamper mpegtsdemux"
-    good=$(grep -hoE 'subprojects/gst-plugins-good/gst/[a-z0-9]+/' "$patches"/*.patch \
-           | awk -F/ '{print $4}' | sort -u)
-    echo "==> building: $(echo "$good" | tr '\n' ' ')| $bad_plugins" >&2
-
-    export PKG_CONFIG_PATH="$brew_bin/../lib/pkgconfig:$brew_bin/../share/pkgconfig"
-    local gb bb args=()
-    gb=$(mktemp -d); bb=$(mktemp -d)
-    args=(--buildtype=release -Dauto_features=disabled)
-    for p in $good; do args+=("-D$p=enabled"); done
-    meson setup "$gb" "$src/subprojects/gst-plugins-good" "${args[@]}" >/dev/null \
-        || { echo "gst-plugins-good: setup failed" >&2; exit 1; }
-    ninja -C "$gb" >/dev/null || { echo "gst-plugins-good: build failed" >&2; exit 1; }
-    args=(--buildtype=release -Dauto_features=disabled)
-    for p in $bad_plugins; do args+=("-D$p=enabled"); done
-    meson setup "$bb" "$src/subprojects/gst-plugins-bad" "${args[@]}" >/dev/null \
-        || { echo "gst-plugins-bad: setup failed" >&2; exit 1; }
-    ninja -C "$bb" >/dev/null || { echo "gst-plugins-bad: build failed" >&2; exit 1; }
-
-    # Wipe: this directory is a build product. A survivor from before a
-    # system upgrade loads, looks right, and is linked against an ABI
-    # that is gone.
-    rm -rf "$KAHAWAI_GST"
-    mkdir -p "$KAHAWAI_GST/plugins" "$KAHAWAI_GST/lib"
-
-    # The patched codecparsers, real file only — a looser glob also
-    # matches meson's .symbols artifacts.
-    local lib
-    lib=$(find "$bb/gst-libs" -type f -name 'libgstcodecparsers-1.0.0.dylib' ! -name '*.symbols' | head -1)
-    [ -n "$lib" ] || { echo "codecparsers not built" >&2; exit 1; }
-    install -m644 "$lib" "$KAHAWAI_GST/lib/"
-    ln -sf libgstcodecparsers-1.0.0.dylib "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.dylib"
-    install_name_tool -id "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" \
-        "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib"
-    codesign -f -s - "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" 2>/dev/null
-
-    local so b
-    for so in "$gb"/gst/*/libgst*.dylib "$bb"/gst/*/libgst*.dylib; do
-        [ -f "$so" ] || continue
-        b=$(basename "$so")
-        install -m644 "$so" "$KAHAWAI_GST/plugins/$b"
-        # macOS resolves @rpath, and the recorded rpaths run
-        # build-tree-then-Homebrew. Once the build tree is gone the
-        # plugin silently loads HOMEBREW's unpatched codecparsers — the
-        # file is installed and the patch does nothing. Pin it absolutely
-        # and re-sign, because install_name_tool voids the signature.
-        if otool -L "$KAHAWAI_GST/plugins/$b" | grep -q '@rpath/libgstcodecparsers'; then
-            install_name_tool -change @rpath/libgstcodecparsers-1.0.0.dylib \
-                "$KAHAWAI_GST/lib/libgstcodecparsers-1.0.0.dylib" "$KAHAWAI_GST/plugins/$b"
-            codesign -f -s - "$KAHAWAI_GST/plugins/$b" 2>/dev/null
-        fi
-        echo "    installed $b" >&2
-    done
-    rm -rf "$src" "$gb" "$bb"
-
-    # Prove the daemon's own setting resolves to what we just built,
-    # rather than to Homebrew's copy of the same plugin.
-    echo "==> loading from:" >&2
-    local name
-    for name in $good videoparsersbad; do
-        printf '    %-16s %s\n' "$name" \
-            "$(GST_PLUGIN_PATH="$KAHAWAI_GST/plugins" gst-inspect-1.0 "$name" 2>/dev/null \
-               | awk '/Filename/{print $2}')" >&2
-    done
-}
+die() { echo "error: $*" >&2; exit 1; }
 
 # One launchd daemon. $1 label, $2 log file, $3.. the ProgramArguments.
 #
-# GST_PLUGIN_PATH is the whole reason these are regenerated rather than
-# left alone once present. A daemon inherits nothing from a login
-# shell, so without it the process loads Homebrew's stock plugins and
-# every patch in patches/gstreamer is inert — installed, and doing
-# nothing. An earlier version returned early when the file existed,
-# which meant a satellite could never acquire a setting it did not have
-# on the day it was first provisioned.
+# Regenerated rather than left alone once present, so a satellite can
+# acquire a setting it did not have on the day it was first provisioned.
+# There is no GST_PLUGIN_PATH any more: the binaries link the patched
+# keg, so the plugins that come with it are the ones they load.
 write_daemon() {
     local label="$1" log="$2"
     shift 2
@@ -204,10 +92,6 @@ write_daemon() {
     <key>KeepAlive</key><true/>
     <key>StandardOutPath</key><string>$log</string>
     <key>StandardErrorPath</key><string>$log</string>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>GST_PLUGIN_PATH</key><string>$KAHAWAI_GST/plugins</string>
-    </dict>
 </dict>
 </plist>
 PLIST
@@ -446,6 +330,22 @@ KEYCHAIN="$HOME/Library/Keychains/kahawai-signing.keychain-db"
 PASSFILE="$HOME/.config/kahawai/signing-keychain.pass"
 cd ~/kahawai-src
 export KAHAWAI_BUILD
+# Build against the PATCHED GStreamer, not Homebrew's stock one.
+#
+# HomebrewFormula/kahawai-gstreamer.rb is the whole stack with
+# patches/ applied, installed keg-only precisely so it does not shadow
+# the system's — which means nothing finds it unless pointed at it. Miss
+# this and the binaries link stock gstreamer, and any patched plugin
+# beside it is a second copy of a library in one process, which on macOS
+# is a crash rather than a warning.
+KEG=/opt/homebrew/opt/kahawai-gstreamer
+if [ -d "$KEG/lib/pkgconfig" ]; then
+    export PKG_CONFIG_PATH="$KEG/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    echo "building against $(pkg-config --modversion gstreamer-1.0) from $KEG"
+else
+    echo "WARNING: no patched GStreamer keg at $KEG — building against the" >&2
+    echo "         system's unpatched GStreamer. See HomebrewFormula/." >&2
+fi
 # Two binaries, because this box is two things. The lean transcoder (no
 # hub, no mediahost, no Tesseract) still dials the dev box's hub; the
 # everything binary runs this box's own all-in-one hub, and that one does
@@ -528,7 +428,9 @@ REMOTE
 # changes only what has drifted.
 provision() {
     [ "$(uname)" = Darwin ] || { echo "run provision ON the mac" >&2; exit 2; }
-    gst
+    [ -d "$KEG/lib/pkgconfig" ] || die "no patched GStreamer keg at $KEG.
+       brew tap iksteen/kahawai https://github.com/iksteen/kahawai
+       brew install --build-from-source iksteen/kahawai/kahawai-gstreamer"
     install_daemon
     echo >&2
     echo "provisioned. From the dev box: scripts/kahawai-mac.sh deploy" >&2
@@ -538,7 +440,6 @@ provision() {
 
 case "${1:-}" in
     setup) setup ;;
-    gst) gst ;;
     provision) provision ;;
     daemons) [ "$(uname)" = Darwin ] || { echo "run daemons ON the mac" >&2; exit 2; }
              install_daemon ;;
@@ -546,10 +447,9 @@ case "${1:-}" in
     prune) shift
            prune_orphans "${1:-$HOST_DEFAULT}" \
                "$(cd "$(dirname "$0")/.." && pwd)" ;;
-    *) echo "usage: $0 {setup|gst|provision|daemons|deploy|prune [host]}" >&2
+    *) echo "usage: $0 {setup|provision|daemons|deploy|prune [host]}" >&2
        echo "  setup      ON the mac, once: signing identity, then provision" >&2
-       echo "  gst        ON the mac: GStreamer + the patches/ plugins" >&2
-       echo "  provision  ON the mac: gst, then both launchd daemons (sudo)" >&2
+       echo "  provision  ON the mac: both launchd daemons (sudo)" >&2
        echo "  daemons    ON the mac: just the launchd daemons (sudo)" >&2
        echo "  deploy     FROM the dev box: sync, build, sign, restart" >&2
        echo "  prune      FROM the dev box: delete satellite files the repo dropped" >&2
