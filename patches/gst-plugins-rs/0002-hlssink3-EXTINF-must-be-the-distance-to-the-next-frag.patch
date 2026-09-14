@@ -1,0 +1,67 @@
+diff --git a/net/hlssink3/src/hlssink3/imp.rs b/net/hlssink3/src/hlssink3/imp.rs
+index 1b2902b0f..b3997f09e 100644
+--- a/net/hlssink3/src/hlssink3/imp.rs
++++ b/net/hlssink3/src/hlssink3/imp.rs
+@@ -649,26 +649,44 @@ impl HlsSink3 {
+         };
+ 
+         let (duration, duration_msec) = {
+-            match s.get::<gst::ClockTime>("fragment-duration") {
+-                Ok(fragment_duration) => (
++            // splitmuxsink's `fragment-duration` is the LONGEST stream's end
++            // minus the fragment start — update_output_fragment_info: "Look
++            // for the largest duration across all streams". Fragments begin
++            // on the reference stream's keyframes, so whenever another
++            // stream ends later (audio, whose frames do not align to a video
++            // GOP) that value runs past where the NEXT fragment starts.
++            //
++            // EXTINF has to be the distance to the next segment, so using it
++            // makes every segment declare time that belongs to its
++            // successor, and a playlist gains that surplus for ever.
++            // Measured against an hlssink2 playlist of the very same cut
++            // points: ~10 ms per 2 s segment, 15 s over a 50 minute file.
++            // A client whose buffered position comes from the playlist and
++            // whose playhead comes from decoded samples then believes it
++            // holds media it does not have, and once that phantom reaches
++            // its minimum buffer the loader stops while the renderer is
++            // actually empty — a stall nothing recovers from.
++            //
++            // The reference stream's own running times are the right
++            // quantity, and the opened/closed messages already carry them.
++            // `fragment-duration` stays as the fallback for a fragment whose
++            // opened message had no running time.
++            let reference_span = state
++                .fragment_opened_at
++                .take()
++                .and_then(|opened_at| closed_at.checked_sub(opened_at));
++
++            match reference_span.or_else(|| s.get::<gst::ClockTime>("fragment-duration").ok()) {
++                Some(fragment_duration) => (
+                     fragment_duration,
+-                    fragment_duration.mseconds() as f32 / 1_000f32,
++                    // Nanoseconds, not `mseconds()`: truncating to whole
++                    // milliseconds loses ~35 us per segment, which is a
++                    // further 52 ms of drift across the same 50 minutes.
++                    (fragment_duration.nseconds() as f64 / 1_000_000_000f64) as f32,
+                 ),
+-                _ => {
+-                    let opened_at = match state.fragment_opened_at.take() {
+-                        Some(opened_at) => opened_at,
+-                        None => {
+-                            gst::error!(CAT, imp = self, "Unknown segment duration");
+-                            return;
+-                        }
+-                    };
+-
+-                    let fragment_duration = closed_at - opened_at;
+-
+-                    (
+-                        fragment_duration,
+-                        fragment_duration.mseconds() as f32 / 1_000f32,
+-                    )
++                None => {
++                    gst::error!(CAT, imp = self, "Unknown segment duration");
++                    return;
+                 }
+             }
+         };

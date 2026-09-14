@@ -15,7 +15,16 @@ fn main() -> anyhow::Result<()> {
 
     let plan = RemuxPlan {
         video: StreamMode::Copy,
-        audio: StreamMode::Copy,
+        // The hub's real remux sessions encode audio to AAC whenever the
+        // client cannot take the source track, and a probe that copies
+        // instead is testing a different pipeline. Copying E-AC-3 into TS
+        // hangs here with no error at all, which cost an hour: PROBE_AAC=1
+        // reproduces what a session actually builds.
+        audio: if std::env::var("PROBE_AAC").is_ok() {
+            StreamMode::Encode
+        } else {
+            StreamMode::Copy
+        },
         audio_track,
         video_track: 0,
         video_kbps: None,
@@ -35,7 +44,17 @@ fn main() -> anyhow::Result<()> {
             .map(|_| SegmentFormat::Ts)
             .unwrap_or(SegmentFormat::Fmp4),
     };
-    let job = kahawai_media::remux::start(&out, plan, Box::new(FileSource::open(&input)?))?;
+    // PROBE_SINK=hlssink2 answers "does the other sink declare the same
+    // segment durations?" — hlssink3's EXTINF values run ~10ms long per
+    // segment, which is what strands a client's buffer estimate.
+    let sink = std::env::var("PROBE_SINK").ok();
+    let job = kahawai_media::remux::start_full(
+        &out,
+        plan,
+        Box::new(FileSource::open(&input)?),
+        0,
+        sink.as_deref(),
+    )?;
     while !job.finished() {
         if let Some(e) = job.failed() {
             anyhow::bail!("remux failed: {e}");

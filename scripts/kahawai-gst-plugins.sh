@@ -59,6 +59,17 @@ HLSSINK3_STOCK="1.28.5 0.15.3"
 # also what the image pins.
 RS_TAG=gstreamer-1.28.6
 
+# Patches in patches/gst-plugins-rs that NO gst-plugins-rs release carries
+# yet. The system's hlssink3 therefore cannot have them however new it is,
+# so a non-empty list means we always build our own — the version check
+# below can only answer "does it have the RELEASED fixes".
+#
+# Both directions of this claim are verified against $RS_TAG when the
+# patches are applied, so an entry that has landed upstream, or one
+# missing that should be here, stops the build instead of drifting.
+# Move an entry out of here when it lands in $RS_TAG.
+RS_UNRELEASED="0002-hlssink3-EXTINF-must-be-the-distance-to-the-next-frag.patch"
+
 src=""
 trap '[ -n "$src" ] && rm -rf "$src"' EXIT
 
@@ -305,10 +316,45 @@ hlssink3_system_version() {
         gst-inspect-1.0 hlssink3 2>/dev/null | awk '/^  Version/ {print $2}'
 }
 
+# patches/gst-plugins-rs against a $RS_TAG checkout, conditionally: some
+# of those patches are already upstream in the tag and `git apply` refuses
+# a patch that is already in the tree.
+#
+# So each one is classified rather than assumed, and the classification is
+# checked against $RS_UNRELEASED in both directions. A patch that no
+# longer applies for any OTHER reason stops the build: it has been
+# outgrown by the tag and needs rebasing, which is exactly the drift this
+# script exists to end.
+apply_rs_patches() {
+    local rs="$1" p base unreleased
+    for p in "$RS_PATCHES"/*.patch; do
+        [ -e "$p" ] || continue
+        base="$(basename "$p")"
+        case " $RS_UNRELEASED " in *" $base "*) unreleased=1 ;; *) unreleased=0 ;; esac
+        if git -C "$rs" apply --check "$p" 2>/dev/null; then
+            [ "$unreleased" = 1 ] || die \
+                "$base is not listed in RS_UNRELEASED but $RS_TAG does not carry it"
+            echo "    applying $base"
+            git -C "$rs" apply "$p" || die "FAILED to apply $base to $RS_TAG"
+        elif git -C "$rs" apply --reverse --check "$p" 2>/dev/null; then
+            [ "$unreleased" = 0 ] || die \
+                "$base is listed in RS_UNRELEASED but $RS_TAG already carries it — drop it from the list"
+            echo "    already in $RS_TAG: $base"
+        else
+            die "$base neither applies to nor is present in $RS_TAG — rebase it"
+        fi
+    done
+}
+
 build_hlssink3() {
     local sys stock=0 v
     sys="$(hlssink3_system_version)"
-    if [ -z "$sys" ]; then
+    if [ -n "$RS_UNRELEASED" ]; then
+        # No release can carry these, so the system's version tells us
+        # nothing: build regardless of what it has.
+        echo "==> hlssink3: building ours — unreleased patches to apply:"
+        for v in $RS_UNRELEASED; do echo "    $v"; done
+    elif [ -z "$sys" ]; then
         echo "==> hlssink3: none on the system — building ours from patches/"
     else
         # Prefix match: the distro calls its build 0.15.3-6302bea23, and
@@ -327,15 +373,11 @@ build_hlssink3() {
     command -v cargo >/dev/null || die "hlssink3 needs building but cargo is not installed"
     local rs
     rs="$(mktemp -d -t kahawai-gst-rs-XXXXXX)"
-    # A release tag that already carries both fixes, not main and not a
-    # patched older tag. patches/gst-plugins-rs is deliberately NOT
-    # applied here, for the reason the Dockerfile gives: $RS_TAG has them
-    # and git apply refuses a patch already in the tree. Those files are
-    # the record of why 0001 needed 0000 first, not something to replay.
-    echo "    cloning $RS_TAG (carries both fixes; patches/gst-plugins-rs not applied)"
+    echo "    cloning $RS_TAG"
     git clone --depth 1 --branch "$RS_TAG" \
         https://gitlab.freedesktop.org/gstreamer/gst-plugins-rs.git "$rs" \
         2>&1 | tail -1 || die "gst-plugins-rs clone failed — is $RS_TAG a tag?"
+    apply_rs_patches "$rs"
     ( cd "$rs" && cargo build --release -p gst-plugin-hlssink3 ) >/dev/null 2>&1 \
         || die "hlssink3 build failed"
     install -m644 "$rs/target/release/libgsthlssink3.so" "$KAHAWAI_GST/plugins/" \
