@@ -65,6 +65,41 @@ impl std::fmt::Display for QuotaSpent {
 
 impl std::error::Error for QuotaSpent {}
 
+/// The account was rejected at login. Ours to fix, not upstream's.
+///
+/// A type for the same reason `QuotaSpent` is one: without it a 401 on
+/// /login arrives as "the subtitle provider did not answer", which sends
+/// the viewer to blame OpenSubtitles and an operator's alerting to file a
+/// misconfiguration as an outage. Search does not log in, so nothing else
+/// in the product notices — the account looks fine right up to the first
+/// download.
+///
+/// The message names the two ways an account that its owner believes is
+/// correct gets refused: the REST API authenticates against
+/// opensubtitles.com, and an opensubtitles.org account is a different
+/// account, not a synonym; and it wants the username, never the email
+/// address. Both are ordinary, and neither is guessable from a 401.
+///
+/// Upstream's own text is NOT forwarded. It carries a failed-attempt
+/// counter against the account, which is worth logging and wrong to show
+/// a viewer who cannot act on it.
+#[derive(Debug)]
+pub struct LoginRejected;
+
+impl std::fmt::Display for LoginRejected {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(
+            "OpenSubtitles rejected the account in Settings. It must be an \
+             opensubtitles.com account — an opensubtitles.org login is a \
+             different account — and the username, not the email address. \
+             Repeated attempts with the same wrong password are counted \
+             against the account, so check it on the site before saving again.",
+        )
+    }
+}
+
+impl std::error::Error for LoginRejected {}
+
 /// Deployment-level provider config (kahawai.toml): just the
 /// application key, and only when a deployment wants its own. Empty =
 /// the admin setting, then the built-in key. Account credentials live
@@ -215,11 +250,17 @@ impl OpenSubtitles {
             .json(&serde_json::json!({ "username": user, "password": pass }));
         let resp = self.http.send(req).await?;
         if !resp.status().is_success() {
-            bail!(
-                "OpenSubtitles login failed: {} {}",
-                resp.status(),
-                resp.text().await.unwrap_or_default()
-            );
+            let status = resp.status();
+            let body = resp.text().await.unwrap_or_default();
+            // 401 is the credential; anything else is upstream having a
+            // bad day and keeps the old shape. The body goes to the log
+            // either way — it carries the failed-attempt counter, which
+            // is the number an operator needs and a viewer cannot use.
+            if status == reqwest::StatusCode::UNAUTHORIZED {
+                return Err(anyhow::Error::new(LoginRejected))
+                    .context(format!("OpenSubtitles login failed: {status} {body}"));
+            }
+            bail!("OpenSubtitles login failed: {status} {body}");
         }
         let token = resp.json::<LoginResp>().await?.token;
         *self.token.lock().await = Some(token.clone());

@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "9ddc2e95769c9947c57714ea6cc0fe98dadff20a9380ea1c28b12bf2c310548b",
+  "x-kahawai-source-sha256": "34878d7a14a1d86cd2992899ca73593efe6e54f1786337e5b701244aaf5fd6fe",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -10413,6 +10413,7 @@
           "provider_unconfigured",
           "provider_error",
           "subtitle_quota_spent",
+          "subtitle_account_rejected",
           "unplayable",
           "satellite_unreachable",
           "web_unavailable",

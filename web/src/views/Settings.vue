@@ -262,6 +262,14 @@ async function disconnect() {
           this server. Attach your own opensubtitles.com account to spend your own budget instead.
           Subtitles you download are shared with everyone here.
         </p>
+        <p class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          It has to be an account on
+          <span class="font-mono">opensubtitles.com</span>, and your username there rather than your
+          email address. An <span class="font-mono">opensubtitles.org</span> login is a different
+          account and will be refused. A wrong account still finds subtitles, because a failed
+          sign-in does not stop a search, and only downloading says so. Fix it here rather than
+          retrying: repeated failures count against the account.
+        </p>
         <!-- In the document from the first render, like the admin panel's:
              a live region inserted together with its text is commonly
              announced by nothing. -->

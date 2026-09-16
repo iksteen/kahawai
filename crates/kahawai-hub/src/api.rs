@@ -851,6 +851,13 @@ fn subtitle_provider_refusal(e: anyhow::Error) -> ApiError {
         // for an admin, whose grant check always passes.
         return ApiError::new(ErrorCode::NotFound, "no such item");
     }
+    // Before the provider is blamed for it, and for the same reason a
+    // spent quota is: a rejected account refuses identically forever, so
+    // "the provider did not answer" sends a viewer to retry a fault that
+    // is ours and points nobody at the setting that fixes it.
+    if let Some(rejected) = e.downcast_ref::<crate::opensubtitles::LoginRejected>() {
+        return ApiError::log(ErrorCode::SubtitleAccountRejected, rejected.to_string(), e);
+    }
     match e.downcast_ref::<crate::opensubtitles::QuotaSpent>() {
         Some(spent) => ApiError::new(ErrorCode::SubtitleQuotaSpent, spent.to_string()),
         // `refusal_or_internal`, not `log`: a SQLITE_BUSY inside the search

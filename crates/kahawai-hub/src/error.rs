@@ -177,6 +177,14 @@ pub enum ErrorCode {
     /// account or tomorrow, and the message says which. Deliberately not 429,
     /// which invites a retry — this one clears in hours, not seconds.
     SubtitleQuotaSpent,
+    /// The subtitle provider rejected the stored account. Ours to fix, and
+    /// the message says how. Not `ProviderError`: a 502 says upstream is
+    /// unwell and invites a retry, where this one will refuse identically
+    /// until somebody edits the account. Not `InvalidCredentials` either —
+    /// that is about the credential the CALLER just presented to us, and
+    /// answering 401 to a logged-in viewer would read as their session
+    /// expiring.
+    SubtitleAccountRejected,
     /// This item cannot be played, and asking again will not change that:
     /// no sources, or nothing about it that this client can be served.
     Unplayable,
@@ -215,8 +223,14 @@ impl ErrorCode {
             LoginThrottled | SessionCap => StatusCode::TOO_MANY_REQUESTS,
             Forbidden | AdminRequired => StatusCode::FORBIDDEN,
             NotFound => StatusCode::NOT_FOUND,
-            Conflict | SetupComplete | Unplayable | LastAdmin | SelfTarget | StaleWrite
-            | SubtitleQuotaSpent => StatusCode::CONFLICT,
+            Conflict
+            | SetupComplete
+            | Unplayable
+            | LastAdmin
+            | SelfTarget
+            | StaleWrite
+            | SubtitleQuotaSpent
+            | SubtitleAccountRejected => StatusCode::CONFLICT,
             SetupRequired | SourceOffline | SatelliteUnreachable | ProviderUnconfigured
             | WebUnavailable => StatusCode::SERVICE_UNAVAILABLE,
             ProviderError => StatusCode::BAD_GATEWAY,
@@ -571,6 +585,45 @@ mod tests {
         assert_ne!(
             ErrorCode::SubtitleQuotaSpent.status(),
             ErrorCode::ProviderError.status()
+        );
+    }
+
+    /// The same distinction for an account the provider refuses.
+    ///
+    /// Measured on the mac hub: a 401 on /login reached the viewer as "the
+    /// subtitle provider did not answer" while search kept working, because
+    /// search never logs in. Nothing in the product said the account was
+    /// wrong, and nothing said which account it had to be — the REST API
+    /// authenticates against opensubtitles.com, and a .org login is a
+    /// different account rather than a synonym for it.
+    ///
+    /// Upstream's own text must NOT reach the client here: it carries a
+    /// failed-attempt counter against the account, which belongs in the log.
+    #[test]
+    fn a_rejected_account_says_which_account_it_wanted() {
+        let rejected = crate::opensubtitles::LoginRejected;
+        let refused = ApiError::log(
+            ErrorCode::SubtitleAccountRejected,
+            rejected.to_string(),
+            anyhow::Error::new(rejected)
+                .context("OpenSubtitles login failed: 401 Unauthorized failed:2 remaining:8"),
+        );
+        let msg = &refused.body.message;
+        assert!(msg.contains("opensubtitles.com"), "{msg}");
+        assert!(msg.contains("opensubtitles.org"), "{msg}");
+        assert!(msg.contains("not the email address"), "{msg}");
+        // The counter is upstream's, and a viewer cannot act on it.
+        assert!(!msg.contains("remaining:8"), "{msg}");
+        // Retrying will not help until somebody edits the account, so this
+        // must not read as the upstream wobble that a 502 invites.
+        assert_ne!(
+            ErrorCode::SubtitleAccountRejected.status(),
+            ErrorCode::ProviderError.status()
+        );
+        // Nor as the caller's own session having expired.
+        assert_ne!(
+            ErrorCode::SubtitleAccountRejected.status(),
+            ErrorCode::Unauthenticated.status()
         );
     }
 
