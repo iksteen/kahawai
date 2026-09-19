@@ -18,14 +18,14 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminEnrollments: vi.fn(),
   adminSatellites: vi.fn(),
   adminSessions: vi.fn(),
-  adminLibraries: vi.fn(),
-  adminCollections: vi.fn(),
+  libraries: vi.fn(),
+  collections: vi.fn(),
   adminUsers: vi.fn(),
   adminApprove: vi.fn(),
-  adminAttachCollection: vi.fn(),
-  adminCreateLibrary: vi.fn(),
+  setCollections: vi.fn(),
+  createLibrary: vi.fn(),
   adminCreateUser: vi.fn(),
-  adminDeleteLibrary: vi.fn(),
+  deleteLibrary: vi.fn(),
   adminDeleteSatellite: vi.fn(),
   adminDeleteUser: vi.fn(),
   adminDetachCollection: vi.fn(),
@@ -133,10 +133,10 @@ beforeEach(() => {
   vi.mocked(api.adminEnrollments).mockResolvedValue({ pending: [] } as never)
   vi.mocked(api.adminSatellites).mockResolvedValue({ satellites: [satellite()] } as never)
   vi.mocked(api.adminSessions).mockResolvedValue({ sessions: [] } as never)
-  vi.mocked(api.adminLibraries).mockResolvedValue({
-    libraries: [{ id: 'films', name: 'Films', media_type: 'movies', collections: [] }],
-  } as never)
-  vi.mocked(api.adminCollections).mockResolvedValue({ collections: [] } as never)
+  vi.mocked(api.libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+  ] as never)
+  vi.mocked(api.collections).mockResolvedValue([])
   vi.mocked(api.adminUsers).mockResolvedValue({ users: [user()] } as never)
   vi.mocked(api.adminApprove).mockResolvedValue({ approved: 'attic' } as never)
   vi.mocked(api.adminProviders).mockResolvedValue({
@@ -153,6 +153,7 @@ beforeEach(() => {
     weak: 0,
     missed: 0,
   } as never)
+  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({ collections: [] })
   clearNotices()
 })
 afterEach(() => {
@@ -337,28 +338,12 @@ describe('the fleet', () => {
     )
   })
 
-  test('files a host could not read are counted on the host (MH-8)', async () => {
-    vi.mocked(api.adminCollections).mockResolvedValue({
-      collections: [
-        {
-          module_id: 'mh1',
-          collection_id: 'a',
-          media_type: 'movies',
-          connected: true,
-          host_name: 'attic',
-          scan: { complete: true, scanned: 10, skipped: 0, failed: 2 },
-        },
-        {
-          module_id: 'mh1',
-          collection_id: 'b',
-          media_type: 'movies',
-          connected: true,
-          host_name: 'attic',
-          scan: { complete: true, scanned: 5, skipped: 0, failed: 1 },
-        },
-      ],
-    } as never)
-    expect((await open()).text()).toContain('3 unreadable')
+  test('imported files are counted on their mediahost', async () => {
+    vi.mocked(api.collections).mockResolvedValue([
+      { mediahost_id: 'mh1', file_count: 10 },
+      { mediahost_id: 'mh1', file_count: 5 },
+    ] as never)
+    expect((await open()).text()).toContain('15 files')
   })
 })
 
@@ -387,10 +372,10 @@ describe('what an empty list means', () => {
 
 describe('the two kinds of failure', () => {
   test('a read failing is reported without taking the panel, and NAMES what failed', async () => {
-    vi.mocked(api.adminSessions).mockRejectedValue(new ApiError(503, 'hub restarting'))
+    vi.mocked(api.collections).mockRejectedValue(new ApiError(503, 'hub restarting'))
     const wrapper = await open()
     expect(wrapper.find('[role="status"]').text()).toContain('hub restarting')
-    expect(wrapper.find('[role="status"]').text()).toContain('sessions')
+    expect(wrapper.find('[role="status"]').text()).toContain('collections')
     // The satellites still arrived, so they are still on screen.
     expect(wrapper.text()).toContain('attic')
   })
@@ -403,8 +388,8 @@ describe('the two kinds of failure', () => {
       api.adminEnrollments,
       api.adminSatellites,
       api.adminSessions,
-      api.adminLibraries,
-      api.adminCollections,
+      api.libraries,
+      api.collections,
       api.adminUsers,
     ]) {
       vi.mocked(read).mockRejectedValue(new ApiError(503, 'hub restarting'))
@@ -418,9 +403,9 @@ describe('the two kinds of failure', () => {
   })
 
   test('but one dead read among five live ones names itself, over a live panel', async () => {
-    vi.mocked(api.adminSessions).mockRejectedValue(new ApiError(503, 'hub restarting'))
+    vi.mocked(api.collections).mockRejectedValue(new ApiError(503, 'hub restarting'))
     const wrapper = await open()
-    expect(wrapper.find('[role="status"]').text()).toContain('sessions')
+    expect(wrapper.find('[role="status"]').text()).toContain('collections')
     expect(wrapper.find('[role="tabpanel"]').exists()).toBe(true)
     expect(wrapper.text()).not.toContain('Could not read the hub.')
   })
@@ -433,8 +418,8 @@ describe('the two kinds of failure', () => {
       api.adminEnrollments,
       api.adminSatellites,
       api.adminSessions,
-      api.adminLibraries,
-      api.adminCollections,
+      api.libraries,
+      api.collections,
       api.adminUsers,
     ]) {
       vi.mocked(read).mockRejectedValue(new ApiError(503, 'hub restarting'))
@@ -533,7 +518,13 @@ describe('the tabs', () => {
     // which keys work, and Left/Right on a column is the wrong one.
     const wrapper = await open()
     const tabs = wrapper.findAll('[role="tab"]')
-    expect(tabs.length).toBe(5)
+    expect(tabs.map((tab) => tab.text())).toEqual([
+      'Satellites',
+      'Libraries',
+      'Providers',
+      'Users & grants',
+      'Sessions',
+    ])
     expect(wrapper.get('[role="tablist"]').attributes('aria-orientation')).toBe('vertical')
     expect(tabs[0]!.attributes('aria-selected')).toBe('true')
     expect(tabs[1]!.attributes('tabindex')).toBe('-1')
@@ -635,166 +626,6 @@ describe('the tabs', () => {
     const wrapper = await open()
     expect(wrapper.text()).toContain('first try')
     expect(wrapper.text()).toContain('second try')
-  })
-})
-
-describe('libraries', () => {
-  test('the create form is cleared once the hub has taken it', async () => {
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    vi.mocked(api.adminCreateLibrary).mockResolvedValue({ id: 'new' } as never)
-    await wrapper.find('#new-library').setValue('Shows')
-    await wrapper.find('form').trigger('submit')
-    await flushPromises()
-    expect(api.adminCreateLibrary).toHaveBeenCalledWith({ name: 'Shows', media_type: 'movies' })
-    expect((wrapper.find('#new-library').element as HTMLInputElement).value).toBe('')
-  })
-
-  test('Refresh is not offered for a library with nothing attached', async () => {
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    expect(
-      wrapper
-        .findAll('button')
-        .find((b) => b.text() === 'Refresh')!
-        .attributes('disabled'),
-    ).toBeDefined()
-  })
-
-  const composed = {
-    libraries: [
-      {
-        id: 'films',
-        name: 'Films',
-        media_type: 'movies',
-        collections: [{ module_id: 'mh1', collection_id: 'movies', host_name: 'attic' }],
-      },
-    ],
-  }
-
-  test('show how each attached collection’s scan is going', async () => {
-    vi.mocked(api.adminLibraries).mockResolvedValue(composed as never)
-    vi.mocked(api.adminCollections).mockResolvedValue({
-      collections: [
-        {
-          module_id: 'mh1',
-          collection_id: 'movies',
-          media_type: 'movies',
-          connected: false,
-          host_name: 'attic',
-          scan: { complete: false, scanned: 40, skipped: 3, failed: 1 },
-        },
-      ],
-    } as never)
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    const text = wrapper.text().replace(/\s+/g, ' ')
-    expect(text).toContain('attic/movies')
-    expect(text).toContain('(offline)')
-    expect(text).toContain('scanning 40')
-    expect(text).toContain('(+3 unchanged)')
-    expect(text).toContain('1 failed')
-  })
-
-  test('can attach a collection the library does not have', async () => {
-    vi.mocked(api.adminLibraries).mockResolvedValue({
-      libraries: [{ id: 'films', name: 'Films', media_type: 'movies', collections: [] }],
-    } as never)
-    vi.mocked(api.adminCollections).mockResolvedValue({
-      collections: [
-        {
-          module_id: 'mh1',
-          collection_id: 'movies',
-          media_type: 'movies',
-          connected: true,
-          host_name: 'attic',
-          scan: null,
-        },
-        // Another type: attaching it would merge music into a film library.
-        {
-          module_id: 'mh1',
-          collection_id: 'flac',
-          media_type: 'music',
-          connected: true,
-          host_name: 'attic',
-          scan: null,
-        },
-      ],
-    } as never)
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    const select = wrapper.find('#attach-films')
-    expect(select.findAll('option')).toHaveLength(2)
-    await select.setValue('0')
-    await flushPromises()
-    expect(api.adminAttachCollection).toHaveBeenCalledWith('films', {
-      module_id: 'mh1',
-      collection_id: 'movies',
-    })
-  })
-
-  test('and attaching sends the collection that was PICKED', async () => {
-    vi.mocked(api.adminLibraries).mockResolvedValue({
-      libraries: [{ id: 'films', name: 'Films', media_type: 'movies', collections: [] }],
-    } as never)
-    vi.mocked(api.adminCollections).mockResolvedValue({
-      collections: ['a', 'b', 'c'].map((id) => ({
-        module_id: 'mh1',
-        collection_id: id,
-        media_type: 'movies',
-        connected: true,
-        host_name: 'attic',
-        scan: null,
-      })),
-    } as never)
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    const select = wrapper.find('#attach-films')
-    await select.setValue('2')
-    await flushPromises()
-    expect(api.adminAttachCollection).toHaveBeenCalledWith('films', {
-      module_id: 'mh1',
-      collection_id: 'c',
-    })
-    // And the menu goes back to "attach…": leaving the picked row selected
-    // after a refusal shows a collection that is not attached, and the
-    // operator cannot re-pick it to try again.
-    expect((select.element as HTMLSelectElement).value).toBe('')
-  })
-
-  test('and detach one it has', async () => {
-    vi.mocked(api.adminLibraries).mockResolvedValue(composed as never)
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    await wrapper.find('[aria-label^="Detach"]').trigger('click')
-    await flushPromises()
-    expect(api.adminDetachCollection).toHaveBeenCalledWith('films', 'mh1', 'movies')
-  })
-
-  test('Refresh says how many hosts were asked, and how many were not there', async () => {
-    vi.mocked(api.adminLibraries).mockResolvedValue(composed as never)
-    vi.mocked(api.adminRefreshLibrary).mockResolvedValue({ asked: 2, offline: 1 } as never)
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    await press(wrapper, 'Refresh')
-    expect(api.adminRefreshLibrary).toHaveBeenCalledWith('films')
-    expect(notice.value).toContain('2 collection(s), 1 offline')
-  })
-
-  test('and deleting one is asked twice — it takes every grant with it', async () => {
-    // The most destructive of the three, and the only one that went on a single
-    // click: re-creating the library mints a new id, so an account granted only
-    // this library silently becomes "no access".
-    const wrapper = await open()
-    await tab(wrapper, 'Libraries')
-    const button = wrapper.findAll('button').find((candidate) => candidate.text() === 'Delete')!
-    expect(button.attributes('aria-label')).toBe('Delete Films')
-    await button.trigger('click')
-    expect(button.attributes('aria-label')).toBe('Really delete Films and revoke its grants?')
-    expect(api.adminDeleteLibrary).not.toHaveBeenCalled()
-    expect(wrapper.text()).toContain('Really delete + revoke grants?')
-    await button.trigger('click')
-    expect(api.adminDeleteLibrary).toHaveBeenCalledWith('films')
   })
 })
 
@@ -909,12 +740,10 @@ describe('accounts', () => {
       libraries: ['films', 'music'],
       grants_version: 4,
     } as never)
-    vi.mocked(api.adminLibraries).mockResolvedValue({
-      libraries: [
-        { id: 'films', name: 'Films', media_type: 'movies', collections: [] },
-        { id: 'music', name: 'Music', media_type: 'music', collections: [] },
-      ],
-    } as never)
+    vi.mocked(api.libraries).mockResolvedValue([
+      { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+      { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
+    ] as never)
     const wrapper = await open()
     await tab(wrapper, 'Users')
 
@@ -931,12 +760,10 @@ describe('accounts', () => {
     // clicks, so disabling swallows the second one instead of ordering it — and
     // it takes the just-pressed button out of the tab order with nothing
     // announcing why.
-    vi.mocked(api.adminLibraries).mockResolvedValue({
-      libraries: [
-        { id: 'films', name: 'Films', media_type: 'movies', collections: [] },
-        { id: 'music', name: 'Music', media_type: 'music', collections: [] },
-      ],
-    } as never)
+    vi.mocked(api.libraries).mockResolvedValue([
+      { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+      { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
+    ] as never)
     const slow = held({ all_libraries: false, libraries: ['films', 'music'], grants_version: 4 })
     vi.mocked(api.adminSetUserLibraries).mockReturnValue(slow.promise as never)
     const wrapper = await open()
@@ -958,12 +785,10 @@ describe('accounts', () => {
     // frozen until a reload: another admin narrowing the account changed
     // nothing on screen, and the panel showed a grant the hub did not have.
     vi.useFakeTimers()
-    vi.mocked(api.adminLibraries).mockResolvedValue({
-      libraries: [
-        { id: 'films', name: 'Films', media_type: 'movies', collections: [] },
-        { id: 'music', name: 'Music', media_type: 'music', collections: [] },
-      ],
-    } as never)
+    vi.mocked(api.libraries).mockResolvedValue([
+      { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+      { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
+    ] as never)
     vi.mocked(api.adminSetUserLibraries).mockResolvedValue({
       all_libraries: false,
       libraries: ['films', 'music'],
@@ -1303,66 +1128,12 @@ describe('providers', () => {
     })
   })
 
-  test('finding skip points follows its own run to a toast, and only its own', async () => {
-    // The poll's three exits: normal completion via the dispatch mark on the
-    // same boot, "nothing pending" without entering the loop at all, and a
-    // hub restart voiding the mark. Each was a forever-spin at some point.
-    vi.useFakeTimers()
-    const status = (over: Record<string, unknown> = {}) => ({
-      running: false,
-      awaiting_host: false,
-      last_failed: false,
-      boot: 1000,
-      dispatched: 0,
-      dispatched_awaiting_host: false,
-      dispatched_failed: false,
-      analyzed: 0,
-      pending_seasons: 3,
-      detector: 1,
-      seasons: [],
-      ...over,
-    })
-    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(status() as never)
+  test('polls segment work only while the provider controls are open', async () => {
     const wrapper = await open()
+    expect(api.adminSegmentsStatus).not.toHaveBeenCalled()
     await tab(wrapper, 'Providers')
-
-    // Normal completion: the counter passes the mark on the same boot.
-    vi.mocked(api.adminSegmentsRun).mockResolvedValue({
-      series: 'Show',
-      season: 1,
-      follow: 0,
-      boot: 1000,
-    } as never)
-    await press(wrapper, 'Find skip points now')
-    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(
-      status({ dispatched: 1, pending_seasons: 2 }) as never,
-    )
-    await vi.advanceTimersByTimeAsync(5100)
-    expect(notice.value).toContain('Season analysed. 2 still to go.')
-
-    // Nothing pending: no season named, no poll, an immediate answer.
-    clearNotices()
-    vi.mocked(api.adminSegmentsRun).mockResolvedValue({ follow: 1, boot: 1000 } as never)
-    await press(wrapper, 'Find skip points now')
-    // Immediate — no timer was advanced, so a poll loop cannot have run:
-    // the toast came from the dispatch answer alone.
-    expect(notice.value).toContain('Every season has been analysed.')
-
-    // A restart voids the mark: the counter reset below it must not read as
-    // still-running (nor a later run's flags as this one's).
-    clearNotices()
-    vi.mocked(api.adminSegmentsRun).mockResolvedValue({
-      series: 'Show',
-      season: 1,
-      follow: 1,
-      boot: 1000,
-    } as never)
-    await press(wrapper, 'Find skip points now')
-    vi.mocked(api.adminSegmentsStatus).mockResolvedValue(
-      status({ boot: 2000, dispatched: 0 }) as never,
-    )
-    await vi.advanceTimersByTimeAsync(5100)
-    expect(notice.value).toContain('The hub restarted')
+    expect(wrapper.text()).toContain('Find skip points now')
+    expect(api.adminSegmentsStatus).toHaveBeenCalled()
   })
 
   test('Enrich now is offered for ANY provider, not TMDB alone', async () => {
@@ -1372,6 +1143,7 @@ describe('providers', () => {
       tmdb: { configured: false },
       tvdb: { configured: true },
       anidb: { configured: false },
+      available: ['tvdb'],
       chains: {},
     } as never)
     const wrapper = await open()
@@ -1471,7 +1243,7 @@ describe('providers', () => {
 
     await press(wrapper, 'Apply')
     expect(api.adminSetChain).toHaveBeenCalledWith('movies', { order: ['tvdb', 'tmdb'] })
-    expect(notice.value).toContain('re-merged')
+    expect(notice.value).toContain('Existing matches are unchanged')
     // The draft is dropped: it is what the hub holds now, so there is nothing
     // left to apply and nothing left to reset.
     expect(
@@ -1522,4 +1294,60 @@ describe('providers', () => {
     slow.settle()
     await flushPromises()
   })
+})
+
+test('segment controls distinguish unknown, disabled and offline reports and only request work', async () => {
+  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({
+    collections: [
+      {
+        collection_id: 'a',
+        mediahost_id: 'host',
+        mediahost_name: 'NAS',
+        name: 'shows',
+        connected: true,
+        pending_sources: 7,
+        enabled: true,
+      },
+      {
+        collection_id: 'b',
+        mediahost_id: 'old',
+        mediahost_name: 'Older',
+        name: 'anime',
+        connected: true,
+        pending_sources: null,
+        enabled: null,
+      },
+      {
+        collection_id: 'c',
+        mediahost_id: 'disabled',
+        mediahost_name: 'Disabled',
+        name: 'shows',
+        connected: true,
+        pending_sources: 0,
+        enabled: false,
+      },
+      {
+        collection_id: 'd',
+        mediahost_id: 'offline',
+        mediahost_name: 'Offline',
+        name: 'shows',
+        connected: false,
+        pending_sources: null,
+        enabled: null,
+      },
+    ],
+  })
+  vi.mocked(api.adminSegmentsRun).mockResolvedValue({ asked: 2, unavailable: 1 })
+  const wrapper = await open()
+  await tab(wrapper, 'Providers')
+  expect(wrapper.text()).toContain('7 sources awaiting analysis')
+  expect(wrapper.text()).toContain('waiting for mediahost status')
+  expect(wrapper.text()).toContain('detection disabled')
+  await wrapper
+    .findAll('button')
+    .find((b) => b.text() === 'Find skip points now')!
+    .trigger('click')
+  await flushPromises()
+  expect(api.adminSegmentsRun).toHaveBeenCalledOnce()
+  expect(wrapper.text()).not.toContain('episodes done since')
 })

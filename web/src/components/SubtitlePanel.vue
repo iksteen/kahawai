@@ -7,6 +7,7 @@
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 
 import Btn from './Btn.vue'
+import type { SubtitleSource } from '../api/generated/model/subtitleSource.ts'
 import type { Candidate } from '../api/generated/model/candidate.ts'
 import type { Quota } from '../api/generated/model/quota.ts'
 import type { TrackListing } from '../api/generated/model/trackListing.ts'
@@ -14,12 +15,17 @@ import { notify } from '../composables/notices.ts'
 import { putPref } from '../composables/prefs.ts'
 import { quotaLabel } from '../domain/quota.ts'
 import { sentence } from '../domain/refusal.ts'
-import { subtitleDelete, subtitleDownload, subtitleSearch } from '../api/generated/kahawai.ts'
+import {
+  catalogueSubtitleDelete,
+  catalogueSubtitleDownload,
+  catalogueSubtitleSearch,
+} from '../api/generated/kahawai.ts'
 
 const props = withDefaults(
   defineProps<{
     item: { id: string; title: string; parent_id?: string | null }
-    sourceId?: number | undefined
+    libraryId: string
+    source?: SubtitleSource | null | undefined
     subs: TrackListing[]
     listingKnown?: boolean
     /// The media type's subtitle language preference (HUB-33). The search is
@@ -43,14 +49,23 @@ const quota = ref<Quota | null>(null)
 /// `null` while the dialog is closed. An empty array is a search that found
 /// nothing, which is a different thing and has its own offer.
 const candidates = ref<Candidate[] | null>(null)
-type SearchTarget = { itemId: string; sourceId: number | undefined }
+type SearchTarget = {
+  itemId: string
+  libraryId: string
+  source?: SubtitleSource | null | undefined
+}
 let candidateTarget: SearchTarget | null = null
 let request = 0
 
 // Cached source choices reuse this panel. Results and in-flight work belong
 // to the source that was searched, including after switching away and back.
 watch(
-  [() => props.item.id, () => props.sourceId],
+  [
+    () => props.item.id,
+    () => props.libraryId,
+    () => props.source?.media_entry_id,
+    () => props.source?.source_version,
+  ],
   () => {
     request++
     candidateTarget = null
@@ -105,13 +120,18 @@ onBeforeUnmount(() => {
 
 async function find(languages: string[]) {
   const mine = ++request
-  const target = { itemId: props.item.id, sourceId: props.sourceId }
+  const target = {
+    itemId: props.item.id,
+    libraryId: props.libraryId,
+    source: props.source ? { ...props.source } : null,
+  }
   busy.value = true
   note.value = ''
   try {
-    const answer = await subtitleSearch(target.itemId, {
+    if (!target.source) throw new Error('Select an available subtitle source first.')
+    const answer = await catalogueSubtitleSearch(target.libraryId, target.itemId, {
+      source: target.source,
       languages,
-      source_id: target.sourceId ?? null,
     })
     if (mine !== request) return
     candidateTarget = target
@@ -136,15 +156,15 @@ async function download(candidate: Candidate) {
   const mine = request
   busy.value = true
   try {
-    const answer = await subtitleDownload(target.itemId, {
+    const answer = await catalogueSubtitleDownload(target.libraryId, target.itemId, {
+      source: target.source!,
       file_id: candidate.file_id,
-      source_id: target.sourceId ?? null,
       language: candidate.language,
     })
     if (mine !== request) return
     quota.value = answer.quota
     candidates.value = null
-    notify('Subtitle downloaded — it is now a track on this item.')
+    notify('Subtitle downloaded — it is now a track on this source.')
     emit('changed')
   } catch (cause) {
     if (mine !== request) return
@@ -156,7 +176,8 @@ async function download(candidate: Candidate) {
 
 async function remove(track: TrackListing) {
   try {
-    await subtitleDelete(track.id)
+    if (!props.source) throw new Error('The subtitle source is unavailable.')
+    await catalogueSubtitleDelete(props.libraryId, props.item.id, track.id, props.source)
     emit('changed')
   } catch (cause) {
     notify(`Could not remove that track: ${sentence(cause)}`)

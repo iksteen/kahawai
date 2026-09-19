@@ -54,7 +54,11 @@ fn exact_read_uses_the_token_not_root_order() {
 #[tokio::test]
 async fn persisted_root_token_path_mismatches_are_rejected() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     let token = root("/media/a");
     registry
         .announce_collection("host", "movies", "movies", &["/media/a".into()])
@@ -75,7 +79,11 @@ async fn persisted_root_token_path_mismatches_are_rejected() {
 #[tokio::test]
 async fn identical_relative_paths_persist_as_distinct_sources() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     let a = root("/media/a");
     let b = root("/media/b");
     registry
@@ -165,8 +173,14 @@ async fn level52_fixture() -> (tempfile::TempDir, sqlx::SqlitePool) {
 async fn migration_and_single_root_adoption_preserve_durable_state() {
     let (dir, db) = level52_fixture().await;
     db.close().await;
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .announce_collection("host", "movies", "movies", &["/media/only".into()])
         .await
@@ -256,7 +270,9 @@ async fn artist_identity_is_backfilled_on_an_existing_catalogue() {
     .unwrap();
     db.close().await;
 
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, String>(
             "SELECT artist_key FROM collection_items WHERE id='old-album'"
@@ -272,7 +288,11 @@ async fn artist_identity_is_backfilled_on_an_existing_catalogue() {
 #[tokio::test]
 async fn single_root_announcement_adopts_legacy_state_without_rescan() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .announce_collection("host", "movies", "movies", &[])
         .await
@@ -346,7 +366,11 @@ async fn single_root_announcement_adopts_legacy_state_without_rescan() {
 #[tokio::test]
 async fn multi_root_legacy_state_is_never_guessed() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .announce_collection("host", "movies", "movies", &[])
         .await

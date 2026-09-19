@@ -30,6 +30,27 @@ use tokio::sync::{mpsc, oneshot};
 pub const WRITER_QUEUE_CAPACITY: usize = 256;
 const SLOW_OPERATION: Duration = Duration::from_secs(1);
 
+/// Snapshot an existing database, including committed WAL contents, without
+/// migrating it or taking ownership of its writer. The destination must be new.
+/// The caller owns directory access and permissions for the resulting file.
+pub async fn snapshot(source: &std::path::Path, destination: &std::path::Path) -> Result<()> {
+    let mut connection = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new().filename(source).read_only(true),
+    )
+    .await?;
+    let result = sqlx::query("VACUUM INTO ?")
+        .bind(
+            destination
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("snapshot path is not utf-8"))?,
+        )
+        .execute(&mut connection)
+        .await;
+    connection.close().await?;
+    result?;
+    Ok(())
+}
+
 tokio::task_local! {
     static WRITER_CONTEXT: u64;
 }

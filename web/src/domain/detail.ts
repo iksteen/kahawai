@@ -81,8 +81,10 @@ export function childCount(
   children: { played: boolean }[] | null,
   one: string,
   many: string,
+  total?: number,
 ): string {
   if (children === null) return ''
   const watched = children.filter((c) => c.played).length
-  return `${children.length} ${children.length === 1 ? one : many} · ${watched} watched`
+  const count = total ?? children.length
+  return `${count} ${count === 1 ? one : many} · ${watched} watched`
 }

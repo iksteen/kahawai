@@ -4,7 +4,7 @@
 /// Grouped by what they are FOR, not by who runs them: an admin comes here
 /// because anime is matching badly, not because they were thinking about
 /// AniDB. The provider name is the row label.
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, ref, watch } from 'vue'
 import { useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import Armed from '../../components/Armed.vue'
@@ -15,9 +15,9 @@ import {
   adminDisconnectProvider,
   adminEnrichRun,
   adminEnrichStatus,
-  adminSegmentsRun,
-  adminSegmentsStatus,
   adminProviders,
+  adminSegmentsStatus,
+  adminSegmentsRun,
   adminSetAnidb,
   adminSetChain,
   adminSetFanart,
@@ -25,7 +25,6 @@ import {
   adminSetTmdb,
   adminSetTvdb,
 } from '../../api/generated/kahawai.ts'
-import type { SegmentRunResponse } from '../../api/generated/model/segmentRunResponse.ts'
 import { moved } from '../../domain/reorder.ts'
 import { notify } from '../../composables/notices.ts'
 import { POLL_MS } from '../../composables/admin.ts'
@@ -51,19 +50,36 @@ const enrich = useQuery({
   queryFn: () => adminEnrichStatus(),
   refetchInterval: POLL_MS,
 })
-/// HUB-37. Beside enrichment because it is the same kind of thing: a
-/// library-wide background pass whose progress an administrator can see and
-/// whose next unit of work they can ask for now.
 const segments = useQuery({
   queryKey: ['admin', 'segments'],
   queryFn: () => adminSegmentsStatus(),
   refetchInterval: POLL_MS,
 })
+const detecting = ref(false)
+const canDetect = computed(
+  () => segments.data.value?.collections.some((c) => c.connected && c.enabled !== false) ?? false,
+)
+async function detect() {
+  if (detecting.value) return
+  detecting.value = true
+  try {
+    await props.act(async () => {
+      const result = await adminSegmentsRun()
+      notify(
+        `Skip-point discovery requested on ${result.asked} mediahosts${result.unavailable ? `; ${result.unavailable} unavailable` : ''}.`,
+      )
+    })
+  } finally {
+    detecting.value = false
+    void client.invalidateQueries({ queryKey: ['admin', 'segments'] })
+  }
+}
 
 async function reload() {
   await Promise.all([
     client.invalidateQueries({ queryKey: ['admin', 'providers'] }),
     client.invalidateQueries({ queryKey: ['admin', 'enrich'] }),
+    client.invalidateQueries({ queryKey: ['admin', 'segments'] }),
   ])
 }
 
@@ -101,14 +117,7 @@ const configured = computed(() => providers.data.value)
 /// Whether ANY provider can answer. The enrich button used to read TMDB's flag
 /// alone, so a series-only deployment had a permanently greyed button and no
 /// explanation of why.
-const anyProvider = computed(
-  () =>
-    !!configured.value &&
-    (configured.value.tmdb.configured ||
-      configured.value.tvdb.configured ||
-      configured.value.anidb.configured ||
-      configured.value.fanart.configured),
-)
+const anyProvider = computed(() => (configured.value?.available?.length ?? 0) > 0)
 
 async function saveTmdb() {
   if (!(await props.act(() => adminSetTmdb({ api_key: tmdb.value })))) return
@@ -207,7 +216,9 @@ async function apply(type: string) {
   try {
     if (!(await props.act(() => adminSetChain(type, { order: order(type) })))) return
     reset(type)
-    notify(`${type}: provider order applied — metadata re-merged.`)
+    notify(
+      `${type}: provider order applied — supplement order updated. Existing matches are unchanged.`,
+    )
     void reload()
   } finally {
     applying.value = null
@@ -217,79 +228,6 @@ async function apply(type: string) {
 async function run() {
   if (!(await props.act(() => adminEnrichRun()))) return
   void reload()
-}
-
-/// One season, dispatched: the run is DETACHED server-side, because a season
-/// is minutes of work and an answer held open that long dies with the first
-/// proxy timeout — which used to cancel the analysis itself. The wait below
-/// is only for the toast; closing the page abandons the toast, never the run.
-const detecting = ref(false)
-/// The poll stops when the page goes; the run does not.
-let left = false
-onBeforeUnmount(() => {
-  left = true
-})
-async function detect() {
-  detecting.value = true
-  try {
-    // `act` wraps the call for error toasts and answers only success; the
-    // dispatch answer has to be caught on the way through.
-    let answered: SegmentRunResponse | null = null
-    const started = await props.act(async () => {
-      answered = await adminSegmentsRun()
-    })
-    // The cast undoes TS's assumption that the closure never ran.
-    const dispatched = answered as SegmentRunResponse | null
-    if (!started || dispatched === null) return
-    // No season named means nothing was dispatched — the sweep (or another
-    // admin) drained the list under a stale button. Nothing will ever move
-    // the counter past the mark, so a poll here waited for ever.
-    if (dispatched.series == null) {
-      notify('Every season has been analysed.')
-      return
-    }
-    const mark = dispatched.follow
-    // Follow THIS run to the end: a completion toast at dispatch time would
-    // say "Season analysed" about a season that has only just been claimed,
-    // and the shared pass flags describe whichever pass finished last — with
-    // the sweep grinding beside the dispatched run, usually not this one.
-    // The dispatch answered with a mark; the run is done when the dispatched
-    // count passes it, and the dispatched_* flags then describe it alone.
-    // A status read that fails is one blip in a minutes-long poll and is
-    // retried, not thrown out of the loop with the toast lost.
-    for (;;) {
-      await new Promise((resolve) => setTimeout(resolve, 5000))
-      if (left) return
-      let answer
-      try {
-        answer = await adminSegmentsStatus()
-      } catch {
-        continue
-      }
-      // The counter lives in the hub's memory: a different boot answers
-      // for a restarted hub whose counter reset, so the mark is void.
-      // Compared by boot, not by `dispatched < mark`, which reads a reset
-      // 0 under a mark of 0 as "still running" for ever.
-      if (answer.boot !== dispatched.boot) {
-        notify('The hub restarted while the season was being analysed — the log has the story.')
-        return
-      }
-      if (answer.dispatched <= mark) continue
-      notify(
-        answer.dispatched_failed
-          ? 'The analysis failed — the hub log has the story.'
-          : answer.dispatched_awaiting_host
-            ? 'The machine holding these files is not answering; the sweep will retry.'
-            : answer.pending_seasons > 0
-              ? `Season analysed. ${answer.pending_seasons} still to go.`
-              : 'Every season has been analysed.',
-      )
-      return
-    }
-  } finally {
-    detecting.value = false
-    void client.invalidateQueries({ queryKey: ['admin', 'segments'] })
-  }
 }
 </script>
 
@@ -512,8 +450,9 @@ async function detect() {
         Matching order
       </h2>
       <p class="mb-3 max-w-[80ch] text-dim">
-        The first provider to supply a field owns it; the rest fill what it left empty. Applying
-        re-merges answers already on disk — instant, and no provider is contacted.
+        The selected record supplies metadata first. This order chooses future automatic matches and
+        fills missing fields from verified supplements. Applying re-merges answers already on disk —
+        instant, and no provider is contacted.
       </p>
       <div v-for="(_chain, type) in chains" :key="type" class="mb-3">
         <div class="mb-1 flex items-center gap-2">
@@ -563,35 +502,54 @@ async function detect() {
         {{ enrich.data.value.missed }} missed
       </span>
     </div>
-
-    <!-- Skip segments: the same shape as enrichment above — a background pass,
-         its progress, and a way to ask for the next unit of work now. -->
-    <div class="flex flex-wrap items-center gap-3">
-      <Btn
-        ghost
-        small
-        :disabled="detecting || (segments.data.value?.pending_seasons ?? 0) === 0"
-        @click="detect"
-      >
-        {{ detecting ? 'Analysing a season…' : 'Find skip points now' }}
-      </Btn>
-      <span
-        v-if="segments.data.value"
-        class="font-mono text-[12px]"
-        :class="segments.data.value.running ? 'text-teal' : 'text-dim'"
-      >
-        {{ segments.data.value.pending_seasons }} seasons to analyse ·
-        {{ segments.data.value.analyzed }} episodes done since the hub started
-      </span>
-      <!-- Only once the status has actually answered: before it loads (or
-           when it failed) the ?? 0 read as "all done" about a hub nobody
-           had heard from. -->
-      <span
-        v-if="segments.data.value && segments.data.value.pending_seasons === 0"
-        class="text-dim"
-      >
-        Nothing waiting: intros, recaps and credits are found in the background.
-      </span>
-    </div>
+    <section aria-labelledby="skip-points" class="rounded border border-line bg-surface p-3">
+      <h2 id="skip-points" class="mb-3 text-[14px] font-[600]">Skip points</h2>
+      <div class="flex flex-wrap items-center gap-3">
+        <Btn
+          ghost
+          small
+          :disabled="detecting || !canDetect || segments.isError.value"
+          @click="detect"
+        >
+          {{ detecting ? 'Requesting…' : 'Find skip points now' }}
+        </Btn>
+        <p class="text-dim">Mediahosts find intros, recaps and credits in the background.</p>
+      </div>
+      <p v-if="segments.isError.value" class="mt-2 text-warn">
+        Could not read skip-point status: {{ sentence(segments.error.value) }}
+        <Btn ghost small @click="segments.refetch()">Try again</Btn>
+      </p>
+      <p v-else-if="!segments.data.value" class="mt-2 text-dim">Loading skip-point status…</p>
+      <template v-else>
+        <p v-if="!segments.data.value.collections.length" class="mt-2 text-dim">
+          No series or anime collections.
+        </p>
+        <ul v-else class="mt-2 flex flex-col gap-1">
+          <li
+            v-for="collection in segments.data.value.collections"
+            :key="collection.collection_id"
+            class="break-words text-[13px]"
+          >
+            {{ collection.mediahost_name }}/{{ collection.name }} ·
+            <span v-if="!collection.connected" class="text-warn">offline</span>
+            <span v-else-if="collection.enabled === false" class="text-dim"
+              >detection disabled on this mediahost</span
+            >
+            <span v-else-if="collection.pending_sources == null" class="text-dim"
+              >waiting for mediahost status</span
+            >
+            <span v-else class="text-dim">
+              {{ collection.pending_sources }} sources awaiting analysis
+              <template v-if="collection.enabled == null">
+                · detection setting not reported</template
+              >
+            </span>
+          </li>
+        </ul>
+        <p v-if="segments.data.value.collections.length" class="mt-2 text-[12px] text-dim">
+          Last reported counts; sources may be waiting for more episodes to compare.
+        </p>
+      </template>
+    </section>
   </div>
 </template>

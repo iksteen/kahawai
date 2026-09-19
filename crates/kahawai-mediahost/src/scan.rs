@@ -78,6 +78,7 @@ pub(crate) async fn scan_local_collection(
     cfg: CollectionConfig,
     catalog: crate::catalog::Catalog,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    deep: bool,
     permit: crate::scheduler::JobPermit,
 ) -> Result<u64> {
     let generation = catalog.begin_scan(&cfg.name).await?;
@@ -123,9 +124,10 @@ pub(crate) async fn scan_local_collection(
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .into_owned();
-                        let physically_unchanged = !path
-                            .parent()
-                            .is_some_and(|parent| force_dirs.contains(parent))
+                        let physically_unchanged = !deep
+                            && !path
+                                .parent()
+                                .is_some_and(|parent| force_dirs.contains(parent))
                             && known
                                 .get(&(batch_root_token.clone(), rel.clone()))
                                 .is_some_and(|old| {
@@ -277,6 +279,7 @@ pub(crate) async fn scan_collection(
     tx: Sender<HostToHub>,
     mut manifest: tokio::sync::mpsc::Receiver<kahawai_proto::v1::Manifest>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    deep: bool,
     sync_version: u64,
     admission: ScanAdmission,
 ) -> Result<ScanOutcome> {
@@ -419,7 +422,8 @@ pub(crate) async fn scan_collection(
                                 .unwrap_or(&path)
                                 .to_string_lossy()
                                 .into_owned();
-                            let unchanged = !path.parent().is_some_and(|p| force2.contains(p))
+                            let unchanged = !deep
+                                && !path.parent().is_some_and(|p| force2.contains(p))
                                 && known2.get(&(root_token2.clone(), rel.clone())).is_some_and(
                                     |(size, mtime, sidecars)| {
                                         let stat_matches =
@@ -1044,9 +1048,10 @@ id: nl, index: 1
             )
             .await
             .unwrap();
-        let current = scan_local_collection(cfg, catalog.clone(), Default::default(), permit)
-            .await
-            .unwrap();
+        let current =
+            scan_local_collection(cfg, catalog.clone(), Default::default(), false, permit)
+                .await
+                .unwrap();
 
         assert_eq!(
             current, original_version,
@@ -1135,9 +1140,17 @@ id: nl, index: 1
 
         let admission = scan_admission(&cfg);
         assert_eq!(
-            scan_collection(cfg, tx, manifest_rx, Default::default(), 1, admission,)
-                .await
-                .unwrap(),
+            scan_collection(
+                cfg,
+                tx,
+                manifest_rx,
+                Default::default(),
+                false,
+                1,
+                admission,
+            )
+            .await
+            .unwrap(),
             ScanOutcome::Completed
         );
         let mut sources = Vec::new();
@@ -1195,9 +1208,17 @@ id: nl, index: 1
 
         let admission = scan_admission(&cfg);
         assert_eq!(
-            scan_collection(cfg, tx, manifest_rx, Default::default(), 9, admission,)
-                .await
-                .unwrap(),
+            scan_collection(
+                cfg,
+                tx,
+                manifest_rx,
+                Default::default(),
+                false,
+                9,
+                admission,
+            )
+            .await
+            .unwrap(),
             ScanOutcome::Completed
         );
         let mut unavailable = false;

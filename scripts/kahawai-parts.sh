@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Verify the multi-part (CD1/CD2) hand-off against a live hub.
 #
-#   kahawai-parts.sh [-a host:port] <username> <password> <item-id>
+#   kahawai-parts.sh -l library [-a host:port] <username> <password> <item-id>
 #
+#   -l library    mediadb library ID (required)
+#   -e entry      pin a stable media entry ID (optional)
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
 #   password "-"  prompt for it instead of passing on the command line
 #   item-id       a movie whose source is split across parts
@@ -15,16 +17,20 @@
 set -euo pipefail
 
 API="${KAHAWAI_API:-localhost:8420}"
+LIBRARY="" ENTRY=""
 
-while getopts "a:h" opt; do
+while getopts "l:e:a:h" opt; do
     case $opt in
+        l) LIBRARY="$OPTARG" ;;
+        e) ENTRY="$OPTARG" ;;
         a) API="$OPTARG" ;;
         h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -8; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
 
-[ $# -ge 3 ] || { echo "usage: $(basename "$0") [-a host:port] <username> <password> <item-id>" >&2; exit 2; }
+[ $# -ge 3 ] || { echo "usage: $(basename "$0") -l library [-a host:port] <username> <password> <item-id>" >&2; exit 2; }
+[ -n "$LIBRARY" ] || { echo "-l library is required" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2 ITEM=$3
 
 if [ "$PASSWORD" = "-" ]; then
@@ -40,7 +46,7 @@ auth=(-H "Authorization: Bearer $TOKEN" -H content-type:application/json)
 
 # Multi-part sources are refused in direct mode, so ask for remux.
 session=$(curl -sf "${auth[@]}" -X POST "http://$API/api/v1/playback/sessions" \
-    -d "{\"item_id\":\"$ITEM\",\"mode\":\"remux\"}")
+    -d "$(python3 -c 'import json,sys;print(json.dumps(dict(library_id=sys.argv[1],item_id=sys.argv[2],media_entry_id=sys.argv[3] or None,mode="remux",resume=False)))' "$LIBRARY" "$ITEM" "$ENTRY")")
 read -r SID PARTS DURATION <<<"$(python3 -c '
 import json, sys
 s = json.load(sys.stdin)

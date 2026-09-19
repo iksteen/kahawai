@@ -3,7 +3,11 @@ use kahawai_hub::registry::{FileUpsertRecord, Registry, SourcePath};
 
 async fn fixture() -> (kahawai_hub::library::Database, Registry, i64, String) {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("m", "mediahost", "m", "fp")
         .await

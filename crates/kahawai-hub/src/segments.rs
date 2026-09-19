@@ -1899,7 +1899,7 @@ mod tests {
     #[tokio::test]
     async fn chapter_hint_requires_normalized_names_for_every_episode() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             r#"
             INSERT INTO collections(module_id,collection_id,media_type)
@@ -1954,7 +1954,11 @@ mod tests {
             .execute(&db)
             .await
             .unwrap();
-        let registry = Registry::new(db.clone(), Default::default());
+        let registry = Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         assert_eq!(registry.backfill_chapter_segments().await.unwrap(), 2);
 
         let pending = pending_seasons(&db).await.unwrap();
@@ -2021,7 +2025,7 @@ mod tests {
     #[tokio::test]
     async fn names_do_not_erase_what_they_never_mentioned() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2031,7 +2035,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         let identity = std::collections::HashMap::from([("e1".to_string(), Some(1000i64))]);
 
@@ -2081,7 +2089,7 @@ mod tests {
     #[tokio::test]
     async fn a_vanished_episode_does_not_take_the_season_with_it() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2091,7 +2099,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         let identity = std::collections::HashMap::from([("e1".to_string(), Some(1000i64))]);
 
@@ -2131,7 +2143,7 @@ mod tests {
     #[tokio::test]
     async fn a_renaming_replaces_what_the_names_once_said() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2141,7 +2153,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         let identity = std::collections::HashMap::from([("e1".to_string(), Some(1000i64))]);
 
@@ -2196,7 +2212,7 @@ mod tests {
     #[tokio::test]
     async fn half_an_answer_keeps_the_question_open() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2206,7 +2222,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         let identity = std::collections::HashMap::from([("e1".to_string(), Some(1000i64))]);
 
@@ -2352,7 +2372,7 @@ mod tests {
     #[tokio::test]
     async fn a_result_for_a_replaced_or_multipart_source_is_dropped_at_commit() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2373,7 +2393,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         let identity = std::collections::HashMap::from([("e1".to_string(), Some(1))]);
         let revisions = std::collections::HashMap::from([(
@@ -2454,7 +2478,7 @@ mod tests {
             part: crate::sessions::PartSource {
                 head_xxh3: 0,
                 tail_xxh3: 0,
-                file_id: 0,
+                file_id: crate::sessions::FileId::Legacy(0),
                 module_id: module.into(),
                 collection_id: "shows".into(),
                 root_token: "root".into(),
@@ -2508,7 +2532,7 @@ mod tests {
     #[tokio::test]
     async fn unreadable_episode_is_terminal_only_for_its_exact_revision() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2536,7 +2560,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let detector = Detector::new();
         sqlx::query(
             "INSERT INTO media_segments(item_id,kind,start_ms,end_ms,source)
@@ -2692,7 +2720,7 @@ mod tests {
         let part = |path_rel: &str, size: u64| crate::sessions::PartSource {
             head_xxh3: 0,
             tail_xxh3: 0,
-            file_id: 0,
+            file_id: crate::sessions::FileId::Legacy(0),
             module_id: "m".into(),
             collection_id: "c".into(),
             root_token: "r".into(),
@@ -2893,7 +2921,7 @@ mod tests {
     #[tokio::test]
     async fn protocol_milliseconds_are_stored_exactly() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2903,7 +2931,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         Detector::new()
             .store(
                 &registry,
@@ -2953,7 +2985,7 @@ mod tests {
     #[tokio::test]
     async fn catalog_tombstone_only_removes_the_source_that_owns_the_result() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         sqlx::raw_sql(
             "INSERT INTO collections(module_id,collection_id,media_type)
                VALUES('m','c','series');
@@ -2968,7 +3000,11 @@ mod tests {
         .execute(&db)
         .await
         .unwrap();
-        let registry = Registry::new(db, Default::default());
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
 
         remove_catalog_result(
             &registry,

@@ -380,3 +380,118 @@ async fn concurrent_imports_share_one_identity_and_replay_keeps_it() {
         first.library_item_id
     );
 }
+
+#[tokio::test]
+async fn viewer_pages_count_identities_filter_sort_and_respect_membership() {
+    let (_dir, s) = store().await;
+    let a = collection(
+        &s,
+        "a",
+        MediaType::Movies,
+        &["Dark.City.1998.mkv", "The.Matrix.1999.mkv"],
+    )
+    .await;
+    let b = collection(
+        &s,
+        "b",
+        MediaType::Movies,
+        &["Dark.City.1998.mkv", "Alien.1979.mkv"],
+    )
+    .await;
+    let library = s
+        .create_library("Films", MediaType::Movies, &[a.clone(), b])
+        .await
+        .unwrap();
+    let (page, total) = s
+        .browse_page(&library, 1, 1, "", "-year", None)
+        .await
+        .unwrap();
+    assert_eq!(total, 3); // Two Dark City copies occupy one grid position.
+    assert_eq!(page.len(), 1);
+    assert_eq!(page[0].year, Some(1998));
+    assert_eq!(page[0].copy_ids.len(), 2);
+    let (page, total) = s
+        .browse_page(&library, 0, 10, "CITY", "title", None)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(page.len(), 1);
+    assert_eq!(
+        s.browse_page(&library, 99, 10, "", "title", None)
+            .await
+            .unwrap()
+            .1,
+        3
+    );
+    s.set_library_collections(&library, &[a]).await.unwrap();
+    let (page, total) = s
+        .browse_page(&library, 0, 10, "", "title", None)
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_eq!(page[0].copy_ids.len(), 1);
+    assert!(
+        s.browse_page(&library, 0, 10, "", "title; DROP TABLE libraries", None)
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn artist_pages_keep_album_copies_separate_and_library_scoped() {
+    let (_dir, s) = store().await;
+    let mut collections = Vec::new();
+    for remote in ["a", "b"] {
+        let (collection, _) = s
+            .offer_collection("host", &offer(remote, MediaType::Music, 1))
+            .await
+            .unwrap();
+        s.apply_catalogue(
+            "host",
+            &delta(
+                remote,
+                true,
+                true,
+                1,
+                vec![file_media(1, "Album/01.flac", tagged("Album", 1, 1))],
+            ),
+        )
+        .await
+        .unwrap();
+        collections.push(collection);
+    }
+    let library = s
+        .create_library("Music", MediaType::Music, &collections)
+        .await
+        .unwrap();
+    let (artists, total) = s
+        .browse_artists(&library, 0, 10, "album", false)
+        .await
+        .unwrap();
+    assert_eq!(total, 1);
+    assert_eq!(artists, vec![("Album Artist".into(), 2)]);
+    let (albums, total) = s
+        .browse_page(&library, 0, 10, "", "year", Some("Album Artist"))
+        .await
+        .unwrap();
+    assert_eq!(total, 2);
+    assert_ne!(albums[0].id, albums[1].id);
+    s.set_library_collections(&library, &collections[..1])
+        .await
+        .unwrap();
+    assert_eq!(
+        s.browse_artists(&library, 0, 10, "", true).await.unwrap().0[0].1,
+        1
+    );
+    assert_eq!(
+        s.browse_artists(&library, 1, 10, "", false).await.unwrap(),
+        (vec![], 1)
+    );
+    assert_eq!(
+        s.browse_artists(&library, 0, 10, "absent", false)
+            .await
+            .unwrap()
+            .1,
+        0
+    );
+}

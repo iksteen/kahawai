@@ -1,5 +1,7 @@
 #!/usr/bin/env python3
-"""One-shot migration-56 -> collection-scoped migration-53 logical replay.
+"""Historical legacy-hub recovery tool, not a mediadb importer.
+
+One-shot migration-56 -> collection-scoped migration-53 logical replay.
 
 The exporter is read-only. It derives collection identity only from exact
 physical-source projections, consolidates temporary library presentations, and

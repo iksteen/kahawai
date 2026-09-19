@@ -5,14 +5,11 @@
 //!
 //! ## Watch-state meaning
 //!
-//! `user_item_state.played` is the boolean answer from the latest non-zero
-//! progress report (or an explicit watched mark), not a historical high-water
-//! mark. A zero report changes neither it nor `updated_at`, because zero is also
-//! emitted by an untouched player and a gapless preload. `play_count` is the
-//! monotonic history: an explicit mark increments it on a false-to-true change,
-//! while playback increments it once at session teardown only when that
-//! session crossed and ultimately stopped beyond the finish threshold.
+//! Catalogue user-state semantics live in [`crate::watch`]. Legacy playback
+//! retains boolean completion and resume positions, without a seen counter.
 
+mod catalogue;
+mod enrichment;
 mod library_api;
 use library_api::item_body;
 
@@ -112,6 +109,9 @@ pub struct NetOptions {
 #[openapi(
     version = "3.2.0",
     paths(
+        catalogue::feeds::catalogue_continue, catalogue::feeds::catalogue_up_next,
+        catalogue::collections, catalogue::libraries, catalogue::create_library, catalogue::refresh_library,
+        catalogue::set_collections, catalogue::delete_library, catalogue::items, catalogue::item, catalogue::playback::catalogue_playback, catalogue::playback::catalogue_next, catalogue::playback::session_fonts, catalogue::playback::session_font, catalogue::playback::session_subtitle, catalogue::catalogue_children, catalogue::catalogue_set_watched, catalogue::catalogue_artists, catalogue::catalogue_artwork, catalogue::catalogue_artist_artwork,
         health,
         metrics,
         bootstrap,
@@ -140,6 +140,9 @@ pub struct NetOptions {
         item_font,
         get_prefs,
         put_pref,
+        catalogue::subtitles::catalogue_subtitle_search,
+        catalogue::subtitles::catalogue_subtitle_download,
+        catalogue::subtitles::catalogue_subtitle_delete,
         account_opensubtitles,
         set_account_opensubtitles,
         delete_account_opensubtitles,
@@ -176,6 +179,14 @@ pub struct NetOptions {
         admin_verify_anidb,
         admin_enrich_status,
         admin_enrich_run,
+        enrichment::enrichment_items,
+        enrichment::enrichment_detail,
+        enrichment::enrichment_correct,
+        enrichment::enrichment_search,
+        enrichment::enrichment_progress,
+        enrichment::enrichment_artwork,
+        enrichment::enrichment_identities,
+        enrichment::enrichment_artist_artwork,
         admin_refresh_library,
         admin_review_list,
         admin_review_search,
@@ -251,7 +262,27 @@ pub fn openapi_document() -> utoipa::openapi::OpenApi {
     // accept the verb. Generate the operation through its POST arm, then
     // move it to the correct 3.2 Path Item field.
     item.query = item.post.take();
-    for item in openapi.paths.paths.values_mut() {
+    for (path, item) in &mut openapi.paths.paths {
+        let retired = [
+            "/api/v1/items",
+            "/api/v1/collections",
+            "/api/v1/libraries",
+            "/api/v1/artists",
+            "/api/v1/up-next",
+            "/api/v1/subtitles",
+            "/api/v1/candidate-artwork",
+            "/admin/v1/libraries",
+            "/admin/v1/collections",
+            "/admin/v1/collection-items",
+            "/admin/v1/library-items",
+            "/admin/v1/items/{id}/match",
+        ]
+        .iter()
+        .any(|prefix| path == prefix || path.starts_with(&format!("{prefix}/")))
+            || matches!(
+                path.as_str(),
+                "/admin/v1/enrich/review" | "/admin/v1/enrich/search"
+            );
         for operation in [
             item.get.as_mut(),
             item.put.as_mut(),
@@ -266,6 +297,12 @@ pub fn openapi_document() -> utoipa::openapi::OpenApi {
         .into_iter()
         .flatten()
         {
+            if retired {
+                operation.description = Some("Unavailable in the mediadb ingestion milestone: authenticated requests return 501 feature_unavailable. Success schemas document the retained consumer contract for its later port.".into());
+                operation.responses.responses.insert("501".into(), utoipa::openapi::response::ResponseBuilder::new()
+                    .description("feature_unavailable: this consumer has not been integrated with mediadb")
+                    .build().into());
+            }
             document_request_id_header(operation);
         }
         for operation in item.additional_operations.values_mut() {
@@ -306,12 +343,177 @@ pub fn router(
     segments: Arc<crate::segments::Detector>,
     net: NetOptions,
 ) -> Router {
+    sessions.attach_registry(registry.clone());
+    enricher.attach_sessions(sessions.clone());
+    enricher.attach_artwork(&artwork);
+    enricher.start_catalogue(registry.clone());
     let cors = cors_layer(&net.cors_origins);
     let web_dir = net.web_dir;
-    // Teardown work needs the registry: the session-ended event, and the
-    // play a finished watch earns when it stops. Attached here so every
-    // embedding of this router has it and not the hub binary alone — an
-    // uncounted play is invisible until someone adds up a year of them.
+    let state = AppState {
+        registry,
+        auth,
+        sessions,
+        enrollments,
+        subtitles,
+        artwork,
+        enricher,
+        segments,
+        proxy_trust: net.proxy_trust,
+        metrics_token: Arc::new(net.metrics_token),
+        setup_url: Arc::new(net.setup_url),
+        public_origin: net.public_origin,
+    };
+    let mut bearer = Router::new()
+        .route("/api/v1/auth/logout", post(logout))
+        .route("/api/v1/prefs", get(get_prefs).put(put_pref))
+        .route(
+            "/api/v1/account/opensubtitles",
+            get(account_opensubtitles)
+                .post(set_account_opensubtitles)
+                .delete(delete_account_opensubtitles),
+        )
+        .route("/api/v1/events", get(events));
+    for path in [
+        "/api/v1/items",
+        "/api/v1/items/{*rest}",
+        "/api/v1/collections",
+        "/api/v1/libraries",
+        "/api/v1/artists",
+        "/api/v1/artists/{*rest}",
+        "/api/v1/up-next",
+        "/api/v1/subtitles/{*rest}",
+        "/api/v1/candidate-artwork",
+    ] {
+        bearer = bearer.route(path, axum::routing::any(catalogue_unavailable));
+    }
+    let bearer = bearer.route_layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        require_bearer,
+    ));
+    let mut admin = Router::new()
+        .route("/admin/v1/enrollments", get(admin_enrollments))
+        .route("/admin/v1/sessions", get(admin_sessions))
+        .route(
+            "/admin/v1/sessions/{id}",
+            axum::routing::delete(admin_end_session),
+        )
+        .route("/admin/v1/sessions/{id}/log", get(admin_session_log))
+        .route("/admin/v1/items/{id}/log", get(admin_item_log))
+        .route("/admin/v1/enrollments/approve", post(admin_approve))
+        .route("/admin/v1/satellites", get(admin_satellites))
+        .route(
+            "/admin/v1/satellites/{id}",
+            axum::routing::delete(admin_delete_satellite),
+        )
+        .route(
+            "/admin/v1/satellites/{id}/disabled",
+            post(admin_set_disabled),
+        )
+        .route("/admin/v1/users", get(admin_users).post(admin_create_user))
+        .route(
+            "/admin/v1/users/{id}",
+            axum::routing::delete(admin_delete_user),
+        )
+        .route(
+            "/admin/v1/users/{id}/libraries",
+            axum::routing::put(catalogue::set_user_libraries),
+        )
+        .route(
+            "/admin/v1/users/{id}/admin",
+            axum::routing::put(admin_set_user_admin),
+        );
+    admin = admin
+        .merge(enrichment::routes())
+        .route(
+            "/admin/v1/segments",
+            get(admin_segments_status).post(admin_segments_run),
+        )
+        .route("/admin/v1/providers", get(admin_providers))
+        .route(
+            "/admin/v1/providers/chains/{media_type}",
+            post(admin_set_chain),
+        )
+        .route("/admin/v1/providers/tmdb", post(admin_set_tmdb))
+        .route("/admin/v1/providers/tvdb", post(admin_set_tvdb))
+        .route("/admin/v1/providers/anidb", post(admin_set_anidb))
+        .route("/admin/v1/providers/anidb/verify", post(admin_verify_anidb))
+        .route("/admin/v1/providers/fanart", post(admin_set_fanart))
+        .route("/admin/v1/providers/theaudiodb", post(admin_set_theaudiodb))
+        .route(
+            "/admin/v1/providers/{provider}/credentials",
+            axum::routing::delete(admin_disconnect_provider),
+        )
+        .route(
+            "/admin/v1/enrich",
+            get(admin_enrich_status).post(admin_enrich_run),
+        );
+    for path in [
+        "/admin/v1/enrich/review",
+        "/admin/v1/enrich/search",
+        "/admin/v1/libraries",
+        "/admin/v1/libraries/{*rest}",
+        "/admin/v1/collections",
+        "/admin/v1/collection-items/{*rest}",
+        "/admin/v1/library-items/{*rest}",
+        "/admin/v1/items/{id}/match",
+    ] {
+        admin = admin.route(path, axum::routing::any(catalogue_unavailable));
+    }
+    let admin = admin
+        .route_layer(axum::middleware::from_fn(require_admin))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_bearer,
+        ));
+    let mut app = Router::new()
+        .merge(bearer)
+        .merge(admin)
+        .merge(catalogue::playback_routes(&state))
+        .merge(catalogue::routes(&state))
+        .merge(enrichment::artwork_routes(&state))
+        .route("/health", get(health))
+        .route("/metrics", get(metrics))
+        .route("/api/v1/bootstrap", get(bootstrap))
+        .route("/api/v1/auth/token", post(login))
+        .route("/api/v1/auth/refresh", post(refresh))
+        .with_state(state)
+        .merge(Router::from(
+            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", openapi_document()),
+        ))
+        .merge(crate::web::router(web_dir))
+        .fallback(unknown_route)
+        .method_not_allowed_fallback(wrong_method);
+    if let Some(cors) = cors {
+        app = app.layer(cors);
+    }
+    app.layer(axum::middleware::from_fn(crate::error::request_context))
+}
+
+async fn catalogue_unavailable() -> ApiError {
+    ApiError::new(
+        ErrorCode::FeatureUnavailable,
+        "this feature is unavailable during catalogue integration",
+    )
+}
+
+/// Isolated regression fixture for consumers awaiting their mediadb port.
+/// The running hub never routes requests through this implementation.
+#[doc(hidden)]
+#[allow(clippy::too_many_arguments)]
+pub fn legacy_router_fixture(
+    registry: Arc<Registry>,
+    auth: Arc<Auth>,
+    sessions: Arc<crate::sessions::Sessions>,
+    enrollments: Arc<crate::enrollment_service::EnrollmentService>,
+    subtitles: Arc<crate::subtitles::Subtitles>,
+    artwork: Arc<crate::artwork::Artwork>,
+    enricher: Arc<crate::enrich::Enricher>,
+    segments: Arc<crate::segments::Detector>,
+    net: NetOptions,
+) -> Router {
+    let cors = cors_layer(&net.cors_origins);
+    let web_dir = net.web_dir;
+    // Teardown uses the registry to release satellite sessions and emit events.
     sessions.attach_registry(registry.clone());
     let state = AppState {
         registry,
@@ -470,6 +672,10 @@ pub fn router(
             "/admin/v1/users/{id}/admin",
             axum::routing::put(admin_set_user_admin),
         )
+        .route(
+            "/admin/v1/segments",
+            get(admin_segments_status).post(admin_segments_run),
+        )
         .route("/admin/v1/providers", get(admin_providers))
         .route(
             "/admin/v1/providers/chains/{media_type}",
@@ -511,10 +717,6 @@ pub fn router(
         )
         // OPS-10: one session's diagnostics as a downloadable bundle,
         // and the newest bundle for an item (whoever played it).
-        .route(
-            "/admin/v1/segments",
-            get(admin_segments_status).post(admin_segments_run),
-        )
         .route("/admin/v1/sessions/{id}/log", get(admin_session_log))
         .route("/admin/v1/items/{id}/log", get(admin_item_log))
         .route_layer(axum::middleware::from_fn(require_admin))
@@ -710,6 +912,8 @@ struct ProvidersResponse {
     fanart: ProviderConfiguration,
     theaudiodb: TheAudioDbConfiguration,
     chains: std::collections::BTreeMap<String, ProviderChain>,
+    #[serde(default)]
+    available: Vec<String>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -945,6 +1149,9 @@ struct PlaybackStreams {
 
 #[derive(Serialize, ToSchema)]
 struct StartSessionResponse {
+    /// Skip markers on this session's captured physical timeline.
+    segments: Vec<crate::segments::Segment>,
+    media_entry_id: Option<String>,
     session_id: String,
     /// Start accepted for this physical version. Clients must use this offset.
     effective_start_ms: u64,
@@ -990,30 +1197,27 @@ struct FontsResponse {
 }
 
 #[derive(Serialize, ToSchema)]
+struct SegmentCollectionStatus {
+    collection_id: String,
+    mediahost_id: String,
+    mediahost_name: String,
+    name: String,
+    connected: bool,
+    /// Last reported source count; absence is unknown, never zero.
+    pending_sources: Option<u64>,
+    enabled: Option<bool>,
+}
+
+#[derive(Serialize, ToSchema)]
 struct SegmentStatusResponse {
-    #[serde(flatten)]
-    status: crate::segments::Status,
-    /// The first 50 pending seasons, in sweep order; `pending_seasons` in
-    /// the status is the FULL count, so the two disagreeing means the list
-    /// is truncated, not that the hub lost track.
-    seasons: Vec<crate::segments::PendingSeason>,
+    collections: Vec<SegmentCollectionStatus>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct SegmentRunResponse {
-    /// Kept for response compatibility; protocol 4 never names a season here
-    /// because each mediahost selects cohorts from its own catalogue.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    series: Option<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    season: Option<i64>,
-    /// Completed wake attempts before this one. Poll status until its
-    /// `dispatched` count passes this mark; discovery completion itself is
-    /// reported by mediahost catalogue status and projected segment facts.
-    follow: usize,
-    /// The hub process the mark belongs to. A status whose `boot` differs
-    /// answers for a restarted hub whose counter reset; the mark is void.
-    boot: u64,
+    /// Mediahost wake messages accepted, not completed analysis jobs.
+    asked: usize,
+    unavailable: usize,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1074,7 +1278,6 @@ struct ChildrenResponse {
 struct ProgressResponse {
     position_ms: u64,
     played: bool,
-    play_count: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1082,7 +1285,6 @@ struct WatchUpdate {
     item_id: String,
     position_ms: u64,
     played: bool,
-    play_count: i64,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -1396,13 +1598,30 @@ async fn require_session_owner(
     next: Next,
 ) -> Result<Response, ApiError> {
     let id = params.get("id").map(String::as_str).unwrap_or_default();
-    let owned = state
+    let session = state
         .sessions
         .get(id)
-        .is_some_and(|session| session.user_id == claims.sub);
-    if !owned {
-        tracing::debug!(user = %claims.username, session = %id, "session hidden by ownership");
-        return Err(hidden("session"));
+        .filter(|session| session.user_id == claims.sub)
+        .ok_or_else(|| hidden("session"))?;
+    if let Some(captured) = &session.catalogue {
+        let granted =
+            crate::grants::can_see_library(state.registry.db(), &claims, &captured.library_id)
+                .await
+                .map_err(internal)?;
+        let member = if let Some(part) = session.parts.first() {
+            state
+                .registry
+                .catalogue()
+                .library_contains_source(&captured.library_id, &part.module_id, &part.collection_id)
+                .await
+                .map_err(internal)?
+        } else {
+            false
+        };
+        if !granted || !member {
+            state.sessions.end(id).await;
+            return Err(hidden("session"));
+        }
     }
     Ok(next.run(req).await)
 }
@@ -1586,11 +1805,31 @@ async fn admin_providers(
         chains.insert(
             media_type.to_string(),
             ProviderChain {
-                order: crate::providers::chain_in_force(db, media_type).await,
-                default: crate::providers::chain_for(media_type)
-                    .iter()
-                    .map(|provider| (*provider).to_string())
-                    .collect(),
+                order: if state.enricher.catalogue_active() {
+                    state
+                        .registry
+                        .catalogue()
+                        .provider_order(
+                            kahawai_mediadb::MediaType::parse(media_type).map_err(internal)?,
+                        )
+                        .await
+                        .map_err(internal)?
+                } else {
+                    crate::providers::chain_in_force(db, media_type).await
+                },
+                default: if state.enricher.catalogue_active() && media_type == "anime" {
+                    vec![
+                        "anidb".into(),
+                        "anilist".into(),
+                        "tmdb".into(),
+                        "tvdb".into(),
+                    ]
+                } else {
+                    crate::providers::chain_for(media_type)
+                        .iter()
+                        .map(|p| (*p).to_owned())
+                        .collect()
+                },
             },
         );
     }
@@ -1602,6 +1841,20 @@ async fn admin_providers(
         theaudiodb: TheAudioDbConfiguration {
             premium_key_configured: theaudiodb,
         },
+        available: [
+            Some("local"),
+            Some("anilist"),
+            Some("musicbrainz"),
+            Some("theaudiodb"),
+            tmdb.then_some("tmdb"),
+            tvdb.then_some("tvdb"),
+            anidb.then_some("anidb"),
+            fanart.then_some("fanart"),
+        ]
+        .into_iter()
+        .flatten()
+        .map(str::to_owned)
+        .collect(),
         chains,
     }))
 }
@@ -1638,6 +1891,32 @@ async fn admin_set_chain(
     ApiPath(media_type): ApiPath<String>,
     ApiJson(body): ApiJson<SetChain>,
 ) -> Result<Json<OkResponse>, ApiError> {
+    if state.enricher.catalogue_active() {
+        let kind = kahawai_mediadb::MediaType::parse(&media_type)
+            .map_err(|_| ApiError::new(ErrorCode::BadRequest, "unknown media type"))?;
+        let mut expected = state
+            .registry
+            .catalogue()
+            .provider_order(kind)
+            .await
+            .map_err(internal)?;
+        let mut actual = body.order.clone();
+        expected.sort();
+        actual.sort();
+        if expected != actual {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "order must contain each provider exactly once",
+            ));
+        }
+        state
+            .registry
+            .catalogue()
+            .set_provider_order(kind, &body.order)
+            .await
+            .map_err(internal)?;
+        return Ok(Json(OkResponse { ok: true }));
+    }
     crate::providers::set_chain(state.registry.db(), &media_type, &body.order)
         .await
         .map_err(
@@ -1757,9 +2036,12 @@ async fn resource_track(
             crate::tracks::get_for_item(state.registry.db(), &session.collection_item_id, track_id)
                 .await
                 .map_err(internal)?
-            && track
-                .source_id
-                .is_none_or(|file| session.parts.iter().any(|p| p.file_id == file))
+            && track.source_id.is_none_or(|file| {
+                session
+                    .parts
+                    .iter()
+                    .any(|p| p.file_id == crate::sessions::FileId::Legacy(file))
+            })
         {
             return Ok(track);
         }
@@ -1788,7 +2070,7 @@ async fn resource_source_copy(
         let bound: bool = sqlx::query_scalar(
             "SELECT EXISTS(SELECT 1 FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id
                 WHERE ps.id=? AND ps.item_id=? AND p.ordinal=1 AND p.file_id=?)",
-        ).bind(session.playable_source_id).bind(&session.collection_item_id).bind(part.file_id)
+        ).bind(session.playable_source_id).bind(&session.collection_item_id).bind(part.file_id.legacy().map_err(internal)?)
             .fetch_one(state.registry.db()).await.map_err(internal)?;
         if bound {
             return Ok((
@@ -2447,8 +2729,21 @@ async fn admin_disconnect_provider(
         (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
     )
 )]
-async fn admin_enrich_status(State(state): State<AppState>) -> Json<crate::enrich::EnrichStatus> {
-    Json(state.enricher.status())
+async fn admin_enrich_status(
+    State(state): State<AppState>,
+) -> Result<Json<crate::enrich::EnrichStatus>, ApiError> {
+    if state.enricher.catalogue_active() {
+        let store = state.registry.catalogue();
+        let rows = store.enrichment_status().await.map_err(internal)?;
+        let (matched, weak, missed) = store.enrichment_counts().await.map_err(internal)?;
+        return Ok(Json(crate::enrich::EnrichStatus {
+            running: rows.iter().any(|r| r.state == "running"),
+            matched: matched as usize,
+            weak: weak as usize,
+            missed: missed as usize,
+        }));
+    }
+    Ok(Json(state.enricher.status()))
 }
 
 /// Start an enrichment run
@@ -2519,34 +2814,19 @@ async fn admin_refresh_library(
     }
     let (mut asked, mut offline) = (0usize, 0usize);
     for (module_id, collection_id) in members {
-        // ?deep=true: re-probe every file, stat-unchanged or not — how
-        // rows probed by an older binary pick up new stream facts.
-        if q.deep.unwrap_or(false) {
-            state.registry.mark_deep_rescan(&module_id, &collection_id);
-        }
-        if request_scan(&state, &module_id, &collection_id).await {
+        if matches!(
+            state
+                .registry
+                .rescan_collection(&module_id, &collection_id, q.deep.unwrap_or(false))
+                .await,
+            crate::registry::RescanResult::Requested
+        ) {
             asked += 1;
         } else {
             offline += 1;
         }
     }
     Ok(Json(RefreshResponse { asked, offline }))
-}
-
-/// Send one collection-scoped scan request (MH-2); the mediahost's
-/// trigger sink coalesces with any running scan.
-async fn request_scan(state: &AppState, module_id: &str, collection_id: &str) -> bool {
-    if !state.registry.is_connected(module_id) {
-        return false;
-    }
-    let msg = kahawai_proto::v1::HubToHost {
-        msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
-            kahawai_proto::v1::RescanRequest {
-                collection_id: collection_id.to_string(),
-            },
-        )),
-    };
-    state.registry.send_to_host(module_id, msg).await.is_ok()
 }
 
 /// List items needing match review
@@ -3178,7 +3458,7 @@ fn retire_deleted_segment_link(
 /// Remove a satellite
 ///
 /// Admin only. Removes the satellite from the allowlist, ends its sessions
-/// and deletes orphaned subtitle payloads. Returns 409 for the in-process
+/// and removes its mediadb catalogue. Legacy payloads remain untouched. Returns 409 for the in-process
 /// mediahost and 404 for an unknown id.
 
 #[utoipa::path(
@@ -3222,11 +3502,8 @@ async fn admin_delete_satellite(
         // diverge.
         .map_err(|e| refusal_or_internal(ErrorCode::NotFound, "no such satellite", e))?;
     retire_deleted_segment_link(&state.segments, &id, deleted.mediahost_link_generation);
-    let removed_payloads = state
-        .subtitles
-        .clean_orphaned_payloads(&state.registry)
-        .await
-        .map_err(internal)?;
+    // Old subtitle/cache state remains untouched until its consumer is ported.
+    let removed_payloads = 0;
     Ok(Json(DeletedSatelliteResponse {
         deleted: id,
         removed: deleted.fingerprint,
@@ -3547,11 +3824,21 @@ async fn admin_sessions(
 ) -> Result<Json<AdminSessionsResponse>, ApiError> {
     let mut sessions = Vec::new();
     for session in state.sessions.list() {
-        let title = sqlx::query_scalar("SELECT title FROM library_items WHERE id = ?")
-            .bind(&session.item_id)
-            .fetch_optional(state.registry.db())
-            .await
-            .map_err(internal)?;
+        let title = if let Some(captured) = &session.catalogue {
+            state
+                .registry
+                .catalogue()
+                .library_item_record(&captured.parent_id)
+                .await
+                .ok()
+                .map(|i| i.title)
+        } else {
+            sqlx::query_scalar("SELECT title FROM library_items WHERE id=?")
+                .bind(&session.item_id)
+                .fetch_optional(state.registry.db())
+                .await
+                .map_err(internal)?
+        };
         let username = sqlx::query_scalar("SELECT username FROM users WHERE id = ?")
             .bind(&session.user_id)
             .fetch_optional(state.registry.db())
@@ -3634,7 +3921,7 @@ async fn admin_session_log(
 /// Download newest session log for an item
 ///
 /// Admin only. Returns the most recent session diagnostics recorded for the
-/// item or any permanent alias, by any user, as a plain-text attachment.
+/// stable mediadb item (including its episodes/tracks), by any user, as a plain-text attachment.
 /// Returns 404 when no such log has been stored.
 #[utoipa::path(
     get, path = "/admin/v1/items/{id}/log", tag = "Admin sessions",
@@ -3659,19 +3946,7 @@ async fn admin_item_log(
         .sessions
         .data_dir()
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no data dir"))?;
-    let canonical = crate::library::resolve_id(state.registry.db(), &id)
-        .await
-        .map_err(internal)?;
-    let family: Vec<String> = sqlx::query_scalar(
-        "WITH RECURSIVE family(id) AS (
-        SELECT ? UNION SELECT l.id FROM library_items l JOIN family f ON l.merged_into=f.id
-      ) SELECT id FROM family",
-    )
-    .bind(&canonical)
-    .fetch_all(state.registry.db())
-    .await
-    .map_err(internal)?;
-    let path = crate::sessionlog::newest_for_items(data_dir, &family)
+    let path = crate::sessionlog::newest_for_item(data_dir, &id)
         .ok_or_else(|| ApiError::new(ErrorCode::NotFound, "no session logs for this item"))?;
     let body = std::fs::read_to_string(&path).map_err(internal)?;
     Ok(log_attachment(format!("kahawai-item-{id}.log"), body))
@@ -4196,6 +4471,10 @@ async fn logout(
 
 #[derive(Deserialize, ToSchema)]
 struct StartSessionRequest {
+    /// Required by the mediadb playback API; limits physical sources to this library.
+    library_id: Option<String>,
+    /// Stable mediadb rendition ID.
+    media_entry_id: Option<String>,
     item_id: String,
     /// Physical source whose stream indexes and chapter timeline are being used.
     source_id: Option<i64>,
@@ -4566,15 +4845,41 @@ async fn start_session(
     axum::Extension(claims): axum::Extension<crate::auth::Claims>,
     ApiJson(body): ApiJson<StartSessionRequest>,
 ) -> Result<(StatusCode, Json<StartSessionResponse>), ApiError> {
-    // HUB-10. Here rather than inside `Sessions::start`: authorization is
-    // the API edge's job, and the session-scoped routes that follow are
-    // reachable only with the ULID this call hands back.
-    if !crate::grants::can_see(state.registry.db(), &claims, &body.item_id)
-        .await
-        .map_err(internal)?
-    {
-        return Err(hidden("item"));
-    }
+    let catalogue = if let Some(library) = &body.library_id {
+        catalogue::visible(&state, &claims, library).await?;
+        let item = state
+            .registry
+            .catalogue()
+            .playback_item(library, &body.item_id)
+            .await
+            .map_err(catalogue::store_error)?;
+        if body.resume_source_fingerprint.is_none()
+            && body
+                .media_entry_id
+                .as_ref()
+                .is_some_and(|id| !item.renditions.iter().any(|r| r.entry.id == *id))
+        {
+            return Err(hidden("source"));
+        }
+        Some(crate::sessions::CataloguePlayback {
+            subtitle_cache: state.subtitles.cache_dir().into(),
+            library_id: library.clone(),
+            item,
+            media_entry_id: body
+                .resume_source_fingerprint
+                .is_none()
+                .then(|| body.media_entry_id.clone())
+                .flatten(),
+        })
+    } else {
+        if !crate::grants::can_see(state.registry.db(), &claims, &body.item_id)
+            .await
+            .map_err(internal)?
+        {
+            return Err(hidden("item"));
+        }
+        None
+    };
     let session = state
         .sessions
         .start(
@@ -4585,6 +4890,7 @@ async fn start_session(
             body.mode.as_deref(),
             body.profile.clone(),
             crate::sessions::StartOptions {
+                catalogue,
                 ms: body.start_ms.unwrap_or(0),
                 explicit_position: body.start_ms.is_some(),
                 source_id: body.source_id,
@@ -4629,30 +4935,44 @@ async fn start_session(
             // Additive (HUB-32a/b); [] on explicit-mode sessions.
             subtitles: session.sub_verdicts.lock().unwrap().clone(),
         });
-    let mut subtitle_listing = match session.parts.first() {
-        Some(p) => state
-            .subtitles
-            .list(
-                &state.registry,
-                &session.collection_item_id,
-                session.effective_profile(),
-                session.ass_policy(),
-                &claims.sub,
-                claims.admin,
-                (&p.module_id, &p.collection_id, &p.root_token, &p.path_rel),
-            )
-            .await
-            .map_err(internal)?,
-        None => Vec::new(),
+    let mut subtitle_listing = if session.catalogue.is_some() {
+        session.catalogue_listing()
+    } else {
+        match session.parts.first() {
+            Some(p) => state
+                .subtitles
+                .list(
+                    &state.registry,
+                    &session.collection_item_id,
+                    session.effective_profile(),
+                    session.ass_policy(),
+                    &claims.sub,
+                    claims.admin,
+                    (&p.module_id, &p.collection_id, &p.root_token, &p.path_rel),
+                )
+                .await
+                .map_err(internal)?,
+            None => Vec::new(),
+        }
     };
     // Extraction uses the captured physical owner; public resource URLs use
     // the canonical requested member, including a member of combined coverage.
     for listing in &mut subtitle_listing {
         listing.track.item_id.clone_from(&session.item_id);
+        if session.catalogue.is_some() {
+            listing.deletable = listing.track.origin == "downloaded"
+                && (claims.admin || listing.track.created_by.as_deref() == Some(&claims.sub));
+        }
     }
     Ok((
         StatusCode::CREATED,
         Json(StartSessionResponse {
+            segments: session
+                .catalogue
+                .as_ref()
+                .map(|c| c.segments.clone())
+                .unwrap_or_default(),
+            media_entry_id: session.catalogue.as_ref().map(|c| c.media_entry_id.clone()),
             session_id: session.id.clone(),
             effective_start_ms: session.effective_start_ms,
             source_fingerprint: session.source_fingerprint.clone(),
@@ -5385,10 +5705,56 @@ async fn item_subtitle_file(
         .into_response())
 }
 
+async fn segment_collections(state: &AppState) -> Result<SegmentStatusResponse, ApiError> {
+    let hosts = state
+        .registry
+        .satellites_overview()
+        .await
+        .map_err(internal)?;
+    let mut collections = Vec::new();
+    for row in state
+        .registry
+        .catalogue()
+        .collection_summaries()
+        .await
+        .map_err(internal)?
+    {
+        let c = row.collection;
+        if !matches!(
+            c.media_type,
+            kahawai_mediadb::MediaType::Series | kahawai_mediadb::MediaType::Anime
+        ) {
+            continue;
+        }
+        let host = hosts.iter().find(|h| h.module_id == c.mediahost_id);
+        let report = state
+            .registry
+            .discovery_status(&c.mediahost_id, &c.remote_id);
+        collections.push(SegmentCollectionStatus {
+            collection_id: c.id,
+            mediahost_name: host
+                .map(|h| h.name.clone())
+                .unwrap_or_else(|| c.mediahost_id.clone()),
+            connected: host.is_some_and(|h| h.connected),
+            mediahost_id: c.mediahost_id,
+            name: c.remote_id,
+            pending_sources: report.as_ref().map(|r| r.pending_segments),
+            enabled: report.and_then(|r| r.segments_enabled),
+        });
+    }
+    collections.sort_by(|a, b| {
+        (&a.mediahost_name, &a.name, &a.collection_id).cmp(&(
+            &b.mediahost_name,
+            &b.name,
+            &b.collection_id,
+        ))
+    });
+    Ok(SegmentStatusResponse { collections })
+}
+
 /// Intro detector status
 ///
-/// Admin only. Returns the intro detector's counters together with up to 50
-/// seasons still awaiting analysis.
+/// Admin only. Reports source-level discovery status from current mediahost links.
 #[utoipa::path(
     get, path = "/admin/v1/segments", tag = "Admin segments",
     security(("bearer_auth" = [])),
@@ -5403,22 +5769,10 @@ async fn item_subtitle_file(
 async fn admin_segments_status(
     State(state): State<AppState>,
 ) -> Result<Json<SegmentStatusResponse>, ApiError> {
-    let db = state.registry.db();
-    // ONE walk of the pending list: the count and the rows must agree
-    // within a response, and Detector::status would run the same
-    // aggregation a second time to disagree across a season completing.
-    let seasons = crate::segments::pending_seasons(db)
-        .await
-        .map_err(internal)?;
-    let mut status = state.segments.status_counters();
-    status.pending_seasons = seasons.len();
-    Ok(Json(SegmentStatusResponse {
-        status,
-        seasons: seasons.into_iter().take(50).collect(),
-    }))
+    Ok(Json(segment_collections(&state).await?))
 }
 
-/// Analyse the next pending season
+/// Wake segment discovery on eligible mediahosts
 ///
 /// Admin only. Wakes connected protocol-4 mediahosts; each mediahost retains
 /// ownership of local cohort selection and priority.
@@ -5436,21 +5790,19 @@ async fn admin_segments_status(
 async fn admin_segments_run(
     State(state): State<AppState>,
 ) -> Result<Json<SegmentRunResponse>, ApiError> {
-    let follow = state.segments.dispatched_so_far();
-    let accepted = state.registry.wake_discovery("segments").await;
-    state
-        .segments
-        .record_dispatched(&Ok(crate::segments::Analysis {
-            scanned: 0,
-            awaiting: usize::from(accepted == 0),
-            attempted: accepted,
-        }));
-    tracing::info!(accepted, "local segment schedulers woken by administrator");
+    let status = segment_collections(&state).await?;
+    let modules: Vec<String> = status
+        .collections
+        .into_iter()
+        .filter(|c| c.enabled != Some(false))
+        .map(|c| c.mediahost_id)
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect();
+    let asked = state.registry.wake_discovery("segments", &modules).await;
     Ok(Json(SegmentRunResponse {
-        series: None,
-        season: None,
-        follow,
-        boot: state.segments.boot(),
+        asked,
+        unavailable: modules.len() - asked,
     }))
 }
 
@@ -6282,12 +6634,8 @@ struct ItemRow<S> {
     /// running time for every row of a page is a cost that buys nothing there.
     #[schema(required)]
     duration_ms: Option<i64>,
-    /// Whether this item is finished as of the last thing that happened to
-    /// it. Not a high-water mark: starting it again clears it, and
-    /// `play_count` — which only rises — is the record of how many times it
-    /// has been finished.
+    /// Whether the latest progress report or explicit mark says it is finished.
     played: bool,
-    play_count: i64,
 }
 
 fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
@@ -6335,7 +6683,6 @@ fn item_row<S>(r: &sqlx::sqlite::SqliteRow, sources: S) -> ItemRow<S> {
         resume_position_ms: (!played).then(|| r.get("position_ms")).flatten(),
         resume_duration_ms: r.try_get("duration_ms").ok().flatten(),
         played,
-        play_count: r.get::<Option<i64>, _>("play_count").unwrap_or(0),
     }
 }
 
@@ -6366,6 +6713,9 @@ async fn item_children(
 }
 #[derive(Serialize, ToSchema)]
 struct ItemSource {
+    /// Stable physical rendition identity in mediadb, independent of response ordering.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    media_entry_id: Option<String>,
     /// Assignment owner shared by every file part of this source.
     collection_item_id: String,
     module_id: String,
@@ -6675,18 +7025,13 @@ struct ItemQueryResponse {
 
 #[derive(Serialize, ToSchema)]
 struct ItemQueryResult {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    subtitle_source: Option<catalogue::subtitles::SubtitleSource>,
     #[schema(required)]
     negotiated: Option<NegotiatedItem>,
-    /// The recap, opening and credits of this item, if they have been
-    /// found. On the QUERY because it is the call a player makes on its way
-    /// into playback — the subtitle listing above rides along for the same
-    /// reason — and the boundaries are useless until something is playing.
-    /// There is deliberately no standalone segments endpoint. Empty when nothing was found, and when
-    /// nothing has been analysed: a player cannot act on the difference.
-    ///
-    /// Outside `negotiated`, because an item whose source is offline still has
-    /// the boundaries somebody found last week.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    /// Skip markers on the negotiated physical rendition's timeline. Empty
+    /// without a selected source or usable observations. The accepted session
+    /// supplies the authoritative list if selection changes between requests.
     segments: Vec<crate::segments::Segment>,
     /// Why the converged half is null. Not an error — the item loaded, and
     /// its page must render — but the same distinction as an error carries,
@@ -6863,6 +7208,7 @@ async fn collection_body(
                 })
                 .flatten();
             ItemSource {
+                media_entry_id: None,
                 collection_item_id: id.to_string(),
                 available: state.registry.is_connected(&module_id),
                 module_id,
@@ -7228,6 +7574,8 @@ fn group_chapters(
 /// are actually playing.
 #[derive(Deserialize, Default, ToSchema)]
 struct ItemQuery {
+    /// Stable mediadb rendition identity; preferred over response-local source numbers.
+    media_entry_id: Option<String>,
     source_id: Option<i64>,
     /// Absent = the conservative fallback, exactly as `start_session`
     /// treats a missing profile.
@@ -7384,6 +7732,7 @@ async fn item_query(
             let out = ItemQueryResponse {
                 item: out,
                 query: ItemQueryResult {
+                    subtitle_source: None,
                     negotiated: None,
                     segments: crate::segments::for_item(state.registry.db(), &representative_copy)
                         .await
@@ -7412,7 +7761,7 @@ async fn item_query(
         info.duration_ms
     }
     .map(|ms| ms as i64);
-    let (source_id, playable_source_id):(String,i64)=sqlx::query_as("SELECT ps.item_id,ps.id FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id WHERE p.file_id=?").bind(parts[0].file_id).fetch_one(state.registry.db()).await.map_err(internal)?;
+    let (source_id, playable_source_id):(String,i64)=sqlx::query_as("SELECT ps.item_id,ps.id FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id WHERE p.file_id=?").bind(parts[0].file_id.legacy().map_err(internal)?).fetch_one(state.registry.db()).await.map_err(internal)?;
     let mut verdicts = sp.subtitles.clone();
     crate::sessions::fill_verdict_track_ids(&state.registry, &parts, &mut verdicts).await;
     // The unified track list for the source the negotiation ACTUALLY
@@ -7494,6 +7843,7 @@ async fn item_query(
     let out = ItemQueryResponse {
         item: out,
         query: ItemQueryResult {
+            subtitle_source: None,
             negotiated: Some(NegotiatedItem {
                 source,
                 // What negotiation decided. A `remux` may still be dispatched to
@@ -7550,9 +7900,7 @@ struct ProgressRequest {
 /// playhead has moved at all. What makes that happen
 /// without any client knowing the rule is the other half — a played item
 /// is served with no `resume_position_ms` (see [`item_row`]), so the next
-/// `Play` on it begins at the beginning. `play_count` is the counter, and it
-/// rises once per watch that ENDED at the end — which this call cannot
-/// know, so `sessions::Sessions::end` is what writes it.
+/// `Play` on it begins at the beginning.
 #[utoipa::path(
     post, path = "/api/v1/playback/sessions/{id}/progress", tag = "Playback",
     security(("bearer_auth" = [])),
@@ -7583,6 +7931,45 @@ async fn post_progress(
         .sessions
         .viewer_position(&state.registry, &id, body.position_ms);
 
+    if let Some(captured) = &session.catalogue {
+        let finished = session
+            .duration_ms
+            .is_some_and(|d| d > 0 && u128::from(body.position_ms) * 10 >= u128::from(d) * 9);
+        let ids = if finished {
+            session.library_item_ids.clone()
+        } else {
+            vec![session.item_id.clone()]
+        };
+        let reports = ids
+            .into_iter()
+            .map(|id| crate::watch::Progress {
+                id,
+                parent: captured.parent_id.clone(),
+                position: body.position_ms,
+                duration: session.duration_ms,
+                track: captured.track,
+            })
+            .collect::<Vec<_>>();
+        crate::watch::progress(state.registry.db(), &claims.sub, &reports)
+            .await
+            .map_err(internal)?;
+        session
+            .last_position_ms
+            .store(body.position_ms, std::sync::atomic::Ordering::Relaxed);
+        let played = crate::watch::read(
+            state.registry.db(),
+            &claims.sub,
+            std::slice::from_ref(&session.item_id),
+        )
+        .await
+        .map_err(internal)?
+        .remove(&session.item_id)
+        .is_some_and(|w| w.played);
+        return Ok(Json(ProgressResponse {
+            position_ms: body.position_ms,
+            played,
+        }));
+    }
     let duration = session.duration_ms;
     let finished = duration.is_some_and(|d| d > 0 && body.position_ms * 10 >= d * 9);
     // A track keeps no resume POSITION — but it keeps its played mark, which
@@ -7614,12 +8001,6 @@ async fn post_progress(
     // So zero leaves the mark alone, and the first position that is not
     // zero decides: starting something again clears it within a ping.
     let at_start = body.position_ms == 0;
-    // The watch remembers where it got to, for the play `Sessions::end`
-    // counts when it stops — under the same exception the column below
-    // gets, and for the same reason. A zero says nothing either way, and
-    // taking it as "not finished" left the two halves of one rule
-    // disagreeing: the item read as played while the session that played
-    // it had forgotten, so the play went uncounted.
     let mut tx = state.registry.db().begin().await.map_err(internal)?;
     let library_item_ids = crate::library::canonical_ids(&mut tx, &session.library_item_ids)
         .await
@@ -7657,7 +8038,6 @@ async fn post_progress(
         return Ok(Json(ProgressResponse {
             position_ms: body.position_ms,
             played: false,
-            play_count: 0,
         }));
     }
 
@@ -7683,7 +8063,7 @@ async fn post_progress(
            -- it refresh the timestamp would make a preload or untouched
            -- restarted player look like a newly completed watch.
            updated_at = CASE WHEN json_extract((SELECT value FROM json_each(?2) WHERE json_extract(value,'$.id')=excluded.item_id),'$.at_start') THEN updated_at ELSE unixepoch() END
-         RETURNING played, play_count",
+         RETURNING played",
     )
     .bind(&claims.sub)
     .bind(serde_json::to_string(&states).map_err(internal)?)
@@ -7695,24 +8075,17 @@ async fn post_progress(
     session
         .last_position_ms
         .store(body.position_ms, std::sync::atomic::Ordering::Relaxed);
-    // Publish the per-session half only after the durable half succeeded, and
-    // while teardown is still excluded by `report_guard`.
-    if !at_start {
-        session.report(finished);
-        session.report_members(body.position_ms);
-    }
     drop(report_guard);
     Ok(Json(ProgressResponse {
         position_ms: body.position_ms,
         played: row.get::<i64, _>("played") != 0,
-        play_count: row.get("play_count"),
     }))
 }
 
 /// The most items one mark may touch. A season is tens and a show is
 /// hundreds; past this the caller is doing something other than ticking
 /// off what it just listed.
-const WATCHED_BATCH_MAX: usize = 2000;
+const WATCHED_BATCH_MAX: usize = crate::watch::MAX_BATCH_ITEMS;
 
 #[derive(Deserialize, ToSchema)]
 struct WatchedRequest {
@@ -7731,13 +8104,7 @@ struct WatchedRequest {
 /// Mark items watched or unwatched
 ///
 /// Sets the played flag for this item, or for up to 2000 of its children
-/// named in the body, clearing resume positions and only ever increasing play
-/// counts. Returns 404 when nothing matched.
-// One `INSERT … SELECT` for a whole season: a client loop half-applies
-// (a failure at episode 14 leaves 13 marked) and costs a round trip per
-// episode. `play_count` only ever climbs — unmarking says "show this as
-// unwatched", not "those viewings never happened" — and the `AND NOT
-// played` guard keeps re-marking from counting twice.
+/// named in the body, clearing resume positions. Returns 404 when nothing matched.
 #[utoipa::path(
     put, path = "/api/v1/items/{id}/watched", tag = "Items",
     security(("bearer_auth" = [])),
@@ -7799,16 +8166,15 @@ async fn item_set_watched(
     let album = library_api::album_child("i", "?4");
     let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
         "INSERT INTO user_item_state (user_id, item_id, position_ms, duration_ms, played, play_count, updated_at)
-         SELECT ?1, i.id, 0, NULL, ?3, ?3, unixepoch()
+         SELECT ?1, i.id, 0, NULL, ?3, 0, unixepoch()
            FROM library_entries i
           WHERE i.id IN (SELECT value FROM json_each(?2))
             AND (i.id = ?4 OR i.parent_id = ?4 OR {album}) AND {visible}
          ON CONFLICT (user_id, item_id) DO UPDATE SET
            position_ms = 0,
-           play_count = play_count + (excluded.played AND NOT played),
            played = excluded.played,
            updated_at = unixepoch()
-         RETURNING item_id, played, play_count"
+         RETURNING item_id, played"
     )))
     .bind(&claims.sub)
     .bind(&list)
@@ -7831,7 +8197,6 @@ async fn item_set_watched(
             item_id: row.get("item_id"),
             position_ms: 0,
             played: row.get::<i64, _>("played") != 0,
-            play_count: row.get("play_count"),
         })
         .collect();
     Ok(Json(UpdatedResponse { updated }))
@@ -7962,13 +8327,17 @@ async fn session_file(
         // only embedded tracks are in the pipeline, so only they tap.
         let file = match file[5..].split_once('.') {
             Some((num, ext)) if num.chars().all(|c| c.is_ascii_digit()) => {
-                let track = crate::tracks::get_for_item(
-                    state.registry.db(),
-                    &session.collection_item_id,
-                    num.parse().unwrap(),
-                )
-                .await
-                .map_err(internal)?
+                let track = if session.catalogue.is_some() {
+                    session.catalogue_track(num.parse().map_err(|_| hidden("track"))?)
+                } else {
+                    crate::tracks::get_for_item(
+                        state.registry.db(),
+                        &session.collection_item_id,
+                        num.parse().map_err(|_| hidden("track"))?,
+                    )
+                    .await
+                    .map_err(internal)?
+                }
                 .filter(|t| t.origin == "embedded")
                 .ok_or(ApiError::new(ErrorCode::NotFound, "no such embedded track"))?;
                 format!("subs-{}.{ext}", track.internal_key())
@@ -8121,12 +8490,16 @@ mod tests {
 
     #[tokio::test]
     async fn candidate_artwork_serves_cached_bytes_only_with_a_valid_ticket() {
-        use super::{Arc, Auth, NetOptions, Registry, StatusCode, router};
+        use super::{Arc, Auth, NetOptions, Registry, StatusCode, legacy_router_fixture as router};
         use axum::{body::Body, http::Request};
         use tower::ServiceExt;
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let auth = Arc::new(Auth::new(db, dir.path()).await.unwrap());
         let enricher = Arc::new(crate::enrich::Enricher::new(dir.path().into()));
         let artwork_dir = dir.path().join("artwork");
@@ -8402,6 +8775,33 @@ mod tests {
 
         let document = serde_json::to_value(openapi_document()).unwrap();
         let expected = [
+            ("get", "/admin/v1/catalogue/collections"),
+            ("post", "/admin/v1/catalogue/libraries"),
+            ("delete", "/admin/v1/catalogue/libraries/{id}"),
+            ("put", "/admin/v1/catalogue/libraries/{id}/collections"),
+            ("post", "/admin/v1/catalogue/libraries/{id}/refresh"),
+            ("get", "/api/v1/catalogue/libraries"),
+            ("get", "/api/v1/catalogue/continue-watching"),
+            ("get", "/api/v1/catalogue/up-next"),
+            ("get", "/api/v1/catalogue/libraries/{id}/items"),
+            ("get", "/api/v1/catalogue/libraries/{id}/items/{item_id}"),
+            (
+                "get",
+                "/api/v1/catalogue/libraries/{id}/items/{item_id}/children",
+            ),
+            (
+                "put",
+                "/api/v1/catalogue/libraries/{id}/items/{item_id}/watched",
+            ),
+            ("get", "/api/v1/catalogue/libraries/{id}/artists"),
+            (
+                "get",
+                "/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",
+            ),
+            (
+                "get",
+                "/api/v1/catalogue/libraries/{id}/artists/{key}/artwork",
+            ),
             ("get", "/health"),
             ("get", "/metrics"),
             ("get", "/api/v1/bootstrap"),
@@ -8422,6 +8822,18 @@ mod tests {
             ("query", "/api/v1/items/{id}"),
             ("get", "/api/v1/items/{id}/children"),
             ("put", "/api/v1/items/{id}/watched"),
+            (
+                "post",
+                "/api/v1/catalogue/libraries/{library}/items/{item}/subtitles/search",
+            ),
+            (
+                "post",
+                "/api/v1/catalogue/libraries/{library}/items/{item}/subtitles/download",
+            ),
+            (
+                "delete",
+                "/api/v1/catalogue/libraries/{library}/items/{item}/subtitles/{track}",
+            ),
             ("post", "/api/v1/items/{id}/subtitles/search"),
             ("post", "/api/v1/items/{id}/subtitles/download"),
             ("delete", "/api/v1/subtitles/{track_id}"),
@@ -8438,6 +8850,14 @@ mod tests {
             ("delete", "/api/v1/playback/sessions/{id}"),
             ("post", "/api/v1/playback/sessions/{id}/progress"),
             ("post", "/api/v1/playback/sessions/{id}/seek"),
+            ("post", "/api/v1/catalogue/libraries/{id}/items/{item_id}"),
+            (
+                "get",
+                "/api/v1/catalogue/libraries/{library}/items/{item}/next",
+            ),
+            ("get", "/api/v1/playback/sessions/{id}/fonts"),
+            ("get", "/api/v1/playback/sessions/{id}/fonts/{n}"),
+            ("get", "/api/v1/playback/sessions/{id}/subtitles/{file}"),
             ("get", "/api/v1/playback/sessions/{id}/stream"),
             ("get", "/api/v1/playback/sessions/{id}/{file}"),
             ("get", "/admin/v1/enrollments"),
@@ -8468,6 +8888,14 @@ mod tests {
             ("post", "/admin/v1/providers/fanart"),
             ("post", "/admin/v1/providers/theaudiodb"),
             ("delete", "/admin/v1/providers/{provider}/credentials"),
+            ("get", "/admin/v1/enrich/items"),
+            ("get", "/admin/v1/enrich/items/{id}"),
+            ("get", "/api/v1/catalogue/collection-items/{id}/artwork"),
+            ("get", "/admin/v1/enrich/items/{id}/identities"),
+            ("get", "/admin/v1/enrich/items/{id}/artist-artwork"),
+            ("get", "/admin/v1/enrich/progress"),
+            ("post", "/admin/v1/enrich/items/{id}/match"),
+            ("post", "/admin/v1/enrich/items/{id}/candidates"),
             ("get", "/admin/v1/enrich"),
             ("post", "/admin/v1/enrich"),
             ("post", "/admin/v1/libraries/{id}/refresh"),
@@ -8683,7 +9111,15 @@ mod tests {
                 if let Some(schema) = response["content"]["application/json"]["schema"].as_object()
                 {
                     assert!(
-                        schema.contains_key("$ref") || schema.contains_key("type"),
+                        schema.contains_key("$ref")
+                            || schema.contains_key("type")
+                            || schema
+                                .get("oneOf")
+                                .and_then(serde_json::Value::as_array)
+                                .is_some_and(|variants| !variants.is_empty()
+                                    && variants.iter().all(
+                                        |v| v.get("$ref").is_some() || v.get("type").is_some()
+                                    )),
                         "{method} {path} has a generic JSON response schema: {schema:?}"
                     );
                 }

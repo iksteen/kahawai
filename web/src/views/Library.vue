@@ -28,7 +28,7 @@ import {
   visibleRows,
 } from '../domain/virtual.ts'
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
-import { listLibraries } from '../api/generated/kahawai.ts'
+import { listLibraries } from '../api/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'

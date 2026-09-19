@@ -7,9 +7,13 @@ use kahawai_transport::mtls::AllowedCerts;
 use sqlx::Row;
 
 async fn setup(dir: &std::path::Path) -> (Registry, AllowedCerts) {
-    let db = kahawai_hub::db::open(dir).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir).await.unwrap();
     let allowed = AllowedCerts::default();
-    let reg = Registry::new(db, allowed.clone());
+    let reg = Registry::new(
+        db,
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reg.record_satellite("01MH", "mediahost", "nas", "fp-old")
         .await
         .unwrap();
@@ -103,9 +107,15 @@ async fn startup_load_admits_pending_within_grace_and_sweeps_lapsed() {
     }
 
     // Hub restart.
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let allowed = AllowedCerts::default();
-    let reg = Registry::new(db, allowed.clone());
+    let reg = Registry::new(
+        db,
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reg.load_allowlist().await.unwrap();
     assert!(allowed.contains("fp-old"));
     assert!(

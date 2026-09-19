@@ -16,13 +16,19 @@
 /// false: the item had loaded, and it was the play that failed.
 
 import { computed, type Ref, ref } from 'vue'
-import { useQuery, useQueryClient } from '@tanstack/vue-query'
+import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query'
 
+import { catalogueChildren } from '../api/catalogue.ts'
 import { buildProfile } from '../api/capabilities.ts'
 import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
 import { queryPlaybackItem } from '../api/playback.ts'
-import { itemChildren, itemQuery, itemSetWatched } from '../api/generated/kahawai.ts'
+import {
+  catalogueSetWatched,
+  itemChildren,
+  itemQuery,
+  itemSetWatched,
+} from '../api/generated/kahawai.ts'
 import { notify } from './notices.ts'
 import { sentence } from '../domain/refusal.ts'
 
@@ -39,11 +45,13 @@ export function useItem(
     mediaType: Ref<string>
     ready: Ref<boolean>
   },
+  library?: Ref<string>,
 ) {
   return useQuery({
     queryKey: computed(() => [
       'item',
       id.value,
+      ...(library ? [library.value] : []),
       ...(playback ? [{ prefs: playback.prefs.value, mediaType: playback.mediaType.value }] : []),
     ]),
     // Nothing is asked for an id nobody has chosen — the season page's open
@@ -52,8 +60,16 @@ export function useItem(
     enabled: computed(() => id.value !== '' && (playback?.ready.value ?? true)),
     queryFn: (): Promise<ItemQueryResponse> =>
       playback
-        ? queryPlaybackItem(id.value, playback.prefs.value, playback.mediaType.value)
-        : itemQuery(id.value, { profile: buildProfile() }),
+        ? queryPlaybackItem(
+            id.value,
+            playback.prefs.value,
+            playback.mediaType.value,
+            undefined,
+            library?.value,
+          )
+        : library
+          ? queryPlaybackItem(id.value, [], '', undefined, library.value)
+          : itemQuery(id.value, { profile: buildProfile() }),
   })
 }
 
@@ -63,28 +79,63 @@ export function useItem(
 /// item — the item does not change when a retry is what you want, and sharing
 /// one attempt meant a track list that failed once could not be asked for
 /// again.
-export function useChildren(item: Ref<{ id: string; kind: string } | undefined>) {
-  return useQuery({
-    queryKey: computed(() => ['children', item.value?.id ?? '']),
-    enabled: computed(() => item.value?.kind === 'series' || item.value?.kind === 'album'),
-    queryFn: () => itemChildren(item.value!.id),
-    select: (answer) => answer.children,
-  })
+export function useChildren(
+  item: Ref<{ id: string; kind: string; library_id?: string | null } | undefined>,
+) {
+  return useChildPages(
+    computed(() => item.value?.id ?? ''),
+    computed(() => item.value?.library_id),
+    computed(() => item.value?.kind === 'series' || item.value?.kind === 'album'),
+  )
 }
 
-/// The same list, asked for by ID rather than by item.
-///
-/// The season page knows the show id from its own URL, so waiting for the item
-/// to answer before asking would put a round trip in front of every still —
-/// and on that page the episodes ARE the page, while the item supplies only
-/// the title on the back button.
-export function useChildrenOf(id: Ref<string>) {
-  return useQuery({
-    queryKey: computed(() => ['children', id.value]),
-    enabled: computed(() => id.value !== ''),
-    queryFn: () => itemChildren(id.value),
-    select: (answer) => answer.children,
+export function useChildrenOf(id: Ref<string>, library?: Ref<string>, season?: Ref<number | null>) {
+  return useChildPages(
+    id,
+    library,
+    computed(() => id.value !== ''),
+    season,
+  )
+}
+
+function useChildPages(
+  id: Ref<string>,
+  library: Ref<string | null | undefined> | undefined,
+  enabled: Ref<boolean>,
+  season?: Ref<number | null>,
+) {
+  const query = useInfiniteQuery({
+    queryKey: computed(() => ['children', id.value, library?.value, season?.value]),
+    enabled,
+    initialPageParam: 0,
+    queryFn: async ({ pageParam }) => {
+      if (library?.value) {
+        const page = await catalogueChildren(library.value, id.value, {
+          offset: pageParam,
+          limit: 200,
+          ...(season ? { season: season.value === null ? 'absolute' : String(season.value) } : {}),
+        })
+        return {
+          ...page,
+          offset: page.offset ?? 0,
+          total: page.total ?? page.children.length,
+          groups: page.groups ?? [],
+        }
+      }
+      const page = await itemChildren(id.value)
+      return { ...page, offset: 0, total: page.children.length, groups: [] }
+    },
+    getNextPageParam: (last) => {
+      const next = last.offset + last.children.length
+      return last.children.length && next < last.total ? next : undefined
+    },
   })
+  return {
+    ...query,
+    data: computed(() => query.data.value?.pages.flatMap((page) => page.children)),
+    total: computed(() => query.data.value?.pages[0]?.total),
+    groups: computed(() => query.data.value?.pages[0]?.groups ?? []),
+  }
 }
 
 /// Ticking something off, and taking the tick back.
@@ -93,15 +144,29 @@ export function useChildrenOf(id: Ref<string>) {
 /// it is still on screen, so pressing it again IS the retry (UX-1). What it
 /// must not do is leave the tick showing a state the hub does not hold, so
 /// everything it touched is asked again.
-export function useWatched() {
+export function useWatched(library?: Ref<string>) {
   const client = useQueryClient()
   const busy = ref(new Set<string>())
 
-  async function mark(id: string, played: boolean, items?: string[]): Promise<boolean> {
+  async function mark(
+    id: string,
+    played: boolean,
+    items?: string[],
+    season?: number | null,
+  ): Promise<boolean> {
     if (busy.value.has(id)) return false
     busy.value = new Set(busy.value).add(id)
     try {
-      await itemSetWatched(id, items ? { played, items } : { played })
+      if (library?.value) {
+        await catalogueSetWatched(library.value, id, {
+          played,
+          ...(season !== undefined
+            ? { season: season === null ? 'absolute' : String(season) }
+            : items
+              ? { items }
+              : {}),
+        })
+      } else await itemSetWatched(id, items ? { played, items } : { played })
       // Both, because a mark changes the child's own row and the parent's
       // count of watched children.
       //
@@ -111,6 +176,10 @@ export function useWatched() {
       const asked = await Promise.all([
         client.invalidateQueries({ queryKey: ['children'] }),
         client.invalidateQueries({ queryKey: ['item'] }),
+        client.invalidateQueries({ queryKey: ['shelf'] }),
+        client.invalidateQueries({ queryKey: ['search'] }),
+        client.invalidateQueries({ queryKey: ['continuing'] }),
+        client.invalidateQueries({ queryKey: ['up-next'] }),
       ]).then(
         () => true,
         () => false,

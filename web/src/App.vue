@@ -20,7 +20,7 @@ import { signOut, whoAmI } from './api/session.ts'
 import { useBoot } from './composables/boot.ts'
 import { useDocumentTitle, screenName } from './composables/title.ts'
 import type { Screen } from './domain/titles.ts'
-import { useLibraries } from './composables/home.ts'
+import { useCatalogueLibraries } from './composables/catalogue.ts'
 import { useQueue } from './composables/queue.ts'
 
 const route = useRoute()
@@ -36,7 +36,7 @@ onMounted(() => void start())
 /// Not before there is a session: this component exists from the first frame,
 /// and asking on the boot or sign-in screens is a guaranteed 401 — two of them
 /// on first-run setup, where no refresh cookie can exist to recover with.
-const libraries = useLibraries(computed(() => phase.value === 'app'))
+const libraries = useCatalogueLibraries(computed(() => phase.value === 'app'))
 
 /// Who the token says you are — for the name in the header and whether to
 /// offer the Admin menu, never as an authorisation decision. See `claims.ts`.

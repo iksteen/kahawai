@@ -113,7 +113,7 @@ pub async fn gather(
     sessions: &Sessions,
     data_dir: &std::path::Path,
 ) -> Result<Snapshot> {
-    let db = registry.db();
+    let catalogue = registry.catalogue().stats().await?;
     let modules = registry
         .satellites_overview()
         .await?
@@ -151,29 +151,15 @@ pub async fn gather(
         })
         .collect();
 
-    let one = |sql: &'static str| async move {
-        sqlx::query_scalar::<_, i64>(sql)
-            .fetch_one(db)
-            .await
-            .unwrap_or(0)
-    };
     Ok(Snapshot {
         modules,
         sessions_active: sessions.list().len(),
-        items: one("SELECT COUNT(*) FROM collection_items").await,
-        files: one("SELECT COUNT(*) FROM files").await,
-        file_bytes: one("SELECT COALESCE(SUM(size), 0) FROM files").await,
-        subtitle_files: one(
-            "SELECT COUNT(*) FROM subtitle_tracks WHERE origin IN ('downloaded', 'ocr')",
-        )
-        .await,
-        enrichment_due: one("SELECT COUNT(*) FROM enrichment_queue WHERE due_at <= unixepoch()")
-            .await,
-        // The number worth alerting on: items nothing has identified.
-        unmatched_items: one("SELECT COUNT(*) FROM collection_items i
-              WHERE i.kind IN ('movie', 'show', 'album')
-                AND NOT EXISTS (SELECT 1 FROM item_match m WHERE m.item_id = i.id)")
-        .await,
+        items: catalogue.items,
+        files: catalogue.files,
+        file_bytes: catalogue.file_bytes,
+        subtitle_files: 0,
+        enrichment_due: 0,
+        unmatched_items: catalogue.unassigned_copies,
         anidb_banned_secs: crate::anidb::ban_remaining(data_dir)?.unwrap_or(0),
     })
 }

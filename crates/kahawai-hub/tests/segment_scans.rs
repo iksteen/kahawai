@@ -9,7 +9,9 @@ use sqlx::Row;
 
 async fn library() -> (tempfile::TempDir, kahawai_hub::library::Database) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::raw_sql(
         "INSERT INTO collections(module_id,collection_id,media_type)
            VALUES('host','series','series');

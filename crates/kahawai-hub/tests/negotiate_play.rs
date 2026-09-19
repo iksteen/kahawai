@@ -35,7 +35,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,
@@ -124,8 +124,14 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry =
-        Arc::new(Registry::new(db.clone(), allowed.clone()).with_local_video_executor(true));
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            allowed.clone(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(true),
+    );
     let mut local_bench = kahawai_media::bench::BenchResults {
         gst: kahawai_media::bench::gst_version(),
         tonemap: kahawai_media::remux::tonemap_available().then_some(
@@ -205,6 +211,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
     catalog_fixture::project_files(
+        &registry,
         &tx,
         &mut inbound,
         "movies",

@@ -16,7 +16,9 @@ async fn enrolled() -> (
     tempfile::TempDir,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at)
          VALUES ('01MH', 'mediahost', 'nas', 'fp', 1)",
@@ -24,7 +26,11 @@ async fn enrolled() -> (
     .execute(&db)
     .await
     .unwrap();
-    let reg = Arc::new(Registry::new(db.clone(), Default::default()));
+    let reg = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     (reg, db, dir)
 }
 

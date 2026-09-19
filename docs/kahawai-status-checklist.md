@@ -273,7 +273,10 @@ How something works and why it was built that way belong in
       JASSUB rendering with embedded fonts, live session-pipeline tap (all embedded
       text codecs), mediahost extraction facility with index-driven sparse reads;
       image subtitles (PGS + VobSub) decoded server-side and rendered on a
-      canvas overlay from the same tap — no video transcoding
+      canvas overlay from the same tap — no video transcoding. Text extraction
+      and image-set caches include the captured source/sidecar revision;
+      protocol 4.3 extraction replies and partial transfers retain that revision.
+      Old path-only payloads and artifacts generated from them are not reused.
 - [x] HUB-32a ASS fallback policy — an ORDERED, capability-driven ladder.
       `native` (the client's own renderer) always wins when declared and
       is not orderable; the fallbacks — flatten, rasterised overlay
@@ -355,8 +358,6 @@ How something works and why it was built that way belong in
       (`kahawai-watched.sh`), for something seen elsewhere or a tick
       undone. Either direction clears the resume position, since
       "watched, and also 40 minutes in" is not a state a card can draw.
-      `play_count` only climbs — unmarking changes what is shown, not
-      what happened.
       Progress writes the same two fields on the same rule. `played` is a
       boolean and NOT a high-water mark: it is what the last report said,
       so watching something again clears it and finishing sets it once
@@ -371,41 +372,7 @@ How something works and why it was built that way belong in
       seen ticks one row ahead of the playhead through an album already
       heard. So the first position that is NOT zero decides, which puts
       the reset a ping behind a restart and off the path of anything that
-      never started. The exception covers BOTH halves of the rule — the
-      stored column and the session's own memory of where it got to — or
-      an item reads as played while the session that played it has
-      forgotten, and the play goes uncounted.
-      `play_count` is the record of how many times it was finished, and it
-      rises once per WATCH, written when the session stops (`sessions.rs`,
-      the one funnel every teardown goes through). Not when the 90 percent
-      line is crossed: that counted a second play for anyone who scrubbed
-      back over the line and forward again, and counted one for a viewer
-      who then abandoned the thing half way.
-      Which session counts is decided by which one did the watching, not
-      by who ended it. A session counts when it stops past the line AND it
-      is the one that took the item there — its flag is seeded from the
-      position it OPENED at, so a session that opens past the line never
-      sees a crossing. That is what keeps a sitting split in two by a
-      reaped pause, a dead transcoder or an admin from counting twice: the
-      client answers a lost session by starting again at the same position
-      (`recovery.ts`), and that continuation earns nothing while the watch
-      that crossed the line keeps its play, wherever it happened to stop.
-      Asking instead WHO stopped the session cannot work in either
-      direction — the answer would have to exclude the reaper, and a
-      viewer who finishes something and closes a laptop that never sends
-      its DELETE is reaped too.
-      Both flags are per SESSION and not read back from
-      `watch_state.played`, so nothing else writing that column — a mark
-      by hand, another device — can put a play in a session's name, and a
-      session that reported no position at all cannot bank the play a
-      previous watch left marked.
-      **Known gap, accepted:** that flag lives in memory, so a hub restart
-      while a finished watch is still open loses its play. Counting at the
-      90 percent crossing was durable and bought that at the price of the
-      two miscounts above; a durable version of this would need the
-      crossing written somewhere a restart survives, which no one has
-      wanted yet. A restart is not one of the teardown paths listed
-      above.
+      never started. There is no seen counter or session-local finish bookkeeping.
       What makes "again" happen at all is that a played item is served with NO
       `resume_position_ms`, so the next Play begins at the beginning
       rather than dropping the viewer into the last tenth. That is
@@ -856,7 +823,8 @@ How something works and why it was built that way belong in
       re-derivable. Manifest v3 inventories every included regular file by
       safe relative path, size and SHA-256, validates into private sibling
       staging, and consumes only those stable bytes before live mutation;
-      v1/v2 remain restorable.
+      v1/v2 remain restorable. Format v4 includes independent online snapshots
+      of hub.db and mediadb.db; both are validated before restore replaces either.
 - [x] OPS-6 Quota-bounded caches with eviction — satisfied by there being
       nothing eligible to evict; requirement amended 2026-07-26 with the
       audit, reasoning in implementation §10. The one deletion is
@@ -965,9 +933,11 @@ How something works and why it was built that way belong in
 
 ## Media database crate
 
-The checks above describe the current hub. `kahawai-mediadb` is a separate
-foundation; its model and deliberate differences are in [mediadb-model.md](mediadb-model.md).
-These entries track the isolated database layer, not deployed hub requirements.
+The checks above describe the original hub and its historical acceptance evidence.
+On the `mediadb` development branch, the active runtime includes ingestion, catalogue APIs and administrative
+enrichment. Its model and deliberate differences are in
+[mediadb-model.md](mediadb-model.md); original playback/enrichment acceptance does
+not describe this branch's current runtime.
 
 - [x] Fresh schema and Rust operations for collection import, physical
       occurrences/ordered media parts, provider assignments and supplements,
@@ -979,5 +949,93 @@ These entries track the isolated database layer, not deployed hub requirements.
 - [x] Independent embedded SQLx migrations on create/open, immutable checksum
       validation, foreign-database rejection and transactional upgrade/retry checks.
       The hub's user/watch-state database remains separate.
-- [ ] Integrate the hub's mediahost ingestion, providers, HTTP API, playback and
-      watch history with `kahawai-mediadb`. Runtime orchestration remains in the hub.
+- [x] Hub startup, complete mediahost offers/deltas, durable ACKs, generation-safe
+      reconnect/deletion, scoped catalogue APIs and independent library grants.
+      Legacy history is preserved without conversion; old catalogue consumers
+      are explicitly unavailable. API companion and isolated real-process check.
+- [x] Admin library composition and grants use mediadb: typed collection selection,
+      ordered membership drafts, save/cancel, deletion and real-browser acceptance.
+- [x] Provider execution/matching on mediadb: independent durable provider work,
+      local NFO/tags, verified links, episode descriptions, artist/cover artwork,
+      retained answers, manual pins/rejections and revision-guarded admin review.
+      Provider failures release claims; cached answers and independent work continue.
+- [x] Original per-item matching screen serves library cards and detail sources,
+      with mediadb search across configured providers and saved identity selection. Manual title/year
+      creation is removed. Candidate images load under the existing CSP; the separate
+      Enrichment admin tab is removed. Copy context, revision conflicts, stable
+      membership and keyboard navigation are checked.
+- [x] Viewer library navigation uses catalogue APIs: original home shelves/jump menu,
+      virtual poster and artist grids with representative-copy match confidence,
+      sorting/search, scoped artwork and metadata
+      detail, physical source lists, runtime/chapters, reload/back navigation and browser checks.
+- [x] Stable episode/track identities derived from parent and native position, with
+      physical-only child lists, scoped rendition details, interval-based pagination,
+      exact counts and stable child URLs. No child identity tables or migration.
+      Provider list order no longer determines episode/track IDs; existing layouts remain.
+      Physical episode coverage is stored in `media_entry_episodes`; migration 4
+      renames the former `entry_episodes` table while preserving existing spans.
+- [x] Catalogue watch state in the hub database, keyed by stable mediadb parent/child
+      IDs. Per-user watched marks, atomic season marks beyond the loaded page,
+      physical-only watched summaries, durable resume/completion storage and no seen counter.
+      Legacy history stays separate; source removal does not delete user state.
+- [x] Continue watching and Up next use mediadb identities and new per-user watch
+      state, with physical-source/grant filtering, deduplication, native episode
+      order, progress thresholds, recency and stable detail links. Original home
+      layout restored; playback now supplies progress.
+- [x] Mediadb playback snapshots feed the existing negotiation and media engine:
+      library-scoped renditions, direct byte ranges, HLS, seeking, stable rendition
+      selection, captured watch identities, whole-file combined episode completion,
+      resume, audio queue and next-episode handover. Original player layout retained.
+      Embedded/sidecar subtitle delivery and fonts use captured session sources;
+      mediahost extraction replies and mediadb loudness facts are connected.
+      Checked with isolated remote/in-process mediahosts and the browser player.
+      Anime items derive movie/series shape from physical entries; anime movies
+      support direct playback and Continue watching.
+- [x] Source-bound skip markers from current mediahost observations and named
+      chapters, captured with playback's physical rendition. Multipart offsets,
+      stale observation rejection and session-authoritative player markers;
+      verified by a real browser pressing Skip intro and checking playback time.
+- [x] Client-side community skip lookup receives selected/verified-linked video
+      provider IDs from mediadb, with movie/show namespace checks and the existing
+      opt-in preference and measured-marker precedence.
+- [x] Subtitle search/download/delete uses the selected mediadb rendition and
+      ordered file version, with atomic stored text, duplicate download reuse,
+      creator/admin deletion and session-captured delivery. The existing detail
+      panel and account credentials use the current API; stale source selections
+      are rejected and replaced media never inherits another version's subtitles.
+- [x] OCR and rasterised ASS use mediadb physical sources and retained artifact
+      caches, with parent-track provenance, atomic publication, remembered empty
+      OCR results, idle OCR scheduling and source-specific playback negotiation.
+      Session URLs serve captured OCR text and raster overlays; the browser keeps
+      its existing renderer and subtitle controls.
+      `scripts/kahawai-remote-subtitles-check.py` checks remote text, OCR and ASS
+      overlays across a same-path source replacement and hub restart.
+- [x] Two-database backup/restore with checksummed mediadb snapshots, stopped-hub
+      restore, journal replacement and rejection of partial/corrupt snapshots.
+      `scripts/kahawai-upgrade-check.py` rehearses a master-era upgrade, current
+      restore and old-binary rollback in disposable profiles.
+- [x] Per-item diagnostic downloads use stable mediadb IDs and include child
+      sessions. Earlier pipeline runs survive scratch cleanup in one bounded
+      session bundle; hub startup recovers interrupted local worker logs.
+      Old-history remapping is not required. Runtime orchestration stays in the hub.
+
+- [x] Mediadb library rescan/deep-rescan controls use committed collection membership,
+      report offline and unsupported hosts independently, and preserve deep intent
+      through mediahost trigger coalescing. Protocol 4.2 carries explicit re-probe
+      requests; older hosts keep ordinary rescan and require an update for deep rescan.
+      CLI companion and real-process normal/deep/normal scan checks included.
+
+- [x] Segment administration reads mediahost-owned pending source counts instead
+      of the retired hub season queue. The Providers panel distinguishes offline,
+      disabled and unknown reports; manual discovery wakes each eligible mediahost
+      once without claiming analysis completion. Reports reset on reconnect.
+
+- [x] CLI tooling uses mediadb libraries, stable item/child IDs and optional media
+      entry selection. Browse reads every page and supports artists, albums,
+      children and home feeds. Matching uses revision-guarded enrichment; the
+      audit opens mediadb instead of legacy hub tables. Playback diagnostics,
+      fanout and container smoke tests pass library IDs and compose collections.
+      `scripts/kahawai-cli-check.py` checks pagination/errors/session identities;
+      `scripts/kahawai-mediadb.sh check-cli` exercises commands on a real hub.
+      Account CLI listing and library grants use catalogue IDs and version-guarded
+      writes; checks cover every account command, viewer access and stale-write errors.

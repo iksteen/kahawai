@@ -58,6 +58,7 @@ login() {
 TOKEN=$(login) || { echo "login failed" >&2; exit 1; }
 
 PIDS=() ; MODULE_IDS=()
+LIBRARY_ID=""
 # Bracketed on purpose: an unbracketed -f pattern also matches the shell
 # running it, which then kills itself and reports success (house rule,
 # hook-enforced).
@@ -82,6 +83,9 @@ cleanup() {
     fi
     [ "$(alive)" -eq 0 ] || echo "   WARNING: $(alive) fanout processes still alive" >&2
     TOKEN=$(login) || true
+    if [ -n "$LIBRARY_ID" ]; then
+        curl -sf -X DELETE "http://$API/admin/v1/catalogue/libraries/$LIBRARY_ID" -H "Authorization: Bearer $TOKEN" >/dev/null || true
+    fi
     for mid in "${MODULE_IDS[@]:-}"; do
         [ -n "$mid" ] && curl -sf -X DELETE "http://$API/admin/v1/satellites/$mid" \
             -H "Authorization: Bearer $TOKEN" >/dev/null 2>&1 || true
@@ -160,10 +164,21 @@ TOKEN=$(login)
 curl -sf "http://$API/admin/v1/satellites" -H "Authorization: Bearer $TOKEN" > "$ROOT/sats.json"
 python3 "$(dirname "$0")/kahawai-fanout-report.py" "$HOSTS" "$ROOT/sats.json"
 
-# Browse must stay answerable with every link up: this is where a
-# per-module cost the hub pays on every request would show.
+# Compose the fixture collections into a real mediadb library before browsing.
 TOKEN=$(login)
+body=""
+for _ in $(seq 30); do
+    collections=$(curl -sf "http://$API/admin/v1/catalogue/collections" -H "Authorization: Bearer $TOKEN")
+    body=$(python3 -c 'import json,sys
+hosts=set(sys.argv[1:]); rows=json.load(sys.stdin)
+ids=[c["id"] for c in rows if c["mediahost_id"] in hosts and c["media_type"]=="movies" and not c["snapshot"] and c["file_count"]>0]
+if len(ids)==len(hosts): print(json.dumps(dict(name="Fanout fixture",media_type="movies",collection_ids=ids)))' "${MODULE_IDS[@]}" <<<"$collections")
+    [ -n "$body" ] && break
+    sleep 1
+done
+[ -n "$body" ] || { echo 'fixture collections did not finish ingestion' >&2; exit 1; }
+LIBRARY_ID=$(curl -sf -X POST "http://$API/admin/v1/catalogue/libraries" -H "Authorization: Bearer $TOKEN" -H content-type:application/json -d "$body" | json_field id)
 start=$(date +%s%N)
-items=$(curl -sf "http://$API/api/v1/items?limit=1" -H "Authorization: Bearer $TOKEN" | json_field total)
+items=$(curl -sf "http://$API/api/v1/catalogue/libraries/$LIBRARY_ID/items?limit=1" -H "Authorization: Bearer $TOKEN" | json_field total)
 end=$(date +%s%N)
 echo "   browse with $HOSTS hosts up  : $(( (end - start) / 1000000 )) ms (items visible: ${items:-?})"

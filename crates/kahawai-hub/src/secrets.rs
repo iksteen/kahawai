@@ -1346,7 +1346,7 @@ mod adoption_tests {
     async fn a_later_failure_still_truncates_what_already_moved() {
         const CANARY: &str = "canary-operator-key";
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
         let c = Credentials::open(dir.path(), db.clone()).await.unwrap();
         sqlx::query("INSERT INTO settings (key, value) VALUES ('tmdb_api_key', ?)")
             .bind(CANARY)

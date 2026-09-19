@@ -47,7 +47,11 @@ async fn full_enrollment_flow() {
     let state = tempfile::tempdir().unwrap();
     let ca = Arc::new(HubCa::load_or_create(pki.path()).unwrap());
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db, Default::default()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db,
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let svc = EnrollmentService::new(ca.clone(), registry.clone(), Duration::from_secs(900), 90);
     let addr = spawn_hub(svc.clone(), &ca).await;
 

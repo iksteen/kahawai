@@ -11,7 +11,7 @@ export const isImageSub = (track: Pick<TrackListing, 'format'>) =>
   ['pgs', 'vobsub', 'dvdsub'].includes(track.format)
 
 /// HUB-32d: a styled script rendered server-side to display sets. Delivered as
-/// an overlay like PGS, but sourced item-level rather than from the live
+/// an overlay like PGS, but from a captured source artifact rather than the live
 /// session tap.
 export const isRasterSub = (track: Pick<TrackListing, 'origin'>) => track.origin === 'raster'
 

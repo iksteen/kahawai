@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 /// A library's items, a chunk at a time. Most of these are about a chunk that
 /// failed beside chunks that did not: the grid is a reserved height full of
 /// placeholders, so a hole in it looks exactly like something still loading.

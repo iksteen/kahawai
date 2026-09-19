@@ -19,19 +19,19 @@
 /// read failed, or an empty list from a 503 renders as "Nobody is playing
 /// anything", which is a statement, and a false one.
 
-import { computed, ref } from 'vue'
+import { computed, ref, type Ref } from 'vue'
 import { useQueries, useQueryClient } from '@tanstack/vue-query'
 
-import type { AdminCollectionsResponse } from '../api/generated/model/adminCollectionsResponse.ts'
-import type { AdminLibrariesResponse } from '../api/generated/model/adminLibrariesResponse.ts'
+import type { CatalogueCollection } from '../api/generated/model/catalogueCollection.ts'
+import type { CatalogueLibrary } from '../api/generated/model/catalogueLibrary.ts'
 import type { AdminSessionsResponse } from '../api/generated/model/adminSessionsResponse.ts'
 import type { EnrollmentsResponse } from '../api/generated/model/enrollmentsResponse.ts'
 import type { SatellitesResponse } from '../api/generated/model/satellitesResponse.ts'
 import type { UsersResponse } from '../api/generated/model/usersResponse.ts'
 import {
-  adminCollections,
+  collections,
   adminEnrollments,
-  adminLibraries,
+  libraries,
   adminSatellites,
   adminSessions,
   adminUsers,
@@ -49,16 +49,16 @@ export const POLL_MS = 15_000
 const READS = ['enrolments', 'satellites', 'sessions', 'libraries', 'collections', 'users'] as const
 export type Read = (typeof READS)[number]
 
-export function useAdmin() {
+export function useAdmin(showSessions: Ref<boolean>) {
   const client = useQueryClient()
 
   const queries = useQueries({
     queries: [
       { queryKey: ['admin', 'enrollments'], queryFn: () => adminEnrollments() },
       { queryKey: ['admin', 'satellites'], queryFn: () => adminSatellites() },
-      { queryKey: ['admin', 'sessions'], queryFn: () => adminSessions() },
-      { queryKey: ['admin', 'libraries'], queryFn: () => adminLibraries() },
-      { queryKey: ['admin', 'collections'], queryFn: () => adminCollections() },
+      { queryKey: ['admin', 'sessions'], queryFn: () => adminSessions(), enabled: showSessions },
+      { queryKey: ['admin', 'libraries'], queryFn: () => libraries() },
+      { queryKey: ['admin', 'collections'], queryFn: () => collections() },
       { queryKey: ['admin', 'users'], queryFn: () => adminUsers() },
     ].map((q) => ({ ...q, refetchInterval: POLL_MS })),
   })
@@ -69,7 +69,9 @@ export function useAdmin() {
   /// "nothing here" is only ever said about a list that was actually read.
   const broken = computed(() => {
     const names: Read[] = []
-    for (const [index, name] of READS.entries()) if (queries.value[index]?.isError) names.push(name)
+    for (const [index, name] of READS.entries())
+      if (queries.value[index]?.isError && (name !== 'sessions' || showSessions.value))
+        names.push(name)
     return names
   })
 
@@ -78,10 +80,12 @@ export function useAdmin() {
   /// "could not reach the hub" over four sections of which three are fine and
   /// one is quietly empty is worse: the operator cannot tell which.
   const readError = computed(() => {
-    const failed = queries.value.find((q) => q.isError)
+    const failed = queries.value.find(
+      (q, i) => q.isError && (READS[i] !== 'sessions' || showSessions.value),
+    )
     if (!failed) return ''
     const why = sentence(failed.error)
-    return broken.value.length === READS.length
+    return broken.value.length === READS.length - (showSessions.value ? 0 : 1)
       ? why
       : `Could not read ${andList(broken.value)}: ${why}`
   })
@@ -121,9 +125,11 @@ export function useAdmin() {
     enrollments: computed(() => at<EnrollmentsResponse>(0)?.pending ?? []),
     satellites: computed(() => enrolled(at<SatellitesResponse>(1)?.satellites ?? [])),
     sessions: computed(() => at<AdminSessionsResponse>(2)?.sessions ?? []),
-    libraries: computed(() => at<AdminLibrariesResponse>(3)?.libraries ?? []),
-    collections: computed(() => at<AdminCollectionsResponse>(4)?.collections ?? []),
+    libraries: computed(() => at<CatalogueLibrary[]>(3) ?? []),
+    collections: computed(() => at<CatalogueCollection[]>(4) ?? []),
     users: computed(() => at<UsersResponse>(5)?.users ?? []),
+    librariesReady: computed(() => queries.value[3]?.data !== undefined),
+    collectionsReady: computed(() => queries.value[4]?.data !== undefined),
     /// Whether a given list is a fact or an absence of one.
     broken,
     /// Nothing has ever been read. Not "no request is in flight": a query that

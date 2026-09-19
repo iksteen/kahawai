@@ -113,6 +113,8 @@ pub async fn request_context(
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, serde::Deserialize, ToSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCode {
+    /// This development milestone has not integrated this consumer yet.
+    FeatureUnavailable,
     /// The hub failed at something that should have worked. Nothing about the
     /// request is wrong; the detail is in the hub's log, deliberately not here.
     Internal,
@@ -205,6 +207,7 @@ impl ErrorCode {
     pub fn status(self) -> StatusCode {
         use ErrorCode::*;
         match self {
+            FeatureUnavailable => StatusCode::NOT_IMPLEMENTED,
             Internal => StatusCode::INTERNAL_SERVER_ERROR,
             BadRequest => StatusCode::BAD_REQUEST,
             UnsupportedMediaType => StatusCode::UNSUPPORTED_MEDIA_TYPE,

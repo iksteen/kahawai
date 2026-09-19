@@ -519,6 +519,7 @@ impl Catalog {
             pending_hashes: hashes as u64,
             pending_segments: segments as u64,
             pending_loudness: loudness as u64,
+            segments_enabled: None,
         })
     }
 

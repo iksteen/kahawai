@@ -1,205 +1,182 @@
 <script setup lang="ts">
-/// HUB-8 hand-matching: provider search prefilled with the FILE's title, a
-/// poster grid, one click to pick.
-///
-/// Anchored on the file identity throughout, and it says so. The display title
-/// is the (possibly wrong) match being judged, so heading the dialog with it
-/// would make a wrong match look like the thing being searched for.
+/// HUB-8: the original per-copy matching screen, backed by mediadb.
+/// Corrections change a copy's metadata; mediadb owns stable library membership.
 import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
-
+import { useQueryClient } from '@tanstack/vue-query'
 import Btn from './Btn.vue'
-import type { ProviderCandidate } from '../api/generated/model/providerCandidate.ts'
 import {
-  adminApplyMatch,
-  adminReviewSearch,
-  itemDetail,
-  listItems,
+  adminProviders,
+  enrichmentDetail,
+  enrichmentCorrect,
+  enrichmentSearch,
+  enrichmentIdentities,
+  getEnrichmentArtworkUrl,
+  item as catalogueItem,
 } from '../api/generated/kahawai.ts'
+import type { EnrichmentDetail } from '../api/generated/model/enrichmentDetail.ts'
 import type { CollectionCopy } from '../api/generated/model/collectionCopy.ts'
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { IdentityChoice } from '../api/generated/model/identityChoice.ts'
 import { sentence } from '../domain/refusal.ts'
-import { seLabel } from '../domain/label.ts'
 import { sourceLocation } from '../domain/source.ts'
 
 const props = defineProps<{
-  item: {
-    id: string
-    collection_item_id?: string
-    kind: string
-    title: string
-    year?: number | null
-    file_title?: string | null
-    file_year?: number | null
-    matched_title?: string | null
-    match_confidence?: string | null
-  }
+  item: { id: string; title: string; library_id?: string | null; collection_item_id?: string }
 }>()
-
 const emit = defineEmits<{ close: []; applied: [libraryItemIds: string[]] }>()
+const client = useQueryClient()
 const copies = ref<CollectionCopy[]>([])
 const selected = ref('')
-const copy = computed(() => copies.value.find((c) => c.id === selected.value))
-const local = ref<ItemRowI64[]>([])
+const detail = ref<EnrichmentDetail>()
+const query = ref('')
+const local = ref<IdentityChoice[]>([])
 const localMore = ref(false)
-const localBusy = ref(false)
-const picked = ref<ItemRowI64[]>([])
-const newYear = ref<string>('')
-
-const fileTitle = computed(() => copy.value?.title ?? props.item.file_title ?? props.item.title)
-// A loaded copy's missing year is its identity, not a cue to borrow another copy's year.
-const fileYear = computed(() =>
-  copy.value ? (copy.value.year ?? null) : (props.item.file_year ?? null),
-)
-const weak = computed(() => copy.value?.match_confidence === 'weak')
-
-const query = ref(fileTitle.value)
-const results = ref<ProviderCandidate[] | null>(null)
-/// Posters the provider named and the browser could not fetch. Without this a
-/// dead URL renders the browser's broken-image glyph in a grid of posters.
-const broken = ref(new Set<string>())
-// Searches can be superseded; a save keeps its selected copy until it settles.
+const loading = ref(true)
 const searching = ref(false)
 const saving = ref(false)
-const busy = computed(() => searching.value || saving.value)
+const busy = computed(() => loading.value || searching.value || saving.value)
 const failure = ref('')
-
-/// Which search this is. Two of them in flight and the older one landing last
-/// leaves the grid showing candidates for a query nobody typed — and the next
-/// click on it APPLIES one.
+const broken = ref(new Set<string>())
+const fileTitle = computed(() => detail.value?.input.title ?? props.item.title)
+const fileYear = computed(() => detail.value?.input.year)
+const results = computed(() => detail.value?.candidates.filter((c) => !c.rejected) ?? [])
+const current = computed(() => {
+  const input = detail.value?.input
+  if (input?.selected) return { id: input.selected[0], record: input.selected[1] }
+  return results.value.find((c) => c.strength === 0)
+})
+const weak = computed(() => !detail.value?.input.selected && !!current.value)
 let asked = 0
-/// What the search in flight is for, so Enter on the same text twice is one
-/// request. Provider search is rate-limited upstream; a held Enter key should
-/// not be what finds that out.
-let inflight = ''
-let localOffset = 0
+let disposed = false
 let localQuery = ''
+let inflight = ''
+const localLabel = (entry: IdentityChoice) => [entry.title, entry.year].filter(Boolean).join(' · ')
+const poster = (record: string) =>
+  getEnrichmentArtworkUrl(
+    selected.value,
+    record === detail.value?.input.selected?.[0] ? {} : { record_id: record },
+  )
 
 async function localPage(what: string, offset: number, mine: number) {
-  localBusy.value = true
-  try {
-    const entries = await listItems({ q: what, limit: 200, offset })
-    if (mine !== asked) return
-    const matches = entries.items.filter((item) => item.kind === props.item.kind)
-    const seen = new Set(local.value.map((item) => item.id))
-    local.value =
-      offset === 0 ? matches : [...local.value, ...matches.filter((item) => !seen.has(item.id))]
-    localQuery = what
-    // Advance through every returned kind: filtering must not skip pages or
-    // hide the next page when this page contains no assignable items.
-    localOffset = offset + entries.items.length
-    localMore.value =
-      entries.items.length > 0 &&
-      (entries.total == null ? entries.items.length === 200 : localOffset < entries.total)
-  } finally {
-    if (mine === asked) localBusy.value = false
-  }
+  const rows = await enrichmentIdentities(selected.value, { q: what, offset, limit: 200 })
+  if (mine !== asked) return
+  local.value = offset ? [...local.value, ...rows] : rows
+  localMore.value = rows.length === 200
+  localQuery = what
 }
-
 async function moreLocal() {
-  if (busy.value || localBusy.value || !localMore.value) return
-  const mine = asked
-  failure.value = ''
-  try {
-    await localPage(localQuery, localOffset, mine)
-  } catch (cause) {
-    if (mine === asked) failure.value = sentence(cause)
-  }
-}
-
-function chooseEpisode(entry: ItemRowI64, checked: boolean) {
-  picked.value = checked
-    ? [...picked.value, entry]
-    : picked.value.filter((item) => item.id !== entry.id)
-}
-
-const localLabel = (entry: ItemRowI64) =>
-  [
-    entry.parent_title,
-    entry.kind === 'episode' ? seLabel(entry.season, entry.episode, entry.episode_end) : '',
-    entry.title,
-    entry.year,
-    entry.artist,
-  ]
-    .filter(Boolean)
-    .join(' · ')
-
-async function search(what: string) {
+  if (busy.value) return
   const mine = ++asked
-  inflight = what
   searching.value = true
   failure.value = ''
-  local.value = []
-  localMore.value = false
-  localOffset = 0
   try {
-    await localPage(what, 0, mine)
-    if (mine !== asked) return
-    if (!['movie', 'series'].includes(props.item.kind)) {
-      results.value = []
-      return
-    }
-    const answer = await adminReviewSearch({
-      kind: props.item.kind,
-      query: what,
-      year: fileYear.value,
-      item: copy.value?.id ?? null,
-    })
-    if (mine !== asked) return
-    results.value = answer.candidates
+    await localPage(localQuery, local.value.length, mine)
   } catch (cause) {
-    if (mine !== asked) return
-    failure.value = sentence(cause)
+    if (mine === asked) failure.value = sentence(cause)
   } finally {
     if (mine === asked) searching.value = false
   }
 }
-
-/// Enter in the field submits, and `:disabled` on the button does not stop it.
-/// A DIFFERENT query supersedes the one in flight — the sequence guard above
-/// makes that safe — and the same one again is nothing to ask twice.
-function again() {
-  if (saving.value || (searching.value && inflight === query.value)) return
-  void search(query.value)
-}
-
-async function apply(
-  action: 'pick' | 'confirm' | 'reject' | 'reset' | 'assign' | 'new',
-  candidate?: ProviderCandidate,
-  libraryItemIds?: string[],
-) {
-  const target = copy.value
-  if (!target || busy.value) return
-  saving.value = true
+async function load() {
+  const mine = ++asked
+  loading.value = true
+  searching.value = false
+  failure.value = ''
+  detail.value = undefined
+  local.value = []
+  localMore.value = false
+  broken.value = new Set()
   try {
-    const changed = await adminApplyMatch(target.id, {
-      expected_revision: target.assignment.revision,
-      library_item_ids: libraryItemIds ?? null,
-      new_item:
-        action === 'new'
-          ? {
-              kind: props.item.kind,
-              title: query.value,
-              year: newYear.value ? Number(newYear.value) : null,
-              artist: target.artist ?? null,
-              parent_id: target.parent_library_item_id ?? null,
-              season: target.season ?? null,
-              episode: target.episode ?? null,
-              edition: null,
+    const answer = await enrichmentDetail(selected.value)
+    if (mine !== asked) return
+    detail.value = answer
+    query.value = answer.input.title
+    await localPage(query.value, 0, mine)
+  } catch (cause) {
+    if (mine === asked) failure.value = sentence(cause)
+  } finally {
+    if (mine === asked) loading.value = false
+  }
+}
+watch(selected, load)
+async function search() {
+  const input = detail.value?.input
+  const what = query.value.trim()
+  const key = what
+  if (!input || loading.value || saving.value || !what || (searching.value && key === inflight))
+    return
+  const mine = ++asked
+  inflight = key
+  searching.value = true
+  failure.value = ''
+  // The local lookup and each provider answer are independent. A failed provider
+  // leaves existing identities and the previous review snapshot available.
+  await Promise.all([
+    localPage(what, 0, mine).catch((cause) => {
+      if (mine === asked) failure.value = sentence(cause)
+    }),
+    (async () => {
+      try {
+        const configured = await adminProviders()
+        if (mine !== asked) return
+        const providers = (configured.chains[input.media_type]?.order ?? []).filter((name) =>
+          configured.available?.includes(name),
+        )
+        if (!providers.length) throw new Error('No matching providers are configured.')
+        await Promise.all(
+          providers.map(async (provider) => {
+            try {
+              await enrichmentSearch(input.item_id, {
+                revision: input.revision,
+                provider,
+                query: what,
+              })
+            } catch (cause) {
+              if (mine === asked)
+                failure.value = [failure.value, `${provider}: ${sentence(cause)}`]
+                  .filter(Boolean)
+                  .join(' ')
             }
-          : null,
+          }),
+        )
+        const answer = await enrichmentDetail(input.item_id)
+        if (mine === asked) {
+          detail.value = answer
+          broken.value = new Set()
+        }
+      } catch (cause) {
+        if (mine === asked) failure.value = sentence(cause)
+      }
+    })(),
+  ])
+  if (mine === asked) searching.value = false
+}
+async function apply(action: string, record_id?: string, library_item_id?: string) {
+  const input = detail.value?.input
+  if (!input || busy.value) return
+  saving.value = true
+  failure.value = ''
+  try {
+    await enrichmentCorrect(input.item_id, {
+      revision: input.revision,
       action,
-      provider: candidate?.provider ?? null,
-      candidate: candidate ?? null,
+      record_id: record_id ?? null,
+      ...(library_item_id ? { library_item_id } : {}),
     })
-    emit('applied', changed.library_item_ids)
+    const answer = await enrichmentDetail(input.item_id)
+    await client.invalidateQueries({
+      predicate: (q) =>
+        ['catalogue', 'item', 'children', 'shelf', 'libraries'].includes(String(q.queryKey[0])),
+      refetchType: 'none',
+    })
+    if (disposed) return
+    emit('applied', [answer.input.library_item_id])
     emit('close')
   } catch (cause) {
-    failure.value = sentence(cause)
+    if (!disposed) failure.value = sentence(cause)
   } finally {
     saving.value = false
   }
 }
-
 /// The modal's own keyboard. Escape closes it, and Tab is kept inside: a
 /// dialog whose focus wanders onto the page behind it is a dialog only for
 /// people using a mouse.
@@ -240,44 +217,34 @@ function keys(event: KeyboardEvent) {
   ;(event.shiftKey ? stops.at(-1) : stops[0])?.focus()
 }
 
-/// On the WINDOW, not on the backdrop. A key only reaches the backdrop's
-/// handler when the focus is inside it, and clicking any prose in the dialog
-/// puts the focus on `<body>` — where Escape then did nothing at all.
-watch(selected, () => {
-  ++asked
-  results.value = null
-  local.value = []
-  picked.value = []
-  query.value = fileTitle.value
-  newYear.value = fileYear.value?.toString() ?? ''
-  void search(query.value)
-})
 onMounted(async () => {
   restore = document.activeElement as HTMLElement | null
   field.value?.focus()
   window.addEventListener('keydown', keys)
   try {
-    const detail = await itemDetail(props.item.id)
-    copies.value = detail.copies
-    selected.value = props.item.collection_item_id
-      ? (copies.value.find((c) => c.id === props.item.collection_item_id)?.id ?? '')
-      : (copies.value[0]?.id ?? '')
-    if (!selected.value) failure.value = 'This source is no longer available. Reload the item.'
+    if (props.item.collection_item_id) selected.value = props.item.collection_item_id
+    else {
+      if (!props.item.library_id) throw new Error('This item has no library context.')
+      const answer = await catalogueItem(props.item.library_id, props.item.id)
+      if (disposed) return
+      copies.value = answer.copies
+      selected.value = answer.copies[0]?.id ?? ''
+    }
+    if (!selected.value) throw new Error('This source is no longer available. Reload the item.')
   } catch (cause) {
-    failure.value = sentence(cause)
+    if (!disposed) {
+      failure.value = sentence(cause)
+      loading.value = false
+    }
   }
 })
 onBeforeUnmount(() => {
+  disposed = true
   asked++
   window.removeEventListener('keydown', keys)
   restore?.focus()
 })
-
-const year = (candidate: ProviderCandidate) => candidate.release_date?.slice(0, 4) ?? '—'
-const format = (candidate: ProviderCandidate) =>
-  'format' in candidate && candidate.format ? ` · ${candidate.format}` : ''
 </script>
-
 <template>
   <div
     class="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/60 p-6"
@@ -302,165 +269,107 @@ const format = (candidate: ProviderCandidate) =>
         <select
           id="match-copy"
           v-model="selected"
-          :disabled="saving"
+          :disabled="loading || saving"
           class="w-full rounded border border-line bg-bg px-2 py-1"
         >
-          <option v-for="entry in copies" :key="entry.id" :value="entry.id">
-            {{ sourceLocation(entry) }} · {{ entry.paths.join(' + ') || entry.title }}
+          <option v-for="(entry, index) in copies" :key="entry.id" :value="entry.id">
+            {{ index + 1 }} · {{ sourceLocation(entry) }} ·
+            {{ entry.paths.join(' + ') || entry.title }}
           </option>
         </select>
       </template>
-      <div v-else-if="copy" class="mt-3 font-mono text-[12px] text-dim">
-        <div>{{ sourceLocation(copy) }}</div>
-        <div v-for="path in copy.paths" :key="path" class="break-all">{{ path }}</div>
+      <div v-if="detail" class="mt-3 font-mono text-[12px] text-dim">
+        <div>
+          {{ detail.host_name ?? detail.input.mediahost_id }} · {{ detail.input.remote_id }}
+        </div>
+        <div v-for="source in detail.input.sources" :key="source.file_id" class="break-all">
+          {{ source.root_path }} / {{ source.path }}
+        </div>
       </div>
-      <p v-if="copy?.assignment.conflict" class="mt-2 text-warn">{{ copy.assignment.conflict }}</p>
       <p class="mt-2 text-dim">
         This decision applies to the selected copy and all its file parts.
       </p>
       <div class="mt-2 flex gap-2">
-        <Btn ghost small :disabled="busy || !copy" @click="apply('reject')">Reject current</Btn>
-        <Btn ghost small :disabled="busy || !copy" @click="apply('reset')"
+        <Btn ghost small :disabled="busy || !current" @click="apply('reject', current?.id)"
+          >Reject current</Btn
+        >
+        <Btn ghost small :disabled="busy || !detail" @click="apply('clear')"
           >Use automatic matching</Btn
         >
       </div>
 
       <div
-        v-if="weak"
+        v-if="weak && current"
         class="mt-3 flex flex-wrap items-center gap-3 rounded border border-sand/40 bg-sand/10 p-2"
       >
         <span>
           Uncertain match:
-          <b>{{ copy?.matched_title || 'Match title unavailable' }}</b>
-          {{ copy?.matched_year ? ` (${copy.matched_year})` : '' }} — confirm it or pick a better
+          <b>{{ current.record.title }}</b>
+          {{ current.record.year ? ` (${current.record.year})` : '' }} — confirm it or pick a better
           one.
         </span>
         <span class="ml-auto flex gap-2">
-          <Btn small :disabled="busy" @click="apply('confirm')">Confirm current</Btn>
-          <Btn ghost small :disabled="busy" @click="apply('reject')">Reject</Btn>
+          <Btn small :disabled="busy" @click="apply('confirm', current.id)">Confirm current</Btn>
+          <Btn ghost small :disabled="busy" @click="apply('reject', current.id)">Reject</Btn>
         </span>
       </div>
 
-      <form class="mt-3 flex flex-wrap items-center gap-2" @submit.prevent="again">
+      <form class="mt-3 flex flex-wrap items-center gap-2" @submit.prevent="search">
         <label class="sr-only" for="match-query">Search titles</label>
         <input
           id="match-query"
           ref="field"
           v-model="query"
-          class="flex-1 rounded border border-line bg-bg px-2 py-1"
+          :disabled="saving"
+          class="min-w-0 flex-1 rounded border border-line bg-bg px-2 py-1"
           placeholder="Search titles"
         />
-        <Btn submit small :disabled="busy">Search</Btn>
+        <Btn submit small :disabled="busy || !query.trim()">{{
+          searching ? 'Searching…' : 'Search'
+        }}</Btn>
       </form>
 
-      <p class="mt-2 text-warn" role="alert">{{ failure }}</p>
-      <section v-if="local.length || localMore || picked.length" class="mt-3">
+      <p v-if="loading" class="mt-2" role="status">Loading matches…</p>
+      <div v-if="failure" class="mt-2">
+        <p class="text-warn" role="alert">{{ failure }}</p>
+        <Btn v-if="selected" small ghost :disabled="busy" @click="load">Reload matches</Btn>
+      </div>
+      <section v-if="local.length || localMore" class="mt-3">
         <h3>Existing library items</h3>
-        <p v-if="props.item.kind === 'episode'" class="text-dim">
-          Select the episodes in playback order.
-        </p>
         <ul class="mt-2 flex flex-col gap-2">
           <li v-for="entry in local" :key="entry.id">
-            <label v-if="props.item.kind === 'episode'"
-              ><input
-                type="checkbox"
-                :checked="picked.some((item) => item.id === entry.id)"
-                @change="chooseEpisode(entry, ($event.target as HTMLInputElement).checked)"
-              />
-              {{ localLabel(entry) }}</label
-            >
-            <Btn
-              v-else
-              ghost
-              small
-              :disabled="busy"
-              @click="apply('assign', undefined, [entry.id])"
-              >{{ localLabel(entry) }}</Btn
-            >
+            <Btn ghost small :disabled="busy" @click="apply('assign', undefined, entry.id)">{{
+              localLabel(entry)
+            }}</Btn>
           </li>
         </ul>
-        <Btn
-          v-if="localMore"
-          ghost
-          small
-          class="mt-2"
-          :disabled="busy || localBusy"
-          @click="moreLocal"
-        >
-          {{ localBusy ? 'Loading library items…' : 'Load more library items' }}
-        </Btn>
-        <template v-if="picked.length">
-          <h4 class="mt-3">Selected episodes in playback order</h4>
-          <ol class="list-decimal pl-6">
-            <li v-for="entry in picked" :key="entry.id">
-              {{ localLabel(entry) }}
-              <Btn
-                ghost
-                small
-                :aria-label="`Remove selected episode: ${localLabel(entry)}`"
-                @click="chooseEpisode(entry, false)"
-                >Remove</Btn
-              >
-            </li>
-          </ol>
-        </template>
-        <Btn
-          v-if="props.item.kind === 'episode'"
-          class="mt-2"
-          small
-          :disabled="busy || !picked.length"
-          @click="
-            apply(
-              'assign',
-              undefined,
-              picked.map((item) => item.id),
-            )
-          "
-          >Assign selected episodes</Btn
+        <Btn v-if="localMore" ghost small class="mt-2" :disabled="busy" @click="moreLocal"
+          >Load more library items</Btn
         >
       </section>
-      <details class="mt-3">
-        <summary>Create a distinct library item</summary>
-        <p class="mt-2 text-dim">
-          Use the title above for an unlisted work, or to distinguish two works with the same title
-          and year.
-        </p>
-        <label class="mt-2 block"
-          >Year
-          <input
-            v-model="newYear"
-            type="number"
-            min="1"
-            max="9999"
-            class="rounded border border-line bg-bg px-2 py-1"
-        /></label>
-        <Btn class="mt-2" small :disabled="busy || !copy || !query.trim()" @click="apply('new')"
-          >Create and assign</Btn
-        >
-      </details>
 
-      <ul v-if="results" class="mt-3 grid gap-3" role="list">
-        <li v-for="candidate in results" :key="`${candidate.provider}-${candidate.id}`">
+      <ul v-if="detail" class="mt-3 grid gap-3" role="list">
+        <li v-for="candidate in results" :key="candidate.id">
           <button
             class="flex w-full cursor-pointer flex-col gap-1 rounded-md border border-line bg-bg p-2 text-left hover:border-teal-dim"
             type="button"
             :disabled="busy"
-            @click="apply('pick', candidate)"
+            @click="apply('pick', candidate.id)"
           >
             <!-- A provider with no poster for a candidate gets the swell, like
                  everything else on the site. -->
             <img
-              v-if="candidate.poster_url && !broken.has(candidate.poster_url)"
+              v-if="!broken.has(candidate.id)"
               class="w-full rounded"
-              :src="candidate.poster_url"
+              :src="poster(candidate.id)"
               alt=""
               loading="lazy"
-              @error="broken = new Set(broken).add(candidate.poster_url!)"
+              @error="broken = new Set(broken).add(candidate.id)"
             />
             <span v-else class="ghost-art" />
-            <span class="line-clamp-2 text-[14px] font-semibold">{{ candidate.title }}</span>
+            <span class="line-clamp-2 text-[14px] font-semibold">{{ candidate.record.title }}</span>
             <span class="font-mono text-[12px] text-dim">
-              {{ year(candidate) }} · {{ candidate.provider }}{{ format(candidate) }}
+              {{ candidate.record.year ?? '—' }} · {{ candidate.record.provider }}
             </span>
           </button>
         </li>

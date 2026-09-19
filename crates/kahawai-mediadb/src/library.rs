@@ -3,6 +3,19 @@ use anyhow::{Result, ensure};
 use sqlx::{Connection, Row};
 
 impl Store {
+    /// Membership check for a session's captured physical source, independent of
+    /// subsequent metadata assignments and their library-item visibility.
+    pub async fn library_contains_source(
+        &self,
+        library: &str,
+        host: &str,
+        remote: &str,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM library_collections l JOIN collections c ON c.id=l.collection_id WHERE l.library_id=? AND c.mediahost_id=? AND c.remote_id=?)")
+            .bind(library).bind(host).bind(remote).fetch_one(self.db.read_pool()).await?)
+    }
+}
+impl Store {
     pub async fn create_library(
         &self,
         name: &str,
@@ -46,26 +59,99 @@ impl Store {
     /// one read snapshot. Library visibility depends on its accessible copies;
     /// global archival depends on whether any copy still references the item.
     pub async fn browse(&self, library: &str, offset: u32, limit: u32) -> Result<Vec<LibraryItem>> {
+        Ok(self
+            .browse_page(library, offset, limit, "", "title", None)
+            .await?
+            .0)
+    }
+
+    /// Filter and count the same accessible identities in one snapshot. Newest
+    /// means the newest accessible copy (ULIDs), not a copy in another library.
+    pub async fn browse_page(
+        &self,
+        library: &str,
+        offset: u32,
+        limit: u32,
+        query: &str,
+        sort: &str,
+        artist: Option<&str>,
+    ) -> Result<(Vec<LibraryItem>, i64)> {
         ensure!(limit > 0, "page size must be positive");
+        let order = match sort {
+            "title" => "w.title_key,w.year,w.id",
+            "-title" => "w.title_key DESC,w.year,w.id",
+            "year" => "w.year,w.title_key,w.id",
+            "-year" => "w.year DESC,w.title_key,w.id",
+            "-added" => "newest DESC,w.id",
+            "added" => "newest,w.id",
+            _ => anyhow::bail!("invalid catalogue sort"),
+        };
         let mut c = self.db.read_pool().acquire().await?;
         let mut tx = c.begin().await?;
         let kind: String = sqlx::query_scalar("SELECT media_type FROM libraries WHERE id=?")
             .bind(library)
             .fetch_one(&mut *tx)
             .await?;
-        let ids: Vec<String> = sqlx::query_scalar(
-            "SELECT w.id FROM library_items w WHERE w.media_type=? AND EXISTS(
-                SELECT 1 FROM collection_items i JOIN library_collections lc ON lc.collection_id=i.collection_id
-                WHERE i.library_item_id=w.id AND lc.library_id=?)
-             ORDER BY w.title_key,w.year,w.id LIMIT ? OFFSET ?")
-            .bind(kind).bind(library).bind(i64::from(limit)).bind(i64::from(offset))
-            .fetch_all(&mut *tx).await?;
+        // Interpolated SQL contains only literals and the whitelist above; values are bound.
+        let filter = "FROM library_items w WHERE w.media_type=? AND instr(w.title_key,?)>0 AND EXISTS(
+            SELECT 1 FROM collection_items i JOIN library_collections lc ON lc.collection_id=i.collection_id
+            WHERE i.library_item_id=w.id AND lc.library_id=? AND (? IS NULL OR COALESCE(i.artist,'Unknown artist')=?))";
+        let total = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) {filter}")))
+            .bind(&kind)
+            .bind(title_key(query))
+            .bind(library)
+            .bind(artist)
+            .bind(artist)
+            .fetch_one(&mut *tx)
+            .await?;
+        let ids: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT w.id,
+            (SELECT MAX(i.id) FROM collection_items i JOIN library_collections lc ON lc.collection_id=i.collection_id
+             WHERE i.library_item_id=w.id AND lc.library_id=?) AS newest {filter} ORDER BY {order} LIMIT ? OFFSET ?")))
+            .bind(library).bind(kind).bind(title_key(query)).bind(library).bind(artist).bind(artist)
+            .bind(i64::from(limit)).bind(i64::from(offset)).fetch_all(&mut *tx).await?;
         let mut out = Vec::with_capacity(ids.len());
         for item in ids {
             out.push(read_item(&mut tx, library, &item).await?);
         }
         tx.commit().await?;
-        Ok(out)
+        Ok((out, total))
+    }
+
+    /// Artist names come from the imported album artist. Albums remain separate
+    /// identities; grouping here only supplies navigation within one library.
+    pub async fn browse_artists(
+        &self,
+        library: &str,
+        offset: u32,
+        limit: u32,
+        query: &str,
+        descending: bool,
+    ) -> Result<(Vec<(String, i64)>, i64)> {
+        let mut c = self.db.read_pool().acquire().await?;
+        let mut tx = c.begin().await?;
+        // Only the literal direction is interpolated; names and filters are bound.
+        let grouped = "SELECT COALESCE(i.artist,'Unknown artist') AS name,COUNT(DISTINCT i.library_item_id) AS albums
+            FROM collection_items i JOIN library_collections lc ON lc.collection_id=i.collection_id
+            WHERE lc.library_id=? AND instr(lower(COALESCE(i.artist,'Unknown artist')),lower(?))>0 GROUP BY name";
+        let total = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+            "SELECT COUNT(*) FROM ({grouped})"
+        )))
+        .bind(library)
+        .bind(query)
+        .fetch_one(&mut *tx)
+        .await?;
+        let direction = if descending { "DESC" } else { "ASC" };
+        let rows = sqlx::query_as(sqlx::AssertSqlSafe(format!(
+            "{grouped} ORDER BY lower(name) {direction},name LIMIT ? OFFSET ?"
+        )))
+        .bind(library)
+        .bind(query)
+        .bind(i64::from(limit))
+        .bind(i64::from(offset))
+        .fetch_all(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok((rows, total))
     }
     pub async fn library_item(&self, library: &str, item: &str) -> Result<LibraryItem> {
         let mut c = self.db.read_pool().acquire().await?;
@@ -171,16 +257,25 @@ async fn set_collections(
     }
     Ok(())
 }
-async fn read_item(
+pub(crate) async fn read_item(
     c: &mut sqlx::SqliteConnection,
     library: &str,
     item: &str,
 ) -> Result<LibraryItem> {
     let rows = sqlx::query(
-        "SELECT i.id,
+        "SELECT i.id,i.artist,col.media_type,
+        EXISTS(SELECT 1 FROM media_entries e WHERE e.item_id=i.id AND e.kind='episode') AS episodic,
         CASE WHEN a.record_id IS NULL THEN i.title ELSE p.title END AS title,
-        CASE WHEN a.record_id IS NULL THEN i.year ELSE p.year END AS year
+        CASE WHEN a.record_id IS NULL THEN i.year ELSE p.year END AS year,
+        CASE WHEN a.manual=1 THEN 'manual'
+             WHEN a.record_id IS NOT NULL THEN 'auto'
+             WHEN EXISTS(SELECT 1 FROM enrichment_candidates ec
+                 WHERE ec.item_id=i.id AND ec.revision=i.enrichment_revision AND ec.strength=0
+                 AND NOT EXISTS(SELECT 1 FROM metadata_rejections r
+                     WHERE r.item_id=i.id AND r.record_id=ec.record_id)) THEN 'weak'
+             ELSE NULL END AS match_confidence
         FROM collection_items i JOIN library_collections lc ON lc.collection_id=i.collection_id
+        JOIN collections col ON col.id=i.collection_id
         LEFT JOIN metadata_assignments a ON a.item_id=i.id
         LEFT JOIN provider_records p ON p.id=a.record_id
         WHERE i.library_item_id=? AND lc.library_id=?
@@ -190,15 +285,29 @@ async fn read_item(
     .bind(library)
     .fetch_all(&mut *c)
     .await?;
-    let first = rows
-        .first()
-        .ok_or_else(|| anyhow::anyhow!("library item has no accessible copy"))?;
+    let first = rows.first().ok_or(crate::NotFound)?;
     let representative_id: String = first.get("id");
+    let media_type = MediaType::parse(first.get("media_type"))?;
+    // A mixed anime item exposes its episode children whenever any visible copy
+    // supplies them. Library composition therefore scopes the shape too.
+    let kind = match media_type {
+        MediaType::Music => LibraryItemKind::Album,
+        MediaType::Movies => LibraryItemKind::Movie,
+        MediaType::Series => LibraryItemKind::Series,
+        MediaType::Anime if rows.iter().any(|r| r.get::<bool, _>("episodic")) => {
+            LibraryItemKind::Series
+        }
+        MediaType::Anime => LibraryItemKind::Movie,
+    };
     Ok(LibraryItem {
+        kind,
         id: item.into(),
         title: first.get("title"),
+        artist: first.get("artist"),
+        media_type,
         year: first.get("year"),
         metadata: crate::metadata::resolve(c, &representative_id).await?,
+        match_confidence: first.get("match_confidence"),
         representative_id,
         copy_ids: rows.iter().map(|r| r.get("id")).collect(),
     })

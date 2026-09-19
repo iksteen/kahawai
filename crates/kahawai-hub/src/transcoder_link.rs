@@ -220,7 +220,10 @@ impl TranscoderLink for TranscoderLinkService {
                                 &l.session_id,
                                 &format!("{header}{}", l.body),
                             );
-                            sessions.deliver_logs(&l.session_id, format!("{header}{}", l.body));
+                            let body = crate::sessionlog::for_session(data_dir, &l.session_id)
+                                .and_then(|p| std::fs::read_to_string(p).ok())
+                                .unwrap_or_else(|| format!("{header}{}", l.body));
+                            sessions.deliver_logs(&l.session_id, body);
                         }
                         tc_to_hub::Msg::SessionReady(r) => {
                             let facts = r

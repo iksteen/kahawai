@@ -186,12 +186,15 @@ impl RemuxRunner {
     }
 }
 
+pub(crate) mod catalogue;
+pub use catalogue::{CataloguePlayback, CatalogueSession, FileId};
+
 /// One file of a (possibly multi-part) source, with its absolute
 /// timeline offset. CD1/CD2-era rips: parts play as one continuous
 /// timeline; part boundaries are ordinary seek-restarts.
 #[derive(Debug, Clone)]
 pub struct PartSource {
-    pub file_id: i64,
+    pub file_id: FileId,
     pub head_xxh3: i64,
     pub tail_xxh3: i64,
     pub module_id: String,
@@ -254,8 +257,14 @@ async fn fill_audio_loudness_gains(
     } else if preference.force() {
         known
     } else {
-        registry
-            .audio_loudness(parts[0].file_id, plan.audio_track)
+        parts[0]
+            .file_id
+            .audio_loudness(
+                registry,
+                plan.audio_track,
+                parts[0].size,
+                parts[0].mtime_unix,
+            )
             .await?
     };
 
@@ -373,6 +382,7 @@ pub struct StartOptions {
     pub album_track_id: Option<i64>,
     pub resume: bool,
     pub source_fingerprint: Option<String>,
+    pub catalogue: Option<CataloguePlayback>,
 }
 impl From<u64> for StartOptions {
     fn from(ms: u64) -> Self {
@@ -384,6 +394,8 @@ impl From<u64> for StartOptions {
 }
 
 pub struct Session {
+    pub catalogue: Option<CatalogueSession>,
+    info: kahawai_core::media::MediaInfo,
     pub id: String,
     pub user_id: String,
     pub item_id: String,
@@ -394,7 +406,6 @@ pub struct Session {
     pub source_fingerprint: String,
     pub replay_gain: Option<kahawai_core::media::ReplayGain>,
     pub boundaries: Vec<crate::library::SourceBoundary>,
-    member_finish: Mutex<std::collections::BTreeMap<String, u8>>,
     visited_members: Mutex<std::collections::BTreeSet<String>>,
     pub effective_start_ms: u64,
     pub last_position_ms: std::sync::atomic::AtomicU64,
@@ -483,38 +494,10 @@ pub struct Session {
     seek_done: tokio::sync::watch::Sender<(u64, Result<u64, String>)>,
     touched: Mutex<std::time::Instant>,
     /// Progress holds a read guard through its watch-state write; teardown
-    /// takes the write guard before deciding whether this session earned a
-    /// play. The gapless player deliberately sends final progress beside
-    /// teardown, so request scheduling must not decide whether the play exists.
+    /// waits for it before ending the session, so the last progress write
+    /// cannot land after teardown has completed.
     ending: tokio::sync::RwLock<bool>,
-    /// Is the playhead past the end threshold? Seeded from where this
-    /// watch BEGAN, then moved by every progress report.
-    ///
-    /// Per SESSION and not read back from `user_item_state.played`, so
-    /// nothing else that writes that column — a mark by hand, another
-    /// device — can put a play in this session's name.
-    /// Did this watch take the item past the line ITSELF?
-    ///
-    /// With the current finished bit it decides `play_count` at teardown, and
-    /// the pair is what keeps one sitting from counting twice. A session
-    /// that is taken away — a reaped pause, a dead transcoder, a lost
-    /// mediahost — is followed by one the client starts AT THE SAME
-    /// POSITION (`recovery.ts`), already past the line and so seeded
-    /// `finished`; it never sees the crossing, so the play stays with the
-    /// watch that did the watching, wherever that one happened to stop.
-    /// Asking instead who ended the session cannot work: the answer would
-    /// have to be "not the reaper", and a viewer who finishes something
-    /// and closes a laptop that never sends its `DELETE` is reaped too.
-    ///
-    /// The two facts are one atomic state rather than two booleans. Teardown
-    /// may race a final progress request; publishing `finished` and
-    /// `saw_finish` separately let it observe the first without the second and
-    /// silently lose the play.
-    watch_finish: std::sync::atomic::AtomicU8,
 }
-
-const WATCH_FINISHED: u8 = 1;
-const WATCH_SAW_FINISH: u8 = 2;
 
 /// A coalesced seek intent.
 #[derive(Debug, Clone, Copy)]
@@ -619,13 +602,14 @@ pub(crate) struct Negotiation<'a> {
     /// HUB-32c: image tracks that already have OCR text derived from
     /// them, keyed per source.
     ocr_set: std::collections::HashSet<(String, String, String, String, i64)>,
+    raster_sources: Option<std::collections::HashSet<FileId>>,
     /// An explicit burn pick, if the caller named one and it is a track
     /// some tier could actually burn.
     burn_row: Option<crate::tracks::Track>,
     audio_track: u32,
     /// QUERY resolves each rendition's preference before ranking. Keyed by
     /// first-part file ID after resolving the public source IDs once.
-    source_audio_tracks: std::collections::HashMap<i64, u32>,
+    source_audio_tracks: std::collections::HashMap<FileId, u32>,
     video_track: u32,
     /// The chosen source has a current measurement and force may therefore
     /// turn only its audio copy/direct path into an encode.
@@ -637,15 +621,13 @@ impl<'a> Negotiation<'a> {
     /// Resolve the caller's inputs once. The subtitle pick is validated
     /// here so a bad track id fails before any source work.
     #[allow(clippy::too_many_arguments)] // the caller's request, spelled out
-    pub(crate) async fn new(
+    pub(crate) async fn preferences(
         sessions: &'a Sessions,
         registry: &'a Registry,
         user_id: &str,
-        item_id: &str,
         profile: Option<kahawai_core::media::CapabilityProfile>,
         audio_track: u32,
         video_track: u32,
-        subtitle_track: Option<i64>,
     ) -> Result<Self> {
         // ONE path: every session negotiates. The user's standing
         // bandwidth cap tightens whatever the client asked for (HUB-15).
@@ -676,6 +658,44 @@ impl<'a> Negotiation<'a> {
             registry.any_transcoder_ass_burn() || local_ass_burn,
         )
         .await;
+        Ok(Self {
+            user_id: user_id.to_string(),
+            registry,
+            sessions,
+            profile,
+            loudness,
+            ass,
+            ocr_set: Default::default(),
+            raster_sources: None,
+            burn_row: None,
+            audio_track,
+            source_audio_tracks: Default::default(),
+            video_track,
+            force_audio_encode: false,
+            force_measurement: None,
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn new(
+        sessions: &'a Sessions,
+        registry: &'a Registry,
+        user_id: &str,
+        item_id: &str,
+        profile: Option<kahawai_core::media::CapabilityProfile>,
+        audio_track: u32,
+        video_track: u32,
+        subtitle_track: Option<i64>,
+    ) -> Result<Self> {
+        let mut out = Self::preferences(
+            sessions,
+            registry,
+            user_id,
+            profile,
+            audio_track,
+            video_track,
+        )
+        .await?;
         // HUB-32c: which embedded image tracks already have an OCR text
         // track derived from them — those prefer text over burn in the
         // negotiation. Fetched once, keyed per source.
@@ -711,21 +731,64 @@ impl<'a> Negotiation<'a> {
                     || matches!(t.format.as_str(), "ass" | "ssa")
             })
             .filter(|t| t.module_id.is_some() && t.stream_index.is_some());
-        Ok(Self {
-            user_id: user_id.to_string(),
-            registry,
-            sessions,
-            profile,
-            loudness,
-            ass,
-            ocr_set,
-            burn_row,
-            audio_track,
-            source_audio_tracks: Default::default(),
-            video_track,
-            force_audio_encode: false,
-            force_measurement: None,
-        })
+        out.ocr_set = ocr_set;
+        out.burn_row = burn_row;
+        Ok(out)
+    }
+
+    pub(crate) fn catalogue_subtitle(
+        &mut self,
+        input: &CataloguePlayback,
+        item: &str,
+        track: Option<i64>,
+    ) -> Result<()> {
+        if let Some(id) = track {
+            let selected = input
+                .media_entry_id
+                .as_ref()
+                .and_then(|id| input.item.renditions.iter().find(|r| r.entry.id == *id));
+            let candidates = input.candidates()?;
+            let picked = selected
+                .and_then(|r| {
+                    candidates.iter().find(|(p, _)| {
+                        r.files
+                            .first()
+                            .is_some_and(|f| p[0].file_id == FileId::Catalogue(f.id.clone()))
+                    })
+                })
+                .map(|(p, info)| -> Result<_> {
+                    Ok(catalogue::tracks(item, &p[0], info)
+                        .into_iter()
+                        .chain(input.capture(p, item)?.subtitles)
+                        .find(|t| t.id == id))
+                })
+                .transpose()?
+                .flatten()
+                .ok_or_else(|| NoSuchTrack {
+                    item: item.into(),
+                    track: id,
+                })?;
+            self.burn_row = Some(picked).filter(|t| {
+                crate::tracks::is_image_format(&t.format)
+                    || matches!(t.format.as_str(), "ass" | "ssa")
+            });
+        }
+        Ok(())
+    }
+
+    pub(crate) fn catalogue_audio_tracks(
+        &mut self,
+        input: &CataloguePlayback,
+        tracks: &std::collections::BTreeMap<String, u32>,
+    ) {
+        for rendition in &input.item.renditions {
+            if let (Some(file), Some(track)) =
+                (rendition.files.first(), tracks.get(&rendition.entry.id))
+            {
+                self.source_audio_tracks
+                    .insert(FileId::Catalogue(file.id.clone()), *track);
+            }
+        }
     }
 
     pub(crate) fn profile(&self) -> &kahawai_core::media::CapabilityProfile {
@@ -753,7 +816,8 @@ impl<'a> Negotiation<'a> {
         .await?;
         for (source_id, file_id) in parts {
             if let Some(track) = tracks.get(&source_id) {
-                self.source_audio_tracks.insert(file_id, *track);
+                self.source_audio_tracks
+                    .insert(FileId::Legacy(file_id), *track);
             }
         }
         Ok(())
@@ -790,7 +854,7 @@ impl<'a> Negotiation<'a> {
         let i = t.stream_index? as usize;
         match t.origin.as_str() {
             "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
-            "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
+            "sidecar" | "downloaded" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
             _ => None,
         }
     }
@@ -875,6 +939,10 @@ impl<'a> Negotiation<'a> {
         facts: &ExecutorFacts,
         force_audio_encode: bool,
     ) -> kahawai_media::negotiate::SourcePlan {
+        let mut ass = self.ass.clone();
+        if let Some(sources) = &self.raster_sources {
+            ass.overlay_ready = parts.first().is_some_and(|p| sources.contains(&p.file_id));
+        }
         let est_kbps = info
             .duration_ms
             .filter(|d| *d > 0)
@@ -904,7 +972,7 @@ impl<'a> Negotiation<'a> {
                 facts.burn_capable,
                 &ocr_flags,
                 self.pick_for(parts),
-                &self.ass,
+                &ass,
                 &facts.video_targets,
                 &facts.full_audio_targets,
                 &facts.local_audio_targets,
@@ -1039,8 +1107,14 @@ impl<'a> Negotiation<'a> {
             return Ok(None);
         }
         let audio_track = (self.audio_track_for(parts) as usize).min(info.audio.len() - 1);
-        self.registry
-            .audio_loudness(parts[0].file_id, audio_track)
+        parts[0]
+            .file_id
+            .audio_loudness(
+                self.registry,
+                audio_track,
+                parts[0].size,
+                parts[0].mtime_unix,
+            )
             .await
     }
 
@@ -1132,7 +1206,11 @@ impl<'a> Negotiation<'a> {
             .bind(source)
             .fetch_all(self.registry.db())
             .await?;
-            eligible.retain(|(parts, _)| parts.first().is_some_and(|p| files.contains(&p.file_id)));
+            eligible.retain(|(parts, _)| {
+                parts
+                    .first()
+                    .is_some_and(|p| files.iter().any(|id| p.file_id == FileId::Legacy(*id)))
+            });
         }
         if eligible.is_empty() {
             if incomplete {
@@ -1140,6 +1218,20 @@ impl<'a> Negotiation<'a> {
             }
             bail!("no sources for item");
         }
+        self.choose_sources(eligible, mode).await
+    }
+
+    pub(crate) async fn choose_sources(
+        &mut self,
+        mut eligible: Vec<(Vec<PartSource>, kahawai_core::media::MediaInfo)>,
+        mode: Option<&str>,
+    ) -> Result<(
+        Vec<PartSource>,
+        kahawai_core::media::MediaInfo,
+        kahawai_media::negotiate::SourcePlan,
+        String,
+    )> {
+        anyhow::ensure!(!eligible.is_empty(), "no sources for item");
         eligible.retain(|(parts, _)| {
             parts
                 .iter()
@@ -1281,6 +1373,12 @@ pub(crate) async fn fill_verdict_track_ids(
     verdicts: &mut [kahawai_media::negotiate::SubtitleVerdict],
 ) {
     let Some(p) = parts.first() else { return };
+    if matches!(p.file_id, FileId::Catalogue(_)) {
+        for v in verdicts {
+            v.track_id = Some(v.index as i64 + 1);
+        }
+        return;
+    }
     let map: std::collections::HashMap<i64, i64> = sqlx::query_as(
         "SELECT t.stream_index,t.id FROM subtitle_tracks t
          JOIN files f ON f.id=t.source_id JOIN collection_roots r ON r.id=f.root_id
@@ -1359,33 +1457,6 @@ impl Session {
         if *guard { None } else { Some(guard) }
     }
 
-    /// Record what a progress report said, for the count that lands when
-    /// this watch stops. See [`Session::watch_finish`].
-    pub fn report(&self, finished: bool) {
-        self.watch_finish
-            .fetch_update(
-                std::sync::atomic::Ordering::AcqRel,
-                std::sync::atomic::Ordering::Acquire,
-                |old| {
-                    if finished {
-                        let crossed = old & WATCH_FINISHED == 0;
-                        Some(old | WATCH_FINISHED | if crossed { WATCH_SAW_FINISH } else { 0 })
-                    } else {
-                        Some(old & !WATCH_FINISHED)
-                    }
-                },
-            )
-            .expect("the finish-state update never refuses");
-    }
-
-    /// Is this watch a play? It ended past the line, and it is the one
-    /// that got the item there. Read once, at teardown.
-    pub fn earned_a_play(&self) -> bool {
-        self.watch_finish.load(std::sync::atomic::Ordering::Acquire)
-            & (WATCH_FINISHED | WATCH_SAW_FINISH)
-            == (WATCH_FINISHED | WATCH_SAW_FINISH)
-    }
-
     pub fn visit_members(&self, position_ms: u64) -> std::collections::BTreeSet<String> {
         let mut visited = self.visited_members.lock().unwrap();
         if let Some(b) = self
@@ -1397,51 +1468,6 @@ impl Session {
             visited.insert(b.library_item_id.clone());
         }
         visited.clone()
-    }
-
-    pub fn report_members(&self, position_ms: u64) {
-        let visited = self.visited_members.lock().unwrap();
-        let mut states = self.member_finish.lock().unwrap();
-        for b in &self.boundaries {
-            if !visited.contains(&b.library_item_id) {
-                continue;
-            }
-            if position_ms < b.start_ms {
-                continue;
-            }
-            let state = states
-                .get_mut(&b.library_item_id)
-                .expect("captured member state");
-            if position_ms >= b.start_ms + (b.end_ms - b.start_ms) * 9 / 10 {
-                if *state & WATCH_FINISHED == 0 {
-                    *state |= WATCH_SAW_FINISH;
-                }
-                *state |= WATCH_FINISHED;
-            } else {
-                *state &= !WATCH_FINISHED;
-            }
-        }
-    }
-
-    fn earned_library_item_ids(&self) -> Vec<String> {
-        if self.boundaries.is_empty() {
-            if self.earned_a_play() {
-                self.library_item_ids.clone()
-            } else {
-                Vec::new()
-            }
-        } else {
-            self.member_finish
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|(_, state)| {
-                    **state & (WATCH_FINISHED | WATCH_SAW_FINISH)
-                        == (WATCH_FINISHED | WATCH_SAW_FINISH)
-                })
-                .map(|(id, _)| id.clone())
-                .collect()
-        }
     }
 
     pub fn idle_for(&self) -> Duration {
@@ -1828,7 +1854,11 @@ impl Sessions {
         match &session.mode {
             Mode::Remux { dir, .. } => {
                 let (_, header) = self.log_header(id);
-                Ok(format!("{header}{}", local_bundle(dir)))
+                let body = format!("{header}{}", local_bundle(dir));
+                crate::sessionlog::store(&data_dir, &session.item_id, id, &body);
+                Ok(crate::sessionlog::for_session(&data_dir, id)
+                    .and_then(|p| std::fs::read_to_string(p).ok())
+                    .unwrap_or(body))
             }
             Mode::Transcode { transcoder } => {
                 let tc = transcoder.lock().unwrap().clone();
@@ -1903,6 +1933,9 @@ impl Sessions {
                 format!("== hub: session {id}\nitem:       {item_id}\n(session did not reach a running state)\n\n"),
             ),
         );
+        if let Some(data_dir) = self.data_dir() {
+            crate::sessionlog::store(data_dir, item_id, id, &kept[id].1);
+        }
     }
 
     /// OPS-10: record why a session failed, on the header every later
@@ -1932,6 +1965,20 @@ impl Sessions {
 
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self.scratch_root.parent()
+    }
+
+    fn keep_local_logs(&self, id: &str, dir: &std::path::Path) {
+        if dir.is_dir()
+            && let Some(data_dir) = self.data_dir()
+        {
+            let (item, header) = self.log_header(id);
+            crate::sessionlog::store(
+                data_dir,
+                &item,
+                id,
+                &format!("{header}{}", local_bundle(dir)),
+            );
+        }
     }
 
     /// Take a slot for `user_id` under `id`, or refuse. The count is
@@ -1969,7 +2016,31 @@ impl Sessions {
     }
 
     pub fn with_limits(scratch_root: PathBuf, max_per_user: usize, idle_timeout: Duration) -> Self {
-        // Sessions never survive a restart; stale scratch is garbage.
+        // Recover crash-interrupted local runs before deleting their scratch.
+        // The durable start header supplies the item identity after memory is lost.
+        if let Some(data_dir) = scratch_root.parent()
+            && let Ok(entries) = std::fs::read_dir(&scratch_root)
+        {
+            for entry in entries.flatten() {
+                let id = entry.file_name().to_string_lossy().into_owned();
+                if let Some(path) = crate::sessionlog::for_session(data_dir, &id)
+                    && let Ok(header) = std::fs::read_to_string(path)
+                    && let Some(item) = header
+                        .lines()
+                        .find_map(|line| line.strip_prefix("item:").map(str::trim))
+                {
+                    crate::sessionlog::store(
+                        data_dir,
+                        item,
+                        &id,
+                        &format!(
+                            "== recovered after hub restart\n{}",
+                            local_bundle(&entry.path())
+                        ),
+                    );
+                }
+            }
+        }
         let _ = std::fs::remove_dir_all(&scratch_root);
         Self {
             leases: Leases::default(),
@@ -2112,7 +2183,7 @@ impl Sessions {
                     info.duration_ms.unwrap_or(0)
                 };
                 parts.push(PartSource {
-                    file_id: r.get("file_id"),
+                    file_id: FileId::Legacy(r.get("file_id")),
                     head_xxh3: r.get("head_xxh3"),
                     tail_xxh3: r.get("tail_xxh3"),
                     module_id: r.get("module_id"),
@@ -2328,7 +2399,11 @@ impl Sessions {
         video_track: u32,
         subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
-        let canonical = crate::library::resolve_id(registry.db(), item_id).await?;
+        let canonical = if start.catalogue.is_some() {
+            item_id.to_owned()
+        } else {
+            crate::library::resolve_id(registry.db(), item_id).await?
+        };
         let item_id = canonical.as_str();
         let id = ulid::Ulid::generate().to_string();
         self.note_session(&id, item_id);
@@ -2375,6 +2450,12 @@ impl Sessions {
             let (item, header) = self.log_header(&id);
             crate::sessionlog::store(data_dir, &item, &id, &header);
         }
+        if started.is_ok()
+            && let Some(data_dir) = self.data_dir()
+        {
+            let (item, header) = self.log_header(&id);
+            crate::sessionlog::store(data_dir, &item, &id, &header);
+        }
         started
     }
 
@@ -2394,70 +2475,104 @@ impl Sessions {
         subtitle_track: Option<i64>,
     ) -> Result<Arc<Session>> {
         let id = id.to_string();
-        let mut neg = Negotiation::new(
-            self,
-            registry,
-            user_id,
-            item_id,
-            profile,
-            audio_track,
-            video_track,
-            subtitle_track,
-        )
-        .await?;
-        let (parts, info, sp, mode) = neg
-            .best_source(
+        let mut neg = if start.catalogue.is_some() {
+            Negotiation::preferences(self, registry, user_id, profile, audio_track, video_track)
+                .await?
+        } else {
+            Negotiation::new(
+                self,
+                registry,
+                user_id,
+                item_id,
+                profile,
+                audio_track,
+                video_track,
+                subtitle_track,
+            )
+            .await?
+        };
+        if let Some(input) = &start.catalogue {
+            neg.catalogue_subtitle(input, item_id, subtitle_track)?;
+        }
+        let (parts, info, sp, mode) = if let Some(input) = &start.catalogue {
+            input
+                .negotiate(&mut neg, mode, start.source_fingerprint.as_deref())
+                .await?
+        } else {
+            neg.best_source(
                 item_id,
                 mode,
                 start.album_track_id,
                 start.source_id,
                 start.source_fingerprint.as_deref(),
             )
-            .await?;
-        let snapshot = crate::library::playback_snapshot(
-            registry.db(),
-            item_id,
-            parts.first().context("source has no parts")?.file_id,
-        )
-        .await?;
-        let selected_fingerprint = crate::registry::source_fingerprint(
-            &parts
-                .iter()
-                .map(|p| (p.size as i64, p.head_xxh3, p.tail_xxh3))
-                .collect::<Vec<_>>(),
-        );
+            .await?
+        };
+        let mut catalogue = start
+            .catalogue
+            .as_ref()
+            .map(|input| input.capture(&parts, item_id))
+            .transpose()?;
+        let snapshot = if let Some(captured) = &catalogue {
+            crate::library::PlaybackSnapshot {
+                playable_source_id: captured.source_id,
+                collection_item_id: captured.copy_id.clone(),
+                revision: 0,
+                library_item_ids: captured.item_ids.clone(),
+                fingerprint: catalogue::fingerprint(&parts),
+                boundaries: vec![],
+            }
+        } else {
+            crate::library::playback_snapshot(registry.db(), item_id, parts[0].file_id.legacy()?)
+                .await?
+        };
         anyhow::ensure!(
-            snapshot.fingerprint == selected_fingerprint,
+            snapshot.fingerprint == catalogue::fingerprint(&parts),
             "physical version changed during negotiation; retry"
         );
         let resume_fingerprint = crate::library::resume_fingerprint(&snapshot);
-        let stored_resume:Option<(i64,Option<String>)>=sqlx::query_as("SELECT position_ms,resume_source_fingerprint FROM user_item_state WHERE user_id=? AND item_id=? AND played=0").bind(user_id).bind(item_id).fetch_optional(registry.db()).await?;
-        let start_ms = start.ms;
-        let resume_source_fingerprint = start.source_fingerprint.as_deref();
-        let expected = resume_source_fingerprint
-            .or_else(|| stored_resume.as_ref().and_then(|(_, fp)| fp.as_deref()));
-        let stale_resume = (start.resume || resume_source_fingerprint.is_some())
-            && !crate::library::same_resume_version(registry.db(), expected, &resume_fingerprint)
+        let start_ms = if catalogue.is_some() {
+            let saved = crate::watch::read(registry.db(), user_id, &[item_id.to_owned()])
+                .await?
+                .remove(item_id)
+                .unwrap_or_default();
+            if start.resume && !start.explicit_position {
+                saved.resume_position_ms.unwrap_or(0) as u64
+            } else {
+                start.ms
+            }
+        } else {
+            let stored_resume:Option<(i64,Option<String>)>=sqlx::query_as("SELECT position_ms,resume_source_fingerprint FROM user_item_state WHERE user_id=? AND item_id=? AND played=0").bind(user_id).bind(item_id).fetch_optional(registry.db()).await?;
+            let start_ms = start.ms;
+            let resume_source_fingerprint = start.source_fingerprint.as_deref();
+            let expected = resume_source_fingerprint
+                .or_else(|| stored_resume.as_ref().and_then(|(_, fp)| fp.as_deref()));
+            let stale_resume = (start.resume || resume_source_fingerprint.is_some())
+                && !crate::library::same_resume_version(
+                    registry.db(),
+                    expected,
+                    &resume_fingerprint,
+                )
                 .await?;
-        let item_relative = start.resume || stale_resume;
-        let start_ms = if stale_resume { 0 } else { start_ms };
-        let start_ms = if let Some(boundary) = snapshot
-            .boundaries
-            .iter()
-            .find(|b| b.library_item_id == item_id)
-        {
-            if (start_ms == 0 && !start.explicit_position) || item_relative {
-                boundary
-                    .start_ms
-                    .saturating_add(start_ms)
-                    .min(boundary.end_ms)
+            let item_relative = start.resume || stale_resume;
+            let start_ms = if stale_resume { 0 } else { start_ms };
+            if let Some(boundary) = snapshot
+                .boundaries
+                .iter()
+                .find(|b| b.library_item_id == item_id)
+            {
+                if (start_ms == 0 && !start.explicit_position) || item_relative {
+                    boundary
+                        .start_ms
+                        .saturating_add(start_ms)
+                        .min(boundary.end_ms)
+                } else {
+                    start_ms
+                }
             } else {
                 start_ms
             }
-        } else {
-            start_ms
         };
-
         for part in &parts {
             registry.hint_discovery(
                 &part.module_id,
@@ -2501,6 +2616,11 @@ impl Sessions {
                     &part.root_token,
                     &walk_rel,
                     walk_idx,
+                    &if sp.burn_sidecar.is_some() {
+                        catalogue::physical(part, &info).sidecar_revision
+                    } else {
+                        catalogue::physical(part, &info).revision
+                    },
                     BURN_SETS_WAIT,
                 )
                 .await;
@@ -2521,7 +2641,8 @@ impl Sessions {
         // ladder would actually take it — rasterising for a client
         // that would flatten anyway is pure waste — and the answer
         // re-plans, exactly as failing display sets do one tier down.
-        if neg.ass.overlay_reachable(neg.profile())
+        if catalogue.is_none()
+            && neg.ass.overlay_reachable(neg.profile())
             && let Some(part) = parts.first()
             && subtitles
                 .overlay_ready(
@@ -2539,6 +2660,40 @@ impl Sessions {
             neg.ass.overlay_ready = true;
             sp = neg.plan_probed(&parts, &info, burn_capable);
         }
+        if let (Some(input), Some(captured)) = (&start.catalogue, &mut catalogue)
+            && neg.ass.overlay_reachable(neg.profile())
+        {
+            let parents = catalogue::tracks(item_id, &parts[0], &info)
+                .into_iter()
+                .chain(captured.subtitles.iter().cloned())
+                .collect::<Vec<_>>();
+            let selected = neg.burn_row.as_ref().map(|t| t.id);
+            if let Some(parent) = parents.iter().find(|t| {
+                matches!(t.format.as_str(), "ass" | "ssa") && selected.is_none_or(|id| t.id == id)
+            }) {
+                match tokio::time::timeout(
+                    crate::subtitles::RASTER_WAIT,
+                    subtitles.catalogue_raster(registry, self, parent),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        *captured = input.capture(&parts, item_id)?;
+                        neg.ass.overlay_ready = true;
+                        neg.raster_sources
+                            .get_or_insert_default()
+                            .insert(parts[0].file_id.clone());
+                        sp = neg.plan_probed(&parts, &info, burn_capable);
+                    }
+                    Ok(Err(error)) => {
+                        tracing::warn!(%error, "catalogue ASS raster unavailable; using next tier")
+                    }
+                    Err(_) => {
+                        tracing::info!("catalogue ASS raster still rendering; using next tier")
+                    }
+                }
+            }
+        }
         // HUB-32a: a sidecar ASS burn needs the script itself, the same
         // way an image burn needs its display sets — the worker cannot
         // read the media's neighbourhood. Embedded burns need nothing:
@@ -2546,19 +2701,26 @@ impl Sessions {
         let mut burn_ass_text: Option<String> = None;
         if let Some(i) = sp.burn_ass_sidecar {
             let part = &parts[0];
-            let tracks = crate::tracks::for_item_source(
-                registry.db(),
-                &snapshot.collection_item_id,
-                &part.module_id,
-                &part.collection_id,
-                &part.root_token,
-                &part.path_rel,
-            )
-            .await?;
-            if let Some(track) = tracks
-                .iter()
-                .find(|t| t.origin == "sidecar" && t.stream_index == Some(i as i64))
-            {
+            let tracks = if let Some(captured) = &catalogue {
+                catalogue::tracks(item_id, part, &info)
+                    .into_iter()
+                    .chain(captured.subtitles.iter().cloned())
+                    .collect()
+            } else {
+                crate::tracks::for_item_source(
+                    registry.db(),
+                    &snapshot.collection_item_id,
+                    &part.module_id,
+                    &part.collection_id,
+                    &part.root_token,
+                    &part.path_rel,
+                )
+                .await?
+            };
+            if let Some(track) = tracks.iter().find(|t| {
+                matches!(t.origin.as_str(), "sidecar" | "downloaded")
+                    && t.stream_index == Some(i as i64)
+            }) {
                 burn_ass_text = subtitles.ass_for_burn(registry, self, track).await;
             }
             if burn_ass_text.is_none() {
@@ -2856,13 +3018,9 @@ impl Sessions {
         } else {
             info.duration_ms
         };
-        // Where this watch begins, on the same 90 percent rule progress
-        // uses. A session that opens PAST the line is a continuation —
-        // recovery restarts at the position that was lost — so its first
-        // report must not read as a crossing.
-        let started_finished =
-            session_duration.is_some_and(|d| d > 0 && start_ms.saturating_mul(10) >= d * 9);
         let session = Arc::new(Session {
+            catalogue,
+            info: info.clone(),
             id,
             user_id: user_id.to_string(),
             item_id: item_id.to_string(),
@@ -2882,22 +3040,6 @@ impl Sessions {
                     .map(|b| b.library_item_id.clone())
                     .collect()
             }),
-            member_finish: Mutex::new(
-                snapshot
-                    .boundaries
-                    .iter()
-                    .map(|b| {
-                        (
-                            b.library_item_id.clone(),
-                            if start_ms >= b.start_ms + (b.end_ms - b.start_ms) * 9 / 10 {
-                                WATCH_FINISHED
-                            } else {
-                                0
-                            },
-                        )
-                    })
-                    .collect(),
-            ),
             boundaries: snapshot.boundaries,
             effective_start_ms: start_ms,
             last_position_ms: std::sync::atomic::AtomicU64::new(start_ms),
@@ -2928,11 +3070,6 @@ impl Sessions {
             pace_class: session_class,
             touched: Mutex::new(std::time::Instant::now()),
             ending: tokio::sync::RwLock::new(false),
-            watch_finish: std::sync::atomic::AtomicU8::new(if started_finished {
-                WATCH_FINISHED
-            } else {
-                0
-            }),
         });
         self.active
             .lock()
@@ -3000,6 +3137,7 @@ impl Sessions {
         // ALWAYS from a clean dir: a crashed first attempt leaves its
         // socket (EADDRINUSE killed the TC-6 fallback) and a stale
         // playlist the readiness check would mistake for output.
+        self.keep_local_logs(session_id, &dir);
         let _ = std::fs::remove_dir_all(&dir);
         kahawai_core::private::create_dir(&dir)
             .with_context(|| format!("creating private session dir {}", dir.display()))?;
@@ -3628,7 +3766,7 @@ impl Sessions {
         // already in hand.
         let mut replan_subs = false;
         if let Some(tid) = subtitle_track
-            && tid <= 0
+            && (tid == 0 || (tid < 0 && session.catalogue.is_none()))
         {
             // Sentinel: withdraw an explicit burn ("subtitles off" /
             // a client-rendered track picked after a burn).
@@ -3644,13 +3782,15 @@ impl Sessions {
             // through `session_refusal` as 409 "this item cannot be played".
             // The player's `switchBurn` then gave up on a film that was
             // playing perfectly well a second earlier.
-            let track =
-                crate::tracks::get_for_item(registry.db(), &session.collection_item_id, tid)
-                    .await?
-                    .ok_or_else(|| NoSuchTrack {
-                        item: session.item_id.clone(),
-                        track: tid,
-                    })?;
+            let track = if session.catalogue.is_some() {
+                session.catalogue_track(tid)
+            } else {
+                crate::tracks::get_for_item(registry.db(), &session.collection_item_id, tid).await?
+            }
+            .ok_or_else(|| NoSuchTrack {
+                item: session.item_id.clone(),
+                track: tid,
+            })?;
             let part = session.parts.first().context("session has no parts")?;
             let is_image = crate::tracks::is_image_format(&track.format);
             // HUB-32a: an ASS pick has to reach negotiation too, but
@@ -3669,7 +3809,9 @@ impl Sessions {
                 let i = track.stream_index.unwrap_or(0) as usize;
                 match track.origin.as_str() {
                     "embedded" => Some(kahawai_media::negotiate::BurnPick::Embedded(i)),
-                    "sidecar" => Some(kahawai_media::negotiate::BurnPick::Sidecar(i)),
+                    "sidecar" | "downloaded" => {
+                        Some(kahawai_media::negotiate::BurnPick::Sidecar(i))
+                    }
                     _ => None,
                 }
             })
@@ -3717,6 +3859,7 @@ impl Sessions {
                                 &root_token,
                                 &walk_rel,
                                 walk_idx,
+                                track.source_revision()?,
                                 BURN_SETS_WAIT,
                             )
                             .await;
@@ -3824,18 +3967,7 @@ impl Sessions {
             // Switching tracks re-plans: the new track's codec decides
             // copy vs encode, not the old one's — and a burn-pick
             // change re-plans even with the same tracks.
-            let file = session
-                .parts
-                .first()
-                .context("session has no parts")?
-                .file_id;
-            let streams: String = sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
-                .bind(file)
-                .fetch_one(registry.db())
-                .await?;
-            // These indexes belong to the session's selected rendition. A
-            // collection-level lookup can pick another file with fewer tracks.
-            let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
+            let info = session.info.clone();
             // HUB-15a: the executor is already chosen here — ask IT.
             // Plain hub-local audio work is not a video executor.
             let tonemap = match &session.mode {
@@ -3878,8 +4010,11 @@ impl Sessions {
                     (video, audio.clone(), audio)
                 }
             };
-            let ocr_set =
-                crate::subtitles::ocr_stream_set(registry.db(), &session.collection_item_id).await;
+            let ocr_set = if let Some(captured) = &session.catalogue {
+                catalogue::ocr_sources(&captured.subtitles)
+            } else {
+                crate::subtitles::ocr_stream_set(registry.db(), &session.collection_item_id).await
+            };
             let ocr_flags = session
                 .parts
                 .first()
@@ -3904,8 +4039,14 @@ impl Sessions {
                 _ => kahawai_proto::ProtocolFeatures::current(),
             };
             let force_measurement = if session.force_loudness && session.parts.len() == 1 {
-                registry
-                    .audio_loudness(session.parts[0].file_id, want_audio)
+                session.parts[0]
+                    .file_id
+                    .audio_loudness(
+                        registry,
+                        want_audio,
+                        session.parts[0].size,
+                        session.parts[0].mtime_unix,
+                    )
                     .await?
             } else {
                 None
@@ -4010,6 +4151,7 @@ impl Sessions {
             Mode::Remux { dir, runner } => {
                 let old = std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
                 old.stop_and_wait().await;
+                self.keep_local_logs(&session.id, dir);
                 let _ = std::fs::remove_dir_all(dir);
                 // The old worker's lease died with it; open a fresh one
                 // on whichever part the target lands in.
@@ -4365,7 +4507,6 @@ impl Sessions {
         // removal either fails its lookup or sees `ending` and writes nothing.
         let mut ending = session.ending.write().await;
         *ending = true;
-        let earned_library_item_ids = session.earned_library_item_ids();
         drop(ending);
         {
             let mut kept = self.known_sessions.lock().unwrap();
@@ -4381,8 +4522,8 @@ impl Sessions {
                 // OPS-10: the hub's OWN worker leaves the same evidence a
                 // satellite's does, and this wipe destroys it. Gather
                 // first, and store directly — a local session never
-                // touches the link. Teardown only: a seek-restart also
-                // wipes this dir, but a bundle per scrub is noise.
+                // touches the link. Seek-restarts preserve their evidence in
+                // the same bounded bundle before clearing scratch too.
                 if let Some(data_dir) = self.scratch_root.parent() {
                     let (item, header) = self.log_header(id);
                     let body = format!("{header}{}", local_bundle(dir));
@@ -4412,55 +4553,13 @@ impl Sessions {
                     });
                 }
             }
-            Mode::Direct { .. } => {}
-        }
-        // HUB-10: a play is counted here and nowhere else on the playback
-        // path, because stopping is the only moment a watch is over.
-        // Counting the 90-percent crossing instead counted a second play
-        // for anyone who scrubbed back over the line and forward again,
-        // and counted one for a viewer who then abandoned the thing at
-        // half way. Whichever session took the item past the line is the
-        // one that counts, so a sitting split across two of them by a
-        // reaped pause or a dead transcoder is still one play.
-        if !earned_library_item_ids.is_empty() {
-            let registry = { self.registry_for_teardown.lock().unwrap().clone() };
-            match registry {
-                Some(registry) => {
-                    if let Err(e) = sqlx::query(
-                        "UPDATE user_item_state SET play_count = play_count + 1
-                          WHERE user_id = ? AND item_id IN(
-                            WITH RECURSIVE ids(id) AS (SELECT value FROM json_each(?) UNION SELECT c.merged_into FROM library_items c JOIN ids ON c.id=ids.id WHERE c.merged_into IS NOT NULL)
-                            SELECT ids.id FROM ids JOIN library_items c ON c.id=ids.id WHERE c.merged_into IS NULL)",
-                    )
-                    .bind(&session.user_id)
-                    .bind(serde_json::to_string(&earned_library_item_ids).expect("session identities serialize"))
-                    .execute(registry.db())
-                    .await
-                    {
-                        tracing::warn!(
-                            session = id,
-                            item = %session.item_id,
-                            error = %e,
-                            "finished watch not counted"
-                        );
-                    }
+            Mode::Direct { .. } => {
+                if let Some(data_dir) = self.data_dir() {
+                    let (item, header) = self.log_header(id);
+                    crate::sessionlog::store(data_dir, &item, id, &header);
                 }
-                // Only reachable in an embedding that never called
-                // `attach_registry` — `api::router` does. Said out loud
-                // rather than dropped, because a play that silently does
-                // not count is invisible until someone adds up a year of
-                // them.
-                None => tracing::warn!(
-                    session = id,
-                    item = %session.item_id,
-                    "no registry attached; finished watch not counted"
-                ),
             }
         }
-        // The event is emitted only after the watch-state write settles. A
-        // client reacting to `sessions` must not refetch the item in the gap
-        // and observe the old play count. Callers that are about to archive or
-        // delete watch state likewise await this method before proceeding.
         if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
             registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         }
@@ -4494,7 +4593,7 @@ mod reads_from_tests {
         PartSource {
             head_xxh3: 0,
             tail_xxh3: 0,
-            file_id: 0,
+            file_id: crate::sessions::FileId::Legacy(0),
             module_id: host.into(),
             collection_id: "movies".into(),
             root_token: "root".into(),
@@ -4573,8 +4672,12 @@ mod lease_purpose_tests {
     /// lease has to say, and this is the only place that says it.
     async fn opened_as(reader: Reader) -> bool {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
         registry.register_link(
             "01MH",
@@ -4623,8 +4726,12 @@ mod lease_purpose_tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("episode.mkv");
         std::fs::write(&source, b"bytes").unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let sessions = Sessions::new(dir.path().join("sessions"));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let entered_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4691,8 +4798,12 @@ mod lease_purpose_tests {
         let dir = tempfile::tempdir().unwrap();
         let source = dir.path().join("episode.mkv");
         std::fs::write(&source, b"bytes").unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let sessions = Sessions::new(dir.path().join("sessions"));
         sessions.set_local_playback(|| panic!("background reads must not reserve playback CPU"));
         let active = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
@@ -4723,6 +4834,28 @@ mod lease_purpose_tests {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn diagnostics_survive_pipeline_purge_and_hub_restart() {
+        let data = tempfile::tempdir().unwrap();
+        let scratch = data.path().join("sessions");
+        let sessions = super::Sessions::new(scratch.clone());
+        sessions.note_session("session", "stable-item");
+        let run = scratch.join("session");
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("worker.log"), "first attempt failed").unwrap();
+        sessions.keep_local_logs("session", &run);
+        std::fs::remove_dir_all(&run).unwrap();
+        std::fs::create_dir_all(&run).unwrap();
+        std::fs::write(run.join("worker.log"), "second attempt interrupted").unwrap();
+        drop(sessions);
+        let _restarted = super::Sessions::new(scratch.clone());
+        assert!(!scratch.exists());
+        let path = crate::sessionlog::newest_for_item(data.path(), "stable-item").unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("first attempt failed"));
+        assert!(body.contains("second attempt interrupted"));
+        assert!(body.contains("recovered after hub restart"));
+    }
     use super::{
         LoudnessPreference, Negotiation, PartSource, Sessions, apply_audio_loudness_measurement,
         fold_facts, local_audio_encoder_names, local_tonemap_available, local_video_encoder_names,
@@ -4786,8 +4919,12 @@ mod tests {
             return;
         };
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         assert!(
             local_video_encoder_names(&registry).is_empty(),
             "unmeasured local encoder was offered"
@@ -4855,8 +4992,12 @@ mod tests {
             return;
         };
         let db = crate::db::open_in_memory().await.unwrap();
-        let registry =
-            crate::registry::Registry::new(db, Default::default()).with_local_video_executor(true);
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(true);
         let mut bench = kahawai_media::bench::BenchResults {
             gst: kahawai_media::bench::gst_version(),
             ..Default::default()
@@ -4878,6 +5019,7 @@ mod tests {
             loudness: LoudnessPreference::Off,
             ass: Default::default(),
             ocr_set: Default::default(),
+            raster_sources: None,
             burn_row: None,
             audio_track: 0,
             source_audio_tracks: Default::default(),
@@ -5058,9 +5200,13 @@ mod tests {
         use kahawai_proto::v1::{CapabilityReport, EncoderCap};
 
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry =
-            crate::registry::Registry::new(db, Default::default()).with_local_video_executor(false);
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(false);
         let connect = |id: &str, minor: u32, hardware: bool| {
             let (tx, rx) = tokio::sync::mpsc::channel(8);
             std::mem::forget(rx);
@@ -5128,7 +5274,7 @@ mod tests {
         let parts = [PartSource {
             head_xxh3: 0,
             tail_xxh3: 0,
-            file_id: 1,
+            file_id: crate::sessions::FileId::Legacy(1),
             module_id: "mediahost".into(),
             collection_id: "movies".into(),
             root_token: "root".into(),
@@ -5232,7 +5378,7 @@ mod tests {
         PartSource {
             head_xxh3: 0,
             tail_xxh3: 0,
-            file_id: 0,
+            file_id: crate::sessions::FileId::Legacy(0),
             module_id: "m".into(),
             collection_id: "c".into(),
             root_token: "root".into(),

@@ -37,10 +37,11 @@ struct Bench {
 /// one file each, every one matched and described — the expensive shape,
 /// not an empty catalogue.
 async fn seed(dir: &std::path::Path, items: usize) -> Bench {
-    let db = kahawai_hub::db::open(dir).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir).await.unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db.clone(), dir).await.unwrap());
 
@@ -161,7 +162,7 @@ async fn seed(dir: &std::path::Path, items: usize) -> Bench {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.to_path_buf()));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry,
         auth.clone(),
         sessions,

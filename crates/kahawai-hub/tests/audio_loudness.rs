@@ -3,7 +3,9 @@ use kahawai_proto::v1::{AudioLayoutLoudness, AudioLoudnessTrack, FileLoudness, S
 
 async fn fixture() -> (tempfile::TempDir, Registry) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::raw_sql(
         r#"
         INSERT INTO collections(module_id,collection_id,media_type)
@@ -20,7 +22,14 @@ async fn fixture() -> (tempfile::TempDir, Registry) {
     .execute(&db)
     .await
     .unwrap();
-    (dir, Registry::new(db, Default::default()))
+    (
+        dir,
+        Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ),
+    )
 }
 
 fn result(mtime_unix: i64) -> FileLoudness {

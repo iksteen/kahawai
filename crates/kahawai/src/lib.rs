@@ -436,6 +436,7 @@ async fn run_hub_inner(
         &kahawai_hub::pki::pki_dir(&cfg.data_dir),
     )?);
     let db = kahawai_hub::db::open(&cfg.data_dir).await?;
+    let catalogue = kahawai_hub::db::open_catalogue(&cfg.data_dir).await?;
     // Generated on first start; fatal thereafter if it cannot be read. No
     // caller holds it yet — this is what creates the key and proves it works.
     // Loaded here rather than in `db::open`, which `backup` also calls
@@ -447,12 +448,10 @@ async fn run_hub_inner(
     // the registry keeps it in sync on approve/delete.
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
     let registry = Arc::new(
-        kahawai_hub::registry::Registry::new(db.clone(), allowed.clone())
+        kahawai_hub::registry::Registry::new(db.clone(), allowed.clone(), catalogue)
             .with_credentials(credentials)
             .with_local_video_executor(local_transcoder),
     );
-    let chapter_files = registry.backfill_chapter_segments().await?;
-    tracing::info!(files = chapter_files, "chapter segment index ready");
     let admitted = registry.load_allowlist().await?;
     tracing::info!(admitted, "mTLS allowlist loaded");
     // HUB-36 phase 4: what the fleet has been measured to achieve, so a
@@ -590,10 +589,6 @@ async fn run_hub_inner(
                 api_key: cfg.subtitles.opensubtitles.api_key.clone(),
             }),
     );
-    // HUB-32c: idle OCR sweep — every image subtitle track grows a text
-    // row eventually, without anyone pressing the button.
-    #[cfg(feature = "ocr")]
-    subtitles.spawn_ocr_sweep(registry.clone(), sessions.clone());
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     // HUB-9: local .nfo files are read over the byte plane, like artwork.
     enricher.attach_sessions(sessions.clone());
@@ -602,22 +597,13 @@ async fn run_hub_inner(
         enricher.clone(),
     ));
     enricher.attach_artwork(&artwork);
+    enricher.start_catalogue(registry.clone());
+    #[cfg(feature = "ocr")]
+    subtitles.spawn_ocr_sweep(registry.clone(), sessions.clone());
     // Protocol 4: the mediahost owns ordering and persistence of source facts.
     // This object remains the hub-side status/projection adapter; it no longer
     // runs the old hub-owned sweep.
     let segments = Arc::new(kahawai_hub::segments::Detector::new());
-    // Enrich whatever resolution has produced since last time.
-    {
-        let enricher = enricher.clone();
-        let registry = registry.clone();
-        tokio::spawn(async move {
-            tokio::time::sleep(Duration::from_secs(15)).await;
-            match enricher.run_once(&registry).await {
-                Ok(_) => {}
-                Err(e) => tracing::debug!(error = format!("{e:#}"), "startup enrichment skipped"),
-            }
-        });
-    }
     if let Some(mh) = local_mediahost {
         const LOCAL_ID: &str = "local";
         registry.ensure_local_satellite(LOCAL_ID, &mh.name).await?;

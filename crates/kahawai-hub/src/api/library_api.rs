@@ -608,7 +608,6 @@ pub(super) async fn item_body(
     }
     out.item.episode_end = None;
     out.item.played = r.get::<Option<i64>, _>("played").unwrap_or(0) != 0;
-    out.item.play_count = r.get::<Option<i64>, _>("play_count").unwrap_or(0);
     out.item.resume_position_ms = if out.item.played {
         None
     } else {

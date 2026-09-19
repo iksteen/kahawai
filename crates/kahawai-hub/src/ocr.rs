@@ -9,10 +9,10 @@
 //! already decode, and dropping it keeps `ocr`-enabled binaries free of
 //! copyleft obligations (NFR-8).
 //!
-//! Results are first-class `subtitle_tracks` rows (origin `ocr`,
-//! `derived_from` = the image-track row read): stored, listed, served,
-//! selected, and deleted exactly like a provider download, marked
-//! machine-derived in the API. Regeneration replaces by parent.
+//! Mediadb playback exposes cached OCR as source-owned tracks with parent-track
+//! provenance and machine-derived labels. The idle worker's retained cache also
+//! records empty answers; no legacy subtitle row is required. The extraction
+//! and recognition engine below is shared with the historical catalogue path.
 //!
 //! Quality, measured on real tracks (Babylon 5 PGS 1080p, conf 70–91;
 //! a 2160p PGS track, conf 84–91): glyphs are bright-on-transparent,

@@ -37,8 +37,14 @@ struct Fx {
 
 async fn fixture() -> Fx {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let reg = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
@@ -80,7 +86,7 @@ async fn fixture() -> Fx {
         90,
     ));
     let artwork_dir = dir.path().join("artwork");
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         reg,
         auth,
         Arc::new(kahawai_hub::sessions::Sessions::new(

@@ -10,7 +10,7 @@ pub mod v1 {
 /// durable local catalogue authoritative and deliberately rejects protocol 3
 /// peers, whose hub-owned manifest/worklist contract has the reverse meaning.
 pub const PROTOCOL_MAJOR: u32 = 4;
-pub const PROTOCOL_MINOR: u32 = 1;
+pub const PROTOCOL_MINOR: u32 = 3;
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
 /// Protocol features that may acquire minor-version gates after the 4.0
@@ -24,12 +24,16 @@ pub enum ProtocolFeature {
     AudioLoudnessAnalysis,
     RetryableSegmentResults,
     DiscoveryPriorityHints,
+    DeepRescan,
+    RevisionedSubtitles,
 }
 
 impl ProtocolFeature {
     pub const fn minimum_minor(self) -> u32 {
         match self {
             Self::DiscoveryPriorityHints => 1,
+            Self::DeepRescan => 2,
+            Self::RevisionedSubtitles => 3,
             _ => 0,
         }
     }
@@ -80,7 +84,11 @@ mod tests {
 
     #[test]
     fn protocol_four_one_keeps_inherited_gates_open_and_adds_hints() {
-        assert_eq!(PROTOCOL_MINOR, 1);
+        assert_eq!(PROTOCOL_MINOR, 3);
+        assert!(!ProtocolFeatures::new(2).supports(ProtocolFeature::RevisionedSubtitles));
+        assert!(ProtocolFeatures::current().supports(ProtocolFeature::RevisionedSubtitles));
+        assert!(!ProtocolFeatures::new(1).supports(ProtocolFeature::DeepRescan));
+        assert!(ProtocolFeatures::current().supports(ProtocolFeature::DeepRescan));
         for feature in [
             ProtocolFeature::SegmentDetection,
             ProtocolFeature::AudioLoudnessScalars,

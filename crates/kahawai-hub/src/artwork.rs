@@ -1005,6 +1005,203 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
     }
 }
 
+impl Artwork {
+    /// Mediadb preview: the caller supplies an authorized copy and a URL from
+    /// its stored metadata. Local paths must still be advertised by that copy.
+    pub(crate) async fn catalogue_at(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        input: &kahawai_mediadb::EnrichmentInput,
+        poster: &str,
+        size: Option<&str>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let original = if let Some(local) = poster.strip_prefix("local://") {
+            let (root, path) = local
+                .split_once('/')
+                .context("invalid local artwork address")?;
+            let source = input
+                .sources
+                .iter()
+                .find(|s| {
+                    s.root_token == root
+                        && s.media.as_ref().and_then(|m| m.artwork.as_deref()) == Some(path)
+                })
+                .context("artwork is not advertised by this copy")?;
+            let key = format!(
+                "{:016x}",
+                xxhash_rust::xxh3::xxh3_64(
+                    format!(
+                        "{}\n{}\n{}\n{}\n{:?}",
+                        input.mediahost_id, input.remote_id, root, path, source.media
+                    )
+                    .as_bytes()
+                )
+            );
+            let cache = self.dir.join(&key);
+            let bytes = match std::fs::read(&cache) {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    let lease = sessions
+                        .open_lease(
+                            registry,
+                            &input.mediahost_id,
+                            &input.remote_id,
+                            root,
+                            path,
+                            crate::sessions::Reader::Sweep,
+                        )
+                        .await?;
+                    let bytes = read_all(lease).await?;
+                    std::fs::create_dir_all(&self.dir)?;
+                    Self::write_atomic(&cache, &bytes)?;
+                    bytes
+                }
+            };
+            let mime = match path
+                .rsplit('.')
+                .next()
+                .unwrap_or_default()
+                .to_ascii_lowercase()
+                .as_str()
+            {
+                "png" => "image/png",
+                "webp" => "image/webp",
+                _ => "image/jpeg",
+            };
+            Some((bytes, mime, key))
+        } else {
+            self.remote_poster(poster).await?
+        };
+        let Some((bytes, mime, key)) = original else {
+            return Ok(None);
+        };
+        Ok(Some(
+            self.at_from_original(bytes, mime, key, size, CacheWrite::BestEffort)
+                .await?,
+        ))
+    }
+}
+impl Artwork {
+    pub(crate) async fn prefetch_catalogue_collage(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        item: &str,
+        library: &str,
+    ) -> Result<()> {
+        let input = registry.catalogue().enrichment_input(item).await?;
+        let artist = input.artist.as_deref().unwrap_or_default();
+        let artist = kahawai_mediadb::title_key(artist);
+        let mut donors = Vec::new();
+        let mut covers = Vec::new();
+        for donor in registry.catalogue().artist_donors(item, library).await? {
+            if !donor.poster.starts_with("local://") && !self.remote_cache_complete(&donor.poster) {
+                continue;
+            }
+            let copy = registry.catalogue().enrichment_input(&donor.id).await?;
+            let Some((bytes, _)) = self
+                .catalogue_at(registry, sessions, &copy, &donor.poster, Some("card"))
+                .await?
+            else {
+                continue;
+            };
+            covers.push(bytes);
+            donors.push(ArtistCollageAlbum {
+                id: donor.id,
+                library_item_id: donor.library_item_id,
+                art_version: Some(donor.revision),
+                poster: donor.poster,
+            });
+            if covers.len() == 4 {
+                break;
+            }
+        }
+        if covers.is_empty() {
+            return Ok(());
+        }
+        let revision = artist_collage_revision(library, &artist, &donors);
+        if self
+            .read_artist_collage_manifest(library, &artist)
+            .is_some_and(|m| m.revision == revision)
+        {
+            return Ok(());
+        }
+        let key = artist_collage_cache_key(library, &artist);
+        let bytes = tokio::task::spawn_blocking(move || compose_artist_collage(&covers)).await??;
+        Self::write_atomic(&self.dir.join(&key), &bytes)?;
+        for (size, _) in SIZES {
+            self.at_from_original(
+                bytes.clone(),
+                "image/jpeg",
+                key.clone(),
+                Some(size),
+                CacheWrite::Required,
+            )
+            .await?;
+        }
+        let manifest = ArtistCollageManifest {
+            library: library.into(),
+            artist_key: artist.clone(),
+            revision,
+            albums: donors.into_iter().map(|d| d.id).collect(),
+        };
+        Self::write_atomic(
+            &artist_collage_manifest_path(&self.dir, library, &artist),
+            &serde_json::to_vec(&manifest)?,
+        )?;
+        Ok(())
+    }
+    pub(crate) async fn catalogue_artist_at(
+        &self,
+        registry: &Registry,
+        item: &str,
+        library: &str,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        if !registry
+            .catalogue()
+            .copy_libraries(item)
+            .await?
+            .iter()
+            .any(|id| id == library)
+        {
+            return Ok(None);
+        }
+        for url in registry.catalogue().artist_artwork(item).await? {
+            if let Some(image) = self.get_cached_remote_at(&url, Some("card")).await? {
+                return Ok(Some(image));
+            }
+        }
+        let input = registry.catalogue().enrichment_input(item).await?;
+        let artist = kahawai_mediadb::title_key(input.artist.as_deref().unwrap_or_default());
+        let Some(manifest) = self.read_artist_collage_manifest(library, &artist) else {
+            return Ok(None);
+        };
+        let available = registry.catalogue().artist_donors(item, library).await?;
+        let mut donors = Vec::new();
+        for id in &manifest.albums {
+            let Some(d) = available.iter().find(|d| &d.id == id) else {
+                return Ok(None);
+            };
+            donors.push(ArtistCollageAlbum {
+                id: d.id.clone(),
+                library_item_id: d.library_item_id.clone(),
+                art_version: Some(d.revision),
+                poster: d.poster.clone(),
+            });
+        }
+        if artist_collage_revision(library, &artist, &donors) != manifest.revision {
+            return Ok(None);
+        }
+        let key = artist_collage_cache_key(library, &artist);
+        Ok(
+            std::fs::read(self.dir.join(variant_dir("card", 480)).join(key))
+                .ok()
+                .map(|bytes| (bytes, "image/jpeg")),
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,8 +1265,12 @@ mod tests {
     async fn artist_collage_uses_the_newest_four_covered_albums_inside_one_library() {
         let key = crate::enrich::artist_key("Artist");
         let tmp = tempfile::tempdir().unwrap();
-        let db = crate::db::open(tmp.path()).await.unwrap();
-        let registry = Registry::new(db.clone(), Default::default());
+        let db = crate::db::open_legacy_fixture(tmp.path()).await.unwrap();
+        let registry = Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         sqlx::query("INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music')")
             .execute(&db)
             .await
@@ -1241,7 +1442,11 @@ mod tests {
     async fn corrected_artist_collage_uses_compatible_distinct_library_albums() {
         let tmp = tempfile::tempdir().unwrap();
         let db = crate::db::open_in_memory().await.unwrap();
-        let registry = Registry::new(db.clone(), Default::default());
+        let registry = Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         sqlx::raw_sql("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','host','fp');
             INSERT INTO collections(module_id,collection_id,media_type) VALUES('host','music','music'),('host','private','music');
             INSERT INTO libraries(id,name,media_type) VALUES('music','Music','music'),('private','Private','music');

@@ -1,3 +1,22 @@
+vi.mock('../src/api/catalogue.ts', async () => {
+  const api = await import('../src/api/generated/kahawai.ts')
+  return {
+    ...api,
+    catalogueChildren: async (_library: string, id: string, params?: { season?: string }) => {
+      const page = await api.itemChildren(id)
+      return {
+        ...page,
+        children: params?.season
+          ? page.children.filter((e) =>
+              params.season === 'absolute'
+                ? (e.proj_season ?? e.season) == null
+                : (e.proj_season ?? e.season) === Number(params.season),
+            )
+          : page.children,
+      }
+    },
+  }
+})
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
@@ -5,6 +24,8 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   artistAlbums: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 

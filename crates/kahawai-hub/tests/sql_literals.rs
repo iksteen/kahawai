@@ -81,7 +81,9 @@ fn is_sql(s: &str) -> bool {
 #[tokio::test]
 async fn every_sql_literal_parses_against_the_schema() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
 
     let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
     let mut checked = 0;

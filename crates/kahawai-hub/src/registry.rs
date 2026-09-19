@@ -354,6 +354,7 @@ pub(crate) struct HostLink {
     protocol_minor: u32,
     generation: u64,
     segment_detector_generation: i64,
+    discovery: Arc<Mutex<HashMap<String, kahawai_proto::v1::DiscoveryStatus>>>,
     current: Arc<AtomicBool>,
 }
 
@@ -371,6 +372,10 @@ impl HostLink {
         kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
             .supports(kahawai_proto::ProtocolFeature::SegmentDetection)
             && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
+    }
+    pub(crate) fn supports_revisioned_subtitles(&self) -> bool {
+        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::RevisionedSubtitles)
     }
     pub(crate) fn supports_loudness_analysis(&self) -> bool {
         kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
@@ -403,8 +408,15 @@ struct TcLink {
     protocol_minor: u32,
 }
 
+pub enum RescanResult {
+    Requested,
+    Offline,
+    Unsupported,
+}
+
 pub struct Registry {
     db: Database,
+    catalogue: kahawai_mediadb::Store,
     /// The credential store. `None` only in tests that never reach one — the
     /// composition root always sets it, and a key it cannot load is fatal
     /// there rather than absent here.
@@ -451,13 +463,6 @@ pub struct Registry {
     catalog_apply_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
     scan_progress: Mutex<HashMap<(String, String), ScanState>>,
-    /// Deep-refresh marks: the next manifest request for (module,
-    /// collection) is answered EMPTY, so the host re-probes every file
-    /// (first-scan semantics — works with any satellite version). This
-    /// is how pre-extension streams_json rows pick up newly probed
-    /// facts (HDR, profile/level): the incremental scan skips
-    /// stat-unchanged files by design and would never heal them.
-    deep_rescan: Mutex<std::collections::HashSet<(String, String)>>,
     /// HUB-11 event bus: invalidation hints pushed to /api/v1/events
     /// subscribers ({kind, ...} JSON). Lagging receivers drop events —
     /// hints, not state; clients refetch what a hint names.
@@ -581,9 +586,14 @@ pub enum RegistryEvent {
 }
 
 impl Registry {
-    pub fn new(db: Database, allowed: kahawai_transport::mtls::AllowedCerts) -> Self {
+    pub fn new(
+        db: Database,
+        allowed: kahawai_transport::mtls::AllowedCerts,
+        catalogue: kahawai_mediadb::Store,
+    ) -> Self {
         Self {
             db,
+            catalogue,
             credentials: None,
             allowed,
             connected: Mutex::new(HashMap::new()),
@@ -598,7 +608,6 @@ impl Registry {
             tc_link_rate: Mutex::new(HashMap::new()),
             disabled: Mutex::new(std::collections::HashSet::new()),
             scan_progress: Mutex::new(HashMap::new()),
-            deep_rescan: Mutex::new(std::collections::HashSet::new()),
             events: tokio::sync::broadcast::channel(256).0,
         }
     }
@@ -1614,6 +1623,7 @@ impl Registry {
                 protocol_minor,
                 generation,
                 segment_detector_generation,
+                discovery: Default::default(),
                 current: Arc::new(AtomicBool::new(true)),
             },
         );
@@ -1685,6 +1695,42 @@ impl Registry {
         }
     }
 
+    /// Capture the sender and its negotiated feature level together. Older hosts
+    /// must never silently turn an explicit deep scan into an incremental scan.
+    pub async fn rescan_collection(
+        &self,
+        module: &str,
+        collection: &str,
+        deep: bool,
+    ) -> RescanResult {
+        let sender = {
+            let links = self.links.lock().unwrap();
+            let Some(link) = links.get(module) else {
+                return RescanResult::Offline;
+            };
+            if deep
+                && !kahawai_proto::ProtocolFeatures::new(link.protocol_minor)
+                    .supports(kahawai_proto::ProtocolFeature::DeepRescan)
+            {
+                return RescanResult::Unsupported;
+            }
+            link.tx.clone()
+        };
+        let message = kahawai_proto::v1::HubToHost {
+            msg: Some(kahawai_proto::v1::hub_to_host::Msg::RescanRequest(
+                kahawai_proto::v1::RescanRequest {
+                    collection_id: collection.into(),
+                    deep,
+                },
+            )),
+        };
+        if sender.send(Ok(message)).await.is_ok() {
+            RescanResult::Requested
+        } else {
+            RescanResult::Offline
+        }
+    }
+
     /// Send a command down a connected host's Link stream.
     pub async fn send_to_host(
         &self,
@@ -1716,15 +1762,54 @@ impl Registry {
         link.send(msg).await
     }
 
+    /// Ephemeral reports belong to a live link, not a second durable work queue.
+    /// Reconnect starts unknown; late messages cannot repopulate the new link.
+    pub fn report_discovery(
+        &self,
+        module: &str,
+        generation: u64,
+        status: kahawai_proto::v1::DiscoveryStatus,
+    ) {
+        if let Some(link) = self
+            .links
+            .lock()
+            .unwrap()
+            .get(module)
+            .filter(|l| l.generation == generation)
+        {
+            link.discovery
+                .lock()
+                .unwrap()
+                .insert(status.collection_id.clone(), status);
+        }
+    }
+
+    pub fn discovery_status(
+        &self,
+        module: &str,
+        collection: &str,
+    ) -> Option<kahawai_proto::v1::DiscoveryStatus> {
+        self.links
+            .lock()
+            .unwrap()
+            .get(module)?
+            .discovery
+            .lock()
+            .unwrap()
+            .get(collection)
+            .cloned()
+    }
+
     /// Administrative wake only. Protocol-4 mediahosts own queue selection;
     /// the hub broadcasts interest without naming a season or exact source.
-    pub async fn wake_discovery(&self, kind: &str) -> usize {
+    pub async fn wake_discovery(&self, kind: &str, modules: &[String]) -> usize {
         let links: Vec<_> = self
             .links
             .lock()
             .unwrap()
-            .values()
-            .map(|link| link.tx.clone())
+            .iter()
+            .filter(|(id, _)| modules.contains(id))
+            .map(|(_, link)| link.tx.clone())
             .collect();
         let mut accepted = 0;
         for link in links {
@@ -1811,6 +1896,10 @@ impl Registry {
     pub fn host_supports_loudness_analysis(&self, module_id: &str) -> bool {
         self.host_link(module_id)
             .is_some_and(|link| link.supports_loudness_analysis())
+    }
+
+    pub fn catalogue(&self) -> &kahawai_mediadb::Store {
+        &self.catalogue
     }
 
     pub fn db(&self) -> &Database {
@@ -2249,11 +2338,17 @@ impl Registry {
     }
 
     pub async fn delete_library(&self, id: &str) -> Result<bool> {
-        let n = sqlx::query("DELETE FROM libraries WHERE id = ?")
+        let mut tx = self.db.begin().await?;
+        let n = sqlx::query("DELETE FROM libraries WHERE id=?")
             .bind(id)
-            .execute(&self.db)
+            .execute(&mut *tx)
             .await?
             .rows_affected();
+        sqlx::query("DELETE FROM user_libraries WHERE library_id=?")
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        tx.commit().await?;
         Ok(n > 0)
     }
 
@@ -3773,22 +3868,6 @@ impl Registry {
             .insert(module_id.to_string(), capabilities);
     }
 
-    pub fn mark_deep_rescan(&self, module_id: &str, collection_id: &str) {
-        self.deep_rescan
-            .lock()
-            .unwrap()
-            .insert((module_id.to_string(), collection_id.to_string()));
-    }
-
-    /// One-shot: consumed by the manifest answer, so a later ordinary
-    /// refresh is incremental again.
-    pub fn take_deep_rescan(&self, module_id: &str, collection_id: &str) -> bool {
-        self.deep_rescan
-            .lock()
-            .unwrap()
-            .remove(&(module_id.to_string(), collection_id.to_string()))
-    }
-
     /// HUB-15b: the verified encoder codec names a transcoder reported
     /// ("h264", "hevc", "aac", …) — what negotiation may pick as an
     /// encode target when this box would run the session.
@@ -4367,13 +4446,17 @@ impl Registry {
             .collect())
     }
 
-    /// Delete a satellite (SEC-6/HUB-20): remove its cert from the
-    /// allowlist, close its link, archive watch state by content identity,
-    /// cascade-delete its collections/files/sources and orphaned items.
+    /// Remove a satellite's mediadb catalogue, then revoke enrollment and its
+    /// active link. Legacy catalogue/history rows in hub.db remain untouched.
+    /// Both steps share the per-host ingestion/registration gate. Catalogue
+    /// deletion commits first, so a crash leaves either a revoked empty host
+    /// or an enrolled host that can reimport; no cross-database outbox is needed.
     /// Returns the removed identity and exact mediahost link generation so the
     /// composition layer can retire work owned by the deleted connection.
     /// Transient disconnects never come here.
     pub async fn delete_satellite(&self, module_id: &str) -> Result<DeletedSatellite> {
+        let gate = self.catalog_apply_lock(module_id);
+        let _guard = gate.lock().await;
         let fingerprint: String =
             sqlx::query_scalar("SELECT cert_fingerprint FROM satellites WHERE module_id = ?")
                 .bind(module_id)
@@ -4392,6 +4475,15 @@ impl Registry {
             "the in-process mediahost cannot be deleted: it is the hub itself"
         );
 
+        let pending: Option<String> =
+            sqlx::query_scalar("SELECT pending_fingerprint FROM satellites WHERE module_id=?")
+                .bind(module_id)
+                .fetch_one(&self.db)
+                .await?;
+        // Delete catalogue data before durable revocation. If the second commit
+        // fails or the process stops, an enrolled peer can reimport on reconnect.
+        let mediahost_link_generation = self.unregister_link(module_id);
+        self.catalogue.remove_mediahost(module_id).await?;
         let mut tx = self.db.begin().await?;
         sqlx::query(
             "INSERT INTO satellite_audit (module_id, fingerprint, action) VALUES (?, ?, 'deleted')",
@@ -4400,57 +4492,20 @@ impl Registry {
         .bind(&fingerprint)
         .execute(&mut *tx)
         .await?;
-        // Archive watch state for every file this host serves (identity-
-        // keyed; restore drops it again if the item still has live sources).
-        sqlx::query(
-            "INSERT OR REPLACE INTO watch_state_archive
-               (user_id, size, head_xxh3, tail_xxh3, position_ms, duration_ms, played, play_count,library_item_id,state_updated_at,resume_source_fingerprint)
-             SELECT w.user_id, f.size, f.head_xxh3, f.tail_xxh3,
-                    w.position_ms, w.duration_ms, w.played, w.play_count,w.library_item_id,w.updated_at,w.resume_source_fingerprint
-             FROM files f JOIN playable_source_parts p ON p.file_id=f.id
-             JOIN playable_sources s ON s.id=p.playable_source_id
-             JOIN collection_watch_state w ON w.item_id=s.item_id
-             WHERE f.module_id=?",
-        )
-        .bind(module_id)
-        .execute(&mut *tx)
-        .await?;
-        let rendition_ids: Vec<i64> =
-            sqlx::query_scalar("SELECT id FROM playable_sources WHERE module_id=?")
-                .bind(module_id)
-                .fetch_all(&mut *tx)
-                .await?;
-        Self::archive_playable_sources(&mut tx, &rendition_ids).await?;
         for sql in [
-            "DELETE FROM files WHERE module_id=?",
-            "DELETE FROM collections WHERE module_id = ?",
-            // HUB-36: what it achieved described hardware the fleet no
-            // longer has. A re-enrolment mints a new id and learns again.
-            "DELETE FROM transcoder_pace WHERE module_id = ?",
-            "DELETE FROM satellites WHERE module_id = ?",
+            "DELETE FROM transcoder_pace WHERE module_id=?",
+            "DELETE FROM satellites WHERE module_id=?",
         ] {
             sqlx::query(sql).bind(module_id).execute(&mut *tx).await?;
         }
-        sqlx::query(
-            "DELETE FROM collection_items WHERE kind NOT IN ('show','album')
-               AND NOT EXISTS (SELECT 1 FROM playable_sources src WHERE src.item_id=collection_items.id)",
-        )
-        .execute(&mut *tx)
-        .await?;
-        // Shows and albums never have direct sources; they die of
-        // childlessness.
-        sqlx::query(
-            "DELETE FROM collection_items WHERE kind IN ('show', 'album') AND id NOT IN (
-                SELECT DISTINCT parent_id FROM collection_items WHERE parent_id IS NOT NULL)",
-        )
-        .execute(&mut *tx)
-        .await?;
         tx.commit().await?;
 
         // Off the allowlist and off the wire: the satellite's reconnects
         // die at the TLS handshake from here on (SEC-6).
         self.allowed.remove(&fingerprint);
-        let mediahost_link_generation = self.unregister_link(module_id);
+        if let Some(pending) = pending {
+            self.allowed.remove(&pending);
+        }
         self.connected.lock().unwrap().remove(module_id);
         // Deleting the satellite forgets the drain with it. This used to happen
         // by accident, because `unregister_link` cleared the set as a side

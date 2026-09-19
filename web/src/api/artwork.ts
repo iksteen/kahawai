@@ -4,14 +4,24 @@
 /// generated bindings; the decisions ABOUT artwork — whose poster an episode
 /// shows, and which version pins it — are in the components that read them.
 
-import { getArtistArtworkUrl, getItemArtworkUrl } from './generated/kahawai.ts'
+import {
+  getCatalogueArtistArtworkUrl,
+  getItemArtworkUrl,
+  getCatalogueArtworkUrl,
+} from './generated/kahawai.ts'
 
 export type ArtSize = 'thumb' | 'card1x' | 'card'
 
-export function artworkUrl(id: string, version?: number | null, size?: ArtSize): string {
+export function artworkUrl(
+  id: string,
+  version?: number | null,
+  size?: ArtSize,
+  library?: string | null,
+): string {
   // Spread rather than assigned: with `exactOptionalPropertyTypes`, an
   // explicit `undefined` is not the same as an absent key, and the generated
   // params type says the key may be absent — not that it may be undefined.
+  if (library) return getCatalogueArtworkUrl(library, id, size ? { size } : undefined)
   return getItemArtworkUrl(id, {
     ...(size ? { size } : {}),
     ...(version ? { v: String(version) } : {}),
@@ -23,8 +33,12 @@ export function artworkUrl(id: string, version?: number | null, size?: ArtSize):
 /// widths are fixed — so these are `x` descriptors and there is no `sizes` to
 /// get wrong. A 1× display stops being sent 6× the pixels it can show; a 2×
 /// one is unaffected.
-export function artworkSrcSet(id: string, version?: number | null): string {
-  return `${artworkUrl(id, version, 'card1x')} 1x, ${artworkUrl(id, version, 'card')} 2x`
+export function artworkSrcSet(
+  id: string,
+  version?: number | null,
+  library?: string | null,
+): string {
+  return `${artworkUrl(id, version, 'card1x', library)} 1x, ${artworkUrl(id, version, 'card', library)} 2x`
 }
 
 export function artistArtworkUrl(
@@ -33,11 +47,11 @@ export function artistArtworkUrl(
   version?: number | null,
   size?: ArtSize,
 ): string {
-  return getArtistArtworkUrl(key, {
-    library,
-    ...(size ? { size } : {}),
+  const params = new URLSearchParams({
     ...(version ? { v: String(version) } : {}),
+    ...(size ? { size } : {}),
   })
+  return `${getCatalogueArtistArtworkUrl(library, key)}${params.size ? `?${params}` : ''}`
 }
 
 export function artistArtworkSrcSet(key: string, library: string, version?: number | null): string {

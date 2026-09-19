@@ -11,7 +11,7 @@ import { onScopeDispose, type Ref, ref, watch } from 'vue'
 
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 import { CHUNK } from '../domain/virtual.ts'
-import { listItems } from '../api/generated/kahawai.ts'
+import { listItems } from '../api/catalogue.ts'
 import { sentence } from '../domain/refusal.ts'
 
 export function useLibraryItems(

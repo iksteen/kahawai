@@ -20,7 +20,7 @@ import { computed, type Ref, ref, watch } from 'vue'
 import { keepPreviousData, useQuery } from '@tanstack/vue-query'
 
 import type { LibrarySummary } from '../domain/shelves.ts'
-import { listItems } from '../api/generated/kahawai.ts'
+import { listItems } from '../api/catalogue.ts'
 import { type LibraryHits, searchRows, searchTrouble } from '../domain/search-nav.ts'
 import { notify } from './notices.ts'
 import { sentence } from '../domain/refusal.ts'

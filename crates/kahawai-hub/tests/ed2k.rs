@@ -20,8 +20,12 @@ fn rec(path: &str, size: u64, mtime: i64) -> FileUpsertRecord {
 }
 
 async fn setup(dir: &std::path::Path) -> Registry {
-    let db = kahawai_hub::db::open(dir).await.unwrap();
-    let reg = Registry::new(db, Default::default());
+    let db = kahawai_hub::db::open_legacy_fixture(dir).await.unwrap();
+    let reg = Registry::new(
+        db,
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reg.announce_collection("01H", "anime", "anime", &[TEST_ROOT.into()])
         .await
         .unwrap();
@@ -136,8 +140,14 @@ async fn copy_forward_and_content_change_semantics() {
 #[tokio::test]
 async fn anime_collection_resolves_movies_but_not_extras() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Registry::new(db.clone(), Default::default());
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let reg = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reg.announce_collection("01H", "anime", "anime", &[TEST_ROOT.into()])
         .await
         .unwrap();

@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 /// The library grid, mounted.
 ///
 /// happy-dom does no layout, so the two numbers the virtualiser measures —
@@ -24,9 +25,16 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(),
   listLibraries: vi.fn(),
   listArtists: vi.fn(),
-  adminApplyMatch: vi.fn(),
-  itemDetail: vi.fn(),
-  adminReviewSearch: vi.fn(),
+  enrichmentCorrect: vi.fn(),
+  item: vi.fn(),
+  enrichmentDetail: vi.fn(),
+  enrichmentIdentities: vi.fn().mockResolvedValue([]),
+  getEnrichmentArtworkUrl: (id: string) => `/api/v1/catalogue/collection-items/${id}/artwork`,
+  enrichmentSearch: vi.fn(),
+  getCatalogueArtistArtworkUrl: (library: string, key: string) =>
+    `/api/v1/catalogue/libraries/${library}/artists/${key}/artwork`,
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
   getArtistArtworkUrl: (key: string, params: { library: string; size?: string; v?: string }) =>
     `/api/v1/artists/${key}/artwork?${new URLSearchParams(
@@ -36,8 +44,16 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
 const admin = { value: false }
 vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
 
-const { itemDetail, adminApplyMatch, adminReviewSearch, listArtists, listItems, listLibraries } =
-  await import('../src/api/generated/kahawai.ts')
+const {
+  item: catalogueItem,
+  enrichmentDetail,
+  enrichmentIdentities,
+  enrichmentCorrect,
+  enrichmentSearch,
+  listArtists,
+  listItems,
+  listLibraries,
+} = await import('../src/api/generated/kahawai.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
 const Card = (await import('../src/components/Card.vue')).default
@@ -45,7 +61,7 @@ const MatchDialog = (await import('../src/components/MatchDialog.vue')).default
 const { DEBOUNCE_MS, useSearch } = await import('../src/composables/search.ts')
 
 const item = (id: string, over: Record<string, unknown> = {}) =>
-  ({ id, title: id, kind: 'movie', played: false, ...over }) as ItemRowI64
+  ({ id, library_id: 'films', title: id, kind: 'movie', played: false, ...over }) as ItemRowI64
 
 /// A card's row, with the fields the card actually reads.
 const row = (over: Record<string, unknown>) =>
@@ -160,6 +176,7 @@ function laidOut({ cols = 10, cellH = 186, viewport = 3000 } = {}) {
 }
 
 beforeEach(() => {
+  vi.mocked(enrichmentIdentities).mockResolvedValue([])
   hub(250)
   vi.mocked(listLibraries).mockResolvedValue({
     libraries: [
@@ -448,7 +465,7 @@ describe('once the page has been measured', () => {
     const portrait = wrapper.find('.artist-grid img')
     expect(wrapper.findAll('.artist-grid img')).toHaveLength(1)
     expect(portrait.attributes('src')).toContain(
-      '/api/v1/artists/bjork/artwork?library=music&size=card&v=77',
+      '/api/v1/catalogue/libraries/music/artists/bjork/artwork?v=77&size=card',
     )
     expect(portrait.attributes('srcset')).toContain('size=card1x')
     expect(portrait.attributes('srcset')).toContain('size=card')
@@ -537,8 +554,8 @@ describe('scrolling it', () => {
 describe('hand-matching from the grid (HUB-8)', () => {
   beforeEach(() => {
     admin.value = true
-    vi.mocked(itemDetail).mockImplementation(
-      async (id) =>
+    vi.mocked(catalogueItem).mockImplementation(
+      async (_library, id) =>
         ({
           copies: [
             {
@@ -552,8 +569,37 @@ describe('hand-matching from the grid (HUB-8)', () => {
           ],
         }) as never,
     )
-    vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
-    vi.mocked(adminApplyMatch).mockResolvedValue({ library_item_ids: ['i1'], revision: 5 } as never)
+    vi.mocked(enrichmentDetail).mockImplementation(
+      async (id) =>
+        ({
+          input: {
+            item_id: id,
+            library_item_id: id,
+            title: 'Heat',
+            year: 1995,
+            revision: 4,
+            manual: false,
+            media_type: 'movies',
+            selected: null,
+            sources: [],
+          },
+          candidates: [
+            {
+              id: 'record',
+              record: { title: 'Heat', provider: 'tmdb' },
+              strength: 0,
+              rejected: false,
+            },
+          ],
+          metadata: { description: {} },
+          entries: [],
+        }) as never,
+    )
+    vi.mocked(enrichmentSearch).mockResolvedValue({ candidates: [] } as never)
+    vi.mocked(enrichmentCorrect).mockResolvedValue({
+      library_item_ids: ['i1'],
+      revision: 5,
+    } as never)
   })
   afterEach(() => (admin.value = false))
 
@@ -576,9 +622,8 @@ describe('hand-matching from the grid (HUB-8)', () => {
     await wrapper.find('[aria-label*="match"]').trigger('click')
     await flushPromises()
     expect(wrapper.find('[role="dialog"]').exists()).toBe(true)
-    expect(adminReviewSearch).toHaveBeenCalledWith(
-      expect.objectContaining({ query: 'Heat', year: 1995 }),
-    )
+    expect(wrapper.find('[role="dialog"] h2').text()).toBe('Match “Heat” (1995)')
+    expect(enrichmentSearch).not.toHaveBeenCalled()
   })
 
   test('closing it without applying re-reads nothing', async () => {
@@ -596,7 +641,7 @@ describe('hand-matching from the grid (HUB-8)', () => {
 
   test('and applying one re-reads the visible result set', async () => {
     hub(1, { match_confidence: 'weak' })
-    vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
+    vi.mocked(enrichmentSearch).mockResolvedValue({ candidates: [] } as never)
     const { wrapper } = await grid()
     await wrapper.find('[aria-label*="match"]').trigger('click')
     await flushPromises()
@@ -607,7 +652,7 @@ describe('hand-matching from the grid (HUB-8)', () => {
       .find((b) => b.text() === 'Confirm current')!
       .trigger('click')
     await flushPromises()
-    expect(adminApplyMatch).toHaveBeenCalledWith(
+    expect(enrichmentCorrect).toHaveBeenCalledWith(
       'i0',
       expect.objectContaining({ action: 'confirm' }),
     )

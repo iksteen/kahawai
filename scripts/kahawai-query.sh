@@ -1,10 +1,12 @@
 #!/usr/bin/env bash
-# Ask an item what THIS client would be served: QUERY /api/v1/items/{id}
-# (RFC 10008). GET answers what the scan found; QUERY answers what
+# Ask an item what THIS client would be served: POST /api/v1/catalogue/libraries/{library}/items/{id}
+# GET answers what the scan found; POST answers what
 # negotiation would do about it, for the capabilities you declare here.
 #
-#   kahawai-query.sh [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>
+#   kahawai-query.sh -l library [-e entry] [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>
 #
+#   -l library    mediadb library ID (required)
+#   -e entry      pin a stable media entry ID
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
 #   -c caps       comma-separated capability bits, default "mp4,h264,aac,ass,overlay":
 #                   mp4 webm matroska    containers the client DEMUXES
@@ -29,7 +31,7 @@
 #   -j            print the raw JSON response
 #   password "-"  prompt for it instead of passing on the command line
 #
-# Item ids come from kahawai-list.sh. Nothing here changes state: QUERY
+# Item ids come from kahawai-list.sh. Nothing here changes state: this request
 # starts no extraction, generates nothing and claims no transcoder, so
 # it is safe to run against a live hub in a loop.
 set -euo pipefail
@@ -39,9 +41,12 @@ CAPS="mp4,h264,aac,ass,overlay"
 MODE=""
 TARGET="ignore"
 RAW=0
+LIBRARY="" ENTRY=""
 
-while getopts "a:c:m:t:jh" opt; do
+while getopts "l:e:a:c:m:t:jh" opt; do
     case $opt in
+        l) LIBRARY="$OPTARG" ;;
+        e) ENTRY="$OPTARG" ;;
         a) API="$OPTARG" ;;
         c) CAPS="$OPTARG" ;;
         m) MODE="$OPTARG" ;;
@@ -52,7 +57,8 @@ while getopts "a:c:m:t:jh" opt; do
 done
 shift $((OPTIND - 1))
 
-[ $# -ge 3 ] || { echo "usage: $(basename "$0") [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>" >&2; exit 2; }
+[ $# -ge 3 ] || { echo "usage: $(basename "$0") -l library [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>" >&2; exit 2; }
+[ -n "$LIBRARY" ] || { echo "-l library is required" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2 ITEM=$3
 
 if [ "$PASSWORD" = "-" ]; then
@@ -64,11 +70,11 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":
     | python3 -c 'import json,sys;print(json.load(sys.stdin)["access_token"])') \
     || { echo "login failed" >&2; exit 1; }
 
-BODY=$(python3 - "$CAPS" "$MODE" "$TARGET" <<'PY'
+BODY=$(python3 - "$CAPS" "$MODE" "$TARGET" "$ENTRY" <<'PY'
 import json, sys
 
-caps, mode, target = sys.argv[1], sys.argv[2], sys.argv[3]
-body = {}
+caps, mode, target, entry = sys.argv[1:]
+body = {"media_entry_id": entry} if entry else {}
 # Required by the API: there is no server-side default, because the
 # right answer differs per client (see TargetDuration).
 if target.startswith("short"):
@@ -112,9 +118,10 @@ print(json.dumps(body))
 PY
 )
 
-RESP=$(curl -sf -X QUERY "http://$API/api/v1/items/$ITEM" \
+ITEM_PATH=$(python3 -c 'import sys,urllib.parse;print("/api/v1/catalogue/libraries/"+urllib.parse.quote(sys.argv[1],safe="")+"/items/"+urllib.parse.quote(sys.argv[2],safe=""))' "$LIBRARY" "$ITEM")
+RESP=$(curl -sf -X POST "http://$API$ITEM_PATH" \
     -H "Authorization: Bearer $TOKEN" -H content-type:application/json \
-    -d "$BODY") || { echo "QUERY failed (is the item id right?)" >&2; exit 1; }
+    -d "$BODY") || { echo "playback query failed (check the library and item IDs)" >&2; exit 1; }
 
 if [ "$RAW" = 1 ]; then
     printf '%s\n' "$RESP" | python3 -m json.tool
@@ -126,17 +133,17 @@ import json, sys
 
 d = json.load(sys.stdin)
 title = d["title"]
-if d.get("show_title"):
-    title = "%s · S%02dE%02d · %s" % (d["show_title"], d.get("season") or 0,
-                                      d.get("episode") or 0, title)
+if d.get("child") and d["child"]["position"]["kind"] == "episode":
+    title = "%s · S%02dE%02d · %s" % (d.get("parent_title") or "", d["child"]["position"].get("season") or 0,
+                                      d["child"]["position"]["episode"], title)
 print(title)
 
 for s in d.get("sources", []):
     st = s.get("streams") or {}
     v = (st.get("video") or [{}])[0]
     a = (st.get("audio") or [{}])[0]
-    print("  %s  %s %s%s %s  %.1f GB%s" % (
-        s["path_rel"], st.get("container", "?"), v.get("codec", "?"),
+    print("  %s  %s  %s %s%s %s  %.1f GB%s" % (
+        s.get("media_entry_id") or "?", s["path_rel"], st.get("container", "?"), v.get("codec", "?"),
         " %dp" % v["height"] if v.get("height") else "",
         a.get("codec", "?"), s["size"] / 1e9,
         "" if s.get("available") else "  (host offline)"))

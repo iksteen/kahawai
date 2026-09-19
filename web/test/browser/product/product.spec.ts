@@ -194,16 +194,15 @@ test.describe.serial('real all-in-one product flows', () => {
     await accessible('admin-satellites')
 
     await page.getByRole('tab', { name: 'Libraries' }).click()
-    await page.getByLabel('New library name').fill('Browser Library')
+    await page.getByRole('textbox', { name: 'Name', exact: true }).fill('Browser Library')
+    await page.getByRole('checkbox', { name: /^This hub\/movies / }).check()
     await page.getByRole('button', { name: 'Create' }).click()
-    const library = page.getByRole('listitem').filter({ hasText: 'Browser Library' })
+    const library = page
+      .getByRole('listitem')
+      .filter({ has: page.getByRole('heading', { name: 'Browser Library movies' }) })
     await expect(library).toBeVisible()
-    const attach = library.getByLabel('Attach a collection to Browser Library')
-    const options = await attach.locator('option').allTextContents()
-    const movies = options.findIndex((option) => option.endsWith('/movies'))
-    expect(movies).toBeGreaterThan(0)
-    await attach.selectOption({ index: movies })
-    await expect(library.getByLabel(/Detach .*\/movies from Browser Library/)).toBeVisible()
+    await expect(library.getByText('This hub/movies', { exact: false })).toBeVisible()
+    await expect(library.getByText('This hub/hidden', { exact: false })).toHaveCount(0)
     await accessible('admin-libraries')
 
     await page.getByRole('tab', { name: 'Providers' }).click()
@@ -237,7 +236,7 @@ test.describe.serial('real all-in-one product flows', () => {
     expect(response.ok, await response.text()).toBe(true)
     await page.goto(`${PUBLIC}/app/admin`)
     await page.getByRole('tab', { name: 'Libraries' }).click()
-    await expect(page.getByText('Browser Library', { exact: true })).toBeVisible()
+    await expect(page.getByRole('heading', { name: 'Browser Library movies' })).toBeVisible()
     await page.getByRole('tab', { name: 'Users & grants' }).click()
     const viewer = page.getByRole('listitem').filter({ hasText: /^viewer/ })
     await expect(viewer.getByRole('button', { name: 'Browser Library' })).toHaveAttribute(

@@ -12,7 +12,6 @@ use kahawai_proto::v1::{
 };
 use kahawai_proto::{PROTOCOL_MAJOR, PROTOCOL_MINOR};
 use kahawai_transport::mtls::peer_identity;
-use prost::Message as _;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::{Request, Response, Status, Streaming};
 
@@ -79,7 +78,7 @@ pub struct MediahostLinkService {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     subtitles: Arc<crate::subtitles::Subtitles>,
-    enricher: Arc<crate::enrich::Enricher>,
+    _enricher: Arc<crate::enrich::Enricher>,
     segments: Arc<crate::segments::Detector>,
 }
 
@@ -88,13 +87,13 @@ impl MediahostLinkService {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
         subtitles: Arc<crate::subtitles::Subtitles>,
-        enricher: Arc<crate::enrich::Enricher>,
+        _enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
         Self::new_with_segments(
             registry,
             sessions,
             subtitles,
-            enricher,
+            _enricher,
             Arc::new(crate::segments::Detector::new()),
         )
     }
@@ -103,14 +102,14 @@ impl MediahostLinkService {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
         subtitles: Arc<crate::subtitles::Subtitles>,
-        enricher: Arc<crate::enrich::Enricher>,
+        _enricher: Arc<crate::enrich::Enricher>,
         segments: Arc<crate::segments::Detector>,
     ) -> Self {
         Self {
             registry,
             sessions,
             subtitles,
-            enricher,
+            _enricher,
             segments,
         }
     }
@@ -146,7 +145,7 @@ fn register_host_link(
 pub fn local_link(
     registry: Arc<Registry>,
     subtitles: Arc<crate::subtitles::Subtitles>,
-    enricher: Arc<crate::enrich::Enricher>,
+    _enricher: Arc<crate::enrich::Enricher>,
     segments: Arc<crate::segments::Detector>,
     module_id: &str,
     name: &str,
@@ -157,32 +156,28 @@ pub fn local_link(
     let (host_tx, mut host_rx) = tokio::sync::mpsc::channel::<HostToHub>(64);
     let (hub_tx, hub_rx) = tokio::sync::mpsc::channel::<Result<HubToHost, Status>>(16);
     let registered_tx = hub_tx.clone();
-    registry.connected(
-        module_id,
-        "mediahost",
-        name,
-        "in-process",
-        kahawai_core::build_stamp(),
-    );
-    let generation = register_host_link(
-        &registry,
-        &segments,
-        module_id,
-        hub_tx,
-        PROTOCOL_MINOR,
-        kahawai_core::segments::DETECTOR_GENERATION,
-    );
     let module_id = module_id.to_string();
+    let name = name.to_string();
     tokio::spawn(async move {
-        let mut seen: std::collections::HashMap<
-            String,
-            std::collections::HashSet<crate::registry::SourcePath>,
-        > = Default::default();
-        let mut partial: std::collections::HashMap<(String, String, String, u32), PartialSets> =
-            Default::default();
-        let mut catalog_delta_progress = std::collections::HashMap::new();
-        let mut catalog_removed_files = std::collections::HashMap::new();
-        let mut catalog_snapshots = std::collections::HashSet::new();
+        let gate = registry.catalog_apply_lock(&module_id);
+        let guard = gate.lock().await;
+        registry.connected(
+            &module_id,
+            "mediahost",
+            &name,
+            "in-process",
+            kahawai_core::build_stamp(),
+        );
+        let generation = register_host_link(
+            &registry,
+            &segments,
+            &module_id,
+            hub_tx,
+            PROTOCOL_MINOR,
+            kahawai_core::segments::DETECTOR_GENERATION,
+        );
+        drop(guard);
+        let mut partial = Default::default();
         while let Some(HostToHub { msg }) = host_rx.recv().await {
             let Some(msg) = msg else { continue };
             if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
@@ -196,19 +191,17 @@ pub fn local_link(
             let Some(msg) = route_segment_reply(&segments, &module_id, generation, msg) else {
                 continue;
             };
+            let _guard = gate.lock().await;
+            if !registry.host_link_is_current(&module_id, generation) {
+                break;
+            }
             if let Err(e) = handle_host_msg(
                 &registry,
                 &subtitles,
-                &enricher,
-                &segments,
+                &mut partial,
                 &module_id,
                 generation,
                 msg,
-                &mut seen,
-                &mut partial,
-                &mut catalog_delta_progress,
-                &mut catalog_removed_files,
-                &mut catalog_snapshots,
             )
             .await
             {
@@ -261,15 +254,21 @@ impl MediahostLink for MediahostLinkService {
         }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let registry = self.registry.clone();
-        let outer_subtitles = self.subtitles.clone();
-        let outer_enricher = self.enricher.clone();
         let outer_segments = self.segments.clone();
         let sessions = self.sessions.clone();
+        let subtitles = self.subtitles.clone();
         let module_id = peer.module_id.clone();
         // Sender first, and only then "present". The reverse order left this
         // host offered as a playback source across the renewal settlement's DB
         // work below — SELECT, sometimes an UPDATE with an audit row — with no
         // way to reach it, which is answered 409 rather than 503.
+        let gate = registry.catalog_apply_lock(&module_id);
+        let guard = gate.lock().await;
+        let admitted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM satellites WHERE module_id=? AND (cert_fingerprint=? OR pending_fingerprint=?))")
+            .bind(&module_id).bind(&peer.fingerprint).bind(&peer.fingerprint).fetch_one(registry.db()).await.map_err(|_| Status::internal("checking enrollment"))?;
+        if !admitted {
+            return Err(Status::unauthenticated("mediahost enrollment was revoked"));
+        }
         let generation = register_host_link(
             &registry,
             &outer_segments,
@@ -289,6 +288,7 @@ impl MediahostLink for MediahostLinkService {
             tracing::warn!(%module_id, error = format!("{e:#}"), "renewal settlement failed");
         }
 
+        drop(guard);
         tokio::spawn(async move {
             let ack = HubToHost {
                 msg: Some(hub_to_host::Msg::HelloAck(HelloAck {
@@ -317,22 +317,9 @@ impl MediahostLink for MediahostLinkService {
             let worker = {
                 let registry = registry.clone();
                 let module_id = module_id.clone();
-                let subtitles = outer_subtitles.clone();
-                let enricher = outer_enricher.clone();
-                let segments = outer_segments.clone();
                 let error_tx = tx.clone();
                 tokio::spawn(async move {
-                    let mut seen: std::collections::HashMap<
-                        String,
-                        std::collections::HashSet<crate::registry::SourcePath>,
-                    > = std::collections::HashMap::new();
-                    let mut partial: std::collections::HashMap<
-                        (String, String, String, u32),
-                        PartialSets,
-                    > = std::collections::HashMap::new();
-                    let mut catalog_delta_progress = std::collections::HashMap::new();
-                    let mut catalog_removed_files = std::collections::HashMap::new();
-                    let mut catalog_snapshots = std::collections::HashSet::new();
+                    let mut partial = Default::default();
                     while let Some(msg) = work_rx.recv().await {
                         let catalog_message = matches!(
                             msg,
@@ -345,23 +332,16 @@ impl MediahostLink for MediahostLinkService {
                         } else {
                             None
                         };
-                        if catalog_message && !registry.host_link_is_current(&module_id, generation)
-                        {
+                        if !registry.host_link_is_current(&module_id, generation) {
                             continue;
                         }
                         if let Err(e) = handle_host_msg(
                             &registry,
                             &subtitles,
-                            &enricher,
-                            &segments,
+                            &mut partial,
                             &module_id,
                             generation,
                             msg,
-                            &mut seen,
-                            &mut partial,
-                            &mut catalog_delta_progress,
-                            &mut catalog_removed_files,
-                            &mut catalog_snapshots,
                         )
                         .await
                         {
@@ -488,111 +468,7 @@ impl MediahostLink for MediahostLinkService {
     }
 }
 
-/// Blocks of one track's display sets, gathered from the messages that
-/// carry them. Per connection: a dropped link drops the partial with it,
-/// and the next request starts the transfer again.
-struct PartialSets {
-    bytes: usize,
-    blocks: Vec<kahawai_proto::v1::ImageSubBlock>,
-}
-
-/// Ceiling on one track's transfer. Not the wire limit — that is per
-/// message and now unreachable — but a guard against a sender that
-/// never marks the end.
-const MAX_SETS_BYTES: usize = 512 * 1024 * 1024;
-
-/// What a chunk of display sets means for the transfer it belongs to.
-enum Chunk {
-    /// Held; the sender has not said done yet.
-    More,
-    /// The last chunk: `m.blocks` now holds the whole track, and the
-    /// value is what it weighed.
-    Complete(usize),
-    /// The sender never said done and went past the cap.
-    TooBig(usize),
-}
-
-/// Gather one message into its transfer, and say whether that completes
-/// it. On completion the message's own `blocks` are replaced by every
-/// block of the track, so the caller stores one thing.
-///
-/// A message with no `done` marker at all is an older mediahost sending
-/// the whole track at once — complete by definition, which is why the
-/// field has presence rather than defaulting to false.
-fn accept_chunk(
-    partial: &mut std::collections::HashMap<(String, String, String, u32), PartialSets>,
-    m: &mut kahawai_proto::v1::ImageSubtitles,
-) -> Chunk {
-    let source = m.source.as_ref().expect("validated exact image source");
-    let key = (
-        m.collection_id.clone(),
-        source.root_token.clone(),
-        source.path_rel.clone(),
-        m.sub_index,
-    );
-    let last = m.done.unwrap_or(true);
-    let held = partial.entry(key.clone()).or_insert_with(|| PartialSets {
-        bytes: 0,
-        blocks: Vec::new(),
-    });
-    held.bytes += m.blocks.iter().map(|b| b.payload.len()).sum::<usize>();
-    held.blocks.append(&mut m.blocks);
-    if held.bytes > MAX_SETS_BYTES {
-        let bytes = held.bytes;
-        partial.remove(&key);
-        return Chunk::TooBig(bytes);
-    }
-    if !last {
-        return Chunk::More;
-    }
-    let held = partial.remove(&key).expect("just inserted");
-    m.blocks = held.blocks;
-    Chunk::Complete(held.bytes)
-}
-
-fn exact_source(
-    source: Option<kahawai_proto::v1::SourcePath>,
-    kind: &str,
-) -> anyhow::Result<kahawai_proto::v1::SourcePath> {
-    let source = source.with_context(|| format!("{kind} missing exact source"))?;
-    anyhow::ensure!(
-        !source.root_token.is_empty(),
-        "{kind} has an empty root token"
-    );
-    Ok(source)
-}
-
-fn split_catalog_source_key(key: &[u8]) -> anyhow::Result<(&str, &str)> {
-    let at = key
-        .iter()
-        .position(|byte| *byte == 0)
-        .context("catalogue source key has no separator")?;
-    Ok((
-        std::str::from_utf8(&key[..at])?,
-        std::str::from_utf8(&key[at + 1..])?,
-    ))
-}
-
-fn catalog_snapshot_required(stored: Option<u64>, oldest: u64, current: u64) -> bool {
-    stored.is_none_or(|version| version == 0 || version < oldest || version > current)
-}
-
-fn validate_catalog_source(
-    key: &[u8],
-    source: &Option<kahawai_proto::v1::SourcePath>,
-    kind: &str,
-) -> anyhow::Result<()> {
-    let (root_token, path_rel) = split_catalog_source_key(key)?;
-    let source = source
-        .as_ref()
-        .with_context(|| format!("catalogue {kind} payload has no source"))?;
-    anyhow::ensure!(
-        source.root_token == root_token && source.path_rel == path_rel,
-        "catalogue {kind} key does not match its payload source"
-    );
-    Ok(())
-}
-
+/// Reject legacy mutation messages before they reach the catalogue writer.
 fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
     let valid = |source: &Option<kahawai_proto::v1::SourcePath>, kind: &str| {
         let source = source
@@ -682,12 +558,12 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
         host_to_hub::Msg::ManifestRequest(_) => "manifest_request",
         host_to_hub::Msg::FilesSeen(_) => "files_seen",
         host_to_hub::Msg::FileHashes(_) => "file_hashes",
-        host_to_hub::Msg::FileSubtitles(_) => "file_subtitles",
+        host_to_hub::Msg::FileSubtitles(_) => "filesubtitles",
         host_to_hub::Msg::FileAttachments(_) => "file_attachments",
         host_to_hub::Msg::FileKeyframeInterval(_) => "file_keyframe_interval",
         host_to_hub::Msg::FileVideoGeometry(_) => "file_video_geometry",
         host_to_hub::Msg::FileLoudness(_) => "file_loudness",
-        host_to_hub::Msg::ImageSubtitles(_) => "image_subtitles",
+        host_to_hub::Msg::ImageSubtitles(_) => "imagesubtitles",
         host_to_hub::Msg::RootResolutions(_) => "root_resolutions",
         host_to_hub::Msg::RootAdoptionAck(_) => "root_adoption_ack",
         host_to_hub::Msg::SegmentDetectionAccepted(_) => "segment_detection_accepted",
@@ -698,609 +574,186 @@ fn kind_name(m: &host_to_hub::Msg) -> &'static str {
     }
 }
 
-async fn apply_file_upsert(
-    registry: &Registry,
-    module_id: &str,
-    upsert: kahawai_proto::v1::FileUpsert,
-    seen: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<crate::registry::SourcePath>,
-    >,
-) -> anyhow::Result<()> {
-    use crate::registry::FileUpsertRecord;
-    anyhow::ensure!(
-        registry
-            .unresolved_legacy_sources(module_id, &upsert.collection_id)
-            .await?
-            .is_empty(),
-        "file upsert refused while legacy roots remain unresolved for {module_id}/{}",
-        upsert.collection_id
+/// The transport owns connection generations; Store owns catalogue state.
+/// Blocks of one track's display sets, gathered from the messages that
+/// carry them. Per connection: a dropped link drops the partial with it,
+/// and the next request starts the transfer again.
+struct PartialSets {
+    bytes: usize,
+    blocks: Vec<kahawai_proto::v1::ImageSubBlock>,
+}
+
+/// Ceiling on one track's transfer. Not the wire limit — that is per
+/// message and now unreachable — but a guard against a sender that
+/// never marks the end.
+const MAX_SETS_BYTES: usize = 512 * 1024 * 1024;
+
+/// What a chunk of display sets means for the transfer it belongs to.
+enum Chunk {
+    /// Held; the sender has not said done yet.
+    More,
+    /// The last chunk: `m.blocks` now holds the whole track, and the
+    /// value is what it weighed.
+    Complete(usize),
+    /// The sender never said done and went past the cap.
+    TooBig(usize),
+}
+
+/// Gather one message into its transfer, and say whether that completes
+/// it. On completion the message's own `blocks` are replaced by every
+/// block of the track, so the caller stores one thing.
+///
+/// A message with no `done` marker at all is an older mediahost sending
+/// the whole track at once — complete by definition, which is why the
+/// field has presence rather than defaulting to false.
+fn accept_chunk(
+    partial: &mut std::collections::HashMap<(String, String, String, u32, String), PartialSets>,
+    m: &mut kahawai_proto::v1::ImageSubtitles,
+) -> Chunk {
+    let source = m.source.as_ref().expect("validated exact image source");
+    let key = (
+        m.collection_id.clone(),
+        source.root_token.clone(),
+        source.path_rel.clone(),
+        m.sub_index,
+        m.source_revision.clone(),
     );
-    let mut files = Vec::with_capacity(upsert.files.len());
-    for file in upsert.files {
-        let source = exact_source(file.source, "FileRecord")?;
-        let root_token = registry
-            .resolve_root_token(module_id, &upsert.collection_id, &source.root_token)
-            .await?;
-        if let Some(paths) = seen.get_mut(&upsert.collection_id) {
-            paths.insert(crate::registry::SourcePath {
-                root_token: root_token.clone(),
-                path_rel: source.path_rel.clone(),
-            });
-        }
-        files.push(FileUpsertRecord {
-            root_token,
-            path_rel: source.path_rel,
-            size: file.size,
-            mtime_unix: file.mtime_unix,
-            head_xxh3: file.head_xxh3,
-            tail_xxh3: file.tail_xxh3,
-            oshash: file.oshash,
-            streams_json: file.streams_json,
-        });
+    let last = m.done.unwrap_or(true);
+    let held = partial.entry(key.clone()).or_insert_with(|| PartialSets {
+        bytes: 0,
+        blocks: Vec::new(),
+    });
+    held.bytes += m.blocks.iter().map(|b| b.payload.len()).sum::<usize>();
+    held.blocks.append(&mut m.blocks);
+    if held.bytes > MAX_SETS_BYTES {
+        let bytes = held.bytes;
+        partial.remove(&key);
+        return Chunk::TooBig(bytes);
     }
-    let count = registry
-        .upsert_files(module_id, &upsert.collection_id, files)
-        .await?;
-    tracing::debug!(%module_id, collection = %upsert.collection_id, files = count,
-        "catalogue file upsert");
-    Ok(())
+    if !last {
+        return Chunk::More;
+    }
+    let held = partial.remove(&key).expect("just inserted");
+    m.blocks = held.blocks;
+    Chunk::Complete(held.bytes)
 }
 
-async fn flush_catalog_files(
-    registry: &Registry,
-    module_id: &str,
-    collection_id: &str,
-    files: &mut Vec<kahawai_proto::v1::FileRecord>,
-    seen: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<crate::registry::SourcePath>,
-    >,
-) -> anyhow::Result<()> {
-    if files.is_empty() {
-        return Ok(());
-    }
-    apply_file_upsert(
-        registry,
-        module_id,
-        kahawai_proto::v1::FileUpsert {
-            collection_id: collection_id.to_string(),
-            files: std::mem::take(files),
-        },
-        seen,
-    )
-    .await
-}
-
-/// `seen` accumulates upserted paths per collection between its announce
-/// and its scan-complete, at which point files missing from the scan are
-/// reconciled away (deletions on disk propagate on every rescan).
-#[allow(clippy::too_many_arguments)] // ordered link state and its complete handlers
 async fn handle_host_msg(
     registry: &Arc<Registry>,
     subtitles: &crate::subtitles::Subtitles,
-    enricher: &Arc<crate::enrich::Enricher>,
-    segments: &Arc<crate::segments::Detector>,
+    partial: &mut std::collections::HashMap<(String, String, String, u32, String), PartialSets>,
     module_id: &str,
     generation: u64,
     msg: host_to_hub::Msg,
-    seen: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<crate::registry::SourcePath>,
-    >,
-    partial: &mut std::collections::HashMap<(String, String, String, u32), PartialSets>,
-    catalog_delta_progress: &mut std::collections::HashMap<String, u64>,
-    catalog_removed_files: &mut std::collections::HashMap<
-        String,
-        std::collections::HashSet<crate::registry::SourcePath>,
-    >,
-    catalog_snapshots: &mut std::collections::HashSet<String>,
 ) -> anyhow::Result<()> {
     match msg {
         host_to_hub::Msg::Heartbeat(_) => registry.seen(module_id),
-        host_to_hub::Msg::AnnounceCollection(a) => {
-            seen.insert(a.id.clone(), Default::default());
-            let roots: Vec<String> = a
-                .roots
-                .iter()
-                .map(|root| {
-                    let normalized = std::path::Path::new(&root.normalized_path);
-                    anyhow::ensure!(
-                        normalized.is_absolute()
-                            && kahawai_core::media::root_token(normalized) == root.root_token,
-                        "collection {} announced invalid root token/path binding",
-                        a.id
-                    );
-                    Ok(root.normalized_path.clone())
-                })
-                .collect::<anyhow::Result<_>>()?;
-            registry
-                .announce_collection(module_id, &a.id, &a.media_type, &roots)
-                .await?;
-            let unresolved = registry.unresolved_legacy_sources(module_id, &a.id).await?;
-            if !unresolved.is_empty() && a.roots.len() > 1 {
-                registry
-                    .send_to_host(
-                        module_id,
-                        kahawai_proto::v1::HubToHost {
-                            msg: Some(kahawai_proto::v1::hub_to_host::Msg::RootResolutionWorklist(
-                                kahawai_proto::v1::RootResolutionWorklist {
-                                    collection_id: a.id,
-                                    sources: unresolved,
-                                },
-                            )),
-                        },
-                    )
-                    .await?;
-            }
-        }
-        host_to_hub::Msg::RootAdoptionAck(ack) => {
-            registry
-                .acknowledge_root_adoption(module_id, &ack.collection_id)
-                .await?;
-            tracing::info!(%module_id, collection = %ack.collection_id,
-                "root adoption acknowledged");
-        }
-        host_to_hub::Msg::RootResolutions(r) => {
-            for resolution in r.resolutions {
-                let Some(source) = resolution.source else {
-                    tracing::warn!(%module_id, collection = %r.collection_id,
-                        path = %resolution.path_rel, error = %resolution.error,
-                        "database source root remains unresolved; collection stays blocked");
-                    continue;
-                };
-                registry
-                    .adopt_legacy_source(
-                        module_id,
-                        &r.collection_id,
-                        &source.root_token,
-                        &source.path_rel,
-                    )
-                    .await?;
-            }
-        }
-        host_to_hub::Msg::FileUpsert(u) => {
-            apply_file_upsert(registry, module_id, u, seen).await?;
-        }
+        host_to_hub::Msg::Hello(_) => {}
         host_to_hub::Msg::CatalogOffer(offer) => {
-            let mut offered = std::collections::HashSet::new();
-            for collection in offer.collections {
-                anyhow::ensure!(!collection.id.is_empty(), "catalogue collection has no id");
-                anyhow::ensure!(
-                    !collection.epoch.is_empty(),
-                    "catalogue collection has no epoch"
-                );
-                anyhow::ensure!(
-                    collection.oldest_replayable_version <= collection.current_version,
-                    "catalogue collection has a replay floor beyond its current version"
-                );
-                anyhow::ensure!(
-                    offered.insert(collection.id.clone()),
-                    "catalogue offer repeats collection {}",
-                    collection.id
-                );
-                let roots: Vec<String> = collection
-                    .roots
-                    .iter()
-                    .map(|root| {
-                        let path = std::path::Path::new(&root.normalized_path);
-                        anyhow::ensure!(
-                            path.is_absolute()
-                                && kahawai_core::media::root_token(path) == root.root_token,
-                            "catalogue collection {} has invalid root binding",
-                            collection.id
-                        );
-                        Ok(root.normalized_path.clone())
-                    })
-                    .collect::<anyhow::Result<_>>()?;
-                registry
-                    .announce_collection(module_id, &collection.id, &collection.media_type, &roots)
-                    .await?;
-                let stored = registry
-                    .catalog_cursor(module_id, &collection.id, &collection.epoch)
-                    .await?;
-                // Version zero is also the durable marker for a snapshot
-                // that started but did not reach its final page. Replaying it
-                // as an incremental delta would omit reconciliation against
-                // files that existed only in the previous epoch.
-                let snapshot = catalog_snapshot_required(
-                    stored,
-                    collection.oldest_replayable_version,
-                    collection.current_version,
-                );
-                let version = if snapshot { 0 } else { stored.unwrap_or(0) };
-                if snapshot {
-                    // Keep the existing projection in place while the full
-                    // current-state snapshot streams in. Upserts then reuse
-                    // stable item ids and preserve hub-owned matches,
-                    // metadata, subtitles and library membership. The seen
-                    // manifest is reconciled only after the final chunk.
-                    registry
-                        .reset_catalog_derived(module_id, &collection.id)
-                        .await?;
-                    registry
-                        .set_catalog_cursor(module_id, &collection.id, &collection.epoch, 0)
-                        .await?;
-                    seen.insert(collection.id.clone(), Default::default());
-                    catalog_delta_progress.insert(collection.id.clone(), 0);
-                    catalog_removed_files.remove(&collection.id);
-                    catalog_snapshots.insert(collection.id.clone());
-                } else {
-                    seen.remove(&collection.id);
-                    catalog_delta_progress.remove(&collection.id);
-                    catalog_removed_files.remove(&collection.id);
-                    catalog_snapshots.remove(&collection.id);
+            for collection in &offer.collections {
+                for root in &collection.roots {
+                    let path = std::path::Path::new(&root.normalized_path);
+                    anyhow::ensure!(
+                        path.is_absolute()
+                            && kahawai_core::media::root_token(path) == root.root_token,
+                        "collection {} announced invalid root token/path binding",
+                        collection.id
+                    );
                 }
+            }
+            let name: String = sqlx::query_scalar("SELECT name FROM satellites WHERE module_id=?")
+                .bind(module_id)
+                .fetch_one(registry.db())
+                .await?;
+            let cursors = registry
+                .catalogue()
+                .offer_catalogue(module_id, &name, &offer)
+                .await?;
+            for cursor in cursors {
                 registry
                     .send_to_host_generation(
                         module_id,
                         generation,
                         HubToHost {
-                            msg: Some(hub_to_host::Msg::CatalogCursor(
-                                kahawai_proto::v1::CatalogCursor {
-                                    collection_id: collection.id,
-                                    epoch: collection.epoch,
-                                    version,
-                                    snapshot,
-                                },
-                            )),
+                            msg: Some(hub_to_host::Msg::CatalogCursor(cursor)),
                         },
                     )
                     .await?;
-            }
-            let removed = registry
-                .retain_catalog_collections(module_id, &offered)
-                .await?;
-            if removed > 0 {
-                tracing::info!(%module_id, removed, "unshared catalogue collections removed");
             }
         }
         host_to_hub::Msg::CatalogDelta(delta) => {
-            anyhow::ensure!(
-                !delta.collection_id.is_empty(),
-                "catalogue delta has no collection"
-            );
-            anyhow::ensure!(!delta.epoch.is_empty(), "catalogue delta has no epoch");
-            let durable_cursor = registry
-                .catalog_cursor(module_id, &delta.collection_id, &delta.epoch)
+            if let Some(ack) = registry
+                .catalogue()
+                .apply_catalogue(module_id, &delta)
                 .await?
-                .context("catalogue delta was not requested for this epoch")?;
-            let cursor = catalog_delta_progress
-                .get(&delta.collection_id)
-                .copied()
-                .unwrap_or(durable_cursor);
-            let active_snapshot = catalog_snapshots.contains(&delta.collection_id);
-            anyhow::ensure!(
-                delta.through_version >= cursor,
-                "catalogue delta moves cursor backwards"
-            );
-            anyhow::ensure!(
-                !active_snapshot || delta.done || delta.through_version == 0,
-                "intermediate catalogue snapshot advanced its durable cursor"
-            );
-            if delta.snapshot {
-                anyhow::ensure!(
-                    cursor == 0,
-                    "catalogue snapshot did not start at the requested cursor"
-                );
-            }
-            let mut previous = if active_snapshot { 0 } else { cursor };
-            let mut removed_files = std::collections::HashSet::new();
-            let mut file_upserts = Vec::new();
-            for record in delta.records {
-                anyhow::ensure!(
-                    record.version > previous
-                        && (active_snapshot || record.version <= delta.through_version),
-                    "catalogue records are not version ordered"
-                );
-                if !matches!((record.kind.as_str(), record.deleted), ("file", false)) {
-                    flush_catalog_files(
-                        registry,
-                        module_id,
-                        &delta.collection_id,
-                        &mut file_upserts,
-                        seen,
-                    )
-                    .await?;
-                }
-                previous = record.version;
-                match (record.kind.as_str(), record.deleted) {
-                    ("file", true) => {
-                        let (root, path) = split_catalog_source_key(&record.key)?;
-                        removed_files.insert(crate::registry::SourcePath {
-                            // A configured root may have been removed since
-                            // this source was catalogued. Historical bindings
-                            // remain valid deletion targets even though they
-                            // may no longer serve new reads/upserts.
-                            root_token: root.to_string(),
-                            path_rel: path.to_string(),
-                        });
-                    }
-                    ("file", false) => {
-                        let upsert =
-                            kahawai_proto::v1::FileUpsert::decode(record.payload.as_slice())
-                                .context("decoding catalogue file record")?;
-                        anyhow::ensure!(
-                            upsert.collection_id == delta.collection_id,
-                            "catalogue file record changed collection"
-                        );
-                        anyhow::ensure!(
-                            upsert.files.len() == 1,
-                            "catalogue file record must contain one source"
-                        );
-                        validate_catalog_source(&record.key, &upsert.files[0].source, "file")?;
-                        file_upserts.extend(upsert.files);
-                    }
-                    ("file_error", false) => {
-                        let error = kahawai_proto::v1::FileError::decode(record.payload.as_slice())
-                            .context("decoding catalogue file error")?;
-                        anyhow::ensure!(
-                            error.collection_id == delta.collection_id,
-                            "catalogue file error changed collection"
-                        );
-                        validate_catalog_source(&record.key, &error.source, "file error")?;
-                        let source = exact_source(error.source, "FileError")?;
-                        tracing::warn!(%module_id, collection = %delta.collection_id,
-                            root = %source.root_token, path = %source.path_rel,
-                            error = %error.error, "mediahost catalogue records unreadable source");
-                    }
-                    ("file_hashes", false) => {
-                        let value =
-                            kahawai_proto::v1::FileHashes::decode(record.payload.as_slice())
-                                .context("decoding catalogue hash record")?;
-                        anyhow::ensure!(
-                            value.hashes.len() == 1,
-                            "catalogue hash record must contain one source"
-                        );
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue hash record changed collection"
-                        );
-                        validate_catalog_source(&record.key, &value.hashes[0].source, "hash")?;
-                        Box::pin(handle_host_msg(
-                            registry,
-                            subtitles,
-                            enricher,
-                            segments,
-                            module_id,
-                            generation,
-                            host_to_hub::Msg::FileHashes(value),
-                            seen,
-                            partial,
-                            catalog_delta_progress,
-                            catalog_removed_files,
-                            catalog_snapshots,
-                        ))
-                        .await?;
-                    }
-                    ("file_hashes", true) => {
-                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
-                        registry
-                            .remove_catalog_hashes(
-                                module_id,
-                                &delta.collection_id,
-                                &crate::registry::SourcePath {
-                                    root_token: root_token.to_string(),
-                                    path_rel: path_rel.to_string(),
-                                },
-                            )
-                            .await?;
-                    }
-                    ("file_loudness", false) => {
-                        let value =
-                            kahawai_proto::v1::FileLoudness::decode(record.payload.as_slice())
-                                .context("decoding catalogue loudness record")?;
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue loudness record changed collection"
-                        );
-                        validate_catalog_source(&record.key, &value.source, "loudness")?;
-                        Box::pin(handle_host_msg(
-                            registry,
-                            subtitles,
-                            enricher,
-                            segments,
-                            module_id,
-                            generation,
-                            host_to_hub::Msg::FileLoudness(value),
-                            seen,
-                            partial,
-                            catalog_delta_progress,
-                            catalog_removed_files,
-                            catalog_snapshots,
-                        ))
-                        .await?;
-                    }
-                    ("file_loudness", true) => {
-                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
-                        registry
-                            .remove_catalog_loudness(
-                                module_id,
-                                &delta.collection_id,
-                                &crate::registry::SourcePath {
-                                    root_token: root_token.to_string(),
-                                    path_rel: path_rel.to_string(),
-                                },
-                            )
-                            .await?;
-                    }
-                    ("file_attachments", false) => {
-                        let value =
-                            kahawai_proto::v1::FileAttachments::decode(record.payload.as_slice())
-                                .context("decoding catalogue attachment record")?;
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue attachment record changed collection"
-                        );
-                        validate_catalog_source(&record.key, &value.source, "attachments")?;
-                        Box::pin(handle_host_msg(
-                            registry,
-                            subtitles,
-                            enricher,
-                            segments,
-                            module_id,
-                            generation,
-                            host_to_hub::Msg::FileAttachments(value),
-                            seen,
-                            partial,
-                            catalog_delta_progress,
-                            catalog_removed_files,
-                            catalog_snapshots,
-                        ))
-                        .await?;
-                    }
-                    ("file_keyframe", false) => {
-                        let value = kahawai_proto::v1::FileKeyframeInterval::decode(
-                            record.payload.as_slice(),
-                        )
-                        .context("decoding catalogue keyframe record")?;
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue keyframe record changed collection"
-                        );
-                        validate_catalog_source(&record.key, &value.source, "keyframe interval")?;
-                        Box::pin(handle_host_msg(
-                            registry,
-                            subtitles,
-                            enricher,
-                            segments,
-                            module_id,
-                            generation,
-                            host_to_hub::Msg::FileKeyframeInterval(value),
-                            seen,
-                            partial,
-                            catalog_delta_progress,
-                            catalog_removed_files,
-                            catalog_snapshots,
-                        ))
-                        .await?;
-                    }
-                    ("file_geometry", false) => {
-                        let value =
-                            kahawai_proto::v1::FileVideoGeometry::decode(record.payload.as_slice())
-                                .context("decoding catalogue geometry record")?;
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue geometry record changed collection"
-                        );
-                        validate_catalog_source(&record.key, &value.source, "video geometry")?;
-                        Box::pin(handle_host_msg(
-                            registry,
-                            subtitles,
-                            enricher,
-                            segments,
-                            module_id,
-                            generation,
-                            host_to_hub::Msg::FileVideoGeometry(value),
-                            seen,
-                            partial,
-                            catalog_delta_progress,
-                            catalog_removed_files,
-                            catalog_snapshots,
-                        ))
-                        .await?;
-                    }
-                    ("file_segments", false) => {
-                        let value = kahawai_proto::v1::SegmentDetectionResult::decode(
-                            record.payload.as_slice(),
-                        )
-                        .context("decoding catalogue segment record")?;
-                        anyhow::ensure!(
-                            value.collection_id == delta.collection_id,
-                            "catalogue segment record changed collection"
-                        );
-                        anyhow::ensure!(
-                            value.episodes.len() == 1,
-                            "catalogue segment record must contain one source"
-                        );
-                        validate_catalog_source(
-                            &record.key,
-                            &value.episodes[0].source,
-                            "segments",
-                        )?;
-                        let stored = crate::segments::store_catalog_result(
-                            registry,
-                            module_id,
-                            &delta.collection_id,
-                            &value,
-                        )
-                        .await?;
-                        tracing::debug!(%module_id, collection = %delta.collection_id, stored,
-                            "source-owned segment result projected");
-                    }
-                    ("file_segments", true) => {
-                        let (root_token, path_rel) = split_catalog_source_key(&record.key)?;
-                        crate::segments::remove_catalog_result(
-                            registry,
-                            module_id,
-                            &delta.collection_id,
-                            &crate::registry::SourcePath {
-                                root_token: root_token.to_string(),
-                                path_rel: path_rel.to_string(),
-                            },
-                        )
-                        .await?;
-                    }
-                    (kind, _) => tracing::debug!(%module_id, kind,
-                        "catalogue record kind not yet consumed by hub"),
-                }
-            }
-            flush_catalog_files(
-                registry,
-                module_id,
-                &delta.collection_id,
-                &mut file_upserts,
-                seen,
-            )
-            .await?;
-            catalog_removed_files
-                .entry(delta.collection_id.clone())
-                .or_default()
-                .extend(removed_files);
-            if delta.done {
-                let removed_files = catalog_removed_files
-                    .remove(&delta.collection_id)
-                    .unwrap_or_default();
-                registry
-                    .remove_catalog_files(module_id, &delta.collection_id, &removed_files)
-                    .await?;
-                if catalog_snapshots.remove(&delta.collection_id) {
-                    let snapshot_seen = seen.remove(&delta.collection_id).unwrap_or_default();
-                    registry
-                        .reconcile_files(module_id, &delta.collection_id, &snapshot_seen)
-                        .await?;
-                }
-                catalog_delta_progress.remove(&delta.collection_id);
-                registry
-                    .set_catalog_cursor(
-                        module_id,
-                        &delta.collection_id,
-                        &delta.epoch,
-                        delta.through_version,
-                    )
-                    .await?;
-            } else {
-                catalog_delta_progress.insert(delta.collection_id.clone(), delta.through_version);
-            }
-            if delta.done {
+            {
                 registry
                     .send_to_host_generation(
                         module_id,
                         generation,
                         HubToHost {
-                            msg: Some(hub_to_host::Msg::CatalogAck(
-                                kahawai_proto::v1::CatalogAck {
-                                    collection_id: delta.collection_id.clone(),
-                                    epoch: delta.epoch,
-                                    version: delta.through_version,
-                                },
-                            )),
+                            msg: Some(hub_to_host::Msg::CatalogAck(ack)),
                         },
                     )
                     .await?;
             }
-            if delta.done {
-                enricher.scan_complete(registry.clone());
+        }
+        host_to_hub::Msg::FileSubtitles(message) => {
+            let source = message.source.context("missing subtitle source")?;
+            if message.error.is_empty()
+                && registry
+                    .catalogue()
+                    .source_exists(
+                        module_id,
+                        &message.collection_id,
+                        &source,
+                        Some(message.size),
+                    )
+                    .await?
+            {
+                for track in message.tracks {
+                    let extracted = kahawai_media::subtitles::Extracted {
+                        cues: serde_json::from_str(&track.cues_json)?,
+                        ass: (!track.ass.is_empty()).then_some(track.ass),
+                    };
+                    subtitles.store_extracted(
+                        module_id,
+                        &message.collection_id,
+                        &source.root_token,
+                        &source.path_rel,
+                        &track.key,
+                        &message.source_revision,
+                        &extracted,
+                    )?;
+                }
+            }
+        }
+        host_to_hub::Msg::ImageSubtitles(mut message) => {
+            let source = message.source.as_ref().context("missing image source")?;
+            if !message.error.is_empty()
+                || !registry
+                    .catalogue()
+                    .source_exists(module_id, &message.collection_id, source, None)
+                    .await?
+            {
+                partial.remove(&(
+                    message.collection_id,
+                    source.root_token.clone(),
+                    source.path_rel.clone(),
+                    message.sub_index,
+                    message.source_revision.clone(),
+                ));
+                return Ok(());
+            }
+            match accept_chunk(partial, &mut message) {
+                Chunk::Complete(bytes) => {
+                    subtitles.store_image_sets(module_id, &message).await?;
+                    tracing::debug!(bytes, "image subtitle transfer complete");
+                }
+                Chunk::TooBig(bytes) => {
+                    tracing::warn!(bytes, "image subtitle transfer exceeded existing limit")
+                }
+                Chunk::More => {}
             }
         }
         host_to_hub::Msg::DiscoveryStatus(status) => {
@@ -1312,860 +765,11 @@ async fn handle_host_msg(
                 status.skipped,
                 !status.scanning,
             );
+            registry.report_discovery(module_id, generation, status);
         }
-        host_to_hub::Msg::FileError(e) => {
-            let source = exact_source(e.source, "FileError")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &e.collection_id, &source.root_token)
-                .await?;
-            if !source.path_rel.is_empty()
-                && let Some(paths) = seen.get_mut(&e.collection_id)
-            {
-                paths.insert(crate::registry::SourcePath {
-                    root_token: root_token.clone(),
-                    path_rel: source.path_rel.clone(),
-                });
-            }
-            tracing::warn!(%module_id, collection = %e.collection_id, %root_token,
-                path = %source.path_rel, error = %e.error, "mediahost reported unreadable source");
-        }
-        host_to_hub::Msg::ManifestRequest(r) => {
-            // Root adoption is a metadata repair, not a scan. Until the
-            // targeted worklist has resolved every legacy row, suppress this
-            // cycle: a partial exact-root manifest followed by reconciliation
-            // would interpret every unresolved legacy key as a deletion.
-            let unresolved = registry
-                .unresolved_legacy_sources(module_id, &r.collection_id)
-                .await?;
-            if !unresolved.is_empty() {
-                registry
-                    .send_to_host(
-                        module_id,
-                        kahawai_proto::v1::HubToHost {
-                            msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
-                                kahawai_proto::v1::Manifest {
-                                    sidecars_compared: true,
-                                    collection_id: r.collection_id.clone(),
-                                    entries: vec![],
-                                    done: true,
-                                    in_sync: true,
-                                    root_adoption: false,
-                                },
-                            )),
-                        },
-                    )
-                    .await?;
-                tracing::warn!(
-                    %module_id,
-                    collection = %r.collection_id,
-                    unresolved = unresolved.len(),
-                    "scan suppressed until legacy roots are resolved"
-                );
-                return Ok(());
-            }
-            // Suppress the first cycle after every row is adopted even when a
-            // restored hub snapshot and mediahost journal have different scan
-            // generations. Pending is durable and cleared only by the host's
-            // acknowledgement, so a crash repeats this harmless response.
-            if registry
-                .root_adoption_pending(module_id, &r.collection_id)
-                .await?
-            {
-                registry
-                    .send_to_host(
-                        module_id,
-                        kahawai_proto::v1::HubToHost {
-                            msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
-                                kahawai_proto::v1::Manifest {
-                                    sidecars_compared: true,
-                                    collection_id: r.collection_id.clone(),
-                                    entries: vec![],
-                                    done: true,
-                                    in_sync: true,
-                                    root_adoption: true,
-                                },
-                            )),
-                        },
-                    )
-                    .await?;
-                tracing::info!(%module_id, collection = %r.collection_id,
-                    "root adoption complete; reconnect scan suppressed");
-                return Ok(());
-            }
-            // Deep refresh: answer EMPTY, so every file re-probes
-            // (first-scan semantics). Must beat the in-sync gate — a
-            // deep refresh of an in-sync collection is the whole point.
-            if registry.take_deep_rescan(module_id, &r.collection_id) {
-                let msg = kahawai_proto::v1::HubToHost {
-                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
-                        kahawai_proto::v1::Manifest {
-                            sidecars_compared: false,
-                            collection_id: r.collection_id.clone(),
-                            entries: vec![],
-                            done: true,
-                            in_sync: false,
-                            root_adoption: false,
-                        },
-                    )),
-                };
-                registry.send_to_host(module_id, msg).await?;
-                tracing::info!(%module_id, collection = %r.collection_id,
-                    "deep refresh: empty manifest sent, full re-probe");
-                return Ok(());
-            }
-            // Reconnect handshake: matching scan generations mean the
-            // hub already reflects the host's last completed scan — no
-            // manifest, no walk, no reconciliation churn on restart.
-            if r.sync_version != 0
-                && r.sync_version
-                    == registry
-                        .collection_sync_version(module_id, &r.collection_id)
-                        .await?
-            {
-                let msg = kahawai_proto::v1::HubToHost {
-                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
-                        kahawai_proto::v1::Manifest {
-                            sidecars_compared: true,
-                            collection_id: r.collection_id.clone(),
-                            entries: vec![],
-                            done: true,
-                            in_sync: true,
-                            root_adoption: false,
-                        },
-                    )),
-                };
-                registry.send_to_host(module_id, msg).await?;
-                tracing::info!(%module_id, collection = %r.collection_id,
-                    version = r.sync_version, "collection in sync; scan skipped");
-                push_ed2k_worklist(registry, module_id, &r.collection_id).await;
-                push_subs_worklist(registry, module_id, &r.collection_id).await;
-                push_attachments_worklist(registry, module_id, &r.collection_id).await;
-                push_keyframe_worklist(registry, module_id, &r.collection_id).await;
-                push_video_geometry_worklist(registry, module_id, &r.collection_id).await;
-                push_loudness_worklist(registry, module_id, &r.collection_id).await;
-                return Ok(());
-            }
-            // Incremental rescan (MH-5): what we already know, so the
-            // host can skip re-inspecting unchanged files.
-            let entries = registry.file_stats(module_id, &r.collection_id).await?;
-            const CHUNK: usize = 8000;
-            let total = entries.len();
-            let mut sent = 0;
-            let mut chunks = entries.chunks(CHUNK).peekable();
-            loop {
-                let chunk = chunks.next().unwrap_or(&[]);
-                let done = chunks.peek().is_none();
-                let msg = kahawai_proto::v1::HubToHost {
-                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::Manifest(
-                        kahawai_proto::v1::Manifest {
-                            sidecars_compared: true,
-                            collection_id: r.collection_id.clone(),
-                            entries: chunk.to_vec(),
-                            done,
-                            in_sync: false,
-                            root_adoption: false,
-                        },
-                    )),
-                };
-                registry.send_to_host(module_id, msg).await?;
-                sent += chunk.len();
-                if done {
-                    break;
-                }
-            }
-            tracing::debug!(%module_id, collection = %r.collection_id, files = total, sent, "manifest sent");
-        }
-        // HUB-32b: display sets the host walked for us; cached for the
-        // burn-in session that asked (and for any later one).
-        host_to_hub::Msg::ImageSubtitles(mut m) => {
-            let mut source = exact_source(m.source.take(), "ImageSubtitles")?;
-            source.root_token = registry
-                .resolve_root_token(module_id, &m.collection_id, &source.root_token)
-                .await?;
-            m.source = Some(source.clone());
-            if !m.error.is_empty() {
-                partial.remove(&(
-                    m.collection_id.clone(),
-                    source.root_token.clone(),
-                    source.path_rel.clone(),
-                    m.sub_index,
-                ));
-                tracing::warn!(%module_id, collection = %m.collection_id, path = %source.path_rel,
-                    track = m.sub_index, error = %m.error, "image display-set extraction failed");
-                if let Err(e) = subtitles
-                    .remember_extraction_failure(
-                        registry,
-                        module_id,
-                        &m.collection_id,
-                        &source.root_token,
-                        &source.path_rel,
-                        m.sub_index,
-                        &m.error,
-                    )
-                    .await
-                {
-                    tracing::warn!(%module_id, error = format!("{e:#}"),
-                        "recording an extraction failure");
-                }
-                return Ok(());
-            }
-            let bytes = match accept_chunk(partial, &mut m) {
-                Chunk::More => return Ok(()),
-                Chunk::TooBig(bytes) => {
-                    tracing::warn!(%module_id, collection = %m.collection_id, path = %source.path_rel,
-                        track = m.sub_index, bytes, "display-set transfer exceeded the cap; abandoned");
-                    return Ok(());
-                }
-                Chunk::Complete(bytes) => bytes,
-            };
-            if let Err(e) = subtitles.store_image_sets(module_id, &m).await {
-                tracing::warn!(%module_id, error = format!("{e:#}"), "storing image display sets");
-            } else {
-                tracing::info!(%module_id, collection = %m.collection_id, path = %source.path_rel,
-                    track = m.sub_index, blocks = m.blocks.len(), bytes, "image display sets cached");
-            }
-        }
-        host_to_hub::Msg::FilesSeen(s) => {
-            if let Some(paths) = seen.get_mut(&s.collection_id) {
-                for source in s.sources {
-                    let token = registry
-                        .resolve_root_token(module_id, &s.collection_id, &source.root_token)
-                        .await?;
-                    paths.insert(crate::registry::SourcePath {
-                        root_token: token,
-                        path_rel: source.path_rel,
-                    });
-                }
-            }
-        }
-        host_to_hub::Msg::ScanProgress(p) if !p.complete => {
-            registry.update_scan_progress(
-                module_id,
-                &p.collection_id,
-                p.scanned,
-                p.failed,
-                p.skipped,
-                false,
-            );
-        }
-        host_to_hub::Msg::ScanProgress(p) if p.complete => {
-            tracing::info!(%module_id, collection = %p.collection_id,
-                scanned = p.scanned, failed = p.failed, skipped = p.skipped, "scan complete");
-            if let Some(paths) = seen.remove(&p.collection_id) {
-                registry
-                    .reconcile_files(module_id, &p.collection_id, &paths)
-                    .await?;
-                let removed = subtitles.clean_orphaned_payloads(registry).await?;
-                if removed > 0 {
-                    tracing::info!(removed, "removed unreachable subtitle payloads");
-                }
-            }
-            if p.sync_version != 0 {
-                registry
-                    .set_collection_sync_version(module_id, &p.collection_id, p.sync_version)
-                    .await?;
-            }
-            registry.update_scan_progress(
-                module_id,
-                &p.collection_id,
-                p.scanned,
-                p.failed,
-                p.skipped,
-                true,
-            );
-            push_ed2k_worklist(registry, module_id, &p.collection_id).await;
-            push_subs_worklist(registry, module_id, &p.collection_id).await;
-            push_attachments_worklist(registry, module_id, &p.collection_id).await;
-            push_keyframe_worklist(registry, module_id, &p.collection_id).await;
-            push_video_geometry_worklist(registry, module_id, &p.collection_id).await;
-            push_loudness_worklist(registry, module_id, &p.collection_id).await;
-            enricher.scan_complete(registry.clone());
-        }
-        host_to_hub::Msg::FileAttachments(fa) => {
-            let source = exact_source(fa.source, "FileAttachments")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &fa.collection_id, &source.root_token)
-                .await?;
-            let stored = registry
-                .record_file_attachments(
-                    module_id,
-                    &fa.collection_id,
-                    &root_token,
-                    &source.path_rel,
-                    fa.size,
-                    crate::registry::Declared {
-                        attachments_json: &fa.attachments_json,
-                        chapters_json: fa.chapters_json.as_deref(),
-                    },
-                )
-                .await?;
-            // `None` is a host that cannot read chapters at all, which is not
-            // the same as one that looked and found none — and this line is
-            // read by somebody asking why a file has no chapters.
-            let chapters = fa.chapters_json.as_deref();
-            if fa.attachments_json != "[]" || chapters.is_some_and(|c| c != "[]") {
-                tracing::info!(%module_id, collection = %fa.collection_id,
-                    path = %source.path_rel, stored,
-                    attachments = fa.attachments_json != "[]",
-                    chapters = match chapters {
-                        None => "not read by this host",
-                        Some("[]") => "none",
-                        Some(_) => "declared",
-                    },
-                    "container header declared by mediahost");
-            }
-        }
-        host_to_hub::Msg::FileKeyframeInterval(k) => {
-            let source = exact_source(k.source, "FileKeyframeInterval")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &k.collection_id, &source.root_token)
-                .await?;
-            registry
-                .record_file_keyframe_interval(
-                    module_id,
-                    &k.collection_id,
-                    &root_token,
-                    &source.path_rel,
-                    k.size,
-                    k.max_keyframe_interval_ms,
-                )
-                .await?;
-        }
-        host_to_hub::Msg::FileVideoGeometry(g) => {
-            let source = exact_source(g.source, "FileVideoGeometry")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &g.collection_id, &source.root_token)
-                .await?;
-            let stored = registry
-                .record_file_video_geometry(
-                    module_id,
-                    &g.collection_id,
-                    &root_token,
-                    &source.path_rel,
-                    g.size,
-                    &g.geometry_json,
-                    &g.error,
-                )
-                .await?;
-            if !g.error.is_empty() {
-                tracing::warn!(%module_id, collection = %g.collection_id,
-                    path = %source.path_rel, stored, error = %g.error,
-                    "targeted video geometry probe failed");
-            }
-        }
-        host_to_hub::Msg::FileLoudness(mut loudness) => {
-            let source = exact_source(loudness.source.take(), "FileLoudness")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &loudness.collection_id, &source.root_token)
-                .await?;
-            let path_rel = source.path_rel;
-            loudness.source = Some(kahawai_proto::v1::SourcePath {
-                root_token: root_token.clone(),
-                path_rel: path_rel.clone(),
-            });
-            let stored = registry
-                .record_file_loudness(module_id, &loudness)
-                .await
-                .with_context(|| {
-                    format!(
-                        "recording loudness result for {}/{}",
-                        loudness.collection_id, path_rel
-                    )
-                })?;
-            tracing::info!(%module_id, collection = %loudness.collection_id,
-                path = %path_rel, tracks = loudness.tracks.len(), stored,
-                "audio loudness result received");
-            if !stored {
-                tracing::debug!(%module_id, collection = %loudness.collection_id,
-                    path = %path_rel,
-                    "stale loudness projection dropped; mediahost owns retry scheduling");
-            }
-        }
-        host_to_hub::Msg::FileSubtitles(fs) => {
-            let source = exact_source(fs.source, "FileSubtitles")?;
-            let root_token = registry
-                .resolve_root_token(module_id, &fs.collection_id, &source.root_token)
-                .await?;
-            if !fs.error.is_empty() {
-                tracing::warn!(%module_id, collection = %fs.collection_id, path = %source.path_rel,
-                    error = %fs.error, "mediahost subtitle extraction failed");
-                registry
-                    .set_subs_extracted(
-                        module_id,
-                        &fs.collection_id,
-                        &root_token,
-                        &source.path_rel,
-                        None,
-                    )
-                    .await?;
-                return Ok(());
-            }
-            for t in &fs.tracks {
-                let cues = serde_json::from_str(&t.cues_json).unwrap_or_default();
-                let ex = kahawai_media::subtitles::Extracted {
-                    cues,
-                    ass: (!t.ass.is_empty()).then(|| t.ass.clone()),
-                };
-                subtitles.store_extracted(
-                    module_id,
-                    &fs.collection_id,
-                    &root_token,
-                    &source.path_rel,
-                    &t.key,
-                    &ex,
-                )?;
-            }
-            let stored = registry
-                .set_subs_extracted(
-                    module_id,
-                    &fs.collection_id,
-                    &root_token,
-                    &source.path_rel,
-                    Some(fs.size),
-                )
-                .await?;
-            tracing::info!(%module_id, collection = %fs.collection_id, path = %source.path_rel,
-                tracks = fs.tracks.len(), stored, "subtitles cached from mediahost");
-        }
-        host_to_hub::Msg::FileHashes(fh) => {
-            for h in fh.hashes {
-                let source = exact_source(h.source, "FileHash")?;
-                let root_token = registry
-                    .resolve_root_token(module_id, &fh.collection_id, &source.root_token)
-                    .await?;
-                if !h.error.is_empty() {
-                    tracing::warn!(%module_id, collection = %fh.collection_id,
-                        root = %root_token, path = %source.path_rel,
-                        error = %h.error, "mediahost reported terminal ed2k failure");
-                    registry
-                        .remove_catalog_hashes(
-                            module_id,
-                            &fh.collection_id,
-                            &crate::registry::SourcePath {
-                                root_token,
-                                path_rel: source.path_rel,
-                            },
-                        )
-                        .await?;
-                    continue;
-                }
-                if h.crc_checked && !h.crc_ok {
-                    tracing::warn!(%module_id, collection = %fh.collection_id,
-                        path = %source.path_rel, "mediahost reports filename CRC32 mismatch");
-                }
-                let stored = registry
-                    .record_ed2k(
-                        module_id,
-                        &fh.collection_id,
-                        &root_token,
-                        &source.path_rel,
-                        &h.ed2k_hex,
-                        h.size,
-                    )
-                    .await?;
-                if !stored {
-                    tracing::debug!(%module_id, path = %source.path_rel,
-                        "ed2k result stale (file changed since listing); dropped");
-                }
-            }
-            enricher.nudge(registry.clone());
-        }
-        host_to_hub::Msg::SegmentDetectionAccepted(accepted) => {
-            segments.segment_accepted(module_id, generation, accepted);
-        }
-        host_to_hub::Msg::SegmentDetectionResult(result) => {
-            segments.segment_result(module_id, generation, result);
-        }
-        host_to_hub::Msg::ScanProgress(_) | host_to_hub::Msg::Hello(_) => {}
+        _ => anyhow::bail!("this mediahost operation is unavailable during catalogue integration"),
     }
     Ok(())
-}
-
-/// MH-9: send the collection's ED2K worklist (anime only; empty = no-op).
-/// Failures are logged, never fatal — hashing is strictly best-effort.
-async fn push_ed2k_worklist(
-    registry: &crate::registry::Registry,
-    module_id: &str,
-    collection_id: &str,
-) {
-    let paths = match registry.ed2k_worklist(module_id, collection_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%module_id, collection = %collection_id,
-                error = format!("{e:#}"), "ed2k worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
-        "sending ed2k worklist");
-    for chunk in paths.chunks(5000) {
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::Hashlist(
-                kahawai_proto::v1::Hashlist {
-                    collection_id: collection_id.to_string(),
-                    sources: chunk
-                        .iter()
-                        .map(|p| kahawai_proto::v1::SourcePath {
-                            root_token: p.root_token.clone(),
-                            path_rel: p.path_rel.clone(),
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_host(module_id, msg).await {
-            tracing::warn!(%module_id, error = format!("{e:#}"), "ed2k worklist send failed");
-            return;
-        }
-    }
-}
-
-/// Efficiency ladder step 2: send the collection's subtitle pre-warm
-/// worklist (video collections; empty = no-op). Best-effort.
-async fn push_attachments_worklist(
-    registry: &crate::registry::Registry,
-    module_id: &str,
-    collection_id: &str,
-) {
-    let paths = match registry
-        .attachments_worklist(module_id, collection_id)
-        .await
-    {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%module_id, collection = %collection_id,
-                error = format!("{e:#}"), "attachments worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
-        "sending attachments worklist");
-    for chunk in paths.chunks(5000) {
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::AttachmentsWorklist(
-                kahawai_proto::v1::AttachmentsWorklist {
-                    collection_id: collection_id.to_string(),
-                    sources: chunk
-                        .iter()
-                        .map(|p| kahawai_proto::v1::SourcePath {
-                            root_token: p.root_token.clone(),
-                            path_rel: p.path_rel.clone(),
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_host(module_id, msg).await {
-            tracing::warn!(%module_id, error = format!("{e:#}"), "attachments worklist send failed");
-            return;
-        }
-    }
-}
-
-/// Source-local full-audio measurement. Sent only to protocol-minor peers that
-/// implement the analyzer; old mediahosts keep the rows pending without seeing
-/// an unknown, expensive worklist.
-async fn push_loudness_worklist(registry: &Registry, module_id: &str, collection_id: &str) {
-    if !registry.host_supports_loudness_analysis(module_id) {
-        return;
-    }
-    let paths = match registry.loudness_worklist(module_id, collection_id).await {
-        Ok(paths) => paths,
-        Err(error) => {
-            tracing::warn!(%module_id, collection = collection_id,
-                error = format!("{error:#}"), "loudness worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = collection_id, files = paths.len(),
-        "sending loudness worklist");
-    for chunk in paths.chunks(128) {
-        let message = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::LoudnessWorklist(
-                kahawai_proto::v1::LoudnessWorklist {
-                    collection_id: collection_id.to_string(),
-                    analyzer: kahawai_media::loudness::ANALYZER,
-                    sources: chunk
-                        .iter()
-                        .map(|source| {
-                            kahawai_proto::v1::SourcePath::new(&source.root_token, &source.path_rel)
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(error) = registry.send_to_host(module_id, message).await {
-            tracing::debug!(%module_id, collection = collection_id,
-                error = format!("{error:#}"), "loudness worklist send stopped");
-            return;
-        }
-    }
-}
-
-/// HUB-17 backfill: which files still have no measured keyframe gap.
-/// Same cheapest tier as attachments — index reads, no decoding — and
-/// the same chunking, because a large collection's list is long and
-/// the link is not a bulk channel.
-async fn push_keyframe_worklist(
-    registry: &crate::registry::Registry,
-    module_id: &str,
-    collection_id: &str,
-) {
-    let paths = match registry.keyframe_worklist(module_id, collection_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%module_id, collection = %collection_id,
-                error = format!("{e:#}"), "keyframe worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
-        "sending keyframe worklist");
-    for chunk in paths.chunks(5000) {
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::KeyframeWorklist(
-                kahawai_proto::v1::KeyframeWorklist {
-                    collection_id: collection_id.to_string(),
-                    sources: chunk
-                        .iter()
-                        .map(|p| kahawai_proto::v1::SourcePath {
-                            root_token: p.root_token.clone(),
-                            path_rel: p.path_rel.clone(),
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_host(module_id, msg).await {
-            tracing::warn!(%module_id, error = format!("{e:#}"), "keyframe worklist send failed");
-            return;
-        }
-    }
-}
-
-/// Source-owned PAR/orientation/display-size backfill. Sent only after an
-/// in-sync handshake or completed scan, but it is not part of either: the host
-/// opens exactly the named files and reports no manifest/generation changes.
-async fn push_video_geometry_worklist(registry: &Registry, module_id: &str, collection_id: &str) {
-    let paths = match registry
-        .video_geometry_worklist(module_id, collection_id)
-        .await
-    {
-        Ok(paths) => paths,
-        Err(e) => {
-            tracing::warn!(%module_id, collection = %collection_id,
-                error = format!("{e:#}"), "video geometry worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
-        "sending video geometry worklist");
-    const CHUNK: usize = 8000;
-    for sources in paths.chunks(CHUNK) {
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::VideoGeometryWorklist(
-                kahawai_proto::v1::VideoGeometryWorklist {
-                    collection_id: collection_id.to_string(),
-                    sources: sources
-                        .iter()
-                        .map(|source| {
-                            kahawai_proto::v1::SourcePath::new(&source.root_token, &source.path_rel)
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_host(module_id, msg).await {
-            tracing::warn!(%module_id, error = format!("{e:#}"),
-                "video geometry worklist send failed");
-            break;
-        }
-    }
-}
-
-async fn push_subs_worklist(
-    registry: &crate::registry::Registry,
-    module_id: &str,
-    collection_id: &str,
-) {
-    let paths = match registry.subs_worklist(module_id, collection_id).await {
-        Ok(p) => p,
-        Err(e) => {
-            tracing::warn!(%module_id, collection = %collection_id,
-                error = format!("{e:#}"), "subs worklist failed");
-            return;
-        }
-    };
-    if paths.is_empty() {
-        return;
-    }
-    tracing::info!(%module_id, collection = %collection_id, files = paths.len(),
-        "sending subtitle worklist");
-    for chunk in paths.chunks(5000) {
-        let msg = kahawai_proto::v1::HubToHost {
-            msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
-                kahawai_proto::v1::SubsWorklist {
-                    collection_id: collection_id.to_string(),
-                    sources: chunk
-                        .iter()
-                        .map(|p| kahawai_proto::v1::SourcePath {
-                            root_token: p.root_token.clone(),
-                            path_rel: p.path_rel.clone(),
-                        })
-                        .collect(),
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_host(module_id, msg).await {
-            tracing::warn!(%module_id, error = format!("{e:#}"), "subs worklist send failed");
-            return;
-        }
-    }
-}
-
-#[cfg(test)]
-mod chunk_tests {
-    use super::*;
-
-    #[test]
-    fn zero_cursor_restarts_an_interrupted_snapshot() {
-        assert!(catalog_snapshot_required(Some(0), 0, 20));
-        assert!(!catalog_snapshot_required(Some(10), 0, 20));
-    }
-
-    #[test]
-    fn catalog_record_key_must_name_its_payload_source() {
-        let mut key = b"root".to_vec();
-        key.push(0);
-        key.extend_from_slice(b"one.mkv");
-        assert!(
-            validate_catalog_source(
-                &key,
-                &Some(kahawai_proto::v1::SourcePath::new("root", "one.mkv")),
-                "file",
-            )
-            .is_ok()
-        );
-        assert!(
-            validate_catalog_source(
-                &key,
-                &Some(kahawai_proto::v1::SourcePath::new("root", "two.mkv")),
-                "file",
-            )
-            .is_err()
-        );
-    }
-
-    fn msg(blocks: &[usize], done: Option<bool>) -> kahawai_proto::v1::ImageSubtitles {
-        kahawai_proto::v1::ImageSubtitles {
-            collection_id: "c".into(),
-            source: Some(kahawai_proto::v1::SourcePath {
-                root_token: "root".into(),
-                path_rel: "film.mkv".into(),
-            }),
-            sub_index: 0,
-            blocks: blocks
-                .iter()
-                .map(|n| kahawai_proto::v1::ImageSubBlock {
-                    start_ms: 0,
-                    duration_ms: 0,
-                    payload: vec![7u8; *n],
-                })
-                .collect(),
-            done,
-            ..Default::default()
-        }
-    }
-
-    /// A track split across messages arrives as one track.
-    ///
-    /// This is why the split exists: one message per track put a whole
-    /// PGS stream on the wire, the largest that survived was 63.8 MiB
-    /// against a 64 MiB limit, and going over reset the SHARED link
-    /// stream — so a single subtitle track took scans and leases down
-    /// with it (3663 sent, 24 arrived, 2026-08-07).
-    #[test]
-    fn chunks_reassemble_into_one_track() {
-        let mut partial = std::collections::HashMap::new();
-        let mut a = msg(&[10, 20], Some(false));
-        assert!(matches!(accept_chunk(&mut partial, &mut a), Chunk::More));
-        let mut b = msg(&[30], Some(false));
-        assert!(matches!(accept_chunk(&mut partial, &mut b), Chunk::More));
-        let mut c = msg(&[40], Some(true));
-        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut c) else {
-            panic!("the last chunk completes the transfer");
-        };
-        assert_eq!(bytes, 100);
-        assert_eq!(c.blocks.len(), 4, "every block, in order of arrival");
-        assert!(partial.is_empty(), "nothing held after completion");
-    }
-
-    /// An older mediahost sends the whole track in one message and no
-    /// marker at all. Absent must read as complete — read as "false,
-    /// more coming" the hub would hold it forever.
-    #[test]
-    fn a_message_without_the_marker_is_a_whole_track() {
-        let mut partial = std::collections::HashMap::new();
-        let mut m = msg(&[5, 5], None);
-        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut m) else {
-            panic!("no marker means one message, complete");
-        };
-        assert_eq!((bytes, m.blocks.len()), (10, 2));
-        assert!(partial.is_empty());
-    }
-
-    /// Two tracks in flight at once do not pour into each other.
-    #[test]
-    fn transfers_are_kept_apart() {
-        let mut partial = std::collections::HashMap::new();
-        let mut first = msg(&[10], Some(false));
-        let mut other = kahawai_proto::v1::ImageSubtitles {
-            sub_index: 1,
-            ..msg(&[20], Some(true))
-        };
-        assert!(matches!(
-            accept_chunk(&mut partial, &mut first),
-            Chunk::More
-        ));
-        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut other) else {
-            panic!("the other track completes on its own");
-        };
-        assert_eq!((bytes, other.blocks.len()), (20, 1));
-        // The first is still held, untouched.
-        let mut rest = msg(&[1], Some(true));
-        let Chunk::Complete(bytes) = accept_chunk(&mut partial, &mut rest) else {
-            panic!("the first completes when its own last chunk lands");
-        };
-        assert_eq!(bytes, 11);
-    }
-
-    /// A sender that never says done is cut off rather than allowed to
-    /// grow the hub's memory without end.
-    #[test]
-    fn a_transfer_that_never_ends_is_abandoned() {
-        let mut partial = std::collections::HashMap::new();
-        let mut over = msg(&[MAX_SETS_BYTES + 1], Some(false));
-        assert!(matches!(
-            accept_chunk(&mut partial, &mut over),
-            Chunk::TooBig(_)
-        ));
-        assert!(partial.is_empty(), "the partial is dropped, not kept");
-    }
 }
 
 #[cfg(test)]
@@ -2183,8 +787,12 @@ mod forget_link_tests {
     #[tokio::test]
     async fn both_maps_are_forgotten_together() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let sessions = Arc::new(Sessions::new(dir.path().join("scratch")));
 
         let (tx, _rx) = tokio::sync::mpsc::channel(1);
@@ -2232,8 +840,12 @@ mod forget_link_tests {
     #[tokio::test]
     async fn a_replaced_link_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Arc::new(Registry::new(db, Default::default()));
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Arc::new(Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        ));
         let sessions = Arc::new(Sessions::new(dir.path().join("scratch")));
 
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
@@ -2282,8 +894,12 @@ mod forget_link_tests {
     #[tokio::test]
     async fn protocol_four_baseline_opens_discovery_but_detector_generation_still_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let (baseline_tx, _baseline_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(
             "host",
@@ -2318,8 +934,12 @@ mod forget_link_tests {
     #[tokio::test]
     async fn replacing_a_link_cancels_its_segment_waiter() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let detector = crate::segments::Detector::new();
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
         let old_generation = register_host_link(
@@ -2352,8 +972,12 @@ mod forget_link_tests {
     #[tokio::test]
     async fn replacement_invalidates_results_before_waiters_are_drained() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let registry = Registry::new(db, Default::default());
+        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let detector = crate::segments::Detector::new();
         let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
         let (old_generation, _) = registry.register_link(
@@ -2408,5 +1032,49 @@ mod forget_link_tests {
 
         assert!(route_segment_reply(&detector, "host", generation, message).is_none());
         assert!(reply.await.unwrap().is_ok());
+    }
+}
+
+#[cfg(test)]
+mod subtitle_revision_tests {
+    use super::*;
+
+    #[test]
+    fn interleaved_revisions_never_share_partial_image_sets() {
+        let mut partial = std::collections::HashMap::new();
+        let message = |revision: &str, last, byte| kahawai_proto::v1::ImageSubtitles {
+            collection_id: "movies".into(),
+            source: Some(kahawai_proto::v1::SourcePath::new("root", "film.mkv")),
+            source_revision: revision.into(),
+            done: Some(last),
+            blocks: vec![kahawai_proto::v1::ImageSubBlock {
+                payload: vec![byte],
+                ..Default::default()
+            }],
+            ..Default::default()
+        };
+        assert!(matches!(
+            accept_chunk(&mut partial, &mut message("old", false, 1)),
+            Chunk::More
+        ));
+        let mut new = message("new", true, 2);
+        assert!(matches!(
+            accept_chunk(&mut partial, &mut new),
+            Chunk::Complete(1)
+        ));
+        assert_eq!(new.blocks[0].payload, vec![2]);
+        let mut old = message("old", true, 3);
+        assert!(matches!(
+            accept_chunk(&mut partial, &mut old),
+            Chunk::Complete(2)
+        ));
+        assert_eq!(
+            old.blocks
+                .iter()
+                .flat_map(|b| b.payload.clone())
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
+        assert!(partial.is_empty());
     }
 }

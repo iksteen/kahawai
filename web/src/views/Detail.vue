@@ -43,9 +43,10 @@ import {
   watchedPct,
 } from '../domain/label.ts'
 import { chapterTitle } from '../domain/chapters.ts'
-import { adminItemLog, itemQuery, listLibraries } from '../api/generated/kahawai.ts'
+import { adminItemLog } from '../api/generated/kahawai.ts'
+import { listLibraries } from '../api/catalogue.ts'
 import { notify } from '../composables/notices.ts'
-import { buildProfile, loadMask } from '../api/capabilities.ts'
+import { loadMask } from '../api/capabilities.ts'
 import { queryPlaybackItem } from '../api/playback.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
@@ -89,12 +90,12 @@ const mediaType = computed(
 )
 const playbackPrefs = computed(() => prefs.query.data.value?.prefs ?? [])
 const playbackReady = computed(() => !prefs.query.isPending.value && !libraries.isPending.value)
-const query = useItem(id, { prefs: playbackPrefs, mediaType, ready: playbackReady })
+const query = useItem(id, { prefs: playbackPrefs, mediaType, ready: playbackReady }, library)
 // A source choice belongs to this visit, never to the user's preferences.
 const sourceOverride = ref<number>()
 const subtitleSourceOverride = ref<number>()
 watch(
-  id,
+  [id, library],
   () => {
     sourceOverride.value = undefined
     subtitleSourceOverride.value = undefined
@@ -105,11 +106,19 @@ const sourceQuery = useQuery({
   queryKey: computed(() => [
     'item',
     id.value,
+    library.value,
     { source: sourceOverride.value, prefs: playbackPrefs.value, mediaType: mediaType.value },
   ]),
   enabled: computed(() => sourceOverride.value !== undefined && playbackReady.value),
   queryFn: () =>
-    queryPlaybackItem(id.value, playbackPrefs.value, mediaType.value, sourceOverride.value),
+    queryPlaybackItem(
+      id.value,
+      playbackPrefs.value,
+      mediaType.value,
+      sourceOverride.value,
+      library.value,
+      query.data.value?.sources.find((s) => s.source_id === sourceOverride.value)?.media_entry_id,
+    ),
 })
 // Keep the item and source choices on screen if checking an override fails.
 const item = computed(() =>
@@ -147,14 +156,31 @@ useScreenName(
   }),
 )
 const children = useChildren(item)
-const { mark, busy } = useWatched()
+const { mark, busy } = useWatched(library)
 
 /// HUB-31: the projection is a preference, and it is not read yet — phase 10
 /// brings Settings and with it `anime_view`. Until then the projected view is
 /// the default, which is what the old client defaults to.
 const projected = computed(() => projecting('seasons', children.data.value ?? []))
 const episodes = computed(() => ordered(children.data.value ?? [], projected.value))
-const seasons = computed(() => seasonsIn(episodes.value, projected.value))
+const seasons = computed(() =>
+  children.groups.value.length
+    ? children.groups.value
+        .filter((group) => group.kind === 'episode')
+        .map((group) => group.number ?? null)
+    : seasonsIn(episodes.value, projected.value),
+)
+const seasonTotal = (season: number | null) =>
+  children.groups.value.find(
+    (group) => group.kind === 'episode' && (group.number ?? null) === season,
+  )?.total ?? episodes.value.filter((e) => seasonOf(e, projected.value) === season).length
+const seasonWatched = (season: number | null) =>
+  children.groups.value.find(
+    (group) => group.kind === 'episode' && (group.number ?? null) === season,
+  )?.played ??
+  episodes.value.filter((e) => seasonOf(e, projected.value) === season && e.played).length
+const seasonSeen = (season: number | null) =>
+  seasonTotal(season) > 0 && seasonWatched(season) === seasonTotal(season)
 const next = computed(() => continueAt(children.data.value ?? null))
 
 /// Hierarchical: an episode goes up to its series, everything else to the
@@ -162,8 +188,11 @@ const next = computed(() => continueAt(children.data.value ?? null))
 /// only thing that knows, because a collection can be in more than one.
 const up = computed(() => {
   const kind = item.value?.kind
-  if (kind === 'episode' && item.value?.parent_id) {
-    return { label: `← ${item.value.show_title ?? 'Series'}`, id: item.value.parent_id }
+  if ((kind === 'episode' || kind === 'song') && item.value?.parent_id) {
+    return {
+      label: `← ${item.value.show_title ?? item.value.parent_title ?? (kind === 'song' ? 'Album' : 'Series')}`,
+      id: item.value.parent_id,
+    }
   }
   if (kind === 'album' && typeof route.params.artist === 'string') {
     return { label: `← ${item.value?.artist ?? 'Artist'}`, id: null, artist: route.params.artist }
@@ -201,9 +230,16 @@ const subtitleNeedsQuery = computed(
     subtitleSource.value !== item.value?.negotiated?.source?.source_id,
 )
 const subtitleQuery = useQuery({
-  queryKey: computed(() => ['item', id.value, { source: subtitleSource.value }]),
+  queryKey: computed(() => ['item', id.value, library.value, { source: subtitleSource.value }]),
   enabled: subtitleNeedsQuery,
-  queryFn: () => itemQuery(id.value, { profile: buildProfile(), source_id: subtitleSource.value! }),
+  queryFn: () =>
+    queryPlaybackItem(
+      id.value,
+      playbackPrefs.value,
+      mediaType.value,
+      subtitleSource.value,
+      library.value,
+    ),
 })
 const subtitleDetail = computed(() =>
   subtitleNeedsQuery.value ? subtitleQuery.data.value : item.value,
@@ -216,6 +252,7 @@ const subtitleListingKnown = computed(
 const subtitleWork = computed(() => works.value.find((work) => work.id === subtitleSource.value))
 const canPlay = computed(
   () =>
+    item.value?.unavailable?.code !== 'feature_unavailable' &&
     sourceReady.value &&
     selectedWork.value?.whole &&
     selectedWork.value.parts.every((part) => part.available),
@@ -307,6 +344,7 @@ const nowPlaying = computed(() =>
 /// as well as in a title: a disabled button is out of the tab order, so its
 /// tooltip is unreachable by exactly the people who need the sentence.
 const whyNoTracks = computed(() => {
+  if (item.value?.unavailable?.code === 'feature_unavailable') return item.value.unavailable.message
   if (tracks.value.length) return ''
   if (children.isError.value) return 'The track list could not be read.'
   if (children.isPending.value) return 'Still reading the track list…'
@@ -331,9 +369,13 @@ const resumeAt = computed(() => (item.value ? resumeMs(item.value) : 0))
 const subline = computed(() => {
   const it = item.value
   if (!it) return ''
-  if (it.kind === 'series') return childCount(children.data.value ?? null, 'episode', 'episodes')
+  if (it.kind === 'series')
+    return childCount(children.data.value ?? null, 'episode', 'episodes', children.total.value)
   if (it.kind === 'album') {
-    return [it.artist, childCount(children.data.value ?? null, 'track', 'tracks')]
+    return [
+      it.artist,
+      childCount(children.data.value ?? null, 'track', 'tracks', children.total.value),
+    ]
       .filter(Boolean)
       .join(' · ')
   }
@@ -357,7 +399,13 @@ function play(at?: number, chapter = false) {
     params: { library: library.value, id: id.value },
     query: {
       ...(at === undefined ? {} : { start: String(Math.round(at)) }),
-      ...(source === undefined ? {} : { source: String(source) }),
+      ...(source === undefined
+        ? {}
+        : {
+            source:
+              item.value?.sources.find((s) => s.source_id === source)?.media_entry_id ??
+              String(source),
+          }),
       ...(chapter ? { chapter: '1' } : {}),
     },
   })
@@ -384,6 +432,7 @@ function markSeason(season: number | null, played: boolean) {
     item.value!.id,
     played,
     inSeason.map((e) => e.id),
+    children.groups.value.length ? season : undefined,
   )
 }
 </script>
@@ -437,12 +486,12 @@ function markSeason(season: number | null, played: boolean) {
       <template v-else-if="item.kind === 'album'">
         <!-- A disabled control must SAY why. Absent data and an empty record
              are different reasons, and neither of them is "no". -->
-        <Btn :disabled="!tracks.length" :title="whyNoTracks" @click="queue.playAlbum(tracks)">
+        <Btn :disabled="!!whyNoTracks" :title="whyNoTracks" @click="queue.playAlbum(tracks)">
           ▶ Play
         </Btn>
         <Btn
           ghost
-          :disabled="!tracks.length"
+          :disabled="!!whyNoTracks"
           :title="whyNoTracks"
           @click="queue.appendAlbum(tracks)"
         >
@@ -456,6 +505,7 @@ function markSeason(season: number | null, played: boolean) {
           <label for="playback-source" class="mb-1 block text-[13px] text-dim">Source</label>
           <select
             id="playback-source"
+            :disabled="item.unavailable?.code === 'feature_unavailable'"
             v-model="sourceOverride"
             class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
           >
@@ -540,26 +590,15 @@ function markSeason(season: number | null, played: boolean) {
             </button>
           </h2>
           <span class="font-mono text-[12px] text-dimmer">
-            {{ episodes.filter((e) => seasonOf(e, projected) === season && e.played).length }}/{{
-              episodes.filter((e) => seasonOf(e, projected) === season).length
-            }}
+            {{ seasonWatched(season) }}/{{ seasonTotal(season) }}
             watched
           </span>
           <button
             class="cursor-pointer text-[12px] text-dim underline hover:text-text"
             type="button"
-            @click="
-              markSeason(
-                season,
-                !episodes.filter((e) => seasonOf(e, projected) === season).every((e) => e.played),
-              )
-            "
+            @click="markSeason(season, !seasonSeen(season))"
           >
-            {{
-              episodes.filter((e) => seasonOf(e, projected) === season).every((e) => e.played)
-                ? 'Mark season unwatched'
-                : 'Mark season watched'
-            }}
+            {{ seasonSeen(season) ? 'Mark season unwatched' : 'Mark season watched' }}
           </button>
         </div>
 
@@ -615,6 +654,16 @@ function markSeason(season: number | null, played: boolean) {
           </li>
         </ul>
       </section>
+      <Btn
+        v-if="children.hasNextPage.value"
+        ghost
+        small
+        class="mt-3"
+        :disabled="children.isFetchingNextPage.value"
+        @click="children.fetchNextPage()"
+      >
+        {{ children.isFetchingNextPage.value ? 'Loading…' : 'Load more episodes' }}
+      </Btn>
     </template>
 
     <!-- A record's track list. Pressing a track plays the RECORD from there,
@@ -644,10 +693,20 @@ function markSeason(season: number | null, played: boolean) {
             <h3 class="mr-auto text-[13px] font-[650] tracking-[0.06em] text-dim uppercase">
               Disc {{ disc.number }}
             </h3>
-            <Btn ghost small @click="queue.playAlbum(disc.entries.map((entry) => entry.track))">
+            <Btn
+              ghost
+              small
+              :disabled="!!whyNoTracks"
+              @click="queue.playAlbum(disc.entries.map((entry) => entry.track))"
+            >
               ▶ Play disc {{ disc.number }}
             </Btn>
-            <Btn ghost small @click="queue.appendAlbum(disc.entries.map((entry) => entry.track))">
+            <Btn
+              ghost
+              small
+              :disabled="!!whyNoTracks"
+              @click="queue.appendAlbum(disc.entries.map((entry) => entry.track))"
+            >
               Add disc {{ disc.number }} to queue
             </Btn>
           </div>
@@ -662,7 +721,8 @@ function markSeason(season: number | null, played: boolean) {
                 class="flex flex-1 cursor-pointer items-center gap-3 py-1.5 text-left hover:text-teal"
                 type="button"
                 :aria-current="trackKey(entry.track) === nowPlaying ? 'true' : undefined"
-                :title="`Play this record from ${entry.track.title}`"
+                :title="whyNoTracks || `Play this record from ${entry.track.title}`"
+                :disabled="!!whyNoTracks"
                 @click="queue.playAlbum(tracks, entry.albumIndex)"
               >
                 <!-- The playing row is marked rather than numbered: which one
@@ -682,6 +742,7 @@ function markSeason(season: number | null, played: boolean) {
               <button
                 class="cursor-pointer px-2 py-1.5 font-mono text-[11px] text-dim hover:text-teal"
                 type="button"
+                :disabled="!!whyNoTracks"
                 :aria-label="`Add ${entry.track.title} to the queue`"
                 title="Add to the queue"
                 @click="queue.appendTrack(entry.track)"
@@ -692,6 +753,16 @@ function markSeason(season: number | null, played: boolean) {
           </ul>
         </section>
       </div>
+      <Btn
+        v-if="children.hasNextPage.value"
+        ghost
+        small
+        class="mt-3"
+        :disabled="children.isFetchingNextPage.value"
+        @click="children.fetchNextPage()"
+      >
+        {{ children.isFetchingNextPage.value ? 'Loading…' : 'Load more tracks' }}
+      </Btn>
     </template>
 
     <!-- A film or an episode -->
@@ -926,6 +997,7 @@ function markSeason(season: number | null, played: boolean) {
         <label for="subtitle-source" class="mb-1 block text-[13px] text-dim">Subtitle source</label>
         <select
           id="subtitle-source"
+          :disabled="item.unavailable?.code === 'feature_unavailable'"
           v-model="subtitleSourceOverride"
           class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
         >
@@ -938,10 +1010,11 @@ function markSeason(season: number | null, played: boolean) {
         </select>
       </div>
       <SubtitlePanel
+        :library-id="library"
+        :source="subtitleDetail?.subtitle_source"
         :item="item"
         :subs="subtitleListingKnown ? (subtitleDetail?.negotiated?.subtitles ?? []) : []"
         :listing-known="subtitleListingKnown"
-        :source-id="subtitleSource"
         :languages="subLanguages"
         :title-choice="titleChoice"
         :fps="fileFps"
@@ -950,7 +1023,7 @@ function markSeason(season: number | null, played: boolean) {
       />
     </template>
 
-    <section v-if="me.admin && !works.length && item.copies.length" class="mt-8">
+    <section v-if="!works.length && item.copies?.length" class="mt-8">
       <h2 class="mb-2 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Sources</h2>
       <ul class="flex flex-col gap-2">
         <li
@@ -961,8 +1034,16 @@ function markSeason(season: number | null, played: boolean) {
           <div class="min-w-0 flex-1">
             <div class="font-mono text-[11px] text-dim">{{ sourceLocation(copy) }}</div>
             <div>{{ copy.title }}</div>
+            <div
+              v-for="path in copy.paths"
+              :key="path"
+              class="truncate font-mono text-[12px] text-dim"
+            >
+              {{ path }}
+            </div>
           </div>
           <MatchButton
+            v-if="me.admin"
             always-visible
             :confidence="copy.match_confidence"
             :label="`${copy.title} (${sourceLocation(copy)})`"

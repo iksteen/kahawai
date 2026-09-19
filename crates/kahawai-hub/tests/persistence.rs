@@ -27,8 +27,14 @@ async fn files_and_items_survive_restart() {
     let dir = tempfile::tempdir().unwrap();
 
     {
-        let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-        let reg = Registry::new(db.clone(), Default::default());
+        let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+            .await
+            .unwrap();
+        let reg = Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
             .await
             .unwrap();
@@ -48,8 +54,14 @@ async fn files_and_items_survive_restart() {
     }
 
     // "Restart": fresh pool over the same directory.
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let reg = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
 
     // The DB (password hashes, sessions) must not be world-readable.
     #[cfg(unix)]
@@ -152,8 +164,14 @@ async fn files_and_items_survive_restart() {
 #[tokio::test]
 async fn reconcile_drops_files_missing_from_scan() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Registry::new(db.clone(), Default::default());
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let reg = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
@@ -278,7 +296,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,
@@ -318,7 +336,11 @@ async fn catalog_cursor_and_projection_survive_reconnect() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -452,73 +474,67 @@ async fn catalog_cursor_and_projection_survive_reconnect() {
     };
 
     scan(1).await;
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
-        .fetch_one(&db)
+    let collection = registry.catalogue().collections("01HOST").await.unwrap()[0]
+        .id
+        .clone();
+    let item = registry
+        .catalogue()
+        .collection_items(&collection)
+        .await
+        .unwrap()[0]
+        .library_item_id
+        .clone();
+    for round in [2, 3] {
+        scan(round).await;
+        assert_eq!(
+            registry.catalogue().files(&collection).await.unwrap().len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .catalogue()
+                .collection_items(&collection)
+                .await
+                .unwrap()[0]
+                .library_item_id,
+            item
+        );
+    }
+    // Arrange an old projection/cursor without populating any legacy files.
+    registry
+        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();
-    assert_eq!(n, 1);
-
-    scan(2).await;
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(
-        n, 1,
-        "a cursor-only reconnect must preserve the projected file"
-    );
-    let items: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(items, 1, "resolved item survives the incremental rescan");
-    // A second cursor-only reconnect remains idempotent.
-    scan(3).await;
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
-        .fetch_one(&db)
-        .await
-        .unwrap();
-    assert_eq!(n, 1, "cursor reconnect must leave state untouched");
-
-    // Protocol-4.0 builds wrote the wire minor into this column. Separating the
-    // catalogue consumer generation introduced no new record kind, so those
-    // already-deployed cursors remain valid and must not pay for a snapshot.
-    sqlx::query(
-        "UPDATE mediahost_catalog_cursors SET consumer_minor=0
-          WHERE module_id='01HOST' AND collection_id='movies'",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    // An obsolete hub cursor cannot affect mediadb's independently committed cursor.
+    sqlx::query("INSERT INTO mediahost_catalog_cursors(module_id,collection_id,epoch,version,consumer_minor) VALUES('01HOST','movies','obsolete',999,-1)")
+        .execute(&db).await.unwrap();
     scan(4).await;
-
-    // A genuinely unknown consumer generation does force current-state replay:
-    // an older consumer may have advanced past additive kinds it did not know.
-    sqlx::query(
-        "UPDATE mediahost_catalog_cursors SET consumer_minor=-1
-          WHERE module_id='01HOST' AND collection_id='movies'",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    scan(5).await;
-    let consumer_minor: i64 = sqlx::query_scalar(
-        "SELECT consumer_minor FROM mediahost_catalog_cursors
-          WHERE module_id='01HOST' AND collection_id='movies'",
-    )
-    .fetch_one(&db)
-    .await
-    .unwrap();
     assert_eq!(
-        consumer_minor,
-        kahawai_hub::registry::CATALOG_CONSUMER_GENERATION
+        registry
+            .catalogue()
+            .catalogue_cursor(&collection)
+            .await
+            .unwrap()
+            .version,
+        1
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM files")
+            .fetch_one(&db)
+            .await
+            .unwrap(),
+        0
     );
 }
 
 #[tokio::test]
 async fn multipart_movies_group_into_one_item() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await

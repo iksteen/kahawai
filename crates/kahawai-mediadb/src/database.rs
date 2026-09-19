@@ -30,12 +30,27 @@ impl Store {
         open(path, MIGRATOR).await
     }
 
+    /// An isolated ephemeral catalogue, useful for embedding and tests.
+    pub async fn in_memory() -> Result<Self> {
+        let options = SqliteConnectOptions::new()
+            .filename(format!("file:mediadb-{}", crate::id()))
+            .in_memory(true)
+            .shared_cache(true)
+            .foreign_keys(true);
+        let db = Database::connect_with(options.clone(), options, 1).await?;
+        db.write("mediadb migrations", |c| {
+            Box::pin(async move {
+                MIGRATOR.run_direct(None, c, false).await?;
+                Ok(())
+            })
+        })
+        .await?;
+        Ok(Self { db })
+    }
+
     /// Create a new mediadb and run its migrations. Never overwrite an existing file.
     pub async fn create(path: &Path) -> Result<Self> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(path)?;
+        let file = kahawai_core::private::create(path)?;
         drop(file);
         connect(path, MIGRATOR).await
     }
@@ -62,6 +77,11 @@ async fn open(path: &Path, migrator: Migrator) -> Result<Store> {
         "not a compatible mediadb database: initial migration is missing or its checksum differs"
     );
     reader.close().await?;
+    for suffix in ["", "-wal", "-shm"] {
+        let mut owned_path = path.as_os_str().to_os_string();
+        owned_path.push(suffix);
+        kahawai_core::private::narrow(Path::new(&owned_path))?;
+    }
     connect(path, migrator).await
 }
 
@@ -117,6 +137,57 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn episode_table_rename_preserves_coverage_and_cascade() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mediadb.db");
+        std::fs::File::create(&path).unwrap();
+        let old =
+            Migrator::with_migrations(MIGRATOR.iter().filter(|m| m.version < 4).cloned().collect());
+        let s = connect(&path, old).await.unwrap();
+        let mut tx = s.db.begin().await.unwrap();
+        sqlx::raw_sql("INSERT INTO mediahosts VALUES('host','Host');
+            INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch) VALUES('col','host','shows','series','epoch');
+            INSERT INTO collection_roots(id,collection_id,token,path) VALUES('root','col','root','/shows');
+            INSERT INTO library_items VALUES('show','series','Show','show',2000,'');
+            INSERT INTO collection_items(id,collection_id,root_id,occurrence,title,library_item_id,description_json)
+                VALUES('copy','col','root','Show','Show','show','{}');
+            INSERT INTO media_entries(id,collection_id,item_id,occurrence,kind,title)
+                VALUES('entry','col','copy','combined','episode','Combined');
+            INSERT INTO entry_episodes VALUES('entry',1,'season',1,3,4),('entry',2,'absolute',NULL,123,NULL);")
+            .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        s.close().await;
+
+        for _ in 0..2 {
+            let s = Store::open(&path).await.unwrap();
+            let spans: Vec<(String, Option<i64>, i64, Option<i64>)> = sqlx::query_as(
+                "SELECT numbering,season,episode,episode_end FROM media_entry_episodes ORDER BY ordinal",
+            ).fetch_all(s.db.read_pool()).await.unwrap();
+            assert_eq!(
+                spans,
+                vec![
+                    ("season".into(), Some(1), 3, Some(4)),
+                    ("absolute".into(), None, 123, None)
+                ]
+            );
+            s.close().await;
+        }
+        let s = Store::open(&path).await.unwrap();
+        let mut tx = s.db.begin().await.unwrap();
+        sqlx::query("DELETE FROM media_entries WHERE id='entry'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM media_entry_episodes")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+        assert_eq!(count, 0);
+        tx.commit().await.unwrap();
+        s.close().await;
     }
 
     #[tokio::test]

@@ -574,3 +574,46 @@ async fn bare_cd_and_part_filenames_take_the_movie_identity_from_the_directory()
         assert_eq!(entries[0].data.parts.len(), 2);
     }
 }
+
+#[tokio::test]
+async fn anime_library_distinguishes_movies_and_series_from_physical_entries() {
+    let (_dir, s) = store().await;
+    let c = collection(
+        &s,
+        "anime",
+        MediaType::Anime,
+        &["My.Neighbour.Totoro.1988.mkv", "Show/[Group] Show - 01.mkv"],
+    )
+    .await;
+    let library = s
+        .create_library("Anime", MediaType::Anime, &[c])
+        .await
+        .unwrap();
+    let items = s.browse(&library, 0, 10).await.unwrap();
+    assert_eq!(items.len(), 2);
+    let movie = items
+        .iter()
+        .find(|i| i.kind == LibraryItemKind::Movie)
+        .unwrap();
+    let series = items
+        .iter()
+        .find(|i| i.kind == LibraryItemKind::Series)
+        .unwrap();
+    assert_eq!(movie.media_type, MediaType::Anime);
+    assert_eq!(series.media_type, MediaType::Anime);
+    assert_eq!(
+        s.playback_item(&library, &movie.id)
+            .await
+            .unwrap()
+            .renditions
+            .len(),
+        1
+    );
+    assert!(
+        s.playback_item(&library, &series.id)
+            .await
+            .unwrap()
+            .renditions
+            .is_empty()
+    );
+}

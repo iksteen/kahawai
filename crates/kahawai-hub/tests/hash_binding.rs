@@ -13,7 +13,9 @@ const AID: u32 = 1234;
 
 async fn harness() -> (Enricher, SqlitePool, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let enricher = Enricher::new(dir.path().to_path_buf());
     sqlx::query(
         "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint, enrolled_at, disabled)
@@ -438,7 +440,11 @@ async fn specials_land_in_season_zero_and_the_rest_is_left_alone() {
 #[tokio::test]
 async fn selection_follows_the_question_not_the_miss() {
     let (enricher, db, _dir) = harness().await;
-    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+    let registry = kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     async fn selected(registry: &kahawai_hub::registry::Registry, enricher: &Enricher) -> bool {
         enricher
             .select_anime_items(registry)

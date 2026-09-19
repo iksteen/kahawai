@@ -23,8 +23,14 @@ const TEST_ROOT: &str = "/kahawai-test-root";
 
 async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     registry
         .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
         .await

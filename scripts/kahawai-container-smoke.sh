@@ -257,20 +257,24 @@ printf '%s' "$browser_login" \
     | py 'assert set(d) == {"access_token", "expires_in"}; print(d["access_token"])' \
     >/dev/null || fail "browser login exposed the wrong response shape"
 
-echo "==> waiting for the scan" >&2
+echo "==> waiting for collection ingestion" >&2
 for _ in $(seq 30); do
-    body=$(curl -sf -H "Authorization: Bearer $auth" "http://$api/api/v1/items")
-    n=$(printf '%s' "$body" | py "$items print(len(it))" 2>/dev/null)
-    [ "${n:-0}" -gt 0 ] && break
+    body=$(curl -sf -H "Authorization: Bearer $auth" "http://$api/admin/v1/catalogue/collections")
+    collection=$(printf '%s' "$body" | py 'print(next((c["id"] for c in d if c["media_type"] == "movies" and c["file_count"] > 0 and not c["snapshot"]), ""))')
+    [ -n "$collection" ] && break
     sleep 3
 done
-[ "${n:-0}" -gt 0 ] || fail "the mediahost never announced the clip"
-item=$(printf '%s' "$body" | py "$items print(it[0]['id'])")
+[ -n "$collection" ] || fail "the mediahost never announced the clip"
+library=$(python3 -c 'import json,sys;print(json.dumps(dict(name="Smoke",media_type="movies",collection_ids=[sys.argv[1]])))' "$collection" |
+    curl -sf -X POST "http://$api/admin/v1/catalogue/libraries" -H "Authorization: Bearer $auth" -H content-type:application/json -d @- |
+    py 'print(d["id"])')
+body=$(curl -sf -H "Authorization: Bearer $auth" "http://$api/api/v1/catalogue/libraries/$library/items")
+item=$(printf '%s' "$body" | py 'print(d["items"][0]["id"])')
 
 echo "==> starting a session" >&2
 session=$(curl -sf -X POST "http://$api/api/v1/playback/sessions" \
     -H "Authorization: Bearer $auth" -H content-type:application/json \
-    -d "{\"item_id\":\"$item\",\"start_ms\":0,\"mode\":\"remux\"}")
+    -d "{\"library_id\":\"$library\",\"item_id\":\"$item\",\"start_ms\":0,\"mode\":\"remux\"}")
 url=$(printf '%s' "$session" | py 'print(d["stream_url"])')
 [ -n "$url" ] || { logs | tail -20 >&2; fail "no session: $session"; }
 

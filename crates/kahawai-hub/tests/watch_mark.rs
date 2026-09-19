@@ -20,7 +20,9 @@ use tower::ServiceExt;
 
 async fn harness() -> (axum::Router, String, kahawai_hub::library::Database) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::query(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
                  VALUES('fixture','mediahost','fixture','fp')",
@@ -38,6 +40,7 @@ async fn harness() -> (axum::Router, String, kahawai_hub::library::Database) {
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(
         kahawai_hub::auth::Auth::new(db.clone(), dir.path())
@@ -58,7 +61,7 @@ async fn harness() -> (axum::Router, String, kahawai_hub::library::Database) {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry,
         auth.clone(),
         sessions,
@@ -151,7 +154,7 @@ async fn state(db: &sqlx::SqlitePool, id: &str) -> (i64, Option<i64>, i64, i64) 
 }
 
 #[tokio::test]
-async fn marking_watched_clears_resume_and_never_loses_the_count() {
+async fn marking_watched_clears_resume_without_a_seen_counter() {
     let (api, token, db) = harness().await;
     sqlx::query(
         "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
@@ -173,7 +176,7 @@ async fn marking_watched_clears_resume_and_never_loses_the_count() {
     let (status, body) = mark(&api, &token, "i1", true).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(only(&body)["played"], true);
-    assert_eq!(only(&body)["play_count"], 1);
+    assert!(only(&body).get("play_count").is_none());
     let (pos, dur, played, count) = state(&db, "i1").await;
     assert_eq!(pos, 0, "a watched item must not also be 50 s in");
     assert_eq!(
@@ -182,24 +185,22 @@ async fn marking_watched_clears_resume_and_never_loses_the_count() {
         "the known duration survives a mark: this endpoint did not measure it, \
          so it has nothing better to say"
     );
-    assert_eq!((played, count), (1, 1));
+    assert_eq!((played, count), (1, 0));
 
-    // Idempotent: marking watched twice is one viewing, not two. The
-    // `AND NOT played` guard in the upsert is what says so.
+    // Repeating a mark is idempotent.
     let (_, body) = mark(&api, &token, "i1", true).await;
-    assert_eq!(only(&body)["play_count"], 1);
+    assert!(only(&body).get("play_count").is_none());
 
-    // Unmarking shows it as unwatched. It does not rewrite history: the
-    // count is what you have seen, not what the tick currently says.
+    // Unmarking changes the boolean. Legacy counters remain untouched.
     let (_, body) = mark(&api, &token, "i1", false).await;
     assert_eq!(only(&body)["played"], false);
-    assert_eq!(only(&body)["play_count"], 1);
+    assert!(only(&body).get("play_count").is_none());
     let (_, _, played, count) = state(&db, "i1").await;
-    assert_eq!((played, count), (0, 1));
+    assert_eq!((played, count), (0, 0));
 
-    // ...and marking it again counts the second viewing.
+    // Marking it again still has no counter.
     let (_, body) = mark(&api, &token, "i1", true).await;
-    assert_eq!(only(&body)["play_count"], 2);
+    assert!(only(&body).get("play_count").is_none());
 }
 
 #[tokio::test]
@@ -217,7 +218,7 @@ async fn an_unknown_item_is_404_not_a_foreign_key_500() {
 }
 
 #[tokio::test]
-async fn watched_marks_follow_first_identification_aliases_without_double_counting() {
+async fn watched_marks_follow_first_identification_aliases() {
     let (api, token, db) = harness().await;
     sqlx::raw_sql(
         "INSERT INTO collection_items(id,kind,title,norm_title,year,module_id,collection_id)
@@ -248,12 +249,12 @@ async fn watched_marks_follow_first_identification_aliases_without_double_counti
     let (status, body) = mark(&api, &token, "bare", true).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(only(&body)["item_id"], "known");
-    assert_eq!(state(&db, "known").await, (0, None, 1, 1));
+    assert_eq!(state(&db, "known").await, (0, None, 1, 0));
 
     let (status, body) = mark_many(&api, &token, "bare", false, Some(&["bare", "known"])).await;
     assert_eq!(status, StatusCode::OK, "{body}");
     assert_eq!(only(&body)["item_id"], "known");
-    assert_eq!(state(&db, "known").await, (0, None, 0, 1));
+    assert_eq!(state(&db, "known").await, (0, None, 0, 0));
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_item_state")
             .fetch_one(&db)
@@ -291,7 +292,7 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
     }
     // One of them is already marked, so the climb-only guard has a case.
     let (_, body) = mark(&api, &token, "s1e1", true).await;
-    assert_eq!(only(&body)["play_count"], 1);
+    assert!(only(&body).get("play_count").is_none());
 
     // A season: the client decides which episodes are in it, because the
     // season a viewer sees can be a projection of absolute numbering.
@@ -313,11 +314,11 @@ async fn a_whole_season_is_one_call_and_cannot_reach_outside_the_show() {
     let (_, _, played, count) = state(&db, "s1e1").await;
     assert_eq!(
         (played, count),
-        (1, 1),
-        "already watched: marked again, counted once"
+        (1, 0),
+        "marking again does not create a counter"
     );
     let (_, _, played, count) = state(&db, "s1e2").await;
-    assert_eq!((played, count), (1, 1));
+    assert_eq!((played, count), (1, 0));
     // The other show's episode was silently skipped, not marked.
     let leaked: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM user_item_state WHERE item_id = 'oth1'")

@@ -18,7 +18,7 @@ pub enum SourceFact {
     Segments(p::SegmentDetectionResult),
 }
 impl SourceFact {
-    fn decode(kind: &str, payload: &[u8]) -> Result<Self> {
+    pub(crate) fn decode(kind: &str, payload: &[u8]) -> Result<Self> {
         Ok(match kind {
             "file_error" => Self::Error(p::FileError::decode(payload)?),
             "file_hashes" => Self::Hashes(p::FileHashes::decode(payload)?),
@@ -99,106 +99,55 @@ impl Store {
         host: &str,
         offer: &p::CatalogCollection,
     ) -> Result<(String, p::CatalogCursor)> {
-        let kind = MediaType::parse(&offer.media_type)?;
-        ensure!(
-            !offer.id.is_empty() && !offer.epoch.is_empty(),
-            "empty collection identity"
-        );
-        ensure!(
-            offer.oldest_replayable_version <= offer.current_version,
-            "invalid replay interval"
-        );
-        integer(offer.current_version)?;
-        for (i, root) in offer.roots.iter().enumerate() {
+        let mut tx = self.db.begin().await?;
+        let result = offer_collection(&mut tx, host, offer).await?;
+        tx.commit().await?;
+        Ok(result)
+    }
+
+    /// A complete host offer replaces its shared namespaces in one transaction.
+    /// Invalid offers leave every collection and cursor unchanged. Disconnects
+    /// are not offers and never remove catalogue data.
+    pub async fn offer_catalogue(
+        &self,
+        host: &str,
+        name: &str,
+        offer: &p::CatalogOffer,
+    ) -> Result<Vec<p::CatalogCursor>> {
+        ensure!(!host.is_empty(), "empty mediahost ID");
+        let mut tx = self.db.begin().await?;
+        sqlx::query(
+            "INSERT INTO mediahosts VALUES(?,?) ON CONFLICT(id) DO UPDATE SET name=excluded.name",
+        )
+        .bind(host)
+        .bind(name)
+        .execute(&mut *tx)
+        .await?;
+        let mut offered = std::collections::HashSet::new();
+        let mut cursors = Vec::new();
+        for collection in &offer.collections {
             ensure!(
-                !root.root_token.is_empty()
-                    && !root.root_token.contains('\0')
-                    && Path::new(&root.normalized_path).is_absolute(),
-                "invalid root"
+                offered.insert(collection.id.clone()),
+                "duplicate collection ID"
             );
-            ensure!(
-                !Path::new(&root.normalized_path)
-                    .components()
-                    .any(|c| matches!(c, Component::ParentDir)),
-                "root is not normalized"
-            );
-            for other in &offer.roots[..i] {
-                ensure!(
-                    root.root_token != other.root_token
-                        && !Path::new(&root.normalized_path).starts_with(&other.normalized_path)
-                        && !Path::new(&other.normalized_path).starts_with(&root.normalized_path),
-                    "duplicate or overlapping roots"
-                );
+            ensure!(!collection.roots.is_empty(), "collection has no roots");
+            cursors.push(offer_collection(&mut tx, host, collection).await?.1);
+        }
+        let existing: Vec<(String, String)> =
+            sqlx::query_as("SELECT id,remote_id FROM collections WHERE mediahost_id=?")
+                .bind(host)
+                .fetch_all(&mut *tx)
+                .await?;
+        for (id, remote) in existing {
+            if !offered.contains(&remote) {
+                sqlx::query("DELETE FROM collections WHERE id=?")
+                    .bind(id)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
-        let mut tx = self.db.begin().await?;
-        let existing =
-            sqlx::query("SELECT * FROM collections WHERE mediahost_id=? AND remote_id=?")
-                .bind(host)
-                .bind(&offer.id)
-                .fetch_optional(&mut *tx)
-                .await?;
-        let (collection, version, snapshot, generation, epoch_changed) = if let Some(row) = existing
-        {
-            ensure!(
-                row.get::<&str, _>("media_type") == kind.as_str(),
-                "collection type changed; remove its old namespace explicitly first"
-            );
-            let version = row.get::<i64, _>("version") as u64;
-            let changed = row.get::<&str, _>("epoch") != offer.epoch;
-            let snapshot = changed
-                || row.get::<bool, _>("snapshot_active")
-                || version == 0
-                || version > offer.current_version
-                || version < offer.oldest_replayable_version;
-            (
-                row.get::<String, _>("id"),
-                if snapshot { 0 } else { version },
-                snapshot,
-                row.get::<i64, _>("generation") + i64::from(snapshot),
-                changed,
-            )
-        } else {
-            (id(), 0, true, 1, false)
-        };
-        sqlx::query("INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch,version,snapshot_active,generation) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch,version=excluded.version,snapshot_active=excluded.snapshot_active,generation=excluded.generation,snapshot_max=0")
-            .bind(&collection).bind(host).bind(&offer.id).bind(kind.as_str()).bind(&offer.epoch).bind(integer(version)?).bind(snapshot).bind(generation).execute(&mut *tx).await?;
-        if epoch_changed {
-            sqlx::query("UPDATE files SET version=0 WHERE collection_id=?")
-                .bind(&collection)
-                .execute(&mut *tx)
-                .await?;
-            sqlx::query("UPDATE source_facts SET version=0 WHERE file_id IN(SELECT id FROM files WHERE collection_id=?)").bind(&collection).execute(&mut *tx).await?;
-        }
-        sqlx::query("UPDATE collection_roots SET active=0 WHERE collection_id=?")
-            .bind(&collection)
-            .execute(&mut *tx)
-            .await?;
-        for root in &offer.roots {
-            let old: Option<String> = sqlx::query_scalar(
-                "SELECT path FROM collection_roots WHERE collection_id=? AND token=?",
-            )
-            .bind(&collection)
-            .bind(&root.root_token)
-            .fetch_optional(&mut *tx)
-            .await?;
-            ensure!(
-                old.as_deref().is_none_or(|p| p == root.normalized_path),
-                "root token changed path"
-            );
-            sqlx::query("INSERT INTO collection_roots VALUES(?,?,?,?,1) ON CONFLICT(collection_id,token) DO UPDATE SET active=1")
-                .bind(id()).bind(&collection).bind(&root.root_token).bind(&root.normalized_path).execute(&mut *tx).await?;
-        }
         tx.commit().await?;
-        Ok((
-            collection,
-            p::CatalogCursor {
-                collection_id: offer.id.clone(),
-                epoch: offer.epoch.clone(),
-                version,
-                snapshot,
-            },
-        ))
+        Ok(cursors)
     }
     pub async fn catalogue_cursor(&self, collection: &str) -> Result<p::CatalogCursor> {
         let row = sqlx::query("SELECT * FROM collections WHERE id=?")
@@ -245,7 +194,9 @@ impl Store {
                 version: cursor,
             }));
         }
-        ensure!(snapshot == delta.snapshot, "snapshot mode mismatch");
+        // Protocol 4 marks only the first message of a snapshot. The durable
+        // attempt established by the offer owns every continuation until done;
+        // later pages may have snapshot=false and unordered record versions.
         ensure!(
             !snapshot || delta.done || delta.through_version == 0,
             "unfinished snapshot advanced cursor"
@@ -434,6 +385,16 @@ impl Store {
             version,
         }))
     }
+    pub async fn source_exists(
+        &self,
+        host: &str,
+        collection: &str,
+        source: &p::SourcePath,
+        size: Option<u64>,
+    ) -> Result<bool> {
+        Ok(sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM files f JOIN collections c ON c.id=f.collection_id JOIN collection_roots r ON r.id=f.root_id WHERE c.mediahost_id=?1 AND c.remote_id=?2 AND r.token=?3 AND f.path=?4 AND (?5 IS NULL OR f.size=?5))")
+            .bind(host).bind(collection).bind(&source.root_token).bind(&source.path_rel).bind(size.map(integer).transpose()?).fetch_one(self.db.read_pool()).await?)
+    }
     pub async fn source_facts(&self, file: &str) -> Result<Vec<SourceFact>> {
         sqlx::query("SELECT kind,payload FROM source_facts WHERE file_id=? ORDER BY kind")
             .bind(file)
@@ -469,7 +430,7 @@ impl Store {
             .collect()
     }
 }
-fn hash(bytes: Option<Vec<u8>>) -> Result<Option<u64>> {
+pub(crate) fn hash(bytes: Option<Vec<u8>>) -> Result<Option<u64>> {
     bytes
         .map(|b| {
             Ok(u64::from_le_bytes(
@@ -523,4 +484,107 @@ impl Store {
                 .collect(),
         )
     }
+}
+
+async fn offer_collection(
+    c: &mut sqlx::SqliteConnection,
+    host: &str,
+    offer: &p::CatalogCollection,
+) -> Result<(String, p::CatalogCursor)> {
+    let kind = MediaType::parse(&offer.media_type)?;
+    ensure!(
+        !offer.id.is_empty() && !offer.epoch.is_empty(),
+        "empty collection identity"
+    );
+    ensure!(
+        offer.oldest_replayable_version <= offer.current_version,
+        "invalid replay interval"
+    );
+    integer(offer.current_version)?;
+    for (i, root) in offer.roots.iter().enumerate() {
+        ensure!(
+            !root.root_token.is_empty()
+                && !root.root_token.contains('\0')
+                && Path::new(&root.normalized_path).is_absolute(),
+            "invalid root"
+        );
+        ensure!(
+            !Path::new(&root.normalized_path)
+                .components()
+                .any(|c| matches!(c, Component::ParentDir)),
+            "root is not normalized"
+        );
+        for other in &offer.roots[..i] {
+            ensure!(
+                root.root_token != other.root_token
+                    && !Path::new(&root.normalized_path).starts_with(&other.normalized_path)
+                    && !Path::new(&other.normalized_path).starts_with(&root.normalized_path),
+                "duplicate or overlapping roots"
+            );
+        }
+    }
+    let existing = sqlx::query("SELECT * FROM collections WHERE mediahost_id=? AND remote_id=?")
+        .bind(host)
+        .bind(&offer.id)
+        .fetch_optional(&mut *c)
+        .await?;
+    let (collection, version, snapshot, generation, epoch_changed) = if let Some(row) = existing {
+        ensure!(
+            row.get::<&str, _>("media_type") == kind.as_str(),
+            "collection type changed; remove its old namespace explicitly first"
+        );
+        let version = row.get::<i64, _>("version") as u64;
+        let changed = row.get::<&str, _>("epoch") != offer.epoch;
+        let snapshot = changed
+            || row.get::<bool, _>("snapshot_active")
+            || version == 0
+            || version > offer.current_version
+            || version < offer.oldest_replayable_version;
+        (
+            row.get::<String, _>("id"),
+            if snapshot { 0 } else { version },
+            snapshot,
+            row.get::<i64, _>("generation") + i64::from(snapshot),
+            changed,
+        )
+    } else {
+        (id(), 0, true, 1, false)
+    };
+    sqlx::query("INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch,version,snapshot_active,generation) VALUES(?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET epoch=excluded.epoch,version=excluded.version,snapshot_active=excluded.snapshot_active,generation=excluded.generation,snapshot_max=0")
+            .bind(&collection).bind(host).bind(&offer.id).bind(kind.as_str()).bind(&offer.epoch).bind(integer(version)?).bind(snapshot).bind(generation).execute(&mut *c).await?;
+    if epoch_changed {
+        sqlx::query("UPDATE files SET version=0 WHERE collection_id=?")
+            .bind(&collection)
+            .execute(&mut *c)
+            .await?;
+        sqlx::query("UPDATE source_facts SET version=0 WHERE file_id IN(SELECT id FROM files WHERE collection_id=?)").bind(&collection).execute(&mut *c).await?;
+    }
+    sqlx::query("UPDATE collection_roots SET active=0 WHERE collection_id=?")
+        .bind(&collection)
+        .execute(&mut *c)
+        .await?;
+    for root in &offer.roots {
+        let old: Option<String> = sqlx::query_scalar(
+            "SELECT path FROM collection_roots WHERE collection_id=? AND token=?",
+        )
+        .bind(&collection)
+        .bind(&root.root_token)
+        .fetch_optional(&mut *c)
+        .await?;
+        ensure!(
+            old.as_deref().is_none_or(|p| p == root.normalized_path),
+            "root token changed path"
+        );
+        sqlx::query("INSERT INTO collection_roots VALUES(?,?,?,?,1) ON CONFLICT(collection_id,token) DO UPDATE SET active=1")
+                .bind(id()).bind(&collection).bind(&root.root_token).bind(&root.normalized_path).execute(&mut *c).await?;
+    }
+    Ok((
+        collection,
+        p::CatalogCursor {
+            collection_id: offer.id.clone(),
+            epoch: offer.epoch.clone(),
+            version,
+            snapshot,
+        },
+    ))
 }

@@ -18,10 +18,13 @@ const SCRAPE_TOKEN: &str = "scrape-me-8f2c";
 /// so this file has no reason to be edited when they change.
 async fn harness() -> (axum::Router, String) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db, dir.path()).await.unwrap());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
@@ -38,7 +41,7 @@ async fn harness() -> (axum::Router, String) {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry,
         auth.clone(),
         sessions,
@@ -181,10 +184,13 @@ async fn health_answers_without_a_credential_and_metrics_does_not() {
 #[tokio::test]
 async fn metrics_are_not_served_when_no_token_is_configured() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(kahawai_hub::auth::Auth::new(db, dir.path()).await.unwrap());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
@@ -201,7 +207,7 @@ async fn metrics_are_not_served_when_no_token_is_configured() {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,

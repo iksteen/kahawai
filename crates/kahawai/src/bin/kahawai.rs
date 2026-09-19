@@ -211,9 +211,9 @@ async fn main() -> Result<()> {
             let m = kahawai_hub::backup::backup(&cfg.hub.data_dir, config_used.as_deref(), &dest)
                 .await?;
             println!(
-                "snapshot written to {}\n  database   {:.1} MB\n  subtitles  {} files, {:.1} MB\n  pki        {}\n  config     {}",
+                "snapshot written to {}\n  databases  {:.1} MB\n  subtitles  {} files, {:.1} MB\n  pki        {}\n  config     {}",
                 dest.display(),
-                m.db_bytes as f64 / 1e6,
+                (m.db_bytes + m.mediadb_bytes.unwrap_or(0)) as f64 / 1e6,
                 m.subtitle_files,
                 m.subtitle_bytes as f64 / 1e6,
                 if m.has_pki { "included" } else { "absent" },

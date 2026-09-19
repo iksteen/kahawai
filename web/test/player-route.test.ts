@@ -24,12 +24,22 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   postProgress: vi.fn(),
   seekSession: vi.fn(),
   adminSessionLog: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/art/${id}`,
   getItemFontUrl: (id: string, n: number) => `/font/${id}/${n}`,
   getItemSubtitleFileUrl: (id: string, file: string) => `/subs/${id}/${file}`,
   getSessionFileUrl: (id: string, file: string) => `/session/${id}/${file}`,
   itemFonts: vi.fn(async () => ({ fonts: [] })),
 }))
+vi.mock('../src/api/catalogue.ts', async () => {
+  const api = await import('../src/api/generated/kahawai.ts')
+  return {
+    listLibraries: api.listLibraries,
+    catalogueDetail: (_library: string, id: string, query: Parameters<typeof api.itemQuery>[1]) =>
+      api.itemQuery(id, query),
+  }
+})
 vi.mock('../src/api/session.ts', () => ({
   whoAmI: () => ({ username: 'me', admin: false }),
   accessToken: () => 'token',

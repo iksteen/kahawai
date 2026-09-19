@@ -233,9 +233,11 @@ native episode identities and public collection-item aliases. Migration 83 also
 repairs unresolved songs whose recording identity is already known; migration 84
 repairs alias-qualified rejections. The existing content archive for manual provider matches and watch state remains unchanged.
 Startup repairs legacy episode coverages using stored paths, preserving source
-IDs and downloaded subtitle payloads, then finishes matching before accepting requests. Rehearse an upgrade on a
-database copy with `scripts/kahawai-library.sh audit DATA_DIRECTORY`; without
-arguments the script runs the library regression tests.
+IDs and downloaded subtitle payloads, then finishes matching before accepting requests.
+These are the legacy hub upgrade steps. The current library audit opens
+`DATA_DIRECTORY/mediadb.db` through Store and reads the active libraries;
+`scripts/kahawai-library.sh` runs mediadb and hub integration checks.
+Current command usage is in [kahawai-cli.md](kahawai-cli.md).
 
 ### 4.2 Item resolution pipeline
 
@@ -637,6 +639,8 @@ A parent-observed child crash or timeout is a durable **quarantine**, not a time
 **Session diagnostics (OPS-10).** A bundle is assembled per session and stored under `<data_dir>/session-logs/{unix}-{item}-{session}.log`, newest 40 kept. The item id rides in the FILENAME because sessions are ephemeral and leave no row behind — that is what makes "the last session for this item" a directory glob rather than a schema change.
 
 *Where it is captured is forced by teardown.* The satellite's `Runner::end` deletes the run dir synchronously the moment the worker exits, and the hub's `EndSession` is fire-and-forget, so there is no later moment to ask: the bundle is gathered inside `end()` before `remove_dir_all` and pushed as `SessionLogs`. The hub's own local worker does the same in `Sessions::end` before its own wipe. A live session can also be asked (`CollectLogs` → `SessionLogs`), which is what the download button does while a problem is on screen.
+
+Restarts update the same bounded session bundle rather than overwriting earlier runs or creating another retention slot. Local seek/retry paths save evidence before clearing scratch; satellite run-end pushes are accumulated there too. A durable start header identifies leftover local scratch after a hub crash, so startup recovers its worker logs before cleanup. Stable mediadb item IDs need no legacy alias joins; parent lookups include encoded episode/track IDs even after their sources disappear. The CLI companion exposes `scripts/kahawai-mediadb.sh api item-log ITEM`.
 
 *The hub half is structured state, not log lines* — item, user, mode, plan, verdict, placed box, work class, sink. Not a stylistic choice: the hub cannot read its own log, which goes to stdout and is redirected by whatever launched it (a shell redirect under `kahawai-restart.sh`, discarded entirely by launchd on macOS). The same reason excludes the transcoder's own log, which does not exist as a file on macOS at all.
 
@@ -1090,7 +1094,7 @@ Negotiation engine: exhaustive table-driven unit tests (capability × source mat
 
 **Clock skew.** Leaf certs issued with `notBefore = now - 24h`; the hub's `ClientCertVerifier` and the satellite's `ServerCertVerifier` allow ±5 min on `notAfter`/`notBefore` boundaries. A satellite failing validation compares peer-reported time (TLS handshake wall clock via a pre-flight `Enrollment.Status` ping that echoes hub time) against its own and logs `clock skew: local is 37 min behind hub — fix NTP` instead of a raw handshake error.
 
-**Backup.** `kahawai hub backup <path>` produces a tar: SQLite snapshot via the online backup API (consistent under load), `pki/`, `subtitles/`, and the active config; `kahawai hub restore <path>` refuses on a non-empty data dir. Because `pki/` and satellite rows travel with the snapshot, restored hubs accept existing satellite certs immediately — no re-enrollment (OPS-5). Documented cron-friendly: exit codes + `--quiet`.
+**Backup.** `kahawai hub backup <path>` creates a private snapshot directory containing hub.db, mediadb.db, `pki/`, `subtitles/`, secrets and the active config. The databases are snapshotted independently while the hub serves; this is not a cross-database transaction. Stop the hub first if both snapshots must represent a quiescent state. The format-4 manifest inventories and hashes both databases and every copied file. `kahawai hub restore <path>` requires a stopped hub, validates the whole snapshot into private staging before changing the destination, and requires `--force` to replace existing databases. Both databases' stale journals are removed. Existing satellite certificates remain valid because PKI and satellite registrations travel together (OPS-5). Older hub-only snapshots remain readable into fresh directories; they cannot be combined with an existing mediadb. `scripts/kahawai-backup-cycle.sh` verifies an online CLI round trip and corruption refusal.
 
 **Disk bounds (OPS-6) — no cache eviction, deliberately.** Two costs decide whether a cache entry may be thrown away, and every cache the hub keeps is expensive on at least one of them.
 
@@ -1130,7 +1134,8 @@ The web UI is built in vertical slices alongside its backend features rather tha
 It is an independent component for the hub to consume. Satellite connections,
 provider execution, HTTP and playback orchestration belong to the hub. Its model,
 interfaces and runnable checks are described in [Media database](mediadb-model.md).
-The current hub and its schema remain the implementation described by the existing sections above. Mediadb
+The preceding sections describe the original hub. On the `mediadb` development
+branch, ingestion and catalogue APIs now use the independent Store. Mediadb
 uses physical collection occurrences and provider assignments as inputs;
 each occurrence references a stable library item selected by its current identity,
 with albums always separate. Library items survive their last copy's removal;
@@ -1143,3 +1148,27 @@ the hub database continues to own users, watch state and its separate migration
 history. A read-only initial-migration checksum check rejects foreign paths before
 any writer opens. Pre-migration development media databases must be recreated once;
 subsequent schema changes append migrations rather than changing the baseline.
+
+
+The ingestion milestone opens both databases before accepting connections and
+routes remote and in-process offers/deltas through mediadb. The hub owns link
+liveness, enrollment and user grants; mediadb owns committed catalogue cursors,
+source facts, library composition and scoped item queries. Old hub catalogue rows
+and history remain untouched, with no conversion requirement. Original consumer
+implementations are retained for regression testing but are unavailable in the
+runtime until ported; background enrichment is not scheduled. See the media-db
+model document for API/script usage and the temporary runtime limitations. The
+admin Libraries panel now composes ordered collection memberships through these
+APIs; Users & grants uses the same library IDs. Viewer UI integration remains
+separate. `scripts/kahawai-mediadb-ui.sh` exercises this admin flow in a browser
+against the real ingestion fixture.
+
+Subtitle extraction caches use the captured physical revision as well as the
+source path and stream index. Sidecar keys also include the companion revision.
+Protocol 4.3 echoes the requested revision through text and chunked image replies;
+a late response cannot populate a newer revision's cache. Older mediahosts use
+the hub's lease fallback for text extraction; cached image extraction/OCR needs
+a 4.3 mediahost. Revision-less extraction caches and the v1 derived artifacts
+that could have consumed them remain on disk but are not reused. Rebuilding is
+expensive (demux/OCR/rendering), so verified revision-specific results remain
+durable and are reused immediately during playback.

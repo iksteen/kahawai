@@ -35,7 +35,7 @@ export function resolveTracks(
   // copies coalesce. They have no portable meaning on another source.
   const shared = (key: string) => {
     const value = get(seriesId, key)?.trim()
-    return value?.startsWith('#') || /^\d+$/.test(value ?? '') ? undefined : value
+    return value?.startsWith('#') || /^-?\d+$/.test(value ?? '') ? undefined : value
   }
   const list = (value?: string) =>
     (value ?? '')
@@ -89,7 +89,7 @@ export function resolveTracks(
   // Top precedence (subtitle unification): THIS item's exact track id — the
   // only spelling that can name a specific downloaded or OCR row.
   const exactSub = sourceScope === null ? undefined : get(sourceScope, 'subs.track')
-  const subTrack = exactSub && /^\d+$/.test(exactSub) ? Number(exactSub) : null
+  const subTrack = exactSub && /^-?\d+$/.test(exactSub) ? Number(exactSub) : null
   return { audioTrack: audioTrack ?? 0, subs, subTrack }
 }
 

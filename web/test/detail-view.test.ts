@@ -1,3 +1,52 @@
+// Layout fixtures exercise the existing playback-capable presentation as well as
+// unavailable states. The real catalogue adapter is covered separately and live.
+vi.mock('../src/composables/item.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/composables/item.ts')>()
+  return {
+    ...actual,
+    useItem: (
+      id: Parameters<typeof actual.useItem>[0],
+      playback: Parameters<typeof actual.useItem>[1],
+      library: Parameters<typeof actual.useItem>[2],
+    ) => actual.useItem(id, playback, library),
+  }
+})
+vi.mock('../src/api/catalogue.ts', async () => {
+  const api = await import('../src/api/generated/kahawai.ts')
+  return {
+    ...api,
+    catalogueDetail: async (
+      _library: string,
+      id: string,
+      query: Parameters<typeof api.itemQuery>[1],
+    ) => {
+      const detail = await api.itemQuery(id, query)
+      const source =
+        query?.source_id ??
+        detail.negotiated?.source?.source_id ??
+        detail.sources?.[0]?.source_id ??
+        1
+      return {
+        ...detail,
+        library_id: _library,
+        subtitle_source: { media_entry_id: String(source), source_version: 'fixture' },
+      }
+    },
+    catalogueChildren: async (_library: string, id: string, params?: { season?: string }) => {
+      const page = await api.itemChildren(id)
+      return {
+        ...page,
+        children: params?.season
+          ? page.children.filter((e) =>
+              params.season === 'absolute'
+                ? (e.proj_season ?? e.season) == null
+                : (e.proj_season ?? e.season) === Number(params.season),
+            )
+          : page.children,
+      }
+    },
+  }
+})
 /// The item pages, mounted. UI-13 is the shape of this file: three failures
 /// live on an item page and they are three different things, and one `error`
 /// state doing two of those jobs is what put "Could not load this item" over
@@ -14,18 +63,49 @@ import { ApiError } from '../src/api/errors.ts'
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   itemQuery: vi.fn(),
   itemDetail: vi.fn(),
+  enrichmentDetail: vi.fn(),
+  enrichmentIdentities: vi.fn().mockResolvedValue([]),
+  getEnrichmentArtworkUrl: (id: string) => `/api/v1/catalogue/collection-items/${id}/artwork`,
   listItems: vi.fn(),
-  adminReviewSearch: vi.fn(),
-  adminApplyMatch: vi.fn(),
+  enrichmentSearch: vi.fn(),
+  enrichmentCorrect: vi.fn(),
   itemChildren: vi.fn(),
   itemSetWatched: vi.fn(),
+  catalogueSetWatched: async (
+    _library: string,
+    id: string,
+    body: { played: boolean; items?: string[] },
+  ) => (await import('../src/api/generated/kahawai.ts')).itemSetWatched(id, body),
   adminItemLog: vi.fn(),
   listLibraries: vi.fn(),
   getPrefs: vi.fn(),
   putPref: vi.fn(),
+  catalogueSubtitleSearch: async (
+    _library: string,
+    id: string,
+    body: { source: { media_entry_id: string }; languages: string[] },
+  ) =>
+    (await import('../src/api/generated/kahawai.ts')).subtitleSearch(id, {
+      languages: body.languages,
+      source_id: Number(body.source.media_entry_id),
+    }),
+  catalogueSubtitleDownload: async (
+    _library: string,
+    id: string,
+    body: { source: { media_entry_id: string }; file_id: string; language: string | null },
+  ) =>
+    (await import('../src/api/generated/kahawai.ts')).subtitleDownload(id, {
+      file_id: body.file_id,
+      language: body.language,
+      source_id: Number(body.source.media_entry_id),
+    }),
+  catalogueSubtitleDelete: async (_library: string, _id: string, track: number) =>
+    (await import('../src/api/generated/kahawai.ts')).subtitleDelete(track),
   subtitleSearch: vi.fn(),
   subtitleDownload: vi.fn(),
   subtitleDelete: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 const admin = { value: false }
@@ -38,9 +118,11 @@ vi.mock('../src/api/capabilities.ts', () => ({
 const {
   adminItemLog,
   itemDetail,
+  enrichmentDetail,
+  enrichmentIdentities,
   listItems,
-  adminReviewSearch,
-  adminApplyMatch,
+  enrichmentSearch,
+  enrichmentCorrect,
   getPrefs,
   itemChildren,
   itemQuery,
@@ -63,7 +145,7 @@ const film = (over: Record<string, unknown> = {}) => ({
   title: 'Heat',
   year: 1995,
   played: false,
-  play_count: 0,
+
   art_version: null,
   duration_ms: 170 * 60_000,
   resume_position_ms: null,
@@ -168,11 +250,34 @@ async function open(view: typeof Detail | typeof Season, at: string) {
 }
 
 beforeEach(() => {
+  vi.mocked(enrichmentIdentities).mockResolvedValue([])
   admin.value = false
   vi.mocked(itemDetail).mockResolvedValue(film() as never)
+  vi.mocked(enrichmentDetail).mockImplementation(async (id) => {
+    const current = await itemDetail('heat')
+    const copy = current.copies.find((c) => c.id === id)!
+    return {
+      input: {
+        item_id: id,
+        library_item_id: current.id,
+        title: copy.title,
+        year: copy.year,
+        revision: copy.assignment.revision,
+        manual: copy.match_confidence === 'manual' || current.kind === 'series',
+        media_type: 'movies',
+        mediahost_id: copy.module_id,
+        remote_id: copy.collection_id,
+        selected: ['record', { title: current.title, provider: 'tmdb' }],
+        sources: copy.paths.map((path, i) => ({ file_id: String(i), root_token: '', path })),
+      },
+      candidates: [],
+      metadata: { description: {} },
+      entries: [],
+    } as never
+  })
   vi.mocked(listItems).mockResolvedValue({ items: [] } as never)
-  vi.mocked(adminReviewSearch).mockResolvedValue({ candidates: [] } as never)
-  vi.mocked(adminApplyMatch).mockResolvedValue({ library_item_ids: ['heat'] } as never)
+  vi.mocked(enrichmentSearch).mockResolvedValue({ candidates: [] } as never)
+  vi.mocked(enrichmentCorrect).mockResolvedValue({ library_item_ids: ['heat'] } as never)
   vi.mocked(itemQuery).mockResolvedValue(film() as never)
   vi.mocked(itemChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(itemSetWatched).mockResolvedValue({ updated: 1 } as never)
@@ -192,6 +297,26 @@ beforeEach(() => {
 afterEach(() => vi.resetAllMocks())
 
 describe('a film', () => {
+  test('catalogue sources remain visible while playback integration is unavailable', async () => {
+    vi.mocked(itemQuery).mockResolvedValue(
+      film({
+        negotiated: null,
+        unavailable: {
+          code: 'feature_unavailable',
+          message: 'Playback is not connected yet.',
+          request_id: '',
+        },
+      }) as never,
+    )
+    const { wrapper } = await open(Detail, '/library/films/item/heat')
+    expect(wrapper.text()).toContain('Heat.mkv')
+    expect(wrapper.findAll('h2').some((h) => h.text() === 'Source')).toBe(true)
+    const play = wrapper.findAll('button').find((button) => button.text().includes('Play'))!
+    expect(play.attributes('disabled')).toBeDefined()
+    expect(wrapper.text()).not.toContain('offline')
+    wrapper.unmount()
+  })
+
   test('says what it is and offers to play it', async () => {
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.find('h1').text()).toContain('Heat')
@@ -575,6 +700,7 @@ describe('choosing a playback source', () => {
       .findAll('button')
       .find((b) => b.text() === 'Find subtitles online')!
       .trigger('click')
+    await flushPromises()
     expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 1 })
     await wrapper.find('#playback-source').setValue('Automatic · m · c · Heat 1080p.mkv · 8.0 GB')
     await flushPromises()
@@ -684,15 +810,15 @@ describe('the files it is made of', () => {
     expect(dialog.find('#match-copy').exists()).toBe(false)
     expect(dialog.text()).toContain('other')
     expect(dialog.text()).not.toContain('Heat CD2.avi')
-    expect(adminReviewSearch).toHaveBeenCalledWith(expect.objectContaining({ item: 'other-copy' }))
+    expect(enrichmentDetail).toHaveBeenCalledWith('other-copy')
     await dialog
       .findAll('button')
       .find((b) => b.text() === 'Reject current')!
       .trigger('click')
     await flushPromises()
-    expect(adminApplyMatch).toHaveBeenCalledWith(
+    expect(enrichmentCorrect).toHaveBeenCalledWith(
       'other-copy',
-      expect.objectContaining({ expected_revision: 7, action: 'reject' }),
+      expect.objectContaining({ revision: 7, action: 'reject' }),
     )
     wrapper.unmount()
   })
@@ -796,7 +922,7 @@ describe('a series', () => {
     vi.mocked(itemQuery).mockResolvedValue(detail as never)
     vi.mocked(itemDetail).mockResolvedValue(detail as never)
     vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
-    vi.mocked(adminApplyMatch).mockImplementation(async () => {
+    vi.mocked(enrichmentCorrect).mockImplementation(async () => {
       vi.mocked(itemChildren).mockResolvedValue({
         children: [episode(1, { season: 2, title: 'Corrected episode' })],
       } as never)
@@ -1043,6 +1169,7 @@ describe('a mark, and what it costs', () => {
     const tick = wrapper.findAll('button').find((b) => b.text().includes('Mark watched'))!
     await tick.trigger('click')
     await tick.trigger('click')
+    await flushPromises()
     expect(itemSetWatched).toHaveBeenCalledTimes(1)
     settle()
     await flushPromises()

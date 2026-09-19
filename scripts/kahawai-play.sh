@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
 # Play a kahawai item in mpv.
 #
-#   kahawai-play.sh [-r|-D] [-P profile.json] [-a host:port] <username> <password> <item-id> [-- mpv args...]
+#   kahawai-play.sh -l library-id [-r|-D] [-P profile.json] [-a host:port] <username> <password> <item-id> [-- mpv args...]
 #
 #   default       the hub NEGOTIATES the mode (HUB-14)
+#   -l LIBRARY    mediadb library containing the item (required)
+#   -e ENTRY      pin a stable mediadb rendition ID
 #   -r            force remux to HLS in the hub
 #   -D            force direct play
 #   -P FILE       send this CapabilityProfile JSON with the request
@@ -17,20 +19,25 @@ set -euo pipefail
 API="${KAHAWAI_API:-localhost:8420}"
 MODE=""
 PROFILE_FILE=""
+LIBRARY=""
+ENTRY=""
 
-while getopts "rDP:s:a:h" opt; do
+while getopts "l:e:rDP:s:a:h" opt; do
     case $opt in
+        l) LIBRARY="$OPTARG" ;;
+        e) ENTRY="$OPTARG" ;;
         r) MODE="remux" ;;
         D) MODE="direct" ;;
         P) PROFILE_FILE="$OPTARG" ;;
         s) START_MS=$((OPTARG * 1000)) ;;
         a) API="$OPTARG" ;;
-        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -12; exit 0 ;;
+        h|*) sed -n '2,/^set /{ /^#/s/^# \{0,1\}//p; }' "$0"; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
 
-[ $# -ge 3 ] || { echo "usage: $(basename "$0") [-r] [-a host:port] <username> <password> <item-id> [-- mpv args...]" >&2; exit 2; }
+[ $# -ge 3 ] || { echo "usage: $(basename "$0") -l library [-r] [-a host:port] <username> <password> <item-id> [-- mpv args...]" >&2; exit 2; }
+[ -n "$LIBRARY" ] || { echo "-l library-id is required" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2 ITEM=$3
 shift 3
 [ "${1:-}" = "--" ] && shift
@@ -45,10 +52,12 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":
     | curl -sf -X POST "http://$API/api/v1/auth/token" -H content-type:application/json -d @- \
     | json_field access_token) || { echo "login failed" >&2; exit 1; }
 
-BODY=$(python3 - "$ITEM" "${START_MS:-}" "$MODE" "$PROFILE_FILE" <<'PYBODY'
+BODY=$(python3 - "$ITEM" "${START_MS:-}" "$MODE" "$PROFILE_FILE" "$LIBRARY" "$ENTRY" <<'PYBODY'
 import json, sys
-item, start_ms, mode, profile_file = sys.argv[1:5]
-body = {"item_id": item}
+item, start_ms, mode, profile_file, library, entry = sys.argv[1:7]
+body = {"item_id": item,"library_id": library,"resume": not bool(start_ms)}
+if entry:
+    body["media_entry_id"] = entry
 if start_ms:
     body["start_ms"] = int(start_ms)
 if mode:

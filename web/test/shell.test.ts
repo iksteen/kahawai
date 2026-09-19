@@ -15,6 +15,8 @@ import SearchBox from '../src/components/SearchBox.vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(async () => ({ items: [], total: 0, limit: 5, offset: 0 })),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 

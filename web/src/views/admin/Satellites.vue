@@ -7,7 +7,7 @@ import { computed, ref, watch } from 'vue'
 
 import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
-import type { CollectionOverview } from '../../api/generated/model/collectionOverview.ts'
+import type { CatalogueCollection } from '../../api/generated/model/catalogueCollection.ts'
 import type { PendingEnrollment } from '../../api/generated/model/pendingEnrollment.ts'
 import type { SatelliteOverview } from '../../api/generated/model/satelliteOverview.ts'
 import {
@@ -21,7 +21,7 @@ import { notify } from '../../composables/notices.ts'
 const props = defineProps<{
   pending: PendingEnrollment[]
   satellites: SatelliteOverview[]
-  collections: CollectionOverview[]
+  collections: CatalogueCollection[]
   /// Which of the panel's reads are failing, so an empty list is never
   /// reported as an empty fleet.
   broken: readonly string[]
@@ -89,20 +89,17 @@ watch(
 async function remove(satellite: SatelliteOverview) {
   if (!(await props.act(() => adminDeleteSatellite(satellite.module_id)))) return
   notify(
-    `Deleted ${satellite.name}: certificate revoked, collections removed. Watch state is archived and restored if the media returns.`,
+    `Deleted ${satellite.name}: certificate revoked, collections removed. Existing watch history is retained.`,
   )
 }
 
-/// MH-8: files a mediahost could not read, per host, because the host is what
-/// you would go and look at. A count and no more — `FileError` carries the path
-/// and the reason but only the hub's log has them, and saying "three" while
-/// pointing at the log beats saying nothing.
-const unreadable = computed(() => {
+/// Imported file counts come from the same catalogue as the library composer.
+const fileCounts = computed(() => {
   const byHost = new Map<string, number>()
   for (const collection of props.collections) {
     byHost.set(
-      collection.module_id,
-      (byHost.get(collection.module_id) ?? 0) + (collection.scan?.failed ?? 0),
+      collection.mediahost_id,
+      (byHost.get(collection.mediahost_id) ?? 0) + collection.file_count,
     )
   }
   return byHost
@@ -213,11 +210,11 @@ function some(satellite: SatelliteOverview) {
             {{ satellite.connected ? 'online' : 'offline' }}
           </span>
           <span
-            v-if="(unreadable.get(satellite.module_id) ?? 0) > 0"
-            class="rounded px-1.5 py-0.5 font-mono text-[11px] text-warn"
-            title="Files this host reported it could not read during a scan. They stay known — nothing was dropped from the library — and the hub log names each one."
+            v-if="(fileCounts.get(satellite.module_id) ?? 0) > 0"
+            class="rounded px-1.5 py-0.5 font-mono text-[11px] text-dim"
+            title="Imported files"
           >
-            {{ unreadable.get(satellite.module_id) }} unreadable
+            {{ fileCounts.get(satellite.module_id) }} files
           </span>
           <!-- Only where it does something. The hub accepts the flag for any
                satellite and only placement reads it, so offering this on a

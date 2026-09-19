@@ -154,7 +154,11 @@ async fn collection_reannouncement_keeps_assignments_until_media_type_changes() 
     use kahawai_hub::registry::Registry;
     let db = fixture().await;
     copy(&db, "movie", "movie", "X-Men", Some(2000), None, None).await;
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     let revision: i64 =
         sqlx::query_scalar("SELECT assignment_revision FROM collection_items WHERE id='movie'")
             .fetch_one(&db)
@@ -736,7 +740,11 @@ async fn compatible_child_enrichment_updates_description_without_changing_identi
 async fn scanner_keeps_single_episode_and_combined_copy_separate() {
     use kahawai_hub::registry::{FileUpsertRecord, Registry};
     let db = fixture().await;
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     let root = "/library-test";
     registry
         .announce_collection("host", "episodes", "series", &[root.into()])
@@ -987,7 +995,11 @@ async fn deleting_one_migrated_subtitle_preserves_the_other_copys_payload() {
     let payload = dir.path().join("downloaded-100.json");
     std::fs::write(&payload, "{}").unwrap();
     let subs = kahawai_hub::subtitles::Subtitles::new(dir.path().into());
-    let registry = kahawai_hub::registry::Registry::new(db, Default::default());
+    let registry = kahawai_hub::registry::Registry::new(
+        db,
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     assert!(
         subs.delete_track(&registry, 100, "user", false)
             .await
@@ -1060,7 +1072,11 @@ async fn identifying_a_parent_keeps_manually_assigned_children_under_the_same_se
 async fn rescanning_corrected_song_tags_refreshes_the_library_title() {
     use kahawai_hub::registry::{FileUpsertRecord, Registry};
     let db = fixture().await;
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     let root = "/library-tag-test";
     registry
         .announce_collection("host", "music", "music", &[root.into()])

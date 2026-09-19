@@ -11,7 +11,9 @@ use sqlx::Row;
 /// Two episodes of a show, each with the chapter names a WEBRip carries.
 async fn season(chapters: &[&str]) -> (tempfile::TempDir, Arc<kahawai_hub::registry::Registry>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::raw_sql(
         "INSERT INTO collections(module_id,collection_id,media_type)
            VALUES('m','c','series');
@@ -28,7 +30,11 @@ async fn season(chapters: &[&str]) -> (tempfile::TempDir, Arc<kahawai_hub::regis
     .await
     .unwrap();
 
-    let registry = Arc::new(kahawai_hub::registry::Registry::new(db, Default::default()));
+    let registry = Arc::new(kahawai_hub::registry::Registry::new(
+        db,
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     // The resolver the detector consults is connectivity-aware; the module
     // is "up" even though no byte plane exists in this harness, so reads
     // fail at the lease, not at planning.

@@ -8,7 +8,7 @@ import { computed, ref } from 'vue'
 
 import Armed from '../../components/Armed.vue'
 import Btn from '../../components/Btn.vue'
-import type { LibraryOverview } from '../../api/generated/model/libraryOverview.ts'
+import type { CatalogueLibrary } from '../../api/generated/model/catalogueLibrary.ts'
 import type { UserAccess } from '../../api/generated/model/userAccess.ts'
 import { adminCreateUser, adminDeleteUser, adminSetUserAdmin } from '../../api/generated/kahawai.ts'
 import {
@@ -24,7 +24,7 @@ import { useGrants } from '../../composables/grants.ts'
 
 const props = defineProps<{
   users: UserAccess[]
-  libraries: LibraryOverview[]
+  libraries: CatalogueLibrary[]
   broken: readonly string[]
   act: (what: () => Promise<unknown>) => Promise<boolean>
   /// Read the users again and resolve when the answer has landed. The grant

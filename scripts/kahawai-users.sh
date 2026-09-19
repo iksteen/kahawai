@@ -45,9 +45,8 @@ TOKEN=$(python3 -c 'import json,sys;print(json.dumps({"client":"api","username":
     || { echo "login failed" >&2; exit 1; }
 
 # One python block rather than a pipeline per verb: grant and revoke are
-# read-modify-write over the whole access set (the endpoint takes the set,
-# not a delta), and splicing that through curl twice is where the race
-# lives.
+# read-modify-write over the whole access set. Send the version we read so
+# a concurrent admin edit is rejected instead of overwritten.
 API="$API" TOKEN="$TOKEN" python3 - "$CMD" "$@" <<'PY'
 import json, os, sys, urllib.error, urllib.request
 
@@ -80,7 +79,7 @@ def find(name):
 
 
 def libraries():
-    return call("GET", "/admin/v1/libraries")["libraries"]
+    return call("GET", "/api/v1/catalogue/libraries")
 
 
 def library_id(needle):
@@ -94,7 +93,8 @@ def library_id(needle):
 
 def set_access(user, all_libraries, libs):
     call("PUT", "/admin/v1/users/%s/libraries" % user["id"],
-         {"all_libraries": all_libraries, "libraries": libs})
+         {"all_libraries": all_libraries, "libraries": libs,
+          "grants_version": user["grants_version"]})
 
 
 cmd, args = sys.argv[1], sys.argv[2:]

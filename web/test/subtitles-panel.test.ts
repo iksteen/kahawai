@@ -11,9 +11,9 @@ import { ApiError } from '../src/api/errors.ts'
 import type { TrackListing } from '../src/api/generated/model/trackListing.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  subtitleSearch: vi.fn(),
-  subtitleDownload: vi.fn(),
-  subtitleDelete: vi.fn(),
+  catalogueSubtitleSearch: vi.fn(),
+  catalogueSubtitleDownload: vi.fn(),
+  catalogueSubtitleDelete: vi.fn(),
   putPref: vi.fn(),
   getPrefs: vi.fn(async () => ({ prefs: [] })),
 }))
@@ -38,6 +38,8 @@ const track = (over: Partial<TrackListing> = {}) =>
     deletable: false,
     ...over,
   }) as TrackListing
+
+const source = (id: number) => ({ media_entry_id: String(id), source_version: 'fixture' })
 
 const candidate = (over: Record<string, unknown> = {}) => ({
   file_id: 'f1',
@@ -65,7 +67,8 @@ async function panel(over: Record<string, unknown> = {}) {
     attachTo: document.body,
     props: {
       item: { id: 'heat', title: 'Heat', parent_id: null },
-      sourceId: 1,
+      libraryId: 'films',
+      source: source(1),
       subs: [track()],
       languages: ['eng'],
       titleChoice: '',
@@ -86,12 +89,15 @@ const press = async (wrapper: Awaited<ReturnType<typeof panel>>, label: string) 
 }
 
 beforeEach(() => {
-  vi.mocked(api.subtitleSearch).mockResolvedValue({
+  vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
     candidates: [candidate()],
     quota: quota(),
   } as never)
-  vi.mocked(api.subtitleDownload).mockResolvedValue({ track_id: 9, quota: quota() } as never)
-  vi.mocked(api.subtitleDelete).mockResolvedValue({ removed: true } as never)
+  vi.mocked(api.catalogueSubtitleDownload).mockResolvedValue({
+    track_id: 9,
+    quota: quota(),
+  } as never)
+  vi.mocked(api.catalogueSubtitleDelete).mockResolvedValue({ removed: true } as never)
   vi.mocked(api.putPref).mockResolvedValue(undefined as never)
   clearNotices()
 })
@@ -142,7 +148,7 @@ describe('what the item already has', () => {
 
     const mine = await panel({ subs: [track({ id: 4, origin: 'downloaded', deletable: true })] })
     await press(mine, 'Remove')
-    expect(api.subtitleDelete).toHaveBeenCalledWith(4)
+    expect(api.catalogueSubtitleDelete).toHaveBeenCalledWith('films', 'heat', 4, source(1))
     expect(mine.emitted('changed')).toHaveLength(1)
   })
 })
@@ -150,15 +156,15 @@ describe('what the item already has', () => {
 describe('searching', () => {
   test('changing sources discards a pending search, even after returning to that source', async () => {
     let finish!: (value: unknown) => void
-    vi.mocked(api.subtitleSearch).mockReturnValueOnce(
+    vi.mocked(api.catalogueSubtitleSearch).mockReturnValueOnce(
       new Promise((resolve) => {
         finish = resolve
       }) as never,
     )
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
-    await wrapper.setProps({ sourceId: 2 })
-    await wrapper.setProps({ sourceId: 1 })
+    await wrapper.setProps({ source: source(2) })
+    await wrapper.setProps({ source: source(1) })
     finish({ candidates: [candidate({ release_name: 'OLD source search' })], quota: quota() })
     await flushPromises()
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
@@ -171,19 +177,19 @@ describe('searching', () => {
   test('changing sources closes results before another source can download them', async () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
-    await wrapper.setProps({ sourceId: 2 })
+    await wrapper.setProps({ source: source(2) })
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
-    expect(api.subtitleDownload).not.toHaveBeenCalled()
+    expect(api.catalogueSubtitleDownload).not.toHaveBeenCalled()
     await press(wrapper, 'Find subtitles (eng)')
     await press(wrapper, 'Download')
-    expect(api.subtitleSearch).toHaveBeenLastCalledWith('heat', {
+    expect(api.catalogueSubtitleSearch).toHaveBeenLastCalledWith('films', 'heat', {
       languages: ['eng'],
-      source_id: 2,
+      source: source(2),
     })
-    expect(api.subtitleDownload).toHaveBeenLastCalledWith('heat', {
+    expect(api.catalogueSubtitleDownload).toHaveBeenLastCalledWith('films', 'heat', {
       file_id: 'f1',
       language: 'eng',
-      source_id: 2,
+      source: source(2),
     })
     wrapper.unmount()
   })
@@ -191,20 +197,29 @@ describe('searching', () => {
   test('is filtered by the media type’s language preference', async () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
-    expect(api.subtitleSearch).toHaveBeenCalledWith('heat', { languages: ['eng'], source_id: 1 })
+    expect(api.catalogueSubtitleSearch).toHaveBeenCalledWith('films', 'heat', {
+      languages: ['eng'],
+      source: source(1),
+    })
   })
 
   test('and nothing found offers the unfiltered search', async () => {
-    vi.mocked(api.subtitleSearch).mockResolvedValue({ candidates: [], quota: quota() } as never)
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
+      candidates: [],
+      quota: quota(),
+    } as never)
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
     expect(wrapper.text()).toContain('Nothing in eng for this file.')
     await press(wrapper, 'Search every language instead')
-    expect(vi.mocked(api.subtitleSearch).mock.calls[1]![1]).toEqual({ languages: [], source_id: 1 })
+    expect(vi.mocked(api.catalogueSubtitleSearch).mock.calls[1]![2]).toEqual({
+      languages: [],
+      source: source(1),
+    })
   })
 
   test('and a refusal is reported rather than swallowed', async () => {
-    vi.mocked(api.subtitleSearch).mockRejectedValue(new ApiError(503, 'provider is away'))
+    vi.mocked(api.catalogueSubtitleSearch).mockRejectedValue(new ApiError(503, 'provider is away'))
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
     expect(wrapper.text()).toContain('provider is away')
@@ -223,7 +238,7 @@ describe('searching', () => {
 describe('a candidate', () => {
   test('a download finishing for an old source cannot close the new source’s results', async () => {
     let finish!: (value: unknown) => void
-    vi.mocked(api.subtitleDownload).mockReturnValueOnce(
+    vi.mocked(api.catalogueSubtitleDownload).mockReturnValueOnce(
       new Promise((resolve) => {
         finish = resolve
       }) as never,
@@ -231,12 +246,12 @@ describe('a candidate', () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
     await press(wrapper, 'Download')
-    expect(api.subtitleDownload).toHaveBeenLastCalledWith('heat', {
+    expect(api.catalogueSubtitleDownload).toHaveBeenLastCalledWith('films', 'heat', {
       file_id: 'f1',
       language: 'eng',
-      source_id: 1,
+      source: source(1),
     })
-    await wrapper.setProps({ sourceId: 2 })
+    await wrapper.setProps({ source: source(2) })
     await press(wrapper, 'Find subtitles (eng)')
     finish({ track_id: 9, quota: quota() })
     await flushPromises()
@@ -246,7 +261,7 @@ describe('a candidate', () => {
   })
 
   test('says when the provider matched the exact file (HUB-22)', async () => {
-    vi.mocked(api.subtitleSearch).mockResolvedValue({
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
       candidates: [candidate({ hash_match: true })],
       quota: quota(),
     } as never)
@@ -257,7 +272,7 @@ describe('a candidate', () => {
 
   test('and warns when it was timed for a different frame rate', async () => {
     // The classic cause of progressive drift.
-    vi.mocked(api.subtitleSearch).mockResolvedValue({
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
       candidates: [candidate({ fps: 25 })],
       quota: quota(),
     } as never)
@@ -267,7 +282,7 @@ describe('a candidate', () => {
   })
 
   test('but not when the two agree', async () => {
-    vi.mocked(api.subtitleSearch).mockResolvedValue({
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
       candidates: [candidate({ fps: 23.976 })],
       quota: quota(),
     } as never)
@@ -280,18 +295,18 @@ describe('a candidate', () => {
     const wrapper = await panel()
     await press(wrapper, 'Find subtitles (eng)')
     await press(wrapper, 'Download')
-    expect(api.subtitleDownload).toHaveBeenCalledWith('heat', {
+    expect(api.catalogueSubtitleDownload).toHaveBeenCalledWith('films', 'heat', {
       file_id: 'f1',
       language: 'eng',
-      source_id: 1,
+      source: source(1),
     })
     expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
-    expect(notice.value).toContain('now a track on this item')
+    expect(notice.value).toContain('now a track on this source')
     expect(wrapper.emitted('changed')).toHaveLength(1)
   })
 
   test('and a refused download keeps the dialog, with the reason', async () => {
-    vi.mocked(api.subtitleDownload).mockRejectedValue(
+    vi.mocked(api.catalogueSubtitleDownload).mockRejectedValue(
       new ApiError(409, 'the shared quota is spent', 'subtitle_quota_spent'),
     )
     const wrapper = await panel()
@@ -313,7 +328,7 @@ describe('the entitlement', () => {
   })
 
   test('and an account’s own entitlement is not called shared', async () => {
-    vi.mocked(api.subtitleSearch).mockResolvedValue({
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
       candidates: [candidate()],
       quota: quota({ per_account: true }),
     } as never)
@@ -323,7 +338,7 @@ describe('the entitlement', () => {
   })
 
   test('and a provider that does not say leaves the standing warning up', async () => {
-    vi.mocked(api.subtitleSearch).mockResolvedValue({
+    vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
       candidates: [candidate()],
       quota: quota({ remaining: null }),
     } as never)
@@ -413,4 +428,32 @@ describe('the candidate dialog is a real one', () => {
     added.mockRestore()
     removed.mockRestore()
   })
+})
+
+test('catalogue searches and downloads capture the physical source version', async () => {
+  const source = { media_entry_id: 'release-a', source_version: 'version-a' }
+  vi.mocked(api.catalogueSubtitleSearch).mockResolvedValue({
+    candidates: [candidate()],
+    quota: quota(),
+  } as never)
+  vi.mocked(api.catalogueSubtitleDownload).mockResolvedValue({
+    track_id: -42,
+    quota: quota(),
+  } as never)
+  const wrapper = await panel({ libraryId: 'films', source })
+  await press(wrapper, 'Find subtitles (eng)')
+  expect(api.catalogueSubtitleSearch).toHaveBeenCalledWith('films', 'heat', {
+    source,
+    languages: ['eng'],
+  })
+  await press(wrapper, 'Download')
+  expect(api.catalogueSubtitleDownload).toHaveBeenCalledWith('films', 'heat', {
+    source,
+    file_id: 'f1',
+    language: 'eng',
+  })
+  await press(wrapper, 'Find subtitles (eng)')
+  await wrapper.setProps({ source: { ...source, source_version: 'replacement' } })
+  expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+  wrapper.unmount()
 })

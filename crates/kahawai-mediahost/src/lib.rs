@@ -171,6 +171,7 @@ impl LocalRuntime {
                 for collection in &status_collections {
                     match status_catalog.discovery_status(&collection.name).await {
                         Ok(mut status) => {
+                            status.segments_enabled = Some(detect_segments);
                             if !detect_segments {
                                 status.pending_segments = 0;
                             }
@@ -204,10 +205,12 @@ impl LocalRuntime {
                     while let Ok(more) = rx.try_recv() {
                         trigger.force_dirs.extend(more.force_dirs);
                         trigger.demand |= more.demand;
+                        trigger.deep |= more.deep;
                     }
                     if let Some(more) = overflow.lock().unwrap().take() {
                         trigger.force_dirs.extend(more.force_dirs);
                         trigger.demand |= more.demand;
+                        trigger.deep |= more.deep;
                     }
                     let root_tokens = collection
                         .resolved_roots()
@@ -236,6 +239,7 @@ impl LocalRuntime {
                         collection.clone(),
                         catalog.clone(),
                         trigger.force_dirs,
+                        trigger.deep,
                         permit,
                     )
                     .await
@@ -378,6 +382,7 @@ impl LocalRuntime {
                                             force_dirs,
                                             initial: false,
                                             demand: false,
+                                            deep: false,
                                         });
                                     }
                                 }
@@ -509,7 +514,7 @@ impl LocalRuntime {
             loop {
                 tokio::select! {
                     _ = ticker.tick() => {}
-                    _ = scheduler_wake.notified() => {}
+                    _ = scheduler_wake.notified() => { segment_exhausted.clear(); }
                 }
                 for collection in &schedule_collections {
                     if collection.media_type == "anime" {
@@ -710,11 +715,12 @@ impl LocalRuntime {
             .collect()
     }
 
-    fn rescan(&self, collection: &str) {
+    fn rescan(&self, collection: &str, deep: bool) {
         for (name, trigger) in &self.triggers {
             if collection.is_empty() || name == collection {
                 trigger.send(ScanTrigger {
                     demand: true,
+                    deep,
                     ..Default::default()
                 });
             }
@@ -1104,7 +1110,7 @@ async fn link_once_v4(
                 }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::RescanRequest(request)) }) => {
                     ensure_scoped_rescan(&selected, &request.collection_id)?;
-                    runtime.rescan(&request.collection_id);
+                    runtime.rescan(&request.collection_id, request.deep);
                 }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::ExtractSubs(request)) }) => {
                     job_tx.try_send(hasher::JobMsg::Urgent(request))
@@ -1511,7 +1517,7 @@ async fn run_local_link(
                     }
                     Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::RescanRequest(request)) })) => {
                         ensure_scoped_rescan(&runtime.collections, &request.collection_id)?;
-                        runtime.rescan(&request.collection_id);
+                        runtime.rescan(&request.collection_id, request.deep);
                     }
                     Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::ExtractSubs(request)) })) => {
                         job_tx.try_send(hasher::JobMsg::Urgent(request))
@@ -1591,6 +1597,7 @@ struct ScanTrigger {
     /// Explicit hub/admin requests are interactive demand; periodic and
     /// watcher freshness remains the normal catalogue class.
     demand: bool,
+    deep: bool,
 }
 
 /// Trigger sender that never drops: when the queue is full, the trigger
@@ -1607,14 +1614,10 @@ impl TriggerSink {
         if let Err(tokio::sync::mpsc::error::TrySendError::Full(t)) = self.tx.try_send(t) {
             tracing::debug!("trigger queue full; merging into overflow");
             let mut slot = self.overflow.lock().unwrap();
-            slot.get_or_insert_with(ScanTrigger::default)
-                .force_dirs
-                .extend(t.force_dirs);
-            if t.demand
-                && let Some(merged) = slot.as_mut()
-            {
-                merged.demand = true;
-            }
+            let merged = slot.get_or_insert_with(ScanTrigger::default);
+            merged.force_dirs.extend(t.force_dirs);
+            merged.demand |= t.demand;
+            merged.deep |= t.deep;
             drop(slot);
             // Wake the orchestrator if space appeared meanwhile; if the
             // queue is still full, its items already guarantee a wake.
@@ -1726,11 +1729,13 @@ impl Engine {
                     trig.force_dirs.extend(more.force_dirs);
                     trig.initial &= more.initial;
                     trig.demand |= more.demand;
+                    trig.deep |= more.deep;
                 }
                 if let Some(o) = overflow.lock().unwrap().take() {
                     trig.force_dirs.extend(o.force_dirs);
                     trig.initial &= o.initial;
                     trig.demand |= o.demand;
+                    trig.deep |= o.deep;
                 }
                 let handshake = if trig.initial { version } else { 0 };
                 let next = version + 1;
@@ -1753,7 +1758,7 @@ impl Engine {
                         &c,
                         &tx,
                         &waiters,
-                        force_dirs.clone(),
+                        (force_dirs.clone(), trig.deep),
                         handshake,
                         next,
                         admission.clone(),
@@ -1907,6 +1912,7 @@ impl Engine {
                                             force_dirs: dirs,
                                             initial: false,
                                             demand: false,
+                                            deep: false,
                                         });
                                     }
                                 }
@@ -1967,6 +1973,7 @@ impl Engine {
                     if r.collection_id.is_empty() || *name == r.collection_id {
                         t.send(ScanTrigger {
                             demand: true,
+                            deep: r.deep,
                             ..Default::default()
                         });
                     }
@@ -2322,7 +2329,7 @@ async fn scan_cycle(
     waiters: &std::sync::Mutex<
         std::collections::HashMap<String, tokio::sync::mpsc::Sender<kahawai_proto::v1::Manifest>>,
     >,
-    force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    force: (std::collections::HashSet<std::path::PathBuf>, bool),
     handshake_version: u64,
     report_version: u64,
     admission: scan::ScanAdmission,
@@ -2358,7 +2365,8 @@ async fn scan_cycle(
         c.clone(),
         tx.clone(),
         mrx,
-        force_dirs,
+        force.0,
+        force.1,
         report_version,
         admission,
     )
@@ -2372,6 +2380,25 @@ mod scheduler_integration_tests {
         run_local_multi, schedule_catalog_updates, scheduler, send_catalog_pages,
         send_link_message_with_timeout,
     };
+
+    #[tokio::test]
+    async fn full_scan_trigger_queue_preserves_deep_intent() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        let sink = super::TriggerSink {
+            tx,
+            overflow: Default::default(),
+        };
+        sink.send(super::ScanTrigger::default());
+        sink.send(super::ScanTrigger {
+            deep: true,
+            demand: true,
+            ..Default::default()
+        });
+        sink.send(super::ScanTrigger::default());
+        let overflow = sink.overflow.lock().unwrap().take().unwrap();
+        assert!(overflow.deep && overflow.demand);
+        assert!(!rx.recv().await.unwrap().deep);
+    }
 
     #[tokio::test]
     async fn startup_scan_discovers_new_media_while_playback_reserves_cpu() {

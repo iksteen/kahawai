@@ -3,6 +3,8 @@
 ///
 /// In a PLAIN script block, which is the only module scope an SFC has: the body
 /// of `<script setup>` is the setup function, so a `let` there starts over with
+import { playbackItem } from '../api/playback.ts'
+import { catalogueNext } from '../api/generated/kahawai.ts'
 /// every instance. The route renders this component keyed on the session id, so
 /// a restart, a stand-by resume, a capability change and every next episode
 /// replace it — and per-instance state started over at 1.0 and UNMUTED, writing
@@ -52,7 +54,6 @@ import {
   endSession,
   getPrefs,
   itemChildren,
-  itemQuery,
   postProgress,
 } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
@@ -1356,6 +1357,7 @@ watch(
 /// nothing, the viewer opted in (the `introdb` pref), and the item carries
 /// an id to key on. Community times keyed on a release version, so the
 /// hub's own measured boundaries always outrank them.
+const sourceSegments = computed(() => props.session.segments ?? props.item.segments ?? [])
 const remoteSegments = ref<Segment[]>([])
 // A watch rather than `onMounted`, defensively: today Player settles prefs
 // before the session exists, so the immediate pass sees them — but nothing
@@ -1367,7 +1369,7 @@ watch(
   () => props.prefs,
   (prefs) => {
     if (askedIntrodb) return
-    if (props.item.segments?.length) return
+    if (sourceSegments.value.length) return
     if (!prefs?.some((p) => p.scope === '' && p.key === 'introdb' && p.value === '1')) return
     askedIntrodb = true
     // The duration of what is PLAYING: the session's, not the item's
@@ -1382,7 +1384,7 @@ watch(
   { immediate: true },
 )
 const skipSegments = computed(() =>
-  props.item.segments?.length ? props.item.segments : remoteSegments.value,
+  sourceSegments.value.length ? sourceSegments.value : remoteSegments.value,
 )
 const skipping = computed(() => skippable(skipSegments.value, playing.posMs))
 const skipText = computed(() => skipLabel(skipping.value))
@@ -1421,12 +1423,21 @@ const startingNext = ref(false)
 onMounted(async () => {
   if (props.item.kind !== 'episode' || !props.item.parent_id) return
   try {
-    const siblings = await itemChildren(props.item.parent_id)
-    const covered = new Set(props.session.library_item_ids ?? [props.item.id])
-    const at = siblings.children.findLastIndex((e) => covered.has(e.id))
-    const after = at >= 0 ? siblings.children[at + 1] : undefined
+    let after
+    if (props.item.library_id)
+      after = await catalogueNext(
+        props.item.library_id,
+        props.item.id,
+        props.session.media_entry_id ? { media_entry_id: props.session.media_entry_id } : undefined,
+      )
+    else {
+      const siblings = await itemChildren(props.item.parent_id)
+      const covered = new Set(props.session.library_item_ids ?? [props.item.id])
+      const at = siblings.children.findLastIndex((e) => covered.has(e.id))
+      after = at >= 0 ? siblings.children[at + 1] : undefined
+    }
     if (!after || goneAway) return
-    const full = await itemQuery(after.id, { profile: buildProfile() })
+    const full = await playbackItem(after.id, { profile: buildProfile() }, props.item.library_id)
     if (!goneAway) next.value = full
   } catch {
     // No next episode to offer is not a failure worth a message.
@@ -1463,7 +1474,7 @@ async function playNext() {
     })
     const cap = prefs.prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
     const previewProfile = buildProfile(cap ? Number(cap) : undefined)
-    after = await itemQuery(after.id, { profile: previewProfile })
+    after = await playbackItem(after.id, { profile: previewProfile }, props.item.library_id)
     const selected = await selectPlaybackSource(after, prefs.prefs, props.mediaType, previewProfile)
     if (goneAway) return
     after = selected.item
@@ -1607,7 +1618,9 @@ const remember = (scope: string, key: string, value: string) =>
         :key="`${trk.subKey}-${trk.epoch}`"
         default
         kind="subtitles"
-        :src="subtitleFileUrl(props.item.id, `${trk.subKey}.vtt`, -Math.round(offset))"
+        :src="
+          subtitleFileUrl(props.item.id, `${trk.subKey}.vtt`, -Math.round(offset), props.session)
+        "
       />
     </video>
 

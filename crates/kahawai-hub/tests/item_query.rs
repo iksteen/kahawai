@@ -685,7 +685,7 @@ fn test_router_with(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,
@@ -824,9 +824,7 @@ async fn the_detection_trigger_is_a_mediahost_wake() {
     assert_eq!(response.status(), axum::http::StatusCode::OK);
 }
 
-/// Nothing pending answers immediately with no season named — the shape
-/// the web poller's "Every season has been analysed" exit depends on —
-/// and still carries the follow/boot pair.
+/// No eligible catalogue collections means no mediahosts were asked.
 #[tokio::test]
 async fn a_trigger_with_nothing_pending_names_no_season() {
     let fx = fixture().await;
@@ -847,10 +845,7 @@ async fn a_trigger_with_nothing_pending_names_no_season() {
         .unwrap();
     let answer: serde_json::Value = serde_json::from_slice(&body).unwrap();
     assert!(answer["series"].is_null(), "{answer}");
-    assert!(
-        answer["follow"].is_u64() && answer["boot"].is_u64(),
-        "{answer}"
-    );
+    assert_eq!(answer, serde_json::json!({"asked":0,"unavailable":0}));
 }
 
 /// The id a third-party lookup keys on rides the metadata: the parent
@@ -1232,8 +1227,14 @@ async fn fixture_with(file: FileUpsertRecord) -> Fx {
 
 async fn fixture_net(file: FileUpsertRecord, net: kahawai_hub::api::NetOptions) -> Fx {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let reg = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let reg = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     reg.announce_collection("01H", "movies", "movies", &[TEST_ROOT.into()])
         .await
         .unwrap();

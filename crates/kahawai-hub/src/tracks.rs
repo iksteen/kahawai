@@ -48,6 +48,15 @@ use sqlx::Row;
 
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Track {
+    #[serde(skip)]
+    pub acquired: Option<std::sync::Arc<kahawai_media::subtitles::Extracted>>,
+    /// Immutable physical revision key for generated catalogue artifacts.
+    #[serde(skip)]
+    pub artifact_key: Option<String>,
+    #[serde(skip)]
+    pub raster: Option<std::path::PathBuf>,
+    #[serde(skip)]
+    pub physical: Option<crate::subtitles::FileSource>,
     pub id: i64,
     pub item_id: String,
     pub origin: String,
@@ -152,7 +161,7 @@ pub fn delivery(
     // already had.
     let (graphics_overlay, vtt_render) = (profile.graphics_overlay, profile.vtt_render);
     // HUB-32d: a rasterised script is display sets like any other, but
-    // it is an ITEM-level artefact — no stream index, no session tap,
+    // it is a stored source artifact — no session tap,
     // so it needs neither `burn_capable` nor an embedded origin.
     //
     // It offers itself only when the LADDER picked the overlay rung.
@@ -343,6 +352,10 @@ impl Track {
 
 fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
     Track {
+        acquired: None,
+        artifact_key: None,
+        raster: None,
+        physical: None,
         id: r.get("id"),
         item_id: r.get("item_id"),
         origin: r.get("origin"),
@@ -413,12 +426,31 @@ pub async fn sync_source_tracks(
     Ok(())
 }
 
+impl Track {
+    pub(crate) fn source_revision(&self) -> anyhow::Result<&str> {
+        use anyhow::Context;
+        let physical = self
+            .physical
+            .as_ref()
+            .context("track has no captured source")?;
+        Ok(if self.origin == "sidecar" {
+            &physical.sidecar_revision
+        } else {
+            &physical.revision
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     fn track(format: &str, origin: &str) -> Track {
         Track {
+            acquired: None,
+            artifact_key: None,
+            raster: None,
+            physical: None,
             id: 1,
             item_id: "i".into(),
             origin: origin.into(),

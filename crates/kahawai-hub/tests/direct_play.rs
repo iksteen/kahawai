@@ -77,7 +77,11 @@ async fn direct_play_ranges_end_to_end() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -141,6 +145,7 @@ async fn direct_play_ranges_end_to_end() {
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
     catalog_fixture::project_files(
+        &registry,
         &tx,
         &mut inbound,
         "movies",
@@ -509,7 +514,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,

@@ -26,7 +26,11 @@ async fn fixture() -> (
     Vec<String>,
 ) {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("host", "mediahost", "host", "fp")
         .await

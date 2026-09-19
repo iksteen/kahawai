@@ -6,6 +6,8 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, test, vi } from 'vitest'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string, params?: { size?: string; v?: string }) =>
     `/api/v1/items/${id}/artwork?size=${params?.size ?? ''}&v=${params?.v ?? ''}`,
 }))

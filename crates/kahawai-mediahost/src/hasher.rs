@@ -74,7 +74,7 @@ impl Tier {
 
 #[derive(Default)]
 struct Queues {
-    urgent: VecDeque<(String, String, String)>,
+    urgent: VecDeque<(String, String, String, String)>,
     urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs>,
     ed2k: Tier,
     subs: Tier,
@@ -94,9 +94,12 @@ fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
         }
         JobMsg::Urgent(e) => {
             if let Some(source) = e.source {
-                queues
-                    .urgent
-                    .push_back((e.collection_id, source.root_token, source.path_rel));
+                queues.urgent.push_back((
+                    e.collection_id,
+                    source.root_token,
+                    source.path_rel,
+                    e.source_revision,
+                ));
             }
             true
         }
@@ -176,7 +179,8 @@ pub async fn run(
             intake(message, &mut queues);
         }
 
-        while let Some((collection_id, root_token, path_rel)) = queues.urgent.pop_front() {
+        while let Some((collection_id, root_token, path_rel, revision)) = queues.urgent.pop_front()
+        {
             let scheduler = scheduler.clone();
             let collections = collections.clone();
             let tx = tx.clone();
@@ -192,6 +196,7 @@ pub async fn run(
                     &collection_id,
                     &root_token,
                     &path_rel,
+                    &revision,
                     Some(urgent),
                     None,
                     &tx,
@@ -221,6 +226,7 @@ pub async fn run(
                         &source.root_token,
                         &source.path_rel,
                         e.sub_index,
+                        &e.source_revision,
                         urgent,
                         &tx,
                     )
@@ -358,6 +364,7 @@ async fn run_background_job(
                 collection_id,
                 root_token,
                 path_rel,
+                "",
                 Some(background),
                 Some(permit),
                 tx,
@@ -615,12 +622,14 @@ async fn probe_geometry_and_send(
 /// through the container's own index. Undecoded on purpose — the
 /// payloads are compact this way and the pipeline worker owns the
 /// decoders.
+#[allow(clippy::too_many_arguments)] // exact source/revision plus scheduler ownership and transport
 async fn extract_image_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
     sub_index: u32,
+    source_revision: &str,
     blocking_guard: BlockingGuard,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
@@ -696,6 +705,7 @@ async fn extract_image_and_send(
                 root_token,
                 path_rel,
                 sub_index,
+                source_revision,
                 track.codec,
                 track.codec_private.unwrap_or_default(),
                 blocks,
@@ -715,6 +725,7 @@ async fn extract_image_and_send(
             kahawai_proto::v1::ImageSubtitles {
                 collection_id: collection_id.into(),
                 source: source(root_token, path_rel),
+                source_revision: source_revision.into(),
                 sub_index,
                 error,
                 // One message, and it is the last one.
@@ -735,11 +746,13 @@ async fn extract_image_and_send(
 
 /// Extract every text subtitle track of one local file (single demux
 /// pass at disk speed) and ship the results to the hub.
+#[allow(clippy::too_many_arguments)] // exact source/revision plus scheduler ownership and transport
 async fn extract_and_send(
     collections: &[CollectionConfig],
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    source_revision: &str,
     background: Option<BlockingGuard>,
     permit: Option<JobPermit>,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
@@ -787,6 +800,7 @@ async fn extract_and_send(
             FileSubtitles {
                 collection_id: collection_id.to_string(),
                 source: source(root_token, path_rel),
+                source_revision: source_revision.into(),
                 size,
                 tracks: tracks
                     .into_iter()
@@ -805,6 +819,7 @@ async fn extract_and_send(
             FileSubtitles {
                 collection_id: collection_id.to_string(),
                 source: source(root_token, path_rel),
+                source_revision: source_revision.into(),
                 size: 0,
                 tracks: vec![],
                 error: format!("{e:#}"),
@@ -891,6 +906,7 @@ async fn send_chunked(
     root_token: &str,
     path_rel: &str,
     sub_index: u32,
+    source_revision: &str,
     codec: String,
     codec_private: Vec<u8>,
     blocks: Vec<kahawai_proto::v1::ImageSubBlock>,
@@ -911,6 +927,7 @@ async fn send_chunked(
         let msg = kahawai_proto::v1::ImageSubtitles {
             collection_id: collection_id.into(),
             source: source(root_token, path_rel),
+            source_revision: source_revision.into(),
             sub_index,
             codec: codec.clone(),
             codec_private: codec_private.clone(),
@@ -949,6 +966,7 @@ async fn send_chunked(
                     kahawai_proto::v1::ImageSubtitles {
                         collection_id: collection_id.into(),
                         source: source(root_token, path_rel),
+                        source_revision: source_revision.into(),
                         sub_index,
                         codec,
                         codec_private,
@@ -959,5 +977,62 @@ async fn send_chunked(
             },
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod subtitle_revision_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn chunked_image_replies_echo_the_requested_revision() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel(4);
+        send_chunked(
+            &tx,
+            "movies",
+            "root",
+            "film.mkv",
+            0,
+            "captured-revision",
+            "S_HDMV/PGS".into(),
+            vec![],
+            vec![
+                kahawai_proto::v1::ImageSubBlock {
+                    payload: vec![1; SETS_CHUNK_BYTES],
+                    ..Default::default()
+                },
+                kahawai_proto::v1::ImageSubBlock {
+                    payload: vec![2],
+                    ..Default::default()
+                },
+            ],
+        )
+        .await;
+        for done in [false, true] {
+            let Some(host_to_hub::Msg::ImageSubtitles(message)) = rx.recv().await.unwrap().msg
+            else {
+                panic!("wrong reply")
+            };
+            assert_eq!(message.source_revision, "captured-revision");
+            assert_eq!(message.done, Some(done));
+        }
+        // Empty tracks still finish and carry the same identity.
+        send_chunked(
+            &tx,
+            "movies",
+            "root",
+            "film.mkv",
+            0,
+            "empty-revision",
+            "S_HDMV/PGS".into(),
+            vec![],
+            vec![],
+        )
+        .await;
+        let Some(host_to_hub::Msg::ImageSubtitles(message)) = rx.recv().await.unwrap().msg else {
+            panic!("wrong reply")
+        };
+        assert_eq!(message.source_revision, "empty-revision");
+        assert_eq!(message.done, Some(true));
     }
 }

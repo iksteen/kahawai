@@ -15,6 +15,8 @@
 
 #![allow(dead_code)] // each test binary uses its own subset
 
+mod catalog;
+
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
@@ -89,7 +91,11 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -241,7 +247,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         Duration::from_secs(900),
         90,
     ));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry.clone(),
         auth,
         sessions.clone(),
@@ -255,6 +261,8 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
+
+    catalog::seed_legacy_fixture(&registry).await;
 
     // The upsert crosses the link asynchronously; wait for the item.
     let item_id = tokio::time::timeout(Duration::from_secs(10), {

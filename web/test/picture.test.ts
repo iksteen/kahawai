@@ -25,6 +25,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   putPref: vi.fn(),
   adminSessionLog: vi.fn(),
   itemFonts: vi.fn(async () => ({ fonts: [] })),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/art/${id}`,
   getItemFontUrl: (id: string, n: number) => `/font/${id}/${n}`,
   getItemSubtitleFileUrl: (id: string, file: string) => `/subs/${id}/${file}`,
@@ -1605,6 +1607,33 @@ describe('chapter marks on the bar', () => {
     // Inside what the pipeline has produced, so the element's own jump —
     // the point is where it landed.
     expect(element.currentTime).toBe(300)
+  })
+
+  test.each([
+    { segments: [] },
+    { segments: [{ kind: 'intro', start_ms: 5_000, end_ms: 35_000, source: 'chromaprint' }] },
+  ])('session markers override stale markers from the preview: %j', async ({ segments }) => {
+    const { wrapper, element } = await watching({
+      item: film({
+        segments: [{ kind: 'intro', start_ms: 5_000, end_ms: 65_000, source: 'chromaprint' }],
+      }) as never,
+      session: session('s1', { segments }) as never,
+    })
+    Object.defineProperty(element, 'seekable', {
+      value: { length: 1, start: () => 0, end: () => 600 },
+      configurable: true,
+    })
+    at(element, 10)
+    await flushPromises()
+    const offer = wrapper.findAll('button').find((b) => b.text() === 'Skip intro')
+    if (!segments.length) {
+      expect(offer).toBeUndefined()
+      return
+    }
+    expect(offer).toBeTruthy()
+    await offer!.trigger('click')
+    await flushPromises()
+    expect(element.currentTime).toBe(35)
   })
 
   test('an intro under the playhead offers Skip, and pressing it seeks past', async () => {

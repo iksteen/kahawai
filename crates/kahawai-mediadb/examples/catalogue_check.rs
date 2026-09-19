@@ -306,7 +306,7 @@ async fn scale(path: &Path) -> Result<()> {
         INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,year,description_json)
         SELECT 'p'||id,'tmdb','movie',id,'en','movies',title,year,'{\"overview\":\"Provider description\"}'
         FROM collection_items WHERE CAST(substr(id,2) AS INTEGER)%2=0;
-        INSERT INTO metadata_assignments SELECT substr(id,2),id FROM provider_records;
+        INSERT INTO metadata_assignments(item_id,record_id) SELECT substr(id,2),id FROM provider_records;
         INSERT INTO media_entries(id,collection_id,item_id,occurrence,kind,title)
         SELECT 'e'||id,'scale',id,occurrence,'movie',title FROM collection_items;
         WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<250000)

@@ -24,6 +24,7 @@ import { watchedPct } from '../domain/label.ts'
 const props = withDefaults(
   defineProps<{
     item: {
+      library_id?: string | null
       id: string
       kind: string
       played: boolean
@@ -78,8 +79,10 @@ const glyph = computed(() => kindGlyph(props.item.kind))
     <img
       class="art"
       :class="broken && 'invisible'"
-      :src="artworkUrl(artId, artVersion, props.size)"
-      :srcset="props.size === 'card' ? artworkSrcSet(artId, artVersion) : undefined"
+      :src="artworkUrl(artId, artVersion, props.size, props.item.library_id)"
+      :srcset="
+        props.size === 'card' ? artworkSrcSet(artId, artVersion, props.item.library_id) : undefined
+      "
       loading="lazy"
       alt=""
       @error="broken = true"

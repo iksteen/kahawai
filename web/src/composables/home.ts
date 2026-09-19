@@ -11,7 +11,7 @@ import { computed, type Ref, ref } from 'vue'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
-import { listItems, listLibraries, upNext } from '../api/generated/kahawai.ts'
+import { listItems, listLibraries, upNext } from '../api/catalogue.ts'
 import {
   appendPage,
   hasMore,

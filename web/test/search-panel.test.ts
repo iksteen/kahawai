@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 /// The search panel, mounted. Two rules run through all of it: a library that
 /// could not be asked is not a library with no matches, and the rows that are
 /// on screen stay actionable while their replacements load.
@@ -12,6 +13,8 @@ import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 

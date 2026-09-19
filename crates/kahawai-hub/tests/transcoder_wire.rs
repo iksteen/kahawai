@@ -35,7 +35,11 @@ async fn spawn_hub() -> Hub {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db, allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db,
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
@@ -294,7 +298,11 @@ async fn transcoder_registers_capabilities_and_clears_on_disconnect() {
 
     // The drain survives a hub restart: a fresh registry over the same
     // database loads the flag.
-    let reborn = Registry::new(hub.registry.db().clone(), Default::default());
+    let reborn = Registry::new(
+        hub.registry.db().clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     reborn.load_allowlist().await.unwrap();
     let sats = reborn.satellites_overview().await.unwrap();
     assert!(
@@ -367,8 +375,14 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
 #[tokio::test]
 async fn capacity_holds_when_placements_arrive_together() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db, AllowedCerts::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db,
+        AllowedCerts::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
 
     // Two boxes, three slots between them: whatever the sort prefers,
     // the fourth caller must be refused.

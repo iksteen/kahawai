@@ -166,6 +166,7 @@ async function prepare(which: 0 | 1, want: number) {
     const session = await startSession(
       {
         item_id: track.id,
+        library_id: track.library_id,
         ...(track.album_track_id == null ? {} : { album_track_id: track.album_track_id }),
         mode: 'direct',
       },

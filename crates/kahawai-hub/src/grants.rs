@@ -1,3 +1,9 @@
+//! Runtime grants reference external mediadb library IDs. Only the user FK is
+//! stored here; library existence, composition and item visibility come from Store.
+//! Removing a library makes dangling grants inert because IDs are never reused.
+//! Runtime writes use `set_catalogue_access`; the legacy SQL predicates and
+//! `set_access` remain regression fixtures for consumers awaiting their port.
+//!
 //! Per-library access grants (HUB-10): which libraries an account may
 //! see, and so which items it may browse, search, open, fetch artwork
 //! for, download subtitles for, and play.
@@ -248,6 +254,24 @@ pub async fn set_access(
     all_libraries: bool,
     libraries: &[String],
 ) -> Result<SetAccess> {
+    let existing: Vec<String> = sqlx::query_scalar("SELECT id FROM libraries")
+        .fetch_all(db)
+        .await?;
+    let valid: Vec<String> = libraries
+        .iter()
+        .filter(|id| existing.contains(id))
+        .cloned()
+        .collect();
+    write_access(db, user_id, expected, all_libraries, &valid).await
+}
+
+async fn write_access(
+    db: &SqlitePool,
+    user_id: &str,
+    expected: i64,
+    all_libraries: bool,
+    libraries: &[String],
+) -> Result<SetAccess> {
     let mut tx = db.begin().await?;
     let res = sqlx::query(
         "UPDATE users SET all_libraries = ?, grants_version = grants_version + 1
@@ -276,14 +300,11 @@ pub async fn set_access(
         .execute(&mut *tx)
         .await?;
     for library_id in libraries {
-        sqlx::query(
-            "INSERT OR IGNORE INTO user_libraries (user_id, library_id)
-             SELECT ?1, id FROM libraries WHERE id = ?2",
-        )
-        .bind(user_id)
-        .bind(library_id)
-        .execute(&mut *tx)
-        .await?;
+        sqlx::query("INSERT OR IGNORE INTO user_libraries (user_id, library_id) VALUES (?1,?2)")
+            .bind(user_id)
+            .bind(library_id)
+            .execute(&mut *tx)
+            .await?;
     }
     let grants_version: i64 = sqlx::query_scalar("SELECT grants_version FROM users WHERE id = ?")
         .bind(user_id)
@@ -306,4 +327,24 @@ pub async fn set_access(
         grants_version,
         libraries: stored,
     })
+}
+
+/// External mediadb library IDs are validated before entering the hub transaction.
+/// A concurrent library deletion can leave a dangling reference; it grants
+/// nothing, because visibility always requires a current mediadb library.
+pub async fn set_catalogue_access(
+    db: &SqlitePool,
+    store: &kahawai_mediadb::Store,
+    user_id: &str,
+    expected: i64,
+    all_libraries: bool,
+    libraries: &[String],
+) -> Result<SetAccess> {
+    let existing = store.libraries().await?;
+    let valid: Vec<String> = libraries
+        .iter()
+        .filter(|id| existing.iter().any(|l| l.id == **id))
+        .cloned()
+        .collect();
+    write_access(db, user_id, expected, all_libraries, &valid).await
 }

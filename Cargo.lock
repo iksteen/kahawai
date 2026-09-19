@@ -2080,6 +2080,7 @@ dependencies = [
  "jsonwebtoken",
  "kahawai-core",
  "kahawai-media",
+ "kahawai-mediadb",
  "kahawai-mediahost",
  "kahawai-proto",
  "kahawai-sqlite",
@@ -2170,11 +2171,13 @@ dependencies = [
  "prost",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tempfile",
  "tokio",
  "ulid",
  "unicode-normalization",
+ "utoipa",
 ]
 
 [[package]]

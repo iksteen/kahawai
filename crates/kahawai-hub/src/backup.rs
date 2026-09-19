@@ -1,25 +1,25 @@
 //! Online backup and restore (OPS-5).
 //!
 //! A snapshot holds everything needed to rebuild this hub somewhere else:
-//! the database, the PKI material, the downloaded subtitles and the
+//! both databases, the PKI material, the downloaded subtitles and the
 //! configuration. The CA is the reason restore is worth having at all —
 //! with it, existing satellites reconnect on their own certificates and
 //! nobody re-enrols five machines by hand.
 //!
-//! What is deliberately NOT in a snapshot is everything a running hub can
-//! work out again: the artwork cache and the provider caches (AniDB
-//! dumps, the anime-lists mapping, HTTP-API records). Those are 225 MB
-//! here against 12 KB of PKI, and re-fetching them costs time rather than
-//! anything irreplaceable. Subtitles ARE included: they are user-initiated
-//! content, which is also why OPS-6 refuses to evict them.
+//! Filesystem artwork and provider caches remain excluded under OPS-5.
+//! Provider answers and downloaded subtitle payloads held in mediadb travel
+//! with that database. The subtitle file tree is included too, preserving
+//! extracted text, OCR answers and rendered ASS artifacts.
 //!
-//! "Online" is the whole trick. `VACUUM INTO` takes a consistent snapshot
-//! of the database — WAL included — while the hub keeps serving; there is
-//! no window where writes are refused. The file trees are copied
-//! afterwards, so a subtitle downloaded mid-backup may or may not be in
-//! it. That is what a point-in-time snapshot means, and it is why the
-//! manifest records when the database was taken rather than when the
-//! command finished.
+//! Online snapshots include committed journal contents while the hub serves.
+//! Hub and mediadb snapshots are independent, taken sequentially: they are not
+//! one cross-database transaction. Changes between them may not line up exactly.
+//! File trees are copied afterwards; artifacts created during backup may be
+//! absent. `taken_at` records when snapshotting began. For a quiescent snapshot,
+//! stop the hub first. Restore always requires a stopped hub, verifies both
+//! databases before replacing either, and can be rerun if interrupted.
+//! Format 4 requires mediadb; formats 1–3 are hub-only and cannot be restored
+//! over an existing mediadb, even with --force.
 
 use std::collections::BTreeMap;
 use std::io::{Read, Write};
@@ -37,9 +37,12 @@ pub struct Manifest {
     /// the layout changes in a way a restore must know about.
     pub format: u32,
     pub kahawai_version: String,
-    /// When the DATABASE was snapshotted, which is the consistent point.
+    /// When snapshotting began; the two databases are independent snapshots.
     pub taken_at: i64,
     pub db_bytes: u64,
+    /// Present in format 4, which requires both database artifacts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mediadb_bytes: Option<u64>,
     pub subtitle_files: u64,
     pub subtitle_bytes: u64,
     pub has_pki: bool,
@@ -50,7 +53,7 @@ pub struct Manifest {
     /// before it was recorded, which is not the same as "carried none".
     #[serde(default)]
     pub secrets: Vec<String>,
-    /// Every regular file in a format-3 snapshot except this manifest itself.
+    /// Every regular file in a format-3+ snapshot except this manifest itself.
     /// Paths are portable, slash-separated names relative to the snapshot root.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub artifacts: Vec<Artifact>,
@@ -74,7 +77,8 @@ pub const SECRET_FILES: [&str; 3] = [
     crate::api::METRICS_TOKEN_FILE,
 ];
 
-const FORMAT: u32 = 3;
+const FORMAT: u32 = 4;
+const DATABASES: [&str; 2] = ["hub.db", "mediadb.db"];
 const MANIFEST: &str = "kahawai-backup.json";
 
 /// Everything a restore puts back, relative to the data dir. Ordered so
@@ -118,6 +122,7 @@ fn now_unix() -> i64 {
 /// `config` is the loaded config file's path, copied verbatim so a
 /// restored hub keeps its ports, keys and provider settings.
 pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Result<Manifest> {
+    let has_mediadb = data_dir.join("mediadb.db").try_exists()?;
     if dest.exists() {
         bail!(
             "{} already exists — snapshots are never merged",
@@ -157,21 +162,9 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
         .with_context(|| format!("creating {}", dest.display()))?;
     let db_out = dest.join("hub.db");
     let taken_at = now_unix();
-    let snapshot_path = db_out
-        .to_str()
-        .context("snapshot path is not utf-8")?
-        .to_string();
-    pool.write("snapshot database", |connection| {
-        Box::pin(async move {
-            sqlx::query("VACUUM INTO ?")
-                .bind(snapshot_path)
-                .execute(connection)
-                .await?;
-            Ok(())
-        })
-    })
-    .await
-    .context("VACUUM INTO — is the destination on a writable filesystem?")?;
+    kahawai_sqlite::snapshot(&data_dir.join("hub.db"), &db_out)
+        .await
+        .context("snapshotting hub database")?;
     pool.close().await;
     // SQLite gives the new file 0666 & ~umask — 0644 under the usual one —
     // and there is no pragma for it. The directory above already hides it;
@@ -179,6 +172,19 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
     kahawai_core::private::narrow(&db_out).context("restricting the snapshot database")?;
     let db_bytes = std::fs::metadata(&db_out)?.len();
     let mut artifacts = vec![hash_artifact(&db_out, Path::new("hub.db"))?];
+    let mediadb_bytes = if has_mediadb {
+        let output = dest.join("mediadb.db");
+        kahawai_sqlite::snapshot(&data_dir.join("mediadb.db"), &output)
+            .await
+            .context("snapshotting mediadb")?;
+        kahawai_core::private::narrow(&output)?;
+        let artifact = hash_artifact(&output, Path::new("mediadb.db"))?;
+        let bytes = artifact.bytes;
+        artifacts.push(artifact);
+        Some(bytes)
+    } else {
+        None
+    };
 
     let mut subtitle_files = 0;
     let mut subtitle_bytes = 0;
@@ -230,10 +236,11 @@ pub async fn backup(data_dir: &Path, config: Option<&Path>, dest: &Path) -> Resu
     artifacts.sort_by(|a, b| a.path.cmp(&b.path));
 
     let manifest = Manifest {
-        format: FORMAT,
+        format: if has_mediadb { FORMAT } else { 3 },
         kahawai_version: env!("CARGO_PKG_VERSION").to_string(),
         taken_at,
         db_bytes,
+        mediadb_bytes,
         subtitle_files,
         subtitle_bytes,
         has_pki: dest.join("pki").exists(),
@@ -262,8 +269,7 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
         );
     }
 
-    let existing = data_dir.join("hub.db");
-    if existing.exists() && !force {
+    if DATABASES.iter().any(|name| data_dir.join(name).exists()) && !force {
         bail!(
             "{} already holds a database — stop the hub and pass --force to replace it",
             data_dir.display()
@@ -289,6 +295,18 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
         source.join("hub.db").is_file(),
         "the snapshot does not have hub.db"
     );
+    if manifest.format >= 4 {
+        anyhow::ensure!(
+            manifest.mediadb_bytes.is_some_and(|bytes| bytes > 0)
+                && source.join("mediadb.db").is_file(),
+            "a format-4 snapshot must contain mediadb.db"
+        );
+    } else {
+        anyhow::ensure!(
+            !source.join("mediadb.db").exists() && !data_dir.join("mediadb.db").exists(),
+            "a hub-only snapshot cannot restore mediadb; restore it into a fresh data directory"
+        );
+    }
     for name in &manifest.secrets {
         anyhow::ensure!(
             source.join(name).is_file(),
@@ -336,10 +354,25 @@ pub async fn restore(src: &Path, data_dir: &Path, force: bool) -> Result<Manifes
 
     // The WAL and shm belong to the database being replaced. Leaving them
     // would hand sqlite a journal describing a file that no longer exists.
-    for stale in ["hub.db-wal", "hub.db-shm"] {
-        let _ = std::fs::remove_file(data_dir.join(stale));
+    for name in DATABASES {
+        let from = source.join(name);
+        if !from.exists() {
+            continue;
+        }
+        for suffix in ["-wal", "-shm"] {
+            let stale = data_dir.join(format!("{name}{suffix}"));
+            match std::fs::remove_file(&stale) {
+                Ok(()) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return Err(error).with_context(|| format!("removing {}", stale.display()));
+                }
+            }
+        }
+        let to = data_dir.join(name);
+        std::fs::copy(from, &to).with_context(|| format!("restoring {name}"))?;
+        kahawai_core::private::narrow(&to).with_context(|| format!("restricting {name}"))?;
     }
-    std::fs::copy(source.join("hub.db"), &existing).context("restoring the database")?;
     for tree in TREES {
         let from = source.join(tree);
         if from.exists() {

@@ -7,7 +7,9 @@ use kahawai_hub::pace;
 #[tokio::test]
 async fn folds_persist_across_restart_and_die_with_the_satellite() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let class = pace::work_class(2160, "hevc", "h264", true);
 
     // First sample IS the estimate — nothing to blend against.

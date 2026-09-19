@@ -1,33 +1,44 @@
-//! Open/migrate a hub database and check library invariants without contacting
-//! satellites or metadata providers. Use a database copy for upgrade rehearsals.
-use anyhow::{Context, Result};
+//! Open/migrate a mediadb copy and read every library through the current Store.
+//! Hub users and watch state are deliberately outside this catalogue audit.
+use anyhow::{Context, Result, ensure};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let directory = std::env::args_os()
         .nth(1)
-        .context("usage: library_audit DATA_DIRECTORY")?;
+        .context("usage: library_audit DATA_DIRECTORY (containing mediadb.db)")?;
     let started = std::time::Instant::now();
-    let db = kahawai_hub::db::open(std::path::Path::new(&directory)).await?;
-    let elapsed = started.elapsed().as_secs_f64();
-    let pending: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM library_pending")
-        .fetch_one(&db)
-        .await?;
-    let unassigned:i64=sqlx::query_scalar("SELECT COUNT(*) FROM collection_items i WHERE NOT EXISTS(SELECT 1 FROM collection_item_library_items a WHERE a.collection_item_id=i.id)").fetch_one(&db).await?;
-    let incompatible:i64=sqlx::query_scalar("SELECT COUNT(*) FROM collection_item_library_items a JOIN collection_items i ON i.id=a.collection_item_id JOIN library_items c ON c.id=a.library_item_id WHERE c.merged_into IS NOT NULL OR c.kind<>CASE i.kind WHEN 'show' THEN 'series' WHEN 'track' THEN 'song' ELSE i.kind END").fetch_one(&db).await?;
-    let kinds: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT kind,COUNT(*) FROM library_items WHERE merged_into IS NULL GROUP BY kind",
-    )
-    .fetch_all(&db)
-    .await?;
-    anyhow::ensure!(
-        pending == 0 && unassigned == 0 && incompatible == 0,
-        "library invariant failure: pending={pending}, unassigned={unassigned}, incompatible={incompatible}"
-    );
+    let store =
+        kahawai_mediadb::Store::open(&std::path::Path::new(&directory).join("mediadb.db")).await?;
+    let open_seconds = started.elapsed().as_secs_f64();
+    let mut libraries = Vec::new();
+    for library in store.libraries().await? {
+        let mut offset = 0;
+        loop {
+            let (items, total) = store
+                .browse_page(&library.id, offset, 200, "", "title", None)
+                .await?;
+            ensure!(
+                items.iter().all(|item| !item.copy_ids.is_empty()),
+                "active item without copies in {}",
+                library.id
+            );
+            offset += items.len() as u32;
+            if i64::from(offset) >= total {
+                break;
+            }
+            ensure!(
+                !items.is_empty(),
+                "empty page before library total in {}",
+                library.id
+            );
+        }
+        libraries.push(serde_json::json!({"id":library.id,"name":library.name,"items":offset}));
+    }
     println!(
         "{}",
-        serde_json::json!({"open_seconds":elapsed,"kinds":kinds,"pending":pending,"unassigned":unassigned,"incompatible":incompatible})
+        serde_json::json!({"open_seconds":open_seconds,"libraries":libraries})
     );
-    db.close().await;
+    store.close().await;
     Ok(())
 }

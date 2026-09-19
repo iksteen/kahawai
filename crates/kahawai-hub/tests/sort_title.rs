@@ -62,7 +62,9 @@ async fn item(db: &SqlitePool, id: &str, title: &str) {
 #[tokio::test]
 async fn sort_title_never_drifts() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
 
     // A new item sorts by its own title.
     item(&db, "i1", "12 Monkeys").await;
@@ -184,7 +186,9 @@ async fn sort_title_never_drifts() {
 #[tokio::test]
 async fn an_episodes_sort_title_follows_the_shows_assignment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "show1", "A Show").await;
     sqlx::query("UPDATE collection_items SET kind='show' WHERE id='show1'")
         .execute(&db)
@@ -270,7 +274,9 @@ async fn an_episodes_sort_title_follows_the_shows_assignment() {
 #[tokio::test]
 async fn a_full_enrichment_leaves_nothing_stale() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     for n in 0..200 {
         item(&db, &format!("i{n}"), &format!("File {n}")).await;
     }
@@ -448,7 +454,9 @@ async fn library_browse_counts_only_top_level_collection_items() {
 #[tokio::test]
 async fn moving_a_row_between_items_leaves_nothing_stale() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "a", "Item A").await;
     item(&db, "b", "Item B").await;
     kahawai_hub::providers::store_answer(
@@ -482,7 +490,9 @@ async fn moving_a_row_between_items_leaves_nothing_stale() {
 #[tokio::test]
 async fn reordering_providers_moves_the_sort_key() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1", "some.file.2019").await;
 
     // Two equally strong answers with different titles. Default order
@@ -546,7 +556,9 @@ async fn reordering_providers_moves_the_sort_key() {
 #[tokio::test]
 async fn a_titleless_match_sorts_by_filename_while_showing_a_borrowed_title() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1", "zzz.filename").await;
 
     // The assigned record identifies the item but names nothing.

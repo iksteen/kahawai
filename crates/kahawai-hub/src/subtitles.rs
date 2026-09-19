@@ -15,6 +15,8 @@
 //! Without it the idle sweep re-asked on every hub run — one file was
 //! re-requested for days — and each ask costs a walk on the mediahost.
 
+pub(crate) mod catalogue;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -102,20 +104,20 @@ enum OcrGeneration {
 /// that host is a state change, so only those entries become eligible again.
 #[cfg(feature = "ocr")]
 #[derive(Default)]
-struct OcrSweepFailures(std::collections::HashMap<i64, Option<String>>);
+struct OcrSweepFailures(std::collections::HashMap<String, Option<String>>);
 
 #[cfg(feature = "ocr")]
 impl OcrSweepFailures {
-    fn contains(&self, track_id: i64) -> bool {
-        self.0.contains_key(&track_id)
+    fn contains(&self, track_id: impl ToString) -> bool {
+        self.0.contains_key(&track_id.to_string())
     }
 
-    fn remember_permanent(&mut self, track_id: i64) {
-        self.0.insert(track_id, None);
+    fn remember_permanent(&mut self, track_id: impl ToString) {
+        self.0.insert(track_id.to_string(), None);
     }
 
-    fn remember_until_reconnect(&mut self, track_id: i64, module_id: String) {
-        self.0.insert(track_id, Some(module_id));
+    fn remember_until_reconnect(&mut self, track_id: impl ToString, module_id: String) {
+        self.0.insert(track_id.to_string(), Some(module_id));
     }
 
     fn host_reconnected(&mut self, module_id: &str) {
@@ -144,28 +146,24 @@ enum OcrSweepWake {
 /// needs. Generous next to the measured ~3.5 s an episode takes, and
 /// bounded for the same reason the burn path's wait is: a tier that is
 /// not ready is a tier to skip, not one to stall on.
-const RASTER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
+pub(crate) const RASTER_WAIT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Cache key for one subtitle track of one source file — shared by the
-/// lazy extractors and the mediahost ingestion path.
-fn legacy_cache_key(module_id: &str, collection_id: &str, path_rel: &str, key: &str) -> String {
-    format!(
-        "v2-{:016x}-{key}",
-        xxhash_rust::xxh3::xxh3_64(format!("{module_id}\n{collection_id}\n{path_rel}").as_bytes())
-    )
-}
-
+/// lazy extractors and the mediahost ingestion path. Revision-less v2 entries
+/// remain on disk but cannot be promoted: their source bytes are unverifiable.
 fn cache_key(
     module_id: &str,
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
     key: &str,
+    revision: &str,
 ) -> String {
     format!(
-        "v2-{:016x}-{key}",
+        "v3-{:016x}-{key}",
         xxhash_rust::xxh3::xxh3_64(
-            format!("{module_id}\n{collection_id}\n{root_token}\n{path_rel}").as_bytes()
+            format!("{module_id}\n{collection_id}\n{root_token}\n{path_rel}\n{revision}")
+                .as_bytes()
         )
     )
 }
@@ -208,6 +206,7 @@ impl std::fmt::Display for NoSuchItem {
 impl std::error::Error for NoSuchItem {}
 
 pub struct Subtitles {
+    provider: Option<Arc<dyn crate::opensubtitles::SubtitleProvider>>,
     dir: PathBuf,
     /// HUB-21 deployment config (kahawai.toml); wins over settings.
     provider_cfg: crate::opensubtitles::ProviderConfig,
@@ -219,13 +218,34 @@ pub struct Subtitles {
 }
 
 impl Subtitles {
+    pub(crate) fn cache_dir(&self) -> &std::path::Path {
+        &self.dir
+    }
     pub fn new(dir: PathBuf) -> Self {
         Self {
             dir,
+            provider: None,
             provider_cfg: Default::default(),
             inflight: Default::default(),
             http: Arc::new(crate::gate::Http::new().expect("http client")),
         }
+    }
+
+    /// Inject a provider implementation, including deterministic integration fixtures.
+    pub fn with_provider(
+        mut self,
+        provider: Arc<dyn crate::opensubtitles::SubtitleProvider>,
+    ) -> Self {
+        self.provider = Some(provider);
+        self
+    }
+    pub(crate) fn download_lock(&self, key: String) -> Arc<tokio::sync::Mutex<()>> {
+        self.inflight
+            .lock()
+            .unwrap()
+            .entry(format!("download:{key}"))
+            .or_default()
+            .clone()
     }
 
     /// Attach deployment-level provider config. Without it (tests, and
@@ -238,11 +258,14 @@ impl Subtitles {
     /// Build the external subtitle provider (HUB-21). The application
     /// key comes from config, else the admin page, else the key we
     /// ship; the optional account always comes from the admin page.
-    async fn external_provider(
+    pub(crate) async fn external_provider(
         &self,
         registry: &Registry,
         user_id: &str,
-    ) -> Result<Box<dyn crate::opensubtitles::SubtitleProvider>> {
+    ) -> Result<Arc<dyn crate::opensubtitles::SubtitleProvider>> {
+        if let Some(provider) = &self.provider {
+            return Ok(provider.clone());
+        }
         // The application key is ours, overridable only by the config
         // file. The feature is always available.
         let key = if self.provider_cfg.api_key.is_empty() {
@@ -268,7 +291,7 @@ impl Subtitles {
         };
         let user = account.remove(crate::opensubtitles::USERNAME);
         let pass = account.remove(crate::opensubtitles::PASSWORD);
-        Ok(Box::new(crate::opensubtitles::OpenSubtitles::new(
+        Ok(Arc::new(crate::opensubtitles::OpenSubtitles::new(
             self.http.clone(),
             key,
             user,
@@ -410,6 +433,11 @@ impl Subtitles {
         sessions: &Sessions,
         track: &crate::tracks::Track,
     ) -> Result<AssBody> {
+        if let Some(body) = &track.acquired {
+            return Ok(AssBody::Full(
+                body.ass.clone().context("subtitle has no ASS form")?,
+            ));
+        }
         let internal_key = track.internal_key();
         let key = internal_key.as_str();
         // Downloaded/OCR ASS serves from the stored body — a hole in
@@ -425,6 +453,8 @@ impl Subtitles {
             path_rel,
             size,
             info,
+            revision,
+            ..
         } = track_source(registry, track).await?;
         let entry = entries(&info)
             .into_iter()
@@ -442,25 +472,20 @@ impl Subtitles {
         };
         let idx: usize = n.parse().context("bad embedded key")?;
 
-        let cache_key = cache_key(&module_id, &collection_id, &root_token, &path_rel, key);
+        let cache_key = cache_key(
+            &module_id,
+            &collection_id,
+            &root_token,
+            &path_rel,
+            key,
+            &revision,
+        );
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
         };
         let guard = lock.lock_owned().await;
         let cache_path = self.dir.join(format!("{cache_key}.json"));
-        let legacy_path = self.dir.join(format!(
-            "{}.json",
-            legacy_cache_key(&module_id, &collection_id, &path_rel, key)
-        ));
-        if registry
-            .collection_root_count(&module_id, &collection_id)
-            .await
-            .unwrap_or(0)
-            == 1
-        {
-            let _ = promote_legacy_cache(&cache_path, &legacy_path);
-        }
         if let Ok(bytes) = std::fs::read(&cache_path) {
             let ex: Extracted = serde_json::from_slice(&bytes)?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
@@ -474,6 +499,7 @@ impl Subtitles {
                 &root_token,
                 &path_rel,
                 key,
+                &revision,
             )
             .await
         {
@@ -532,6 +558,7 @@ impl Subtitles {
                             &root_token,
                             &path_rel,
                             &format!("e{i}"),
+                            &revision,
                             ex,
                         ) {
                             tracing::warn!(error = format!("{e:#}"), "subtitle cache write failed");
@@ -556,6 +583,9 @@ impl Subtitles {
         sessions: &Sessions,
         track: &crate::tracks::Track,
     ) -> Result<Extracted> {
+        if let Some(body) = &track.acquired {
+            return Ok((**body).clone());
+        }
         let internal_key = track.internal_key();
         let key = internal_key.as_str();
         // HUB-24: downloaded subtitles live in the cache keyed by their
@@ -574,14 +604,28 @@ impl Subtitles {
             path_rel,
             size,
             info,
+            revision,
+            sidecar_revision,
         } = track_source(registry, track).await?;
         entries(&info)
             .into_iter()
             .find(|e| e.key == key)
             .with_context(|| format!("no subtitle {key} on this item"))?;
 
-        // v2: the cache holds cues + optional faithful ASS.
-        let cache_key = cache_key(&module_id, &collection_id, &root_token, &path_rel, key);
+        // Cache parsed cues and the optional faithful ASS script.
+        let revision = if key.starts_with('s') {
+            sidecar_revision
+        } else {
+            revision
+        };
+        let cache_key = cache_key(
+            &module_id,
+            &collection_id,
+            &root_token,
+            &path_rel,
+            key,
+            &revision,
+        );
         let lock = {
             let mut map = self.inflight.lock().unwrap();
             map.entry(cache_key.clone()).or_default().clone()
@@ -589,18 +633,6 @@ impl Subtitles {
         let _guard = lock.lock().await;
 
         let cache_path = self.dir.join(format!("{cache_key}.json"));
-        let legacy_path = self.dir.join(format!(
-            "{}.json",
-            legacy_cache_key(&module_id, &collection_id, &path_rel, key)
-        ));
-        if registry
-            .collection_root_count(&module_id, &collection_id)
-            .await
-            .unwrap_or(0)
-            == 1
-        {
-            let _ = promote_legacy_cache(&cache_path, &legacy_path);
-        }
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(serde_json::from_slice(&bytes)?);
         }
@@ -635,6 +667,7 @@ impl Subtitles {
                     &root_token,
                     &path_rel,
                     key,
+                    &revision,
                 )
                 .await
             {
@@ -674,6 +707,7 @@ impl Subtitles {
                     &root_token,
                     &path_rel,
                     &format!("e{i}"),
+                    &revision,
                     &ex,
                 )?;
             }
@@ -1113,12 +1147,7 @@ impl Subtitles {
         registry: &Registry,
         parent: &crate::tracks::Track,
     ) -> Result<(u32, u32, (u32, u32))> {
-        let source_id = parent.source_id.context("track has no physical source")?;
-        let streams: String = sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
-            .bind(source_id)
-            .fetch_one(registry.db())
-            .await?;
-        let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
+        let info = track_source(registry, parent).await?.info;
         let v = info.video.first().context("source has no video track")?;
         anyhow::ensure!(v.width > 0 && v.height > 0, "source video has no size");
         // Unknown frame rate: 24000/1001 is the anime default and the
@@ -1168,13 +1197,7 @@ impl Subtitles {
                 track.language.clone(),
             )),
             "sidecar" => {
-                let source_id = track.source_id.context("track has no physical source")?;
-                let streams: String =
-                    sqlx::query_scalar("SELECT streams_json FROM files WHERE id=?")
-                        .bind(source_id)
-                        .fetch_one(registry.db())
-                        .await?;
-                let info: kahawai_core::media::MediaInfo = serde_json::from_str(&streams)?;
+                let info = track_source(registry, track).await?.info;
                 let ext = info
                     .external_subtitles
                     .get(idx)
@@ -1190,115 +1213,6 @@ impl Subtitles {
             }
             other => bail!("cannot OCR a track of origin {other}"),
         }
-    }
-
-    #[cfg(feature = "ocr")]
-    async fn ocr_generate_within(
-        &self,
-        registry: &Registry,
-        parent_id: i64,
-        user_id: &str,
-        sets_wait: std::time::Duration,
-    ) -> Result<OcrGeneration> {
-        // One generation per parent at a time: the idle sweep and the
-        // button race here, and losing the race means the work is
-        // already done — return the winner's row instead of redoing it.
-        let lock = {
-            let mut map = self.inflight.lock().unwrap();
-            map.entry(format!("ocr:{parent_id}")).or_default().clone()
-        };
-        let _guard = lock.lock_owned().await;
-        if sqlx::query_scalar::<_, i64>(
-            "SELECT id FROM subtitle_tracks WHERE derived_from = ? AND origin = 'ocr'",
-        )
-        .bind(parent_id)
-        .fetch_optional(registry.db())
-        .await?
-        .is_some()
-        {
-            return Ok(OcrGeneration::Generated);
-        }
-        let parent = crate::tracks::get_internal(registry.db(), parent_id)
-            .await?
-            .with_context(|| format!("no subtitle track {parent_id}"))?;
-        let (module_id, collection_id, root_token, extract_rel, extract_idx, language) =
-            self.extract_ref(registry, &parent).await?;
-        let model = crate::ocr::model_for(language.as_deref()).with_context(|| {
-            format!(
-                "no Tesseract model for language {:?} — install its traineddata",
-                language.as_deref().unwrap_or("(untagged)")
-            )
-        })?;
-        // The display sets: cached from any earlier burn/overlay use, or
-        // walked by the mediahost now. A viewer may be waiting (the
-        // urgent case), so the wait is bounded like the burn path's.
-        let sets = match self
-            .image_sets_state(
-                registry,
-                &module_id,
-                &collection_id,
-                &root_token,
-                &extract_rel,
-                extract_idx,
-                sets_wait,
-            )
-            .await
-        {
-            ImageSetsState::Ready(path) => path,
-            ImageSetsState::RetryOnReconnect => {
-                return Ok(OcrGeneration::RetryOnReconnect { module_id });
-            }
-            ImageSetsState::Unavailable => {
-                anyhow::bail!("display sets unavailable (unindexed or unreadable track)");
-            }
-        };
-        let cues = tokio::task::spawn_blocking({
-            let sets = sets.clone();
-            let model = model.clone();
-            move || crate::ocr::ocr_sets_file(&sets, &model)
-        })
-        .await??;
-        if cues.is_empty() {
-            // An ANSWER, remembered: a signs-only or decorative track OCRs
-            // to nothing every time, and treating that as a failure made
-            // the idle sweep re-fetch the sets and re-run Tesseract on
-            // every hub start. CASCADE on the parent row re-asks when the
-            // source is replaced.
-            sqlx::query(
-                "INSERT INTO ocr_no_text (track_id, model, at)
-                 VALUES (?, ?, unixepoch())
-                 ON CONFLICT(track_id) DO UPDATE SET model = excluded.model,
-                                                     at = excluded.at",
-            )
-            .bind(parent_id)
-            .bind(&model)
-            .execute(registry.db())
-            .await?;
-            tracing::info!(item = %parent.item_id, parent = parent_id, %model,
-                "image subtitle OCRed to nothing; recorded so it is not asked again");
-            return Ok(OcrGeneration::NoText);
-        }
-        let n_cues = cues.len();
-        let ex = Extracted { cues, ass: None };
-
-        let id: i64 = sqlx::query_scalar(
-            "INSERT INTO subtitle_tracks
-               (item_id,source_id,origin,format,language,label,provider,machine,
-                created_by,derived_from)
-             SELECT item_id,source_id,'ocr','srt',?,?,'ocr',1,?,id
-               FROM subtitle_tracks WHERE id=? RETURNING id",
-        )
-        .bind(&language)
-        .bind(&model)
-        .bind(user_id)
-        .bind(parent_id)
-        .fetch_one(registry.db())
-        .await?;
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(self.downloaded_path(id), serde_json::to_vec(&ex)?)?;
-        tracing::info!(item = %parent.item_id, parent = parent_id, track = id,
-            %model, cues = n_cues, "image subtitle OCRed to text");
-        Ok(OcrGeneration::Generated)
     }
 
     #[cfg(feature = "ocr")]
@@ -1380,13 +1294,11 @@ impl Subtitles {
         retry_earlier_candidates
     }
 
-    /// HUB-32c idle sweep: OCR every image subtitle track in the library
-    /// that lacks a text row, one at a time, only while nothing is
-    /// playing. The cost model that makes this defensible: the sets
-    /// extraction is a sparse index walk on the mediahost (kilobytes,
-    /// idle-tier there) and ~15 s of hub CPU per track, once ever —
-    /// peanuts next to the ED2K pass that reads every byte of every
-    /// file. The per-track button stays as the urgent path.
+    /// HUB-32c idle sweep: OCR each physical image subtitle in mediadb
+    /// that lacks a cached answer, one at a time, only while nothing is
+    /// playing. Retaining the answer avoids repeating extraction and OCR
+    /// or making playback wait for them. Reconnects retry only work
+    /// blocked on that mediahost.
     #[cfg(feature = "ocr")]
     pub fn spawn_ocr_sweep(
         self: &Arc<Self>,
@@ -1405,29 +1317,28 @@ impl Subtitles {
             let mut failed = OcrSweepFailures::default();
             loop {
                 Self::drain_ocr_reconnects(&registry, &mut events, &mut failed);
-                let candidates = subs.ocr_candidates(&registry).await;
+                let candidates = match subs.catalogue_ocr_candidates(&registry).await {
+                    Ok(tracks) => tracks,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not read OCR work from mediadb");
+                        vec![]
+                    }
+                };
                 let mut generated = 0usize;
                 let mut retry_earlier_candidates = false;
-                for id in candidates {
+                for track in candidates {
+                    let id = track.artifact_key.clone().expect("catalogue OCR identity");
                     if Self::drain_ocr_reconnects(&registry, &mut events, &mut failed) {
                         retry_earlier_candidates = true;
                         break;
                     }
-                    if failed.contains(id) {
+                    if failed.contains(&id) {
                         continue;
                     }
                     // Idle means idle: playback outranks the sweep.
                     while !sessions.list().is_empty() {
                         tokio::time::sleep(std::time::Duration::from_secs(60)).await;
                     }
-                    // The row may have vanished under a rescan since the
-                    // candidate query ran; only try where the model and
-                    // the mediahost exist.
-                    let Ok(Some(track)) = crate::tracks::get_internal(registry.db(), id).await
-                    else {
-                        failed.remember_permanent(id);
-                        continue;
-                    };
                     let Ok((
                         module_id,
                         collection_id,
@@ -1437,7 +1348,7 @@ impl Subtitles {
                         language,
                     )) = subs.extract_ref(&registry, &track).await
                     else {
-                        failed.remember_permanent(id);
+                        failed.remember_permanent(&id);
                         continue;
                     };
                     if !registry.is_connected(&module_id) {
@@ -1457,16 +1368,14 @@ impl Subtitles {
                                 &root_token,
                                 &extract_rel,
                                 extract_idx,
+                                track.source_revision().expect("captured source"),
                                 SETS_WAIT_IDLE,
                             )
                             .await;
-                        failed.remember_permanent(id);
+                        failed.remember_permanent(&id);
                         continue;
                     }
-                    match subs
-                        .ocr_generate_within(&registry, id, "idle-sweep", SETS_WAIT_IDLE)
-                        .await
-                    {
+                    match subs.catalogue_ocr(&registry, &track).await {
                         Ok(OcrGeneration::Generated) => generated += 1,
                         // No text is an answer and it is now recorded;
                         // the next candidates query no longer offers it.
@@ -1474,12 +1383,12 @@ impl Subtitles {
                         Ok(OcrGeneration::RetryOnReconnect { module_id }) => {
                             tracing::info!(track = id, item = %track.item_id, %module_id,
                                 "idle OCR paused until mediahost reconnects");
-                            failed.remember_until_reconnect(id, module_id);
+                            failed.remember_until_reconnect(&id, module_id);
                         }
                         Err(e) => {
                             tracing::warn!(track = id, item = %track.item_id,
                                 error = format!("{e:#}"), "idle OCR failed; skipping this run");
-                            failed.remember_permanent(id);
+                            failed.remember_permanent(&id);
                         }
                     }
                     tokio::time::sleep(std::time::Duration::from_secs(10)).await;
@@ -1506,28 +1415,6 @@ impl Subtitles {
                 }
             }
         });
-    }
-
-    /// Image subtitle tracks with no OCR text row derived from them
-    /// yet — the sweep's work list, ordered so one item finishes before
-    /// the next begins.
-    #[cfg(feature = "ocr")]
-    async fn ocr_candidates(&self, registry: &Registry) -> Vec<i64> {
-        sqlx::query_scalar(
-            "SELECT t.id FROM subtitle_tracks t JOIN files f ON f.id=t.source_id
-             WHERE t.origin IN ('embedded','sidecar')
-               AND t.format IN ('pgs', 'vobsub', 'dvdsub')
-               AND NOT EXISTS (
-                     SELECT 1 FROM subtitle_tracks d
-                     WHERE d.derived_from = t.id AND d.origin = 'ocr')
-               AND NOT EXISTS (
-                     SELECT 1 FROM ocr_no_text n WHERE n.track_id = t.id)
-             ORDER BY COALESCE((SELECT MIN(fb.item_id) FROM file_bindings fb
-                                 WHERE fb.file_id=f.id),''), t.id",
-        )
-        .fetch_all(registry.db())
-        .await
-        .unwrap_or_default()
     }
 
     /// Remove a DOWNLOADED track — the only hub-stored origin anyone
@@ -1572,6 +1459,7 @@ impl Subtitles {
     }
 
     /// Ingest a mediahost-extracted track into the cache (ladder step 2).
+    #[allow(clippy::too_many_arguments)] // exact source, stream and revision plus payload
     pub fn store_extracted(
         &self,
         module_id: &str,
@@ -1579,12 +1467,23 @@ impl Subtitles {
         root_token: &str,
         path_rel: &str,
         key: &str,
+        revision: &str,
         ex: &Extracted,
     ) -> Result<()> {
+        if revision.is_empty() {
+            return Ok(());
+        }
         std::fs::create_dir_all(&self.dir)?;
         let path = self.dir.join(format!(
             "{}.json",
-            cache_key(module_id, collection_id, root_token, path_rel, key)
+            cache_key(
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                key,
+                revision
+            )
         ));
         std::fs::write(&path, serde_json::to_vec(ex)?)?;
         Ok(())
@@ -1683,6 +1582,7 @@ impl Subtitles {
         root_token: &str,
         path_rel: &str,
         sub_index: usize,
+        revision: &str,
         wait: std::time::Duration,
     ) -> Option<std::path::PathBuf> {
         match self
@@ -1693,6 +1593,7 @@ impl Subtitles {
                 root_token,
                 path_rel,
                 sub_index,
+                revision,
                 wait,
             )
             .await
@@ -1711,25 +1612,21 @@ impl Subtitles {
         root_token: &str,
         path_rel: &str,
         sub_index: usize,
+        revision: &str,
         wait: std::time::Duration,
     ) -> ImageSetsState {
         let key = format!("i{sub_index}");
         let cache_path = self.dir.join(format!(
             "{}.sets",
-            cache_key(module_id, collection_id, root_token, path_rel, &key)
+            cache_key(
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                &key,
+                revision
+            )
         ));
-        let legacy_path = self.dir.join(format!(
-            "{}.sets",
-            legacy_cache_key(module_id, collection_id, path_rel, &key)
-        ));
-        if registry
-            .collection_root_count(module_id, collection_id)
-            .await
-            .unwrap_or(0)
-            == 1
-        {
-            let _ = promote_legacy_cache(&cache_path, &legacy_path);
-        }
         if tokio::fs::metadata(&cache_path).await.is_ok() {
             return ImageSetsState::Ready(cache_path);
         }
@@ -1762,12 +1659,16 @@ impl Subtitles {
                         path_rel: path_rel.to_string(),
                     }),
                     sub_index: sub_index as u32,
+                    source_revision: revision.into(),
                 },
             )),
         };
         let Some(link) = registry.host_link(module_id) else {
             return ImageSetsState::RetryOnReconnect;
         };
+        if !link.supports_revisioned_subtitles() {
+            return ImageSetsState::Unavailable;
+        }
         let link_generation = link.generation();
         if link.send(msg).await.is_err() {
             return ImageSetsState::RetryOnReconnect;
@@ -1797,6 +1698,9 @@ impl Subtitles {
         module_id: &str,
         msg: &kahawai_proto::v1::ImageSubtitles,
     ) -> Result<()> {
+        if msg.source_revision.is_empty() {
+            return Ok(());
+        }
         let key = format!("i{}", msg.sub_index);
         let source = msg
             .source
@@ -1809,7 +1713,8 @@ impl Subtitles {
                 &msg.collection_id,
                 &source.root_token,
                 &source.path_rel,
-                &key
+                &key,
+                &msg.source_revision,
             )
         ));
         let blocks: Vec<(u64, Option<u64>, Vec<u8>)> = msg
@@ -1835,6 +1740,7 @@ impl Subtitles {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)] // exact source, stream and captured revision
     async fn request_extraction(
         &self,
         registry: &Registry,
@@ -1843,13 +1749,16 @@ impl Subtitles {
         root_token: &str,
         path_rel: &str,
         key: &str,
+        revision: &str,
     ) -> Option<Extracted> {
-        if !registry.is_connected(module_id) {
+        let link = registry.host_link(module_id)?;
+        if !link.supports_revisioned_subtitles() {
             return None;
         }
         let msg = kahawai_proto::v1::HubToHost {
             msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractSubs(
                 kahawai_proto::v1::ExtractSubs {
+                    source_revision: revision.into(),
                     collection_id: collection_id.to_string(),
                     source: Some(kahawai_proto::v1::SourcePath {
                         root_token: root_token.to_string(),
@@ -1858,12 +1767,20 @@ impl Subtitles {
                 },
             )),
         };
-        registry.send_to_host(module_id, msg).await.ok()?;
+        let generation = link.generation();
+        link.send(msg).await.ok()?;
         tracing::info!(collection = %collection_id, path = %path_rel,
             "urgent subtitle extraction requested from mediahost");
         let cache_path = self.dir.join(format!(
             "{}.json",
-            cache_key(module_id, collection_id, root_token, path_rel, key)
+            cache_key(
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                key,
+                revision
+            )
         ));
         // The mediahost is never slower than dragging the file over the
         // lease ourselves — wait while its link is alive (10 min sanity
@@ -1873,7 +1790,7 @@ impl Subtitles {
             if let Ok(bytes) = tokio::fs::read(&cache_path).await {
                 return serde_json::from_slice(&bytes).ok();
             }
-            if !registry.is_connected(module_id) {
+            if !registry.host_link_is_current(module_id, generation) {
                 tracing::warn!(path = %path_rel, "mediahost gone mid-extraction; falling back to lease");
                 return None;
             }
@@ -1892,6 +1809,20 @@ impl Subtitles {
         item_id: &str,
         source_id: Option<i64>,
     ) -> Result<Vec<(String, Vec<u8>)>> {
+        self.fonts_for_source(
+            registry,
+            sessions,
+            font_source(registry, item_id, source_id).await?,
+        )
+        .await
+    }
+
+    pub async fn fonts_for_source(
+        &self,
+        registry: &Registry,
+        sessions: &Sessions,
+        source: FileSource,
+    ) -> Result<Vec<(String, Vec<u8>)>> {
         let FileSource {
             module_id,
             collection_id,
@@ -1899,7 +1830,8 @@ impl Subtitles {
             path_rel,
             size,
             info,
-        } = font_source(registry, item_id, source_id).await?;
+            ..
+        } = source;
         let cache_key = format!(
             "fonts-{:016x}",
             xxhash_rust::xxh3::xxh3_64(
@@ -1972,7 +1904,7 @@ impl Subtitles {
                         out.push((a.file_name, buf));
                     }
                     tracing::info!(
-                        item = item_id,
+                        source = path_rel,
                         fonts = out.len(),
                         "fonts read from declared ranges"
                     );
@@ -2110,21 +2042,27 @@ fn entries(info: &kahawai_core::media::MediaInfo) -> Vec<SubtitleEntry> {
 /// Metadata and byte reads must use the physical file named by the track.
 /// A stream index such as e0 is only meaningful within that file; selecting a
 /// collection's default source here substitutes another release's timestamps.
-struct FileSource {
-    module_id: String,
-    collection_id: String,
-    root_token: String,
-    path_rel: String,
-    size: u64,
-    info: kahawai_core::media::MediaInfo,
+#[derive(Debug, Clone)]
+pub struct FileSource {
+    pub module_id: String,
+    pub collection_id: String,
+    pub root_token: String,
+    pub path_rel: String,
+    pub size: u64,
+    pub revision: String,
+    pub sidecar_revision: String,
+    pub info: kahawai_core::media::MediaInfo,
 }
 
 async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Result<FileSource> {
+    if let Some(physical) = &track.physical {
+        return Ok(physical.clone());
+    }
     let source_id = track
         .source_id
         .context("subtitle track has no physical source")?;
     let row = sqlx::query(
-        "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,f.size,f.streams_json
+        "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel,f.size,f.streams_json,f.revision
         FROM files f JOIN collection_roots r ON r.id=f.root_id WHERE f.id=?",
     )
     .bind(source_id)
@@ -2136,6 +2074,8 @@ async fn track_source(registry: &Registry, track: &crate::tracks::Track) -> Resu
         root_token: row.get("root_token"),
         path_rel: row.get("path_rel"),
         size: row.get::<i64, _>("size") as u64,
+        revision: row.get::<i64, _>("revision").to_string(),
+        sidecar_revision: row.get::<i64, _>("revision").to_string(),
         info: serde_json::from_str(row.get::<String, _>("streams_json").as_str())?,
     })
 }
@@ -2149,7 +2089,7 @@ async fn font_source(
 ) -> Result<FileSource> {
     let rows = sqlx::query(
         "SELECT f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                f.size,f.streams_json
+                f.size,f.streams_json,f.revision
          FROM playable_sources ps JOIN playable_source_parts p ON p.playable_source_id=ps.id
          JOIN files f ON f.id=p.file_id JOIN collection_roots r ON r.id=f.root_id
          WHERE ps.item_id=?1 AND (?2 IS NULL OR ps.id=?2)
@@ -2172,6 +2112,8 @@ async fn font_source(
         root_token: row.get("root_token"),
         path_rel: row.get("source_path"),
         size: row.get::<i64, _>("size") as u64,
+        revision: row.get::<i64, _>("revision").to_string(),
+        sidecar_revision: row.get::<i64, _>("revision").to_string(),
         info,
     })
 }
@@ -2200,7 +2142,6 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 
 #[cfg(all(test, feature = "ocr"))]
 mod ocr_memory_tests {
-    use std::sync::Arc;
 
     #[test]
     fn reconnect_releases_only_failures_owned_by_that_mediahost() {
@@ -2222,7 +2163,11 @@ mod ocr_memory_tests {
     #[tokio::test]
     async fn mediahost_reconnect_wakes_the_ocr_sweep() {
         let db = crate::db::open_in_memory().await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let mut events = registry.subscribe_events();
         registry.connected("tc", "transcoder", "encoder", "fp-tc", "test");
         registry.connected("mh", "mediahost", "storage", "fp-mh", "test");
@@ -2244,7 +2189,11 @@ mod ocr_memory_tests {
     #[tokio::test]
     async fn stale_connected_state_with_no_link_is_retryable() {
         let db = crate::db::open_in_memory().await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         registry.connected("mh", "mediahost", "storage", "fp", "test");
         let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
 
@@ -2256,6 +2205,7 @@ mod ocr_memory_tests {
                 "root",
                 "episode.mkv",
                 0,
+                "revision",
                 std::time::Duration::from_secs(1),
             )
             .await;
@@ -2266,7 +2216,11 @@ mod ocr_memory_tests {
     #[tokio::test]
     async fn replacing_the_extraction_link_makes_the_wait_retryable() {
         let db = crate::db::open_in_memory().await.unwrap();
-        let registry = crate::registry::Registry::new(db, Default::default());
+        let registry = crate::registry::Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link("mh", old_tx, kahawai_proto::PROTOCOL_MINOR, 0);
         registry.connected("mh", "mediahost", "storage", "fp", "test");
@@ -2278,6 +2232,7 @@ mod ocr_memory_tests {
             "root",
             "episode.mkv",
             0,
+            "revision",
             std::time::Duration::from_secs(2),
         );
         tokio::pin!(wait);
@@ -2294,46 +2249,6 @@ mod ocr_memory_tests {
             wait.await,
             super::ImageSetsState::RetryOnReconnect
         ));
-    }
-
-    /// "OCR produced no text" is an answer, not weather: once recorded,
-    /// the idle sweep must stop offering the track — before this memory
-    /// existed, a signs-only track re-fetched its display sets and ran
-    /// Tesseract again on every hub start, for ever.
-    #[tokio::test]
-    async fn a_track_that_ocred_to_nothing_is_not_asked_again() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        sqlx::raw_sql(
-            "INSERT INTO collections(module_id,collection_id,media_type)
-               VALUES('m','c','series');
-             INSERT INTO collection_items(id,kind,title,norm_title,sort_title,module_id,collection_id)
-               VALUES('e1','episode','One','one','one','m','c');
-             INSERT INTO files(module_id,collection_id,path_rel,size,mtime_unix,
-                               head_xxh3,tail_xxh3,oshash,streams_json)
-               VALUES('m','c','e1.mkv',10,1,0,0,0,'{}');
-             -- Embedded tracks carry ONLY source_id (migration 54).
-             INSERT INTO subtitle_tracks(source_id,origin,format,language,stream_index)
-               SELECT id,'embedded','pgs','en',0 FROM files;",
-        )
-        .execute(&db)
-        .await
-        .unwrap();
-        let registry = Arc::new(crate::registry::Registry::new(db, Default::default()));
-        let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
-
-        let offered = subs.ocr_candidates(&registry).await;
-        assert_eq!(offered.len(), 1, "the image track is the sweep's work");
-
-        sqlx::query("INSERT INTO ocr_no_text (track_id, model, at) VALUES (?, 'eng', unixepoch())")
-            .bind(offered[0])
-            .execute(registry.db())
-            .await
-            .unwrap();
-        assert!(
-            subs.ocr_candidates(&registry).await.is_empty(),
-            "a remembered empty answer is not re-asked"
-        );
     }
 }
 
@@ -2363,7 +2278,12 @@ mod account_tests {
                 .await
                 .unwrap();
         }
-        let registry = Registry::new(db, Default::default()).with_credentials(credentials);
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials);
         let subtitles = Subtitles::new(tempfile::tempdir().unwrap().keep());
         subtitles
             .external_provider(&registry, "u1")
@@ -2430,7 +2350,12 @@ mod account_tests {
             .await
             .unwrap();
 
-        let registry = Registry::new(db, Default::default()).with_credentials(credentials);
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials);
         let subtitles = Subtitles::new(tempfile::tempdir().unwrap().keep());
         assert!(subtitles.external_provider(&registry, "u1").await.is_err());
     }
@@ -2484,7 +2409,11 @@ mod library_search_tests {
         })
         .await
         .unwrap();
-        let registry = Registry::new(db, Default::default());
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let identity = Subtitles::search_identity(&registry, "right", "wrong")
             .await
             .unwrap();
@@ -2510,7 +2439,11 @@ mod library_search_tests {
         })
         .await
         .unwrap();
-        let registry = Registry::new(db, Default::default());
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let identity = Subtitles::search_identity(&registry, "right", "wrong")
             .await
             .unwrap();

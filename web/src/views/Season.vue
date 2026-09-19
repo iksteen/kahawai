@@ -45,9 +45,9 @@ const season = computed(() => parseSeason(String(route.params.season ?? 'all')))
 /// not behind the item, which supplies only the title on the back button. In
 /// series they cost a round trip before a single still appears; and which of
 /// the two failures the viewer saw depended on which settled last.
-const children = useChildrenOf(showId)
-const show = useItem(showId)
-const { mark, busy } = useWatched()
+const children = useChildrenOf(showId, library, season)
+const show = useItem(showId, undefined, library)
+const { mark, busy } = useWatched(library)
 
 /// The show's own details failing is a notice: the page underneath is the
 /// episodes, and they are fine.
@@ -81,9 +81,15 @@ useScreenName(
 const mine = computed(() =>
   children.data.value?.filter((e) => seasonOf(e, projected.value) === season.value),
 )
-const watched = computed(() => mine.value?.filter((e) => e.played).length ?? 0)
+const watched = computed(
+  () =>
+    children.groups.value.find((g) => g.kind === 'episode' && (g.number ?? null) === season.value)
+      ?.played ??
+    mine.value?.filter((e) => e.played).length ??
+    0,
+)
 const allSeen = computed(
-  () => (mine.value?.length ?? 0) > 0 && watched.value === mine.value?.length,
+  () => (children.total.value ?? 0) > 0 && watched.value === children.total.value,
 )
 
 /// Which still is open underneath the strip. The episode itself is fetched per
@@ -102,7 +108,11 @@ watch(
   },
   { immediate: true },
 )
-const picked = useItem(computed(() => pickedId.value ?? ''))
+const picked = useItem(
+  computed(() => pickedId.value ?? ''),
+  undefined,
+  library,
+)
 watch(
   () => picked.isError.value,
   (failed) => {
@@ -170,7 +180,11 @@ function play(id: string, fromStart = false) {
         {{ seasonLabel(season, projected) }}
       </h1>
       <span class="font-mono text-dim">
-        {{ mine === undefined ? '' : `${mine.length} episodes · ${watched} watched` }}
+        {{
+          mine === undefined
+            ? ''
+            : `${children.total.value ?? mine.length} episodes · ${watched} watched`
+        }}
       </span>
       <!-- One press for a season somebody has already watched elsewhere.
            WHICH episodes are in it is decided here, because the season a
@@ -187,7 +201,14 @@ function play(id: string, fromStart = false) {
               ? 'This season has no episodes'
               : undefined
         "
-        @click="mark(showId, !allSeen, mine?.map((e) => e.id) ?? [])"
+        @click="
+          mark(
+            showId,
+            !allSeen,
+            mine?.map((e) => e.id) ?? [],
+            children.groups.value.length ? season : undefined,
+          )
+        "
       >
         <Icon name="check" :size="13" />
         {{ allSeen ? 'Mark none watched' : 'Mark all watched' }}
@@ -239,6 +260,16 @@ function play(id: string, fromStart = false) {
         </span>
       </button>
     </Lane>
+    <Btn
+      v-if="children.hasNextPage.value"
+      ghost
+      small
+      class="mt-3"
+      :disabled="children.isFetchingNextPage.value"
+      @click="children.fetchNextPage()"
+    >
+      {{ children.isFetchingNextPage.value ? 'Loading…' : 'Load more episodes' }}
+    </Btn>
 
     <!-- The one you land on opens here rather than on a page of its own. -->
     <section

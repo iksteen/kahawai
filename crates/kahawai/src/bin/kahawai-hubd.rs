@@ -127,7 +127,7 @@ async fn main() -> Result<()> {
             println!(
                 "snapshot written to {} ({:.1} MB)",
                 dest.display(),
-                m.db_bytes as f64 / 1e6
+                (m.db_bytes + m.mediadb_bytes.unwrap_or(0)) as f64 / 1e6
             );
             Ok(())
         }

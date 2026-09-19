@@ -1,8 +1,10 @@
 #!/usr/bin/env bash
 # Measure audio/video sync in a transcoded session's own segments.
 #
-#   kahawai-avsync.sh [-a host:port] [-n segments] <username> <password> <item-id>
+#   kahawai-avsync.sh -l library [-a host:port] [-n segments] <username> <password> <item-id>
 #
+#   -l library    mediadb library ID (required)
+#   -e entry      pin a stable media entry ID (optional)
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
 #   -n N          how many segments to measure (default 20)
 #   -c            measure the COPY path: offer every passthrough codec, so
@@ -27,20 +29,24 @@
 set -euo pipefail
 
 API="${KAHAWAI_API:-localhost:8420}"
+LIBRARY="" ENTRY=""
 SEGMENTS=20
 
 COPY=""
-while getopts "a:n:ch" opt; do
+while getopts "l:e:a:n:ch" opt; do
     case $opt in
+        l) LIBRARY="$OPTARG" ;;
+        e) ENTRY="$OPTARG" ;;
         a) API="$OPTARG" ;;
         n) SEGMENTS="$OPTARG" ;;
         c) COPY=1 ;;
-        h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -12; exit 0 ;;
+        h|*) sed -n '2,/^set /{ /^#/s/^# \{0,1\}//p; }' "$0"; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
 
-[ $# -ge 3 ] || { echo "usage: $(basename "$0") [-a host:port] [-n segments] <username> <password> <item-id>" >&2; exit 2; }
+[ $# -ge 3 ] || { echo "usage: $(basename "$0") -l library [-a host:port] [-n segments] <username> <password> <item-id>" >&2; exit 2; }
+[ -n "$LIBRARY" ] || { echo "-l library is required" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2 ITEM=$3
 
 if [ "$PASSWORD" = "-" ]; then
@@ -64,7 +70,7 @@ else
 fi
 SESSION=$(curl -fsS -X POST "http://$API/api/v1/playback/sessions" \
     -H "Authorization: Bearer $TOKEN" -H 'content-type: application/json' \
-    -d "{\"item_id\":\"$ITEM\",\"profile\":$PROFILE}")
+    -d "$(python3 -c 'import json,sys;print(json.dumps(dict(library_id=sys.argv[1],item_id=sys.argv[2],media_entry_id=sys.argv[3] or None,profile=json.loads(sys.argv[4]),resume=False)))' "$LIBRARY" "$ITEM" "$ENTRY" "$PROFILE")")
 SID=$(echo "$SESSION" | python3 -c 'import json,sys; print(json.load(sys.stdin)["session_id"])')
 echo "session $SID"
 

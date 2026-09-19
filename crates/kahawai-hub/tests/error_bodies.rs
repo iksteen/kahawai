@@ -123,7 +123,9 @@ async fn refusal(router: axum::Router, request: Request<Body>) -> (StatusCode, S
 
 async fn setup_router() -> (tempfile::TempDir, axum::Router, Arc<Auth>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Arc::new(Auth::new(db, dir.path()).await.unwrap());
     let router = kahawai_hub::api::setup_router(auth.clone(), None);
     (dir, router, auth)
@@ -133,10 +135,13 @@ async fn setup_router() -> (tempfile::TempDir, axum::Router, Arc<Auth>) {
 /// `setup_router` — the public one is the only place the CORS layer exists.
 async fn api_harness() -> (tempfile::TempDir, axum::Router) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(Auth::new(db, dir.path()).await.unwrap());
     // Past setup, or `login` answers `setup_required` before it ever reaches
@@ -159,7 +164,7 @@ async fn api_harness() -> (tempfile::TempDir, axum::Router) {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
-    let router = kahawai_hub::api::router(
+    let router = kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,
@@ -338,7 +343,9 @@ async fn the_same_route_distinguishes_its_refusals_by_code() {
 #[tokio::test]
 async fn an_internal_failure_says_nothing_about_the_hub() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let router = kahawai_hub::api::setup_router(auth, None);
     // Storage failure rather than validation failure: the arm that used to
@@ -712,10 +719,13 @@ async fn a_wrong_content_type_is_415_and_not_400() {
 #[tokio::test]
 async fn a_name_that_is_taken_is_a_conflict_and_not_a_hub_fault() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
         db,
         kahawai_transport::mtls::AllowedCerts::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     registry.create_library("Films", "movies").await.unwrap();
 

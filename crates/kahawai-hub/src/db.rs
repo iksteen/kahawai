@@ -1,5 +1,8 @@
 //! Embedded SQLite (HUB-13): WAL mode, migrations on open, no external
-//! services.
+//! services. Runtime startup preserves old catalogue/history rows without
+//! installing the retired catalogue's repair callbacks. `open_catalogue` opens
+//! the independently migrated media database. Legacy consumer regression tests
+//! explicitly use `open_legacy_fixture`; no runtime backend switch exists.
 
 use std::path::Path;
 
@@ -80,6 +83,23 @@ pub async fn open(data_dir: &Path) -> Result<Database> {
             })
         })
         .await?;
+    Ok(database)
+}
+
+/// Open the independent catalogue before exposing any hub listeners.
+pub async fn open_catalogue(data_dir: &Path) -> Result<kahawai_mediadb::Store> {
+    let path = data_dir.join("mediadb.db");
+    if path.try_exists()? {
+        kahawai_mediadb::Store::open(&path).await
+    } else {
+        kahawai_mediadb::Store::create(&path).await
+    }
+}
+
+/// Regression fixture for the retired catalogue implementation. Never used by startup.
+#[doc(hidden)]
+pub async fn open_legacy_fixture(data_dir: &Path) -> Result<Database> {
+    let database = open(data_dir).await?;
     install_derived(&database).await?;
     backfill_norm_artist(&database).await?;
     backfill_artist_key(&database).await?;

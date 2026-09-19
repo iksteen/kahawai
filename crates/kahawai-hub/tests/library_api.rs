@@ -12,10 +12,13 @@ async fn harness() -> (
     std::path::PathBuf,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(
         kahawai_hub::auth::Auth::new(db.clone(), dir.path())
@@ -37,7 +40,7 @@ async fn harness() -> (
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
     let artwork_dir = dir.path().join("artwork");
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry.clone(),
         auth.clone(),
         sessions,
@@ -1418,53 +1421,32 @@ async fn review_queue_includes_library_ambiguity_and_child_conflicts_despite_con
 }
 
 #[tokio::test]
-async fn newest_item_diagnostics_follow_aliases_in_both_directions() {
-    let (api, token, db, _, artwork) = harness().await;
-    sqlx::raw_sql(
-        "INSERT INTO library_items(id,kind,title,norm_title,sort_title,added_id,merged_into) VALUES
-        ('canonical-work','movie','Canonical','canonical','canonical','canonical-work',NULL),
-        ('middle-alias','movie','Middle','middle','middle','middle-alias','canonical-work'),
-        ('old-alias','movie','Old','old','old','old-alias','middle-alias');",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    let logs = kahawai_hub::sessionlog::dir(artwork.parent().unwrap());
-    std::fs::create_dir_all(&logs).unwrap();
-    for (name, body) in [
-        (
-            "1000000000-canonical-work-session1.log",
-            "older canonical diagnostics",
-        ),
-        (
-            "2000000000-old-alias-session2.log",
-            "latest absorbed diagnostics",
-        ),
-        ("3000000000-unrelated-session3.log", "unrelated diagnostics"),
-    ] {
-        std::fs::write(logs.join(name), body).unwrap();
-    }
-    for newest in ["latest absorbed diagnostics", "new canonical diagnostics"] {
-        if newest == "new canonical diagnostics" {
-            std::fs::write(logs.join("4000000000-canonical-work-session4.log"), newest).unwrap();
-        }
-        for id in ["canonical-work", "middle-alias", "old-alias"] {
-            let response = api
-                .clone()
-                .oneshot(
-                    Request::get(format!("/admin/v1/items/{id}/log"))
-                        .header("authorization", format!("Bearer {token}"))
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(response.status(), axum::http::StatusCode::OK, "{id}");
-            let body = axum::body::to_bytes(response.into_body(), 1 << 20)
-                .await
-                .unwrap();
-            assert_eq!(body.as_ref(), newest.as_bytes(), "{id}");
-        }
+async fn newest_item_diagnostics_use_stable_ids_without_legacy_rows() {
+    let (api, token, _, _, artwork) = harness().await;
+    let item = "01M2CKKCV4232EDSV45SPXYFSC";
+    let child = format!("child1:{item}:e:1:2");
+    kahawai_hub::sessionlog::store(
+        artwork.parent().unwrap(),
+        &child,
+        "session",
+        "episode diagnostics",
+    );
+    for id in [item, child.as_str()] {
+        let response = api
+            .clone()
+            .oneshot(
+                Request::get(format!("/admin/v1/items/{id}/log"))
+                    .header("authorization", format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), axum::http::StatusCode::OK);
+        let body = axum::body::to_bytes(response.into_body(), 1 << 20)
+            .await
+            .unwrap();
+        assert_eq!(body.as_ref(), b"episode diagnostics");
     }
 }
 

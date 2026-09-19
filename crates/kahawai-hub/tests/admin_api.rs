@@ -41,7 +41,9 @@ fn rec(path: &str, size: u64, head: u64, tail: u64) -> FileUpsertRecord {
 #[tokio::test]
 async fn admin_flow_enrollments_satellites_archive_restore() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let ca = Arc::new(HubCa::load_or_create(dir.path()).unwrap());
     let allowed = AllowedCerts::default();
     let credentials = Arc::new(
@@ -49,8 +51,14 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             .await
             .unwrap(),
     );
-    let registry =
-        Arc::new(Registry::new(db.clone(), allowed.clone()).with_credentials(credentials.clone()));
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            allowed.clone(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials.clone()),
+    );
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -79,7 +87,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(
         tempfile::tempdir().unwrap().keep(),
     ));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry.clone(),
         auth.clone(),
         sessions,
@@ -210,6 +218,7 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
             "anidb": { "configured": false },
             "fanart": { "configured": false },
             "theaudiodb": { "premium_key_configured": false },
+            "available": ["local", "anilist", "musicbrainz", "theaudiodb"],
             "chains": {
                 "movies": {
                     "order": ["tmdb", "tvdb"],
@@ -508,8 +517,8 @@ async fn admin_flow_enrollments_satellites_archive_restore() {
     );
     assert_eq!(
         counts,
-        (0, 0, 1, 1),
-        "source deleted, catalogue history retained and archived"
+        (1, 1, 1, 0),
+        "legacy catalogue and history are preserved without conversion"
     );
     let audit: Vec<String> = sqlx::query_scalar("SELECT action FROM satellite_audit ORDER BY id")
         .fetch_all(&db)
@@ -610,8 +619,14 @@ async fn legacy_review_queue_flow() {
 
 async fn review_queue_flow_impl(legacy: bool) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(
         kahawai_hub::auth::Auth::new(db.clone(), dir.path())
             .await
@@ -630,7 +645,7 @@ async fn review_queue_flow_impl(legacy: bool) {
         std::time::Duration::from_secs(60),
         90,
     ));
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry.clone(),
         auth,
         sessions,

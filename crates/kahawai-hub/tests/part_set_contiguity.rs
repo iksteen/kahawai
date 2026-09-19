@@ -39,12 +39,18 @@ async fn item_with(
     present: &[&str],
 ) -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::query("INSERT INTO users(id,username,password_hash) VALUES('u1','tester','unused')")
         .execute(&db)
         .await
         .unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let hosts: std::collections::BTreeSet<&str> = files.iter().map(|(h, _)| *h).collect();
     for host in &hosts {
         registry
@@ -189,7 +195,11 @@ async fn a_whole_part_set_negotiates() {
 #[tokio::test]
 async fn multipart_names_never_merge_across_collections() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     for host in ["01AWAY", "02HERE"] {
         registry
             .announce_collection(host, "movies", "movies", &[TEST_ROOT.into()])

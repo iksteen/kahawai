@@ -65,7 +65,9 @@ fn answer(title: &str, overview: Option<&str>, rating: Option<f64>) -> Fields {
 #[tokio::test]
 async fn earlier_provider_wins_a_field_and_later_ones_fill_the_holes() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     let chain = chain_in_force(&db, "movies").await;
     assert_eq!(chain, vec!["tmdb", "tvdb"]);
@@ -107,7 +109,9 @@ async fn earlier_provider_wins_a_field_and_later_ones_fill_the_holes() {
 #[tokio::test]
 async fn reordering_re_decides_ownership_without_asking_anyone() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -155,7 +159,9 @@ async fn reordering_re_decides_ownership_without_asking_anyone() {
 #[tokio::test]
 async fn a_manual_pick_outranks_every_provider_and_survives_reorders() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -201,7 +207,9 @@ async fn a_manual_pick_outranks_every_provider_and_survives_reorders() {
 #[tokio::test]
 async fn a_stored_order_that_is_not_a_permutation_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     // Dropping a provider would silently disable it; adding an unknown
     // one would silently do nothing.
     assert!(set_chain(&db, "movies", &["tmdb".into()]).await.is_err());
@@ -216,7 +224,9 @@ async fn a_stored_order_that_is_not_a_permutation_is_refused() {
 #[tokio::test]
 async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     // No sources yet: everything enriches as movies/series by default.
     assert_eq!(media_type_of_item(&db, "i1").await, "movies");
@@ -252,7 +262,9 @@ async fn an_items_media_type_comes_from_the_collection_it_lives_in() {
 #[tokio::test]
 async fn the_anime_composites_answer_ranks_as_the_chain_entry() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     // The chain follows the item's own collection now, so the fixture has
     // to live in an anime one — passing a chain in is no longer possible,
@@ -317,7 +329,9 @@ async fn the_anime_composites_answer_ranks_as_the_chain_entry() {
 async fn an_unreachable_provider_is_rescheduled_not_dropped() {
     use kahawai_hub::providers::{due_items, reschedule, settled};
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
 
     reschedule(&db, "i1", "anime", "anidb banned us").await;
@@ -408,7 +422,9 @@ async fn a_recorded_miss_is_not_owed_ad_infinitum() {
 async fn due_work_is_offered_to_the_next_run() {
     use kahawai_hub::providers::due_items;
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     sqlx::query(
         "INSERT INTO enrichment_queue (item_id, provider, due_at, reason)
@@ -426,7 +442,9 @@ async fn due_work_is_offered_to_the_next_run() {
 #[tokio::test]
 async fn episodes_are_never_left_queued() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "show1").await;
     sqlx::query(
         "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
@@ -471,7 +489,9 @@ async fn episodes_are_never_left_queued() {
 async fn series_has_its_own_chain_independent_of_movies() {
     use kahawai_hub::providers::{MEDIA_TYPES, chain_for, media_type_key};
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     assert!(MEDIA_TYPES.contains(&"series"));
     assert_eq!(media_type_key("series"), "series");
     assert_eq!(chain_for("series"), chain_for("movies"), "same default");
@@ -497,7 +517,9 @@ async fn series_has_its_own_chain_independent_of_movies() {
 #[tokio::test]
 async fn a_complete_row_does_not_stop_the_chain() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     // TMDB answered completely.
     store_answer(
@@ -552,7 +574,9 @@ async fn a_complete_row_does_not_stop_the_chain() {
 #[tokio::test]
 async fn a_weak_non_owner_does_not_donate_fields() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -622,7 +646,9 @@ async fn a_weak_non_owner_does_not_donate_fields() {
 #[tokio::test]
 async fn a_confident_match_outranks_a_weak_one_whatever_the_order() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -726,7 +752,9 @@ fn a_stated_year_beats_an_exact_title_with_no_year() {
 #[tokio::test]
 async fn a_second_manual_pick_replaces_the_first() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     kahawai_hub::providers::assign_manual(
         &db,
@@ -802,7 +830,9 @@ async fn answer_row(db: &SqlitePool, id: &str, provider: &str, pid: &str, streng
 #[tokio::test]
 async fn strong_beats_weak_across_the_preference_order() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "111", "weak").await; // ranks FIRST for movies
     answer_row(&db, "i1", "tvdb", "222", "auto").await;
@@ -825,7 +855,9 @@ async fn strong_beats_weak_across_the_preference_order() {
 #[tokio::test]
 async fn a_later_preferred_answer_replaces_an_automatic_match() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tvdb", "222", "auto").await;
     assert_eq!(assigned(&db, "i1").await.unwrap().0, "tvdb");
@@ -843,7 +875,9 @@ async fn a_later_preferred_answer_replaces_an_automatic_match() {
 #[tokio::test]
 async fn misses_leave_the_item_unassigned() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     assert_eq!(assigned(&db, "i1").await, None, "never asked");
 
@@ -859,7 +893,9 @@ async fn misses_leave_the_item_unassigned() {
 #[tokio::test]
 async fn a_bridged_answer_never_owns_the_item() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "anilist", "9253", "auto").await;
     answer_row(&db, "i1", "tmdb", "42509", "bridged").await;
@@ -885,7 +921,9 @@ async fn a_bridged_answer_never_owns_the_item() {
 #[tokio::test]
 async fn refused_records_are_skipped_until_something_new_appears() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "19069", "auto").await;
     assert_eq!(assigned(&db, "i1").await.unwrap().1, "19069");
@@ -918,7 +956,9 @@ async fn refused_records_are_skipped_until_something_new_appears() {
 #[tokio::test]
 async fn episodes_are_never_assigned() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "ep").await;
     sqlx::query("UPDATE collection_items SET kind='episode' WHERE id='ep'")
         .execute(&db)
@@ -933,7 +973,9 @@ async fn episodes_are_never_assigned() {
 #[tokio::test]
 async fn an_assignment_whose_answer_decays_is_dropped() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "111", "auto").await;
     assert!(assigned(&db, "i1").await.is_some());
@@ -947,7 +989,9 @@ async fn an_assignment_whose_answer_decays_is_dropped() {
 #[tokio::test]
 async fn a_manual_assignment_is_never_recomputed() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     kahawai_hub::providers::assign_manual(
         &db,
@@ -984,7 +1028,9 @@ async fn a_manual_assignment_is_never_recomputed() {
 #[tokio::test]
 async fn confirming_an_automatic_match_makes_it_as_durable_as_a_pin() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tvdb", "414734", "auto").await;
     assert_eq!(
@@ -1030,7 +1076,9 @@ async fn confirming_an_automatic_match_makes_it_as_durable_as_a_pin() {
 #[tokio::test]
 async fn rejecting_keeps_the_answers_and_schedules_another_look() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer_row(&db, "i1", "tmdb", "19069", "auto").await;
     answer_row(&db, "i1", "tvdb", "", "miss").await;
@@ -1076,7 +1124,9 @@ async fn rejecting_keeps_the_answers_and_schedules_another_look() {
 #[tokio::test]
 async fn concurrent_answers_leave_one_correct_assignment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     for n in 0..12 {
         let id = format!("i{n}");
         item(&db, &id).await;
@@ -1117,7 +1167,9 @@ async fn concurrent_answers_leave_one_correct_assignment() {
 #[tokio::test]
 async fn the_view_side_fills_from_the_preference_order() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     // TMDB is assigned but has no synopsis; TVDB has one.
     store_answer(
@@ -1166,7 +1218,9 @@ async fn the_view_side_fills_from_the_preference_order() {
 #[tokio::test]
 async fn the_view_resolves_an_episode_through_its_show() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "show1").await;
     sqlx::query(
         "INSERT INTO collection_items(id,kind,title,norm_title,parent_id,season,episode,module_id,collection_id)
@@ -1235,7 +1289,9 @@ async fn the_view_resolves_an_episode_through_its_show() {
 #[tokio::test]
 async fn the_view_stays_flattenable() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     let plan: Vec<String> = sqlx::query(
         "EXPLAIN QUERY PLAN
@@ -1261,7 +1317,9 @@ async fn the_view_stays_flattenable() {
 #[tokio::test]
 async fn local_metadata_leads_the_chain() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     assert_eq!(chain_in_force(&db, "movies").await, vec!["tmdb", "tvdb"]);
     assert_eq!(
         chain_in_force(&db, "anime").await,
@@ -1327,7 +1385,9 @@ async fn local_metadata_leads_the_chain() {
 #[tokio::test]
 async fn a_pin_elsewhere_displaces_the_nfo() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -1402,7 +1462,9 @@ async fn a_pin_elsewhere_displaces_the_nfo() {
 #[tokio::test]
 async fn local_artwork_supplies_the_poster_but_never_the_identity() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
 
     store_answer(
@@ -1514,7 +1576,9 @@ fn item_ref(id: &str) -> kahawai_hub::providers::ItemRef {
 #[tokio::test]
 async fn a_fully_declined_chain_never_wipes_a_standing_answer() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -1558,7 +1622,9 @@ async fn a_fully_declined_chain_never_wipes_a_standing_answer() {
 #[tokio::test]
 async fn a_declined_chain_records_a_miss_only_where_nothing_stands() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
 
     let mut set = kahawai_hub::providers::ProviderSet::default();
@@ -1592,7 +1658,9 @@ async fn a_declined_chain_records_a_miss_only_where_nothing_stands() {
 #[tokio::test]
 async fn a_provider_outside_the_bound_set_owes_no_work() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     store_answer(
         &db,
@@ -1653,7 +1721,9 @@ async fn a_provider_outside_the_bound_set_owes_no_work() {
 #[tokio::test]
 async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let credentials = std::sync::Arc::new(
         kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
             .await
@@ -1673,8 +1743,12 @@ async fn a_restart_that_re_selects_a_matched_item_does_not_erase_it() {
         )
         .await
         .unwrap();
-    let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default())
-        .with_credentials(credentials);
+    let registry = kahawai_hub::registry::Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    )
+    .with_credentials(credentials);
 
     item(&db, "i1").await;
     store_answer(
@@ -1859,7 +1933,9 @@ fn the_chains_share_no_providers() {
 #[tokio::test]
 async fn a_run_without_a_tmdb_key_still_runs() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     // A real store, holding nothing: without one this proves the rule through
     // the no-store branch, which production never takes.
     let credentials = std::sync::Arc::new(
@@ -1868,8 +1944,12 @@ async fn a_run_without_a_tmdb_key_still_runs() {
             .unwrap(),
     );
     let registry = std::sync::Arc::new(
-        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
-            .with_credentials(credentials),
+        kahawai_hub::registry::Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials),
     );
     // Deliberately no TMDB credential at all.
     item(&db, "i1").await;
@@ -1899,7 +1979,9 @@ async fn a_run_without_a_tmdb_key_still_runs() {
 #[tokio::test]
 async fn an_unreadable_tmdb_credential_does_not_stop_enrichment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let credentials = std::sync::Arc::new(
         kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
             .await
@@ -1921,8 +2003,12 @@ async fn an_unreadable_tmdb_credential_does_not_stop_enrichment() {
         .unwrap();
 
     let registry = std::sync::Arc::new(
-        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
-            .with_credentials(credentials),
+        kahawai_hub::registry::Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials),
     );
     assert!(
         kahawai_hub::enrich::tmdb_key(&registry).await.is_err(),
@@ -1965,7 +2051,9 @@ fn finished(
 #[tokio::test]
 async fn an_unreadable_tvdb_credential_does_not_stop_enrichment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let credentials = std::sync::Arc::new(
         kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
             .await
@@ -1986,8 +2074,12 @@ async fn an_unreadable_tvdb_credential_does_not_stop_enrichment() {
     item(&db, "i1").await;
 
     let registry = std::sync::Arc::new(
-        kahawai_hub::registry::Registry::new(db.clone(), Default::default())
-            .with_credentials(credentials),
+        kahawai_hub::registry::Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials),
     );
     let enricher =
         std::sync::Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
@@ -2118,7 +2210,11 @@ async fn an_invalidated_answer_refreshes_the_current_work_once_then_settles() {
             .await
             .unwrap();
             assert!(question_pending(&db, "show", provider, "title", "new show|2010").await);
-            let registry = kahawai_hub::registry::Registry::new(db.clone(), Default::default());
+            let registry = kahawai_hub::registry::Registry::new(
+                db.clone(),
+                Default::default(),
+                kahawai_mediadb::Store::in_memory().await.unwrap(),
+            );
             let dir = tempfile::tempdir().unwrap();
             let enricher = kahawai_hub::enrich::Enricher::new(dir.path().to_owned());
             let before = if provider == "anime" {

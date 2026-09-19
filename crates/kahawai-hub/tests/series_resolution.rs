@@ -22,7 +22,11 @@ fn rec(path: &str, size: u64) -> FileUpsertRecord {
 #[tokio::test]
 async fn resolves_series_into_shows_and_episodes() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await
@@ -137,7 +141,11 @@ async fn resolves_series_into_shows_and_episodes() {
 #[tokio::test]
 async fn libraries_auto_provision_and_enforce_types() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await
@@ -191,7 +199,11 @@ async fn libraries_auto_provision_and_enforce_types() {
 #[tokio::test]
 async fn resolves_music_into_albums_and_tracks() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await
@@ -308,7 +320,11 @@ async fn resolves_music_into_albums_and_tracks() {
 #[tokio::test]
 async fn album_artist_groups_compilations_and_preserves_existing_identity_and_state() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await
@@ -516,7 +532,11 @@ async fn album_artist_groups_compilations_and_preserves_existing_identity_and_st
 #[tokio::test]
 async fn album_artist_correction_preserves_a_human_musicbrainz_pin() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await
@@ -591,7 +611,11 @@ async fn album_artist_correction_preserves_a_human_musicbrainz_pin() {
 #[tokio::test]
 async fn replacement_at_the_same_path_does_not_inherit_item_or_watch_state() {
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Registry::new(db.clone(), Default::default());
+    let registry = Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     registry
         .record_satellite("01HOST", "mediahost", "nas", "fp")
         .await

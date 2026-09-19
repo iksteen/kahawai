@@ -70,7 +70,9 @@ async fn seed(db: &kahawai_hub::library::Database) {
 #[tokio::test]
 async fn bridge_ids_are_rebuilt_from_stored_answers() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     seed(&db).await;
 
     // Nothing recorded yet: both ids come purely from what is on disk.

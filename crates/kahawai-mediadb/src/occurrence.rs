@@ -1,3 +1,8 @@
+//! `media_entry_episodes` records the numbered episode spans covered by each
+//! physical media entry; logical episode identities are derived separately.
+//! Music disc and track positions are positive numbers or unknown. Automatic
+//! detection treats zero as unknown in both tags and filename/directory guesses;
+//! the original file metadata remains intact even when its position is unknown.
 use crate::*;
 use anyhow::{Result, ensure};
 use kahawai_core::{media::MediaInfo, names};
@@ -40,63 +45,65 @@ impl Store {
         let mut c = self.db.read_pool().acquire().await?;
         use sqlx::Connection;
         let mut tx = c.begin().await?;
-        let rows = sqlx::query("SELECT * FROM media_entries WHERE item_id=? ORDER BY id")
-            .bind(item)
-            .fetch_all(&mut *tx)
-            .await?;
-        let mut entries = vec![];
-        for r in rows {
-            let id: String = r.get("id");
-            let parts = sqlx::query(
-                "SELECT file_id,ordinal FROM media_parts WHERE entry_id=? ORDER BY ordinal",
-            )
-            .bind(&id)
-            .fetch_all(&mut *tx)
-            .await?
-            .into_iter()
-            .map(|p| Part {
-                file_id: p.get("file_id"),
-                ordinal: p.get::<i64, _>("ordinal") as u32,
-            })
-            .collect();
-            let kind = match r.get::<&str, _>("kind") {
-                "movie" => EntryKind::Movie,
-                "track" => EntryKind::Track {
-                    disc: r.get::<Option<i64>, _>("disc").map(|n| n as u32),
-                    track: r.get::<Option<i64>, _>("track").map(|n| n as u32),
-                },
-                _ => {
-                    let rows=sqlx::query("SELECT season,episode,episode_end FROM entry_episodes WHERE entry_id=? ORDER BY ordinal")
-                        .bind(&id).fetch_all(&mut *tx).await?;
-                    EntryKind::Episode {
-                        episodes: rows
-                            .into_iter()
-                            .map(|e| EpisodeSpan {
-                                season: e.get::<Option<i64>, _>("season").map(|n| n as u32),
-                                episode: e.get::<i64, _>("episode") as u32,
-                                episode_end: e
-                                    .get::<Option<i64>, _>("episode_end")
-                                    .map(|n| n as u32),
-                            })
-                            .collect(),
-                    }
-                }
-            };
-            entries.push(MediaEntry {
-                id,
-                item_id: item.into(),
-                data: NewEntry {
-                    occurrence: r.get("occurrence"),
-                    title: r.get("title"),
-                    artist: r.get("artist"),
-                    kind,
-                    parts,
-                },
-            });
-        }
+        let entries = read_entries(&mut tx, item).await?;
         tx.commit().await?;
         Ok(entries)
     }
+}
+pub(crate) async fn read_entries(c: &mut SqliteConnection, item: &str) -> Result<Vec<MediaEntry>> {
+    let rows = sqlx::query("SELECT * FROM media_entries WHERE item_id=? ORDER BY id")
+        .bind(item)
+        .fetch_all(&mut *c)
+        .await?;
+    let mut entries = vec![];
+    for r in rows {
+        let id: String = r.get("id");
+        let parts = sqlx::query(
+            "SELECT file_id,ordinal FROM media_parts WHERE entry_id=? ORDER BY ordinal",
+        )
+        .bind(&id)
+        .fetch_all(&mut *c)
+        .await?
+        .into_iter()
+        .map(|p| Part {
+            file_id: p.get("file_id"),
+            ordinal: p.get::<i64, _>("ordinal") as u32,
+        })
+        .collect();
+        let kind = match r.get::<&str, _>("kind") {
+            "movie" => EntryKind::Movie,
+            "track" => EntryKind::Track {
+                disc: r.get::<Option<i64>, _>("disc").map(|n| n as u32),
+                track: r.get::<Option<i64>, _>("track").map(|n| n as u32),
+            },
+            _ => {
+                let rows=sqlx::query("SELECT season,episode,episode_end FROM media_entry_episodes WHERE entry_id=? ORDER BY ordinal")
+                        .bind(&id).fetch_all(&mut *c).await?;
+                EntryKind::Episode {
+                    episodes: rows
+                        .into_iter()
+                        .map(|e| EpisodeSpan {
+                            season: e.get::<Option<i64>, _>("season").map(|n| n as u32),
+                            episode: e.get::<i64, _>("episode") as u32,
+                            episode_end: e.get::<Option<i64>, _>("episode_end").map(|n| n as u32),
+                        })
+                        .collect(),
+                }
+            }
+        };
+        entries.push(MediaEntry {
+            id,
+            item_id: item.into(),
+            data: NewEntry {
+                occurrence: r.get("occurrence"),
+                title: r.get("title"),
+                artist: r.get("artist"),
+                kind,
+                parts,
+            },
+        });
+    }
+    Ok(entries)
 }
 pub(crate) async fn prune(c: &mut SqliteConnection) -> Result<()> {
     sqlx::query("DELETE FROM media_entries WHERE NOT EXISTS(SELECT 1 FROM media_parts WHERE entry_id=media_entries.id)").execute(&mut *c).await?;
@@ -172,7 +179,7 @@ pub(crate) async fn put(
         let entry_id = existing.unwrap_or_else(id);
         sqlx::query("INSERT INTO media_entries VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET kind=excluded.kind,title=excluded.title,artist=excluded.artist,disc=excluded.disc,track=excluded.track")
             .bind(&entry_id).bind(&value.collection_id).bind(&item).bind(&entry.occurrence).bind(kind).bind(&entry.title).bind(&entry.artist).bind(disc.map(i64::from)).bind(track.map(i64::from)).execute(&mut *c).await?;
-        sqlx::query("DELETE FROM entry_episodes WHERE entry_id=?")
+        sqlx::query("DELETE FROM media_entry_episodes WHERE entry_id=?")
             .bind(&entry_id)
             .execute(&mut *c)
             .await?;
@@ -188,7 +195,7 @@ pub(crate) async fn put(
                             && old.episode_end.unwrap_or(old.episode) >= episode.episode),
                     "overlapping episode coverage"
                 );
-                sqlx::query("INSERT INTO entry_episodes VALUES(?,?,?,?,?,?)")
+                sqlx::query("INSERT INTO media_entry_episodes VALUES(?,?,?,?,?,?)")
                     .bind(&entry_id)
                     .bind(position as i64 + 1)
                     .bind(if episode.season.is_some() {
@@ -345,8 +352,9 @@ fn detect(kind: MediaType, path: &str, media: &MediaInfo) -> Option<NewOccurrenc
                 .filter(|n| *n > 0)
         };
         entry.kind = EntryKind::Track {
-            disc: number("disc_number").or(disc_folder),
-            track: number("track_number").or_else(|| guess.as_ref().map(|g| g.track)),
+            disc: number("disc_number").or(disc_folder.filter(|n| *n > 0)),
+            track: number("track_number")
+                .or_else(|| guess.as_ref().map(|g| g.track).filter(|n| *n > 0)),
         };
         // A physical album directory is authoritative. Flat tagged tracks have
         // no directory boundary, so their exact album/artist tags partition it.

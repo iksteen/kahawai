@@ -299,13 +299,23 @@ test('the match selector renders hub-served candidate box art under CSP', async 
     file_year: 2000,
     match_confidence: 'auto',
     sources: 1,
-    play_count: 0,
+
     played: false,
     library_id: 'movies',
   }
+  const record = {
+    provider: 'tmdb',
+    title: 'X-Men',
+    year: 2000,
+    description: {},
+    media_type: 'movies',
+    external_id: '1',
+    namespace: 'movie',
+    language: 'en',
+  }
   await page.route('**/api/v1/**', async (route) => {
     const path = new URL(route.request().url()).pathname
-    if (path.endsWith('/artwork') || path === '/api/v1/candidate-artwork') {
+    if (path.endsWith('/artwork')) {
       await route.fulfill({ contentType: 'image/png', body: png })
       return
     }
@@ -313,47 +323,60 @@ test('the match selector renders hub-served candidate box art under CSP', async 
       path === '/api/v1/auth/refresh'
         ? { access_token: access, expires_in: 900 }
         : path === '/api/v1/bootstrap'
-          ? { setup_required: false, setup_available: false, setup_url: null }
-          : path === '/api/v1/libraries'
-            ? { libraries: [{ id: 'movies', name: 'Movies', media_type: 'movies' }] }
-            : path === '/api/v1/items'
-              ? { items: [item], total: 1, offset: 0, limit: 100 }
-              : path === '/api/v1/items/copy'
-                ? {
-                    ...item,
-                    sources: [],
-                    copies: [
-                      {
-                        id: 'copy',
-                        title: 'X-Men',
-                        year: 2000,
-                        paths: ['X-Men.mkv'],
-                        assignment: { revision: 1, mode: 'automatic', library_item_ids: ['copy'] },
-                      },
-                    ],
-                  }
+          ? { setup_required: false }
+          : path === '/api/v1/catalogue/libraries'
+            ? [
+                {
+                  id: 'movies',
+                  name: 'Movies',
+                  media_type: 'movies',
+                  collection_ids: ['collection'],
+                },
+              ]
+            : path === '/api/v1/catalogue/libraries/movies/items'
+              ? {
+                  items: [
+                    {
+                      ...item,
+                      media_type: 'movies',
+                      copy_ids: ['copy'],
+                      representative_id: 'copy',
+                      metadata: {},
+                    },
+                  ],
+                  total: 1,
+                  offset: 0,
+                  limit: 100,
+                }
+              : path === '/api/v1/catalogue/libraries/movies/items/copy'
+                ? { copies: [{ id: 'copy', title: 'X-Men', year: 2000, paths: ['X-Men.mkv'] }] }
                 : {}
     await route.fulfill({ json: answer })
   })
-  await page.route('**/admin/v1/enrich/search', (route) =>
+  await page.route('**/admin/v1/enrich/items/copy**', (route) =>
     route.fulfill({
-      json: {
-        candidates: [
-          {
-            id: 1,
-            provider: 'tmdb',
-            title: 'X-Men',
-            release_date: '2000-07-14',
-            format: 'Movie',
-            poster_path: '/poster.jpg',
-            poster_url: '/api/v1/candidate-artwork?ticket=fixture',
+      json: new URL(route.request().url()).pathname.endsWith('/identities')
+        ? []
+        : {
+            input: {
+              item_id: 'copy',
+              library_item_id: 'copy',
+              title: 'X-Men',
+              year: 2000,
+              media_type: 'movies',
+              revision: 1,
+              manual: false,
+              selected: ['record', record],
+              sources: [],
+            },
+            candidates: [{ id: 'record', record, strength: 0, rejected: false }],
+            metadata: { description: {} },
+            entries: [],
           },
-        ],
-      },
     }),
   )
   await page.goto('/app/library/movies')
-  await page.getByRole('button', { name: 'Re-match metadata: X-Men' }).click({ force: true })
+  await page.getByRole('button', { name: /metadata.*X-Men/i }).click({ force: true })
   const poster = page.getByRole('dialog').locator('img')
   await expect(poster).toBeVisible()
   await expect

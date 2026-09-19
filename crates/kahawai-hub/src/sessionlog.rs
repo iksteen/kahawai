@@ -1,7 +1,10 @@
 //! One session's diagnostics, kept where a human can read them —
 //! **one directory, whatever went wrong**.
 //!
-//! `<data_dir>/session-logs/{unix}-{item}-{session}.log`, newest `KEEP`.
+//! `<data_dir>/session-logs/{unix}-{item}-{session}.log`, newest `KEEP` sessions.
+//! Updates reuse the session's file and retain earlier runs within MAX_BYTES.
+//! These files outlive scratch cleanup and hub restarts. Mediadb child IDs
+//! encode their stable parent, so parent lookups need no catalogue join.
 //!
 //! There is deliberately no second store for crashes. Splitting them
 //! meant knowing which kind of failure you were chasing BEFORE you knew
@@ -47,6 +50,7 @@ use std::path::{Path, PathBuf};
 /// evicting a failure before anyone looks. Bounded at all because a
 /// crash LOOP must not fill the disk it is being reported on.
 const KEEP: usize = 40;
+static STORE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 /// Cap per bundle. GStreamer debug output can be enormous; measured
 /// bundles are ~27 KB, so this bounds pathology rather than truncating
@@ -92,6 +96,7 @@ pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
     if body.trim().is_empty() {
         return;
     }
+    let _guard = STORE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let dir = dir(data_dir);
     match kahawai_core::private::create_dir(&dir) {
         Ok(()) => {}
@@ -106,11 +111,22 @@ pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let name = format!("{stamp}-{item_id}-{session_id}.log");
-    if kahawai_core::private::write(&dir.join(&name), head_and_tail(body, MAX_BYTES).as_bytes())
-        .is_ok()
+    let path = for_session(data_dir, session_id)
+        .unwrap_or_else(|| dir.join(format!("{stamp}-{item_id}-{session_id}.log")));
+    let previous = std::fs::read_to_string(&path).unwrap_or_default();
+    if previous.ends_with(body) {
+        return;
+    }
+    let body = if previous.is_empty() {
+        body.to_owned()
+    } else {
+        format!("{previous}\n== next diagnostic snapshot\n{body}")
+    };
+    let temporary = path.with_extension("partial");
+    if kahawai_core::private::write(&temporary, head_and_tail(&body, MAX_BYTES).as_bytes()).is_ok()
+        && std::fs::rename(&temporary, &path).is_ok()
     {
-        tracing::debug!(bundle = %dir.join(&name).display(), "session diagnostics kept");
+        tracing::debug!(bundle = %path.display(), "session diagnostics kept");
     }
     prune(&dir);
 }
@@ -118,14 +134,10 @@ pub fn store(data_dir: &Path, item_id: &str, session_id: &str, body: &str) {
 /// The newest bundle for an item, whoever played it — the point is
 /// debugging somebody else's report.
 pub fn newest_for_item(data_dir: &Path, item_id: &str) -> Option<PathBuf> {
-    newest_matching(&dir(data_dir), &[format!("-{item_id}-")])
-}
-
-/// A shared item's permanent aliases may name older bundles. Search their
-/// family in one directory pass, preserving the existing retention policy.
-pub fn newest_for_items(data_dir: &Path, item_ids: &[String]) -> Option<PathBuf> {
-    let needles: Vec<String> = item_ids.iter().map(|id| format!("-{id}-")).collect();
-    newest_matching(&dir(data_dir), &needles)
+    newest_matching(
+        &dir(data_dir),
+        &[format!("-{item_id}-"), format!("-child1:{item_id}:")],
+    )
 }
 
 /// A specific session's bundle, if one was kept.
@@ -139,6 +151,7 @@ fn newest_matching(dir: &Path, needles: &[String]) -> Option<PathBuf> {
     let mut hits: Vec<PathBuf> = std::fs::read_dir(dir)
         .ok()?
         .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().is_some_and(|ext| ext == "log"))
         .filter(|p| {
             p.file_name()
                 .and_then(|n| n.to_str())
@@ -156,9 +169,15 @@ fn head_and_tail(body: &str, max: usize) -> String {
     if body.len() <= max {
         return body.to_string();
     }
-    let half = max / 2;
+    let mut half = max / 2;
+    while !body.is_char_boundary(half) {
+        half -= 1;
+    }
     let head_end = body[..half].rfind('\n').map_or(half, |i| i + 1);
-    let tail_start = body.len() - half;
+    let mut tail_start = body.len() - half;
+    while !body.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
     let tail_start = body[tail_start..]
         .find('\n')
         .map_or(tail_start, |i| tail_start + i + 1);
@@ -173,6 +192,24 @@ fn head_and_tail(body: &str, max: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeated_runs_share_one_bounded_bundle_and_parent_lookup() {
+        let d = tempfile::tempdir().unwrap();
+        let child = "child1:01M2CKKCV4232EDSV45SPXYFSC:e:1:2";
+        store(d.path(), child, "session", "first run\n");
+        for n in 0..60 {
+            store(d.path(), child, "session", &format!("restart {n}\n"));
+        }
+        let path = newest_for_item(d.path(), "01M2CKKCV4232EDSV45SPXYFSC").unwrap();
+        let body = std::fs::read_to_string(path).unwrap();
+        assert!(body.contains("first run"));
+        assert!(body.contains("restart 59"));
+        assert_eq!(std::fs::read_dir(dir(d.path())).unwrap().count(), 1);
+        assert!(newest_for_item(d.path(), "unrelated").is_none());
+        let unicode = "映画字幕\n".repeat(MAX_BYTES);
+        assert!(head_and_tail(&unicode, MAX_BYTES).len() < MAX_BYTES + 200);
+    }
 
     #[test]
     fn keeps_both_ends_prunes_and_is_found_by_item() {

@@ -1,3 +1,36 @@
+// Layout fixtures exercise the existing playback-capable presentation as well as
+// unavailable states. The real catalogue adapter is covered separately and live.
+vi.mock('../src/composables/item.ts', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../src/composables/item.ts')>()
+  return {
+    ...actual,
+    useItem: (
+      id: Parameters<typeof actual.useItem>[0],
+      playback: Parameters<typeof actual.useItem>[1],
+    ) => actual.useItem(id, playback),
+  }
+})
+vi.mock('../src/api/catalogue.ts', async () => {
+  const api = await import('../src/api/generated/kahawai.ts')
+  return {
+    ...api,
+    catalogueDetail: (_library: string, id: string, query: Parameters<typeof api.itemQuery>[1]) =>
+      api.itemQuery(id, query),
+    catalogueChildren: async (_library: string, id: string, params?: { season?: string }) => {
+      const page = await api.itemChildren(id)
+      return {
+        ...page,
+        children: params?.season
+          ? page.children.filter((e) =>
+              params.season === 'absolute'
+                ? (e.proj_season ?? e.season) == null
+                : (e.proj_season ?? e.season) === Number(params.season),
+            )
+          : page.children,
+      }
+    },
+  }
+})
 /// UI-17, as a standing check rather than a one-off audit.
 ///
 /// A keyboard-only run and a screen reader are the pass; this is what stops the
@@ -15,17 +48,25 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { defineComponent, h, nextTick, ref } from 'vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  upNext: vi.fn(async () => ({ items: [], total: 0, limit: 12, offset: 0 })),
   listLibraries: vi.fn(async () => ({ libraries: [] })),
   listItems: vi.fn(async () => ({ items: [], total: 0, limit: 100, offset: 0 })),
   itemQuery: vi.fn(),
   itemChildren: vi.fn(async () => ({ children: [] })),
   itemSetWatched: vi.fn(),
+  catalogueSetWatched: async (
+    _library: string,
+    id: string,
+    body: { played: boolean; items?: string[] },
+  ) => (await import('../src/api/generated/kahawai.ts')).itemSetWatched(id, body),
   getPrefs: vi.fn(async () => ({ prefs: [] })),
   putPref: vi.fn(),
   adminItemLog: vi.fn(),
   subtitleSearch: vi.fn(),
   subtitleDownload: vi.fn(),
   subtitleDelete: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/art/${id}`,
 }))
 vi.mock('../src/api/session.ts', () => ({
@@ -158,7 +199,7 @@ const film = (over: Record<string, unknown> = {}) => ({
   title: 'Heat',
   year: 1995,
   played: false,
-  play_count: 0,
+
   art_version: null,
   duration_ms: 6_000_000,
   resume_position_ms: null,

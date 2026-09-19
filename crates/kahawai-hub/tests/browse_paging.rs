@@ -22,10 +22,13 @@ async fn harness() -> (
     std::path::PathBuf,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let auth = Arc::new(
         kahawai_hub::auth::Auth::new(db.clone(), dir.path())
@@ -47,7 +50,7 @@ async fn harness() -> (
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
     let artwork_dir = dir.path().join("artwork");
-    let api = kahawai_hub::api::router(
+    let api = kahawai_hub::api::legacy_router_fixture(
         registry.clone(),
         auth.clone(),
         sessions,
@@ -746,6 +749,7 @@ async fn capability_changes_delivery_not_existence() {
     let reg = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
     let subs = kahawai_hub::subtitles::Subtitles::new(tempfile::tempdir().unwrap().keep());
     let list = |ass_render: bool, overlay: bool| {

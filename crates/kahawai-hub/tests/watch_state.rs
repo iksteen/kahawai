@@ -1,5 +1,5 @@
 //! Watch state + session lifecycle (HUB-10/18): progress → resume →
-//! played/play-count, per-user session caps, idle-session reaping.
+//! played state, per-user session caps, idle-session reaping.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -46,7 +46,11 @@ async fn progress_resume_played_caps_and_idle() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     // Tight limits so this test can see them: 2 sessions/user, 700 ms idle.
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::with_limits(
         tempfile::tempdir().unwrap().keep(),
@@ -113,6 +117,7 @@ async fn progress_resume_played_caps_and_idle() {
         .into_inner();
     inbound.message().await.unwrap().unwrap(); // HelloAck
     catalog_fixture::project_files(
+        &registry,
         &tx,
         &mut inbound,
         "movies",
@@ -235,7 +240,7 @@ async fn progress_resume_played_caps_and_idle() {
     assert_eq!(v["items"][0]["resume_position_ms"], 50_000);
     assert_eq!(v["items"][0]["played"], false);
 
-    // Crossing 90%: played, count 1 — and it doesn't double-count.
+    // Crossing 90% marks the item played.
     for pos in [95_000, 97_000] {
         let resp = api
             .clone()
@@ -255,10 +260,7 @@ async fn progress_resume_played_caps_and_idle() {
     )
     .await;
     assert_eq!(v["played"], true);
-    assert_eq!(
-        v["play_count"], 0,
-        "crossing the line is not finishing: the play lands when the watch stops"
-    );
+    assert!(v.get("play_count").is_none());
     // A finished item answers with no resume position. That is what makes
     // the next Play start it at the start, with no client-side rule about
     // ignoring a position that is nine tenths of the way in.
@@ -315,10 +317,7 @@ async fn progress_resume_played_caps_and_idle() {
 
     // Scrubbing back over the line and forward again. `played` is a
     // boolean, not a high-water mark, so it follows the playhead both
-    // ways once the playhead has actually moved — and none of it counts a
-    // play, because the watch has not stopped. Counting the crossing made
-    // this one viewing count twice, which is why the count moved to
-    // teardown.
+    // ways once the playhead has actually moved.
     let resp = progress(1_000).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
     let v = body_json(resp).await;
@@ -326,16 +325,13 @@ async fn progress_resume_played_caps_and_idle() {
         v["played"], false,
         "starting it again is not having seen it"
     );
-    assert_eq!(v["play_count"], 0, "and nothing has been counted yet");
+    assert!(v.get("play_count").is_none());
 
-    // Back past the line: played again, still nothing counted.
+    // Back past the line: played again.
     let resp = progress(96_000).await.unwrap();
     let v = body_json(resp).await;
     assert_eq!(v["played"], true);
-    assert_eq!(
-        v["play_count"], 0,
-        "one watch, however often the line moves"
-    );
+    assert!(v.get("play_count").is_none());
 
     // Per-user cap: second session fine, third refused (limit 2).
     //
@@ -400,132 +396,18 @@ async fn progress_resume_played_caps_and_idle() {
     .await
     .expect("idle session was never reaped");
 
-    // Stopping is what counts the play, and being reaped IS stopping —
-    // it is what a closed laptop looks like from here. ONE play, though
-    // the 90 percent line was crossed twice. The janitor owns this teardown,
-    // so observe its durable write rather than only the session disappearing.
-    let count = || {
-        let api = api.clone();
-        let item_id = item_id.clone();
-        async move {
-            body_json(
-                api.oneshot(get(format!("/api/v1/items/{item_id}")))
-                    .await
-                    .unwrap(),
-            )
-            .await["play_count"]
-                .clone()
-        }
-    };
-    tokio::time::timeout(Duration::from_secs(5), async {
-        loop {
-            let n = count().await;
-            if n == 1 {
-                return;
-            }
-            assert_eq!(n, 0, "a watch counts once, at its end");
-            tokio::time::sleep(Duration::from_millis(20)).await;
-        }
-    })
-    .await
-    .expect("the finished watch was never counted");
-
-    // Room again after reaping.
+    // Teardown leaves the last completion mark durable, without counting plays.
+    let v = body_json(
+        api.clone()
+            .oneshot(get(format!("/api/v1/items/{item_id}")))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(v["played"], true);
+    assert!(v.get("play_count").is_none());
     let resp = start_session().await.unwrap();
     assert_eq!(resp.status(), StatusCode::CREATED);
-
-    // And the OTHER session reaped above — the one from the cap check,
-    // on this same item, which never reported a position — added
-    // nothing. A session that played nothing must not count the play a
-    // previous watch left marked.
-    assert_eq!(
-        count().await,
-        1,
-        "a session that watched nothing is not a play"
-    );
-
-    // Two more finished watches. Ended in this order deliberately: the
-    // one that must NOT count goes last, so anything it writes has to
-    // appear after a total that is already settled.
-    let del = |uri: String| {
-        api.clone().oneshot(
-            Request::delete(uri)
-                .header("authorization", bearer.clone())
-                .body(Body::empty())
-                .unwrap(),
-        )
-    };
-    let finish = |id: &str| {
-        let id = id.to_string();
-        let api = api.clone();
-        let bearer = bearer.clone();
-        async move {
-            let resp = api
-                .oneshot(
-                    Request::post(format!("/api/v1/playback/sessions/{id}/progress"))
-                        .header("authorization", bearer)
-                        .header("content-type", "application/json")
-                        .body(Body::from(
-                            serde_json::json!({ "position_ms": 97_000 }).to_string(),
-                        ))
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
-            assert_eq!(resp.status(), StatusCode::OK);
-            assert_eq!(body_json(resp).await["played"], true);
-        }
-    };
-    let session_id = |v: &serde_json::Value| v["session_id"].as_str().unwrap().to_string();
-
-    // A watch that takes the item past the line itself, stopped by the
-    // viewer: a play, exactly as the reaped one was.
-    let watched = session_id(&body_json(resp).await);
-    finish(&watched).await;
-    assert_eq!(
-        del(format!("/api/v1/playback/sessions/{watched}"))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NO_CONTENT
-    );
-    assert_eq!(
-        count().await,
-        2,
-        "the DELETE response waits until the finished watch is durable"
-    );
-
-    // A session that OPENS past the line is a continuation, not a watch.
-    // It is what the client starts after losing one — `recovery.ts` picks
-    // the position back up — and it ends past the line like the session
-    // before it, so counting on that alone counted one sitting twice.
-    let resp = api
-        .clone()
-        .oneshot(post(
-            "/api/v1/playback/sessions".into(),
-            serde_json::json!({"item_id": item_id, "mode": "direct", "start_ms": 96_000}),
-        ))
-        .await
-        .unwrap();
-    assert_eq!(resp.status(), StatusCode::CREATED);
-    let resumed = session_id(&body_json(resp).await);
-    finish(&resumed).await;
-    assert_eq!(
-        del(format!("/api/v1/playback/sessions/{resumed}"))
-            .await
-            .unwrap()
-            .status(),
-        StatusCode::NO_CONTENT
-    );
-    // A bounded wait, because what is being asserted is an absence — but
-    // a tight one: the two increments above are written by the same
-    // machinery and both landed well inside it.
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert_eq!(
-        count().await,
-        2,
-        "a session that never crossed the line must not count the play the one that did already earned"
-    );
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.
@@ -544,7 +426,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,

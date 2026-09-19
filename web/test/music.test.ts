@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, expect, test, vi } from 'vitest'

@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 /// The home screen, mounted. The rule most of this is about: a library that
 /// would not load must not look like a library with nothing in it — the second
 /// is dropped, and conflating them deleted whole libraries from this screen
@@ -16,6 +17,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   listLibraries: vi.fn(),
   listItems: vi.fn(),
   upNext: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 vi.mock('../src/api/session.ts', () => ({ whoAmI: vi.fn(() => ({ username: 'x', admin: false })) }))

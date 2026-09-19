@@ -5,6 +5,7 @@
 //! recorded `miss` so the next run doesn't re-search it. The admin can
 //! re-run after fixing titles; a review queue (HUB-8) comes later.
 
+mod catalogue;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -493,6 +494,9 @@ pub(crate) struct TvdbCreds {
 }
 
 pub struct Enricher {
+    catalogue_started: AtomicBool,
+    catalogue_import: tokio::sync::OnceCell<()>,
+    catalogue_wake: tokio::sync::Notify,
     /// Every provider call goes out through this: pacing and
     /// rate-limit backoff live in `gate.rs`, not at the call sites.
     http: std::sync::Arc<crate::gate::Http>,
@@ -1098,6 +1102,9 @@ impl Enricher {
     pub fn new(data_dir: std::path::PathBuf) -> Self {
         let http = std::sync::Arc::new(crate::gate::Http::new().expect("http client"));
         Self {
+            catalogue_started: AtomicBool::new(false),
+            catalogue_import: Default::default(),
+            catalogue_wake: Default::default(),
             anilist: crate::anime::Anilist::new(http.clone()),
             data_dir,
             http,
@@ -1489,16 +1496,31 @@ impl Enricher {
         order: &str,
         lease: &crate::gate::CredentialLease,
     ) -> Result<Vec<EpisodeData>> {
+        self.tvdb_episodes_english_cached(token, series_id, order, lease, None)
+            .await
+    }
+
+    async fn tvdb_episodes_english_cached(
+        &self,
+        token: &str,
+        series_id: &str,
+        order: &str,
+        lease: &crate::gate::CredentialLease,
+        store: Option<&kahawai_mediadb::Store>,
+    ) -> Result<Vec<EpisodeData>> {
         let mut out = self
-            .tvdb_episodes(token, series_id, order, None, lease)
+            .tvdb_episodes_cached(token, series_id, order, None, lease, store)
             .await?;
         let eng = match self
-            .tvdb_episodes(token, series_id, order, Some("eng"), lease)
+            .tvdb_episodes_cached(token, series_id, order, Some("eng"), lease, store)
             .await
         {
             Ok(episodes) => episodes,
-            Err(_) => {
+            Err(error) => {
                 lease.check()?;
+                if store.is_some() {
+                    return Err(error);
+                }
                 Vec::new()
             }
         };
@@ -1527,7 +1549,20 @@ impl Enricher {
         lang: Option<&str>,
         lease: &crate::gate::CredentialLease,
     ) -> Result<Vec<EpisodeData>> {
-        #[derive(Deserialize)]
+        self.tvdb_episodes_cached(token, series_id, order, lang, lease, None)
+            .await
+    }
+
+    async fn tvdb_episodes_cached(
+        &self,
+        token: &str,
+        series_id: &str,
+        order: &str,
+        lang: Option<&str>,
+        lease: &crate::gate::CredentialLease,
+        store: Option<&kahawai_mediadb::Store>,
+    ) -> Result<Vec<EpisodeData>> {
+        #[derive(Serialize, Deserialize)]
         struct Ep {
             id: u64,
             #[serde(default)]
@@ -1547,18 +1582,32 @@ impl Enricher {
             #[serde(default)]
             aired: Option<String>,
         }
-        #[derive(Deserialize)]
+        #[derive(Serialize, Deserialize)]
         struct Data {
             #[serde(default)]
             episodes: Vec<Ep>,
         }
-        #[derive(Deserialize)]
+        #[derive(Serialize, Deserialize)]
         struct Resp {
             data: Data,
         }
         let mut out = Vec::new();
         for page in 0..20 {
-            let resp = self
+            let question = format!(
+                "episodes:{series_id}:{order}:{}:{page}",
+                lang.unwrap_or("base")
+            );
+            let cached = if let Some(store) = store {
+                store
+                    .recent_cache_answer("tvdb-pages", &question, catalogue::now() - 7 * 24 * 3600)
+                    .await?
+            } else {
+                None
+            };
+            let r: Resp = if let Some(cached) = cached {
+                serde_json::from_str(&cached)?
+            } else {
+                let resp = self
                 .http
                 .send_current(
                     self.http
@@ -1575,10 +1624,22 @@ impl Enricher {
                     lease.clone(),
                 )
                 .await?;
-            if !resp.status().is_success() {
-                break;
-            }
-            let r: Resp = resp.json().await?;
+                if resp.status() == reqwest::StatusCode::NOT_FOUND {
+                    break;
+                }
+                let r: Resp = resp.status_checked()?.json().await?;
+                if let Some(store) = store {
+                    store
+                        .put_cache_answer(
+                            "tvdb-pages",
+                            &question,
+                            &serde_json::to_string(&r)?,
+                            catalogue::now(),
+                        )
+                        .await?;
+                }
+                r
+            };
             if r.data.episodes.is_empty() {
                 break;
             }
@@ -1602,6 +1663,13 @@ impl Enricher {
     /// Debounced auto-run: at most one spawned enrichment per 10 min,
     /// used by hooks like "new ED2K hashes landed".
     pub fn nudge(self: &Arc<Self>, registry: Arc<Registry>) {
+        if self.catalogue_started.load(Ordering::SeqCst) {
+            self.catalogue_wake.notify_waiters();
+            tokio::spawn(async move {
+                let _ = registry.catalogue().wake_enrichment(None).await;
+            });
+            return;
+        }
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
@@ -1619,6 +1687,13 @@ impl Enricher {
     }
 
     pub(crate) fn request_run(self: &Arc<Self>, registry: Arc<Registry>) {
+        if self.catalogue_started.load(Ordering::SeqCst) {
+            self.catalogue_wake.notify_waiters();
+            tokio::spawn(async move {
+                let _ = registry.catalogue().wake_enrichment(None).await;
+            });
+            return;
+        }
         self.schedule(registry, std::time::Duration::ZERO);
     }
 
@@ -1627,6 +1702,13 @@ impl Enricher {
     /// part of the portrait owed-work set, so attaching an existing music
     /// collection uses this path.
     pub(crate) fn request_artist_run(self: &Arc<Self>, registry: Arc<Registry>) {
+        if self.catalogue_started.load(Ordering::SeqCst) {
+            self.catalogue_wake.notify_waiters();
+            tokio::spawn(async move {
+                let _ = registry.catalogue().wake_enrichment(None).await;
+            });
+            return;
+        }
         self.artist_run_requested.store(true, Ordering::SeqCst);
         self.start_scheduler(registry, std::time::Duration::ZERO);
     }
@@ -4646,7 +4728,7 @@ impl Enricher {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EpisodeData {
     pub provider_id: String,
     pub season: Option<i64>,
@@ -5467,7 +5549,11 @@ mod tests {
         // A completed direct lookup remains cached even without a compatible
         // album provider row. This actual prefetch pass must perform no HTTP.
         let tmp = tempfile::tempdir().unwrap();
-        let registry = Registry::new(db.clone(), Default::default());
+        let registry = Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
         let enricher = Arc::new(Enricher::new(tmp.path().to_path_buf()));
         let artwork = Arc::new(crate::artwork::Artwork::new(
             tmp.path().join("artwork"),
@@ -5671,6 +5757,7 @@ mod tests {
         let registry = Arc::new(Registry::new(
             crate::db::open_in_memory().await.unwrap(),
             Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
         ));
         let enricher = Arc::new(Enricher::new(tempfile::tempdir().unwrap().keep()));
         // Keep the shared scheduler from entering a real artist pass; this
@@ -5701,6 +5788,7 @@ mod tests {
         let registry = Arc::new(Registry::new(
             crate::db::open_in_memory().await.unwrap(),
             Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
         ));
         let enricher = Arc::new(Enricher::new(tempfile::tempdir().unwrap().keep()));
         // Hold the runner so the flags remain observable.
@@ -5737,6 +5825,7 @@ mod tests {
         let registry = Arc::new(Registry::new(
             crate::db::open_in_memory().await.unwrap(),
             Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
         ));
         let mut events = registry.subscribe_events();
         let enricher = Arc::new(Enricher::new(dir.path().to_path_buf()));
@@ -5923,7 +6012,12 @@ mod tests {
                 .await
                 .unwrap(),
         );
-        let registry = Registry::new(db, Default::default()).with_credentials(credentials.clone());
+        let registry = Registry::new(
+            db,
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials.clone());
         let stored = |fields: BTreeMap<&'static str, &'static str>| {
             let credentials = credentials.clone();
             async move {
@@ -6875,6 +6969,7 @@ mod nfo_tests {
         let registry = Arc::new(crate::registry::Registry::new(
             db.clone(),
             Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
         ));
         registry
             .record_satellite("host", "mediahost", "host", "fp")

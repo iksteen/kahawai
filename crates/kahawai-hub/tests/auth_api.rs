@@ -72,7 +72,9 @@ fn post_authed(uri: &str, token: &str, body: serde_json::Value) -> Request<Body>
 #[tokio::test]
 async fn setup_maps_validation_and_storage_failures_separately() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let request = |username: &str, password: &str| {
@@ -101,7 +103,9 @@ async fn setup_maps_validation_and_storage_failures_separately() {
 #[tokio::test]
 async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy_hashes() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
 
     assert_eq!(
@@ -161,8 +165,14 @@ async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy
 #[tokio::test]
 async fn setup_then_auth_flow() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     assert!(auth.setup_required());
     let local = kahawai_hub::api::setup_router(auth.clone(), None);
@@ -497,7 +507,7 @@ fn test_router_with_net(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::router(
+    kahawai_hub::api::legacy_router_fixture(
         registry,
         auth,
         sessions,
@@ -527,14 +537,22 @@ async fn auth_harness() -> (
     kahawai_hub::auth::TokenPair,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let credentials = Arc::new(
         kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
             .await
             .unwrap(),
     );
-    let registry =
-        Arc::new(Registry::new(db.clone(), Default::default()).with_credentials(credentials));
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_credentials(credentials),
+    );
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     auth.complete_setup("root", "hunter22222hunter")
         .await
@@ -858,9 +876,14 @@ async fn media_cookie_is_limited_to_the_explicit_read_allowlist() {
 #[tokio::test]
 async fn configured_origin_controls_validation_and_request_metadata_controls_cookie_security() {
     let (_dir, db, auth, _api, _root) = auth_harness().await;
+    let catalogue = kahawai_mediadb::Store::in_memory().await.unwrap();
     let router = |net| {
         test_router_with_net(
-            Arc::new(Registry::new(db.clone(), Default::default())),
+            Arc::new(Registry::new(
+                db.clone(),
+                Default::default(),
+                catalogue.clone(),
+            )),
             auth.clone(),
             Arc::new(kahawai_hub::sessions::Sessions::new(
                 tempfile::tempdir().unwrap().keep(),
@@ -1045,7 +1068,9 @@ async fn configured_origin_controls_validation_and_request_metadata_controls_coo
 #[tokio::test]
 async fn concurrent_local_setup_has_exactly_one_winner() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let (a, b) = tokio::join!(
         auth.complete_setup("browser", "hunter222222"),
@@ -1077,8 +1102,14 @@ async fn items_filter_by_library() {
     };
 
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let api = test_router(
         registry.clone(),
@@ -1227,8 +1258,14 @@ async fn items_filter_by_library() {
 #[tokio::test]
 async fn admin_creates_users() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     auth.complete_setup("root", "hunter222222").await.unwrap();
     let admin_token = auth
@@ -1305,8 +1342,14 @@ async fn login_throttles_after_repeated_failures() {
     // OPS-2: five consecutive bad passwords lock the account — the
     // sixth attempt gets 429 even with the CORRECT password.
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     auth.complete_setup("ingmar", "hunter222222").await.unwrap();
     let api = test_router(
@@ -1368,8 +1411,14 @@ async fn login_throttles_after_repeated_failures() {
 #[tokio::test]
 async fn bootstrap_states_setup_without_authentication() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let api = test_router(
@@ -1447,7 +1496,9 @@ async fn bootstrap_states_setup_without_authentication() {
 #[tokio::test]
 async fn expired_refresh_families_prune_at_open() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
     auth.complete_setup("u", "hunter22222hunter").await.unwrap();
     sqlx::query(
@@ -1515,9 +1566,14 @@ async fn refresh_family_migration_invalidates_legacy_tokens() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
-        .await
-        .unwrap();
+    let auth = Auth::new(
+        kahawai_hub::db::open_legacy_fixture(dir.path())
+            .await
+            .unwrap(),
+        dir.path(),
+    )
+    .await
+    .unwrap();
     assert!(matches!(
         auth.refresh(legacy).await,
         Err(kahawai_hub::auth::RefreshError::Invalid)
@@ -1719,9 +1775,14 @@ async fn auth_version_migration_invalidates_existing_access_and_refresh() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
-        .await
-        .unwrap();
+    let auth = Auth::new(
+        kahawai_hub::db::open_legacy_fixture(dir.path())
+            .await
+            .unwrap(),
+        dir.path(),
+    )
+    .await
+    .unwrap();
     assert!(auth.authenticate(&access).await.is_err());
     assert!(matches!(
         auth.refresh(refresh).await,
@@ -2008,7 +2069,9 @@ async fn password_reset_revokes_all_families_across_restart() {
     let second = auth.login("root", "hunter22222hunter").await.unwrap();
     // A distinct pool is the separate CLI process: no Auth state is shared with
     // the running hub, only the durable database transaction.
-    let cli_db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let cli_db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     kahawai_hub::auth::reset_password(&cli_db, "root", "new-password-22")
         .await
         .unwrap();
@@ -2055,7 +2118,9 @@ async fn password_reset_revokes_all_families_across_restart() {
 #[tokio::test]
 async fn delete_racing_demotion_keeps_an_admin() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
 
     // Re-run the actual race, not merely its two statements in a chosen order.
@@ -2111,8 +2176,14 @@ async fn delete_racing_demotion_keeps_an_admin() {
 #[tokio::test]
 async fn admin_deletes_users() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
-    let registry = Arc::new(Registry::new(db.clone(), Default::default()));
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
+    let registry = Arc::new(Registry::new(
+        db.clone(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     auth.complete_setup("root", "hunter222222").await.unwrap();
     let admin_token = auth

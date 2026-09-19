@@ -428,7 +428,7 @@ async fn reopen_repairs_false_recording_ambiguity_without_touching_other_songs()
     );
     pool.close().await;
 
-    let db = db::open(dir.path()).await.unwrap();
+    let db = db::open_legacy_fixture(dir.path()).await.unwrap();
     assert_eq!(sqlx::query_scalar::<_, String>("SELECT library_item_id FROM collection_item_library_items WHERE collection_item_id='late-copy'")
         .fetch_one(&db).await.unwrap(), "known");
     assert_eq!(
@@ -459,7 +459,7 @@ async fn reopen_repairs_false_recording_ambiguity_without_touching_other_songs()
             .await
             .unwrap();
     db.close().await;
-    let db = db::open(dir.path()).await.unwrap();
+    let db = db::open_legacy_fixture(dir.path()).await.unwrap();
     assert_eq!(
         sqlx::query_scalar::<_, i64>(
             "SELECT assignment_revision FROM collection_items WHERE id='late-copy'"

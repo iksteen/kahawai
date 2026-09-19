@@ -129,7 +129,7 @@ What survives, in AR-13 and unchanged by this: the byte plane's ~4 KB/s figure i
 
 ### 6.3 Users, auth, and API
 
-**HUB-10** The hub shall support multiple user accounts with per-library access grants, per-user watch state (played/unplayed, resume positions, play counts), and an admin role for configuration.
+**HUB-10** The hub shall support multiple user accounts with per-library access grants, per-user watch state (played/unplayed, resume positions), and an admin role for configuration.
 **HUB-11** The client API shall be a versioned HTTP/JSON API plus a real-time channel (WebSocket or SSE) for session events and library-change notifications, with token-based auth (short-lived access tokens, revocable refresh tokens) and optional reverse-proxy/OIDC-friendly operation.
 **HUB-12** The API shall expose browse (hierarchical: library → show → season → episode; artist → album → track), search across libraries, item detail with full technical stream info, image serving with server-side resizing and caching (including access-controlled Album Artist portraits), playback endpoints, and admin endpoints (module registry, library composition, enrichment control, session monitoring).
 **HUB-13** All state owned by the hub (registry, libraries, items, users, watch state, enrichment cache index) shall persist in an embedded database requiring no external services by default.

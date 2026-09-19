@@ -80,6 +80,8 @@ message FileSubtitles {
   repeated SubTrack tracks = 4;
   // Whole-file failure (unreadable, no text tracks despite discovery…).
   string error = 5;
+  // Opaque source revision captured by the hub; echoed unchanged in replies.
+  string source_revision = 6;
 }
 
 message SubTrack {
@@ -322,6 +324,8 @@ message CatalogDelta {
   // zero until a multi-page snapshot's final reconciliation; incremental
   // versions may have gaps when a newer current row supersedes a mutation.
   uint64 through_version = 4;
+  // Marks the first message of a snapshot stream. Continuations can be false;
+  // the hub retains snapshot state until the final done message commits.
   bool snapshot = 5;
   bool done = 6;
 }
@@ -354,6 +358,8 @@ message DiscoveryStatus {
   uint64 pending_hashes = 7;
   uint64 pending_segments = 8;
   uint64 pending_loudness = 9;
+  // Absent on older mediahosts: zero pending alone does not mean enabled.
+  optional bool segments_enabled = 10;
 }
 
 message DiscoveryWake {
@@ -436,6 +442,8 @@ message AudioLayoutGain {
 message ExtractSubs {
   string collection_id = 1;
   SourcePath source = 2;
+  // Opaque source revision captured by the hub; echoed unchanged in replies.
+  string source_revision = 3;
 }
 
 message ExtractImageSubs {
@@ -443,6 +451,8 @@ message ExtractImageSubs {
   SourcePath source = 2;
   // Which subtitle track, in the e{n} numbering discovery uses.
   uint32 sub_index = 3;
+  // Opaque source revision captured by the hub; echoed unchanged in replies.
+  string source_revision = 4;
 }
 
 /// One image subtitle track, undecoded: the payloads are still PGS
@@ -467,6 +477,8 @@ message ImageSubtitles {
   // and playback with it (measured 2026-08-07: 3663 extractions sent,
   // 24 arrived).
   optional bool done = 8;
+  // Opaque source revision captured by the hub; echoed unchanged in replies.
+  string source_revision = 9;
 }
 
 message ImageSubBlock {
@@ -584,6 +596,8 @@ message Hashlist {
 
 message RescanRequest {
   string collection_id = 1;
+  // Re-probe unchanged media too; scoped to this request, never a persistent mode.
+  bool deep = 2;
 }
 
 message OpenRead {

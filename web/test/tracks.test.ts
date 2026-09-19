@@ -47,3 +47,7 @@ test('shared language choices remain portable across copies', () => {
     ]),
   ).toEqual({ audioTrack: 1, subs: [], subTrack: null })
 })
+
+test('a downloaded subtitle ID remains an exact source preference', () => {
+  expect(resolve([{ scope: scope!, key: 'subs.track', value: '-42' }]).subTrack).toBe(-42)
+})

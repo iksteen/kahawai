@@ -33,7 +33,11 @@ async fn spawn_hub() -> Hub {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(db, allowed.clone()));
+    let registry = Arc::new(Registry::new(
+        db,
+        allowed.clone(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    ));
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = format!("localhost:{}", listener.local_addr().unwrap().port());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
@@ -68,10 +72,19 @@ async fn spawn_hub() -> Hub {
 
 /// Enroll a satellite directly against the CA and admit it on the hub's
 /// allowlist (the wire flow has its own test).
-fn enroll(hub: &Hub, module_id: &str, name: &str) -> SatelliteIdentity {
+async fn enroll(hub: &Hub, module_id: &str, name: &str) -> SatelliteIdentity {
     let id = sign_only(&hub.ca, module_id, name);
     hub.allowed
         .insert(&kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap());
+    hub.registry
+        .record_satellite(
+            module_id,
+            "mediahost",
+            name,
+            &kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap(),
+        )
+        .await
+        .unwrap();
     id
 }
 
@@ -101,15 +114,7 @@ async fn wait_until(mut cond: impl FnMut() -> bool, what: &str) {
 #[tokio::test]
 async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01LINK", "nas");
-    sqlx::query(
-        "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
-         VALUES('01LINK','mediahost','nas',?)",
-    )
-    .bind(kahawai_transport::mtls::cert_fingerprint_pem(&id.cert_pem).unwrap())
-    .execute(hub.registry.db())
-    .await
-    .unwrap();
+    let id = enroll(&hub, "01LINK", "nas").await;
     let addr = hub.addr.clone();
     let reconnect_id = id.clone();
 
@@ -255,24 +260,32 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     assert_eq!(state.module_type, "mediahost");
     assert_eq!(state.name, "nas");
 
-    // The announced collection and its file arrive in the registry.
-    let registry = hub.registry.clone();
-    tokio::time::timeout(Duration::from_secs(10), async {
+    let collection_id = tokio::time::timeout(Duration::from_secs(10), async {
         loop {
-            let cols = registry.collections().await.unwrap();
-            if cols.iter().any(|c| {
-                c.module_id == "01LINK"
-                    && c.collection_id == "movies"
-                    && c.available
-                    && c.file_count == 1
-            }) {
-                break;
+            for c in hub
+                .registry
+                .catalogue()
+                .collections("01LINK")
+                .await
+                .unwrap()
+            {
+                if hub.registry.catalogue().files(&c.id).await.unwrap().len() == 1 {
+                    return c.id;
+                }
             }
             tokio::time::sleep(Duration::from_millis(50)).await;
         }
     })
     .await
     .expect("collection with one file");
+    let file_id = hub
+        .registry
+        .catalogue()
+        .files(&collection_id)
+        .await
+        .unwrap()[0]
+        .id
+        .clone();
 
     // A terminal hash result is current catalogue state, not merely a log
     // message. In particular, it must clear a prior exact hash when a file was
@@ -297,6 +310,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
             kahawai_proto::v1::FileHash {
                 source: Some(source.clone()),
                 error: "replacement could not be read".into(),
+                size: 123,
                 ..Default::default()
             },
         ),
@@ -336,42 +350,53 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
                 kahawai_proto::v1::CatalogAck { version: acked, .. }
             )) if acked == version
         ));
-        let stored: Option<String> = sqlx::query_scalar(
-            "SELECT ed2k FROM files WHERE module_id='01LINK' AND collection_id='movies'",
-        )
-        .fetch_one(hub.registry.db())
-        .await
-        .unwrap();
-        assert_eq!(stored.as_deref(), (version == 2).then_some("exact-hash"));
+        let facts = hub
+            .registry
+            .catalogue()
+            .source_facts(&file_id)
+            .await
+            .unwrap();
+        let hash = facts
+            .into_iter()
+            .find_map(|f| match f {
+                kahawai_mediadb::SourceFact::Hashes(h) => Some(h.hashes[0].clone()),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(hash.ed2k_hex, if version == 2 { "exact-hash" } else { "" });
     }
-    let ed2k: Option<String> = sqlx::query_scalar(
-        "SELECT ed2k FROM files WHERE module_id='01LINK' AND collection_id='movies'",
-    )
-    .fetch_one(hub.registry.db())
-    .await
-    .unwrap();
-    assert!(
-        ed2k.is_none(),
-        "terminal current hash state retained stale ED2K"
-    );
 
     // A new catalogue epoch is a physical refresh, not permission to erase
     // hub-owned identity decisions. Stream the same current source through a
     // forced snapshot and verify its stable item row (and manual pin) survive.
-    let item_id: String = sqlx::query_scalar(
-        "SELECT id FROM collection_items WHERE module_id='01LINK' AND collection_id='movies' AND kind='movie'",
-    )
-    .fetch_one(hub.registry.db())
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO manual_match(item_id,provider,provider_id,pinned_at)
-         VALUES(?,'tmdb','123',unixepoch())",
-    )
-    .bind(&item_id)
-    .execute(hub.registry.db())
-    .await
-    .unwrap();
+    let item_id = hub
+        .registry
+        .catalogue()
+        .collection_items(&collection_id)
+        .await
+        .unwrap()[0]
+        .id
+        .clone();
+    let metadata = hub
+        .registry
+        .catalogue()
+        .put_provider_record(&kahawai_mediadb::ProviderRecord {
+            provider: "tmdb".into(),
+            namespace: "movies".into(),
+            external_id: "123".into(),
+            language: "en".into(),
+            media_type: kahawai_mediadb::MediaType::Movies,
+            title: "Heat".into(),
+            year: Some(1995),
+            description: Default::default(),
+        })
+        .await
+        .unwrap();
+    hub.registry
+        .catalogue()
+        .assign_metadata(&item_id, Some(&metadata))
+        .await
+        .unwrap();
     let root_path = std::path::Path::new("/tank/movies");
     let root_token = kahawai_core::media::root_token(root_path);
     tx.send(kahawai_proto::v1::HostToHub {
@@ -448,14 +473,14 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     .unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {
         loop {
-            let mtime: i64 = sqlx::query_scalar(
-                "SELECT mtime_unix FROM files
-                  WHERE module_id='01LINK' AND collection_id='movies'",
-            )
-            .fetch_one(hub.registry.db())
-            .await
-            .unwrap();
-            if mtime == 457 {
+            let mtime = hub
+                .registry
+                .catalogue()
+                .files(&collection_id)
+                .await
+                .unwrap()[0]
+                .mtime;
+            if mtime == Some(457) {
                 break;
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -463,16 +488,15 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
     })
     .await
     .expect("replacement snapshot first page was not applied");
-    let staged_cursor: i64 = sqlx::query_scalar(
-        "SELECT version FROM mediahost_catalog_cursors
-          WHERE module_id='01LINK' AND collection_id='movies'",
-    )
-    .fetch_one(hub.registry.db())
-    .await
-    .unwrap();
+    let staged_cursor = hub
+        .registry
+        .catalogue()
+        .catalogue_cursor(&collection_id)
+        .await
+        .unwrap();
     assert_eq!(
-        staged_cursor, 0,
-        "an incomplete snapshot became a durable resume point"
+        staged_cursor.version, 0,
+        "an incomplete snapshot became a resume point"
     );
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::CatalogDelta(
@@ -493,14 +517,17 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         .expect("replacement snapshot final ACK timeout")
         .unwrap()
         .unwrap();
-    let preserved: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM manual_match WHERE item_id=? AND provider_id='123'",
-    )
-    .bind(&item_id)
-    .fetch_one(hub.registry.db())
-    .await
-    .unwrap();
-    assert_eq!(preserved, 1, "catalogue replacement erased a manual pin");
+    let copies = hub
+        .registry
+        .catalogue()
+        .collection_items(&collection_id)
+        .await
+        .unwrap();
+    assert_eq!(copies[0].id, item_id);
+    assert_eq!(
+        copies[0].selected_record.as_deref(),
+        Some(metadata.as_str())
+    );
 
     // Drop the client: AR-6 — satellite and collection marked unavailable,
     // nothing deleted.
@@ -517,13 +544,17 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         "mediahost to be marked disconnected",
     )
     .await;
-    let cols = hub.registry.collections().await.unwrap();
-    let col = cols.iter().find(|c| c.module_id == "01LINK").unwrap();
-    assert!(
-        !col.available,
-        "collection must be unavailable after disconnect"
+    assert!(!hub.registry.is_connected("01LINK"));
+    assert_eq!(
+        hub.registry
+            .catalogue()
+            .files(&collection_id)
+            .await
+            .unwrap()
+            .len(),
+        1,
+        "disconnect retains files"
     );
-    assert_eq!(col.file_count, 1, "files must survive a disconnect (AR-6)");
 
     // The hub, not an in-memory ACK observation on the mediahost, supplies
     // the durable resume point after reconnect.
@@ -593,7 +624,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
 #[tokio::test]
 async fn protocol_4_rejects_legacy_reconciliation_messages() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01LEGACY", "legacy-v4");
+    let id = enroll(&hub, "01LEGACY", "legacy-v4").await;
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await
@@ -670,7 +701,7 @@ async fn unlisted_cert_is_refused_fail_closed() {
 #[tokio::test]
 async fn deleted_cert_is_refused_at_tls_layer() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01GONE", "gone");
+    let id = enroll(&hub, "01GONE", "gone").await;
     // Admitted first: the link works.
     assert!(try_link(&hub.addr, &id).await.is_ok());
     // Deletion removes the fingerprint from the allowlist (SEC-6).
@@ -720,7 +751,7 @@ async fn try_link(addr: &str, id: &SatelliteIdentity) -> Result<(), Box<dyn std:
 #[tokio::test]
 async fn protocol_4_rejects_a_missing_exact_source() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01BADP3", "bad-p3");
+    let id = enroll(&hub, "01BADP3", "bad-p3").await;
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await
@@ -768,7 +799,7 @@ async fn protocol_4_rejects_a_missing_exact_source() {
 #[tokio::test]
 async fn protocol_4_rejects_an_invalid_root_binding() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01BADROOT", "bad-root");
+    let id = enroll(&hub, "01BADROOT", "bad-root").await;
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await
@@ -817,7 +848,7 @@ async fn protocol_4_rejects_an_invalid_root_binding() {
     let status = inbound.message().await.unwrap_err();
     assert_eq!(status.code(), tonic::Code::FailedPrecondition);
     assert!(
-        status.message().contains("invalid root binding"),
+        status.message().contains("invalid root token/path binding"),
         "{status}"
     );
 }
@@ -825,7 +856,7 @@ async fn protocol_4_rejects_an_invalid_root_binding() {
 #[tokio::test]
 async fn protocol_3_mediahost_is_rejected_during_hello() {
     let hub = spawn_hub().await;
-    let id = enroll(&hub, "01OLD", "protocol-two");
+    let id = enroll(&hub, "01OLD", "protocol-two").await;
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.addr, tls)
         .await

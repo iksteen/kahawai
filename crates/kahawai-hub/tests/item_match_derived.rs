@@ -124,7 +124,9 @@ async fn answer(db: &SqlitePool, id: &str, provider: &str, pid: &str, confidence
 #[tokio::test]
 async fn the_assignment_follows_every_input_with_nothing_called() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
 
     // An item nothing has answered for has no assignment. Absence is the
     // representation — there is no "unmatched" row.
@@ -278,7 +280,9 @@ async fn the_assignment_follows_every_input_with_nothing_called() {
 #[tokio::test]
 async fn a_pin_whose_answer_disappears_does_not_strand_an_assignment() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     item(&db, "i1").await;
     answer(&db, "i1", "tvdb", "414734", "auto").await;
     sqlx::query(
@@ -366,7 +370,9 @@ async fn withdrawing_child_pins_returns_episodes_and_tracks_to_their_parent() {
 #[tokio::test]
 async fn replacing_old_trigger_definitions_repairs_unpinned_child_assignments() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     pinned_children(&db).await;
     // A pre-fix trigger left the result behind when the pin was removed.
     // Removing this one definition models that state and forces the startup
@@ -380,7 +386,9 @@ async fn replacing_old_trigger_definitions_repairs_unpinned_child_assignments() 
     .unwrap();
     assert!(assigned(&db, "episode").await.is_some());
     db.close().await;
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     assert_eq!(assigned(&db, "episode").await, None);
     assert_eq!(assigned(&db, "track").await, None);
     assert_eq!(drifted(&db).await, 0);
@@ -393,7 +401,9 @@ async fn replacing_old_trigger_definitions_repairs_unpinned_child_assignments() 
 #[tokio::test]
 async fn moving_a_source_between_collections_re_ranks_the_item() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     for (id, mt) in [("c-movies", "movies"), ("c-anime", "anime")] {
         sqlx::query(
             "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint,

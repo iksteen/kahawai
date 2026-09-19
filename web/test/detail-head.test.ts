@@ -6,6 +6,8 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, test, vi } from 'vitest'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string, p?: { size?: string }) => `/art/${id}?size=${p?.size ?? ''}`,
 }))
 
@@ -17,7 +19,7 @@ const item = (over: Record<string, unknown> = {}) => ({
   title: 'Heat',
   year: 1995,
   art_version: 2,
-  play_count: 0,
+
   duration_ms: 170 * 60_000,
   resume_position_ms: null,
   resume_duration_ms: null,
@@ -38,13 +40,12 @@ describe('what it says', () => {
 
   test('and the facts everybody checks', () => {
     const wrapper = head({
-      play_count: 3,
       metadata: { premiered: '1995-12-15', rating: 8.3, confidence: 'weak' },
     })
     expect(wrapper.text()).toContain('1995-12-15')
     expect(wrapper.text()).toContain('8.3')
     expect(wrapper.text()).toContain('uncertain match')
-    expect(wrapper.text()).toContain('seen ×3')
+    expect(wrapper.text()).not.toContain('seen ×')
   })
 
   test('and none of them when there is nothing to say', () => {

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # NFR-1: measure what a viewer waits for, against the live fleet.
 #
-#   kahawai-latency.sh [-n runs] [-c sessions] [-a host:port] <username> <password> [item-id...]
+#   kahawai-latency.sh -l library [-n runs] [-c sessions] [-a host:port] <username> <password> [item-id...]
 #
 #   -n RUNS       repeats per case (default 5)
 #   -c SESSIONS   concurrent direct-play sessions for the load case (default 100)
@@ -10,9 +10,10 @@
 #                 ([hub] max_per_user, default 4) is per ACCOUNT, so a
 #                 hub-capacity figure needs either enough accounts or a
 #                 raised cap — one account cannot show it.
+#   -l library    mediadb library ID (required)
+#   -e entry      pin a stable media entry ID (optional)
 #   -a host:port  API address (default: $KAHAWAI_API or localhost:8420)
-#   item-id...    cases to measure; defaults to the three torture titles
-#                 configured below when they resolve on this hub
+#   item-id...    stable mediadb IDs to measure (at least one required)
 #
 # START LATENCY is timed from the session POST to the first byte a
 # PLAYER can consume — the range response's first byte for direct play,
@@ -29,6 +30,7 @@
 set -euo pipefail
 
 API="${KAHAWAI_API:-localhost:8420}"
+LIBRARY="" ENTRY=""
 RUNS=5
 CONCURRENT=100
 USERS=0
@@ -38,18 +40,21 @@ USERS=0
 BUDGET_DIRECT_MS=2000
 BUDGET_TRANSCODE_MS=6000
 
-while getopts "n:c:u:a:h" opt; do
+while getopts "l:e:n:c:u:a:h" opt; do
     case $opt in
         n) RUNS="$OPTARG" ;;
         c) CONCURRENT="$OPTARG" ;;
         u) USERS="$OPTARG" ;;
+        l) LIBRARY="$OPTARG" ;;
+        e) ENTRY="$OPTARG" ;;
         a) API="$OPTARG" ;;
         h|*) grep '^#' "$0" | sed 's/^# \{0,1\}//' | head -28; exit 0 ;;
     esac
 done
 shift $((OPTIND - 1))
 
-[ $# -ge 2 ] || { echo "usage: $(basename "$0") [-n runs] [-c sessions] <username> <password> [item-id...]" >&2; exit 2; }
+[ $# -ge 2 ] || { echo "usage: $(basename "$0") -l library [-n runs] [-c sessions] <username> <password> [item-id...]" >&2; exit 2; }
+[ -n "$LIBRARY" ] || { echo "-l library is required" >&2; exit 2; }
 USERNAME=$1 PASSWORD=$2
 shift 2
 
@@ -67,33 +72,27 @@ login() {
 }
 TOKEN=$(login) || { echo "login failed" >&2; exit 1; }
 
-# The three shapes worth timing, and why each is here:
-#   the home-grown torture file — local mediahost, small, the floor
-#   Allegiant  — 12 GB, 4K-class scope, DTS: the heaviest decode
-#   The Truman Show — HDR10, E-AC-3: the tone-map path
-DEFAULT_ITEMS=(
-    "01KYR0QZVT4WGQ6H5ZK56BZ956"
-    "01KY5X2CMT1BFJT206RWAJ9BPN"
-    "01KYYXCAHGEE7QAWR76929MCPS"
-)
+# IDs come from kahawai-list.sh -l LIBRARY; no machine-specific legacy IDs.
+[ $# -gt 0 ] || { echo 'at least one stable item ID is required' >&2; exit 2; }
 ITEMS=("$@")
-[ ${#ITEMS[@]} -gt 0 ] || ITEMS=("${DEFAULT_ITEMS[@]}")
 
 # A client that accepts everything these files hold, so the hub has no
 # reason to encode: this is the direct-play case.
 PROFILE_PERMISSIVE='{"containers":["matroska","mp4","webm"],
   "video":[{"codec":"hevc"},{"codec":"h264"},{"codec":"av1"},{"codec":"vp9"}],
   "audio":["dts","eac3","ac3","aac","flac","opus","truehd"],"hdr":true,
-  "graphics_overlay":true,"ass_render":true}'
+  "graphics_overlay":true,"ass_render":true,"target_duration":{"mode":"ignore"}}'
 # A client that accepts none of it: forces the full encode, tone-map
 # included, which is the six-second budget's real subject.
 PROFILE_STRICT='{"containers":["ts"],"video":[{"codec":"h264"}],"audio":["aac"],"hdr":false,
-  "graphics_overlay":false,"ass_render":false}'
+  "graphics_overlay":false,"ass_render":false,"target_duration":{"mode":"ignore"}}'
 
 now_ms() { python3 -c 'import time;print(int(time.time()*1000))'; }
 
 title_of() {
-    curl -sf "http://$API/api/v1/items/$1" -H "Authorization: Bearer $TOKEN" \
+    local path
+    path=$(python3 -c 'import sys,urllib.parse;print("/api/v1/catalogue/libraries/"+urllib.parse.quote(sys.argv[1],safe="")+"/items/"+urllib.parse.quote(sys.argv[2],safe=""))' "$LIBRARY" "$1")
+    curl -sf "http://$API$path" -H "Authorization: Bearer $TOKEN" \
         | json_field title 2>/dev/null || echo "$1"
 }
 
@@ -108,8 +107,8 @@ end_session() {
 start_once() {
     local item=$1 profile=$2 t0 resp sid mode stream elapsed deadline
     t0=$(now_ms)
-    resp=$(python3 -c 'import json,sys;print(json.dumps({"item_id":sys.argv[1],"profile":json.loads(sys.argv[2])}))' \
-             "$item" "$profile" \
+    resp=$(python3 -c 'import json,sys;print(json.dumps({"item_id":sys.argv[1],"profile":json.loads(sys.argv[2]),"library_id":sys.argv[3],"media_entry_id":sys.argv[4] or None,"resume":False}))' \
+             "$item" "$profile" "$LIBRARY" "$ENTRY" \
            | curl -sf -X POST "http://$API/api/v1/playback/sessions" \
                -H "Authorization: Bearer $TOKEN" -H content-type:application/json -d @-) \
         || { echo "error -1"; return; }

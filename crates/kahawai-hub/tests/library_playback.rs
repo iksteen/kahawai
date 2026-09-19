@@ -207,7 +207,7 @@ async fn recovery_refuses_a_replaced_version_but_waits_for_a_retained_offline_ve
     let source = started["source_id"].as_i64().unwrap();
     let fingerprint = started["source_fingerprint"].as_str().unwrap();
     let session = h.sessions.get(sid).unwrap();
-    let file = session.parts[0].file_id;
+    let file = session.parts[0].file_id.legacy().unwrap();
     let module = session.parts[0].module_id.clone();
     call(
         &h,
@@ -360,7 +360,7 @@ async fn exact_episode_boundaries_drive_resume_and_history_without_splitting_fil
     .unwrap();
     assert_eq!(
         states,
-        vec![(ids[1].clone(), 2900, 1, 1)],
+        vec![(ids[1].clone(), 2900, 1, 0)],
         "starting the second episode must not mark the first watched"
     );
     sqlx::query("DELETE FROM user_item_state")
@@ -431,7 +431,7 @@ async fn exact_episode_boundaries_drive_resume_and_history_without_splitting_fil
             .fetch_one(&h.db)
             .await
             .unwrap();
-    assert_eq!(first, (2900, 1, 1));
+    assert_eq!(first, (2900, 1, 0));
     // Altering coordinates without altering the bytes invalidates a saved offset.
     sqlx::query("UPDATE user_item_state SET position_ms=500,played=0 WHERE item_id=?")
         .bind(&ids[1])

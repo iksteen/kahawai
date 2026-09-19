@@ -221,7 +221,7 @@ browser_body, browser_cookies = expect(
 assert_browser_response(browser_body, browser_cookies, "browser login")
 
 expect(200, call("HEAD", "/api/v1/events", opener=browser), "media-cookie event stream")
-expect(401, call("GET", "/api/v1/items", opener=browser), "cookie catalogue rejection")
+expect(401, call("GET", "/api/v1/catalogue/libraries", opener=browser), "cookie catalogue rejection")
 expect(
     401,
     call("POST", "/api/v1/playback/sessions", {}, opener=browser),

@@ -1,3 +1,4 @@
+import { sessionFonts, getSessionFontUrl } from '../api/generated/kahawai.ts'
 /// The three ways a subtitle track reaches the screen, and the one that keeps a
 /// native `<track>` in the right mode.
 ///
@@ -215,7 +216,7 @@ export function useSubtitleRenderers(p: {
 
     void (async () => {
       const response = await fetch(
-        overlayUrl(selected, p.itemId.value, p.session.value.stream_url),
+        overlayUrl(selected, p.itemId.value, p.session.value.stream_url, p.session.value),
         { signal: aborter.signal },
       )
       // Reported, because `delivery` is `overlay` here and the `.vtt` <track>
@@ -296,8 +297,15 @@ export function useSubtitleRenderers(p: {
     void (async () => {
       let fonts: string[] = []
       try {
-        const answer = await itemFonts(p.itemId.value, { source_id: p.session.value.source_id })
-        fonts = answer.fonts.map((_, at) => fontUrl(p.itemId.value, at, p.session.value.source_id))
+        const session = p.session.value
+        const answer = session.media_entry_id
+          ? await sessionFonts(session.session_id)
+          : await itemFonts(p.itemId.value, { source_id: session.source_id })
+        fonts = answer.fonts.map((_, at) =>
+          session.media_entry_id
+            ? getSessionFontUrl(session.session_id, at)
+            : fontUrl(p.itemId.value, at, session.source_id),
+        )
       } catch {
         // No fonts: libass falls back.
       }
@@ -378,7 +386,9 @@ export function useSubtitleRenderers(p: {
       // handful of cues that arrived and a complete copy sitting on the hub,
       // silently. Doubled text beats missing text.
       if (!fed && !dead) {
-        await feed(subtitleFileUrl(p.itemId.value, `${selected.id}.ass`)).catch(() => false)
+        await feed(
+          subtitleFileUrl(p.itemId.value, `${selected.id}.ass`, undefined, p.session.value),
+        ).catch(() => false)
       }
       // On the INSTANCE, not on `fed`: a stream that dies after its header has
       // already put subtitles on screen and still returns false, so reporting

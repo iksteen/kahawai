@@ -409,3 +409,192 @@ async fn snapshot_replaces_fact_versions_from_a_cursor_ahead_of_the_host() {
         _ => panic!("wrong fact"),
     }
 }
+
+#[tokio::test]
+async fn complete_offers_are_atomic_and_only_remove_the_offering_hosts_namespaces() {
+    let (_dir, s) = store().await;
+    let a = collection(&s, "a", MediaType::Movies, &["Dark.City.1998.mkv"]).await;
+    let b = collection(&s, "b", MediaType::Movies, &["The.Matrix.1999.mkv"]).await;
+    let item = s.collection_items(&b).await.unwrap()[0]
+        .library_item_id
+        .clone();
+    let original = serde_json::to_value(s.collection_summaries().await.unwrap()).unwrap();
+    let mut changed = offer("a", MediaType::Movies, 10);
+    changed.epoch = "new-epoch".into();
+    let mut invalid = offer("new", MediaType::Movies, 1);
+    invalid.roots[0].normalized_path = "relative".into();
+    assert!(
+        s.offer_catalogue(
+            "host",
+            "Changed name",
+            &p::CatalogOffer {
+                collections: vec![changed.clone(), invalid]
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(s.collection_summaries().await.unwrap()).unwrap(),
+        original
+    );
+    assert!(
+        s.offer_catalogue(
+            "host",
+            "Fixture",
+            &p::CatalogOffer {
+                collections: vec![changed.clone(), changed]
+            }
+        )
+        .await
+        .is_err()
+    );
+    assert_eq!(
+        serde_json::to_value(s.collection_summaries().await.unwrap()).unwrap(),
+        original
+    );
+    s.offer_catalogue(
+        "other",
+        "Other",
+        &p::CatalogOffer {
+            collections: vec![offer("b", MediaType::Movies, 1)],
+        },
+    )
+    .await
+    .unwrap();
+    let other = s.collections("other").await.unwrap()[0].id.clone();
+    assert_ne!(other, b);
+    let cursors = s
+        .offer_catalogue(
+            "host",
+            "Fixture",
+            &p::CatalogOffer {
+                collections: vec![offer("a", MediaType::Movies, 1)],
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(cursors[0].version, 1);
+    assert!(!cursors[0].snapshot);
+    assert_eq!(s.collections("host").await.unwrap()[0].id, a);
+    assert!(s.library_item_record(&item).await.unwrap().archived);
+    assert_eq!(s.collections("other").await.unwrap()[0].id, other);
+    s.offer_catalogue("host", "Fixture", &p::CatalogOffer::default())
+        .await
+        .unwrap();
+    assert!(s.collections("host").await.unwrap().is_empty());
+    assert_eq!(s.collections("other").await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn first_message_marker_covers_unordered_snapshot_continuations() {
+    let (_dir, s) = store().await;
+    let col = collection(&s, "c", MediaType::Movies, &["Old.1990.mkv"]).await;
+    let old = s.collection_items(&col).await.unwrap()[0]
+        .library_item_id
+        .clone();
+    let mut o = offer("c", MediaType::Movies, 5);
+    o.oldest_replayable_version = 2;
+    s.offer_collection("host", &o).await.unwrap();
+    assert!(
+        s.apply_catalogue(
+            "host",
+            &delta("c", true, false, 0, vec![file(5, "New.2001.mkv")])
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    // The producer marks only the first chunk. File-first pages are not ordered
+    // by version, including across page boundaries.
+    assert!(
+        s.apply_catalogue(
+            "host",
+            &delta("c", false, false, 0, vec![file(2, "Other.2000.mkv")])
+        )
+        .await
+        .unwrap()
+        .is_none()
+    );
+    assert_eq!(s.files(&col).await.unwrap().len(), 3);
+    assert_eq!(s.catalogue_cursor(&col).await.unwrap().version, 0);
+    let ack = s
+        .apply_catalogue("host", &delta("c", false, true, 5, vec![]))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(ack.version, 5);
+    assert_eq!(s.files(&col).await.unwrap().len(), 2);
+    assert!(s.library_item_record(&old).await.unwrap().archived);
+    assert!(!s.catalogue_cursor(&col).await.unwrap().snapshot);
+}
+
+#[tokio::test]
+async fn zero_music_numbers_do_not_abort_ingestion_or_advance_past_lost_files() {
+    let (dir, s) = store().await;
+    let (col, _) = s
+        .offer_collection("host", &offer("music", MediaType::Music, 3))
+        .await
+        .unwrap();
+    let chunk = delta(
+        "music",
+        true,
+        true,
+        3,
+        vec![
+            file_media(
+                1,
+                "Artist/Album/CD0/00 - Unknown.flac",
+                tagged("Album", 0, 0),
+            ),
+            file_media(
+                2,
+                "Artist/Album/CD0/00 - Tagged.flac",
+                tagged("Album", 2, 7),
+            ),
+            file_media(
+                3,
+                "Artist/Album/CD2/03 - Guessed.flac",
+                tagged("Album", 0, 0),
+            ),
+        ],
+    );
+    assert!(s.apply_catalogue("host", &chunk).await.unwrap().is_some());
+    s.close().await;
+    let s = Store::open(&dir.path().join("mediadb.db")).await.unwrap();
+    assert_eq!(s.catalogue_cursor(&col).await.unwrap().version, 3);
+    assert!(!s.catalogue_cursor(&col).await.unwrap().snapshot);
+    assert_eq!(s.files(&col).await.unwrap().len(), 3);
+    let items = s.collection_items(&col).await.unwrap();
+    assert_eq!(items.len(), 1);
+    let entries = s.media_entries(&items[0].id).await.unwrap();
+    assert_eq!(entries.len(), 3);
+    for (suffix, disc, track) in [
+        ("00 - Unknown.flac", None, None),
+        ("00 - Tagged.flac", Some(2), Some(7)),
+        ("03 - Guessed.flac", Some(2), Some(3)),
+    ] {
+        let entry = entries
+            .iter()
+            .find(|e| e.data.occurrence.ends_with(suffix))
+            .unwrap();
+        let EntryKind::Track {
+            disc: actual_disc,
+            track: actual_track,
+        } = entry.data.kind
+        else {
+            panic!("expected track")
+        };
+        assert_eq!((actual_disc, actual_track), (disc, track));
+    }
+    s.apply_catalogue("host", &chunk).await.unwrap();
+    assert_eq!(
+        s.media_entries(&items[0].id)
+            .await
+            .unwrap()
+            .iter()
+            .map(|e| &e.id)
+            .collect::<Vec<_>>(),
+        entries.iter().map(|e| &e.id).collect::<Vec<_>>()
+    );
+}

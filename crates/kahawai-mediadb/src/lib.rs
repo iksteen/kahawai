@@ -54,11 +54,19 @@
 //! SQL foreign keys enforce physical ownership; the Rust operations additionally
 //! enforce metadata type compatibility and shape-dependent invariants.
 mod catalogue;
+mod children;
+pub use children::*;
 mod database;
+mod inspection;
 mod library;
+pub use inspection::{CatalogueStats, CollectionSummary};
+mod enrichment;
 mod metadata;
+pub use enrichment::*;
 mod occurrence;
+mod subtitles;
 mod types;
+pub use subtitles::DownloadedSubtitle;
 
 pub use catalogue::SourceFact;
 pub use types::*;

@@ -12,32 +12,7 @@ impl Store {
             "empty provider identity"
         );
         let mut tx = self.db.begin().await?;
-        let existing: Option<(String,String,String,Option<i32>)> = sqlx::query_as("SELECT id,media_type,title,year FROM provider_records WHERE provider=? AND namespace=? AND external_id=? AND language=?")
-            .bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language).fetch_optional(&mut *tx).await?;
-        if let Some((_, kind, _, _)) = &existing {
-            ensure!(
-                kind == record.media_type.as_str(),
-                "provider record changed media type"
-            );
-        }
-        let identity_changed = existing
-            .as_ref()
-            .is_some_and(|r| title_key(&r.2) != title_key(&record.title) || r.3 != record.year);
-        let record_id = existing.map(|r| r.0).unwrap_or_else(id);
-        sqlx::query("INSERT INTO provider_records VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json")
-            .bind(&record_id).bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language)
-            .bind(record.media_type.as_str()).bind(&record.title).bind(record.year).bind(serde_json::to_string(&record.description)?)
-            .execute(&mut *tx).await?;
-        if identity_changed {
-            let copies: Vec<String> =
-                sqlx::query_scalar("SELECT item_id FROM metadata_assignments WHERE record_id=?")
-                    .bind(&record_id)
-                    .fetch_all(&mut *tx)
-                    .await?;
-            for copy in copies {
-                crate::library::rebind(&mut tx, &copy).await?;
-            }
-        }
+        let record_id = put_record(&mut tx, record).await?;
         tx.commit().await?;
         Ok(record_id)
     }
@@ -60,7 +35,7 @@ impl Store {
                 .execute(&mut *tx)
                 .await?;
             if let Some(record) = record {
-                sqlx::query("INSERT INTO metadata_assignments VALUES(?,?)")
+                sqlx::query("INSERT INTO metadata_assignments(item_id,record_id) VALUES(?,?)")
                     .bind(item)
                     .bind(record)
                     .execute(&mut *tx)
@@ -135,7 +110,7 @@ impl Store {
         resolve(&mut c, item).await
     }
 }
-async fn compatible(c: &mut SqliteConnection, record: &str, kind: &str) -> Result<()> {
+pub(crate) async fn compatible(c: &mut SqliteConnection, record: &str, kind: &str) -> Result<()> {
     let actual: String = sqlx::query_scalar("SELECT media_type FROM provider_records WHERE id=?")
         .bind(record)
         .fetch_one(c)
@@ -147,7 +122,10 @@ async fn compatible(c: &mut SqliteConnection, record: &str, kind: &str) -> Resul
     Ok(())
 }
 pub(crate) async fn resolve(c: &mut SqliteConnection, item: &str) -> Result<ResolvedDescription> {
-    let rows=sqlx::query("SELECT p.id,p.description_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
+    let rows=sqlx::query("SELECT p.id,p.description_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
+        AND NOT EXISTS(SELECT 1 FROM metadata_assignments a WHERE a.item_id=l.item_id AND a.manual=1 AND a.record_id<>l.record_id)
+        AND NOT EXISTS(SELECT 1 FROM metadata_rejections r WHERE r.item_id=l.item_id AND r.record_id=l.record_id)
+        UNION ALL SELECT p.id,p.description_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
         UNION ALL SELECT p.id,p.description_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
         JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 ORDER BY position")
@@ -208,4 +186,37 @@ impl Store {
             description: serde_json::from_str(row.get("description_json"))?,
         })
     }
+}
+
+pub(crate) async fn put_record(
+    c: &mut SqliteConnection,
+    record: &ProviderRecord,
+) -> Result<String> {
+    let existing: Option<(String,String,String,Option<i32>)> = sqlx::query_as("SELECT id,media_type,title,year FROM provider_records WHERE provider=? AND namespace=? AND external_id=? AND language=?")
+            .bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language).fetch_optional(&mut *c).await?;
+    if let Some((_, kind, _, _)) = &existing {
+        ensure!(
+            kind == record.media_type.as_str(),
+            "provider record changed media type"
+        );
+    }
+    let identity_changed = existing
+        .as_ref()
+        .is_some_and(|r| title_key(&r.2) != title_key(&record.title) || r.3 != record.year);
+    let record_id = existing.map(|r| r.0).unwrap_or_else(id);
+    sqlx::query("INSERT INTO provider_records VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json")
+            .bind(&record_id).bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language)
+            .bind(record.media_type.as_str()).bind(&record.title).bind(record.year).bind(serde_json::to_string(&record.description)?)
+            .execute(&mut *c).await?;
+    if identity_changed {
+        let copies: Vec<String> =
+            sqlx::query_scalar("SELECT item_id FROM metadata_assignments WHERE record_id=?")
+                .bind(&record_id)
+                .fetch_all(&mut *c)
+                .await?;
+        for copy in copies {
+            crate::library::rebind(c, &copy).await?;
+        }
+    }
+    Ok(record_id)
 }

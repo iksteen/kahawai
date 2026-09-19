@@ -19,7 +19,9 @@ fn declared(chapters_json: Option<&str>) -> Declared<'_> {
 
 async fn library() -> (tempfile::TempDir, kahawai_hub::registry::Registry) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
+        .await
+        .unwrap();
     sqlx::raw_sql(
         "INSERT INTO collections(module_id,collection_id,media_type)
            VALUES('m','c','series');
@@ -33,7 +35,11 @@ async fn library() -> (tempfile::TempDir, kahawai_hub::registry::Registry) {
     .execute(&db)
     .await
     .unwrap();
-    let registry = kahawai_hub::registry::Registry::new(db, Default::default());
+    let registry = kahawai_hub::registry::Registry::new(
+        db,
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    );
     (dir, registry)
 }
 

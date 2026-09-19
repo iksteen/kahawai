@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { playbackItem } from '../api/playback.ts'
 /// The player as a page: everything between a `/play` URL and a picture.
 ///
 /// Acquiring a session belongs HERE rather than to the item page, which is what
@@ -25,7 +26,8 @@ import type { PlayerMode } from '../domain/player-keys.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
 import type { StartSessionResponse } from '../api/generated/model/startSessionResponse.ts'
 import { buildProfile } from '../api/capabilities.ts'
-import { endSession, getPrefs, itemQuery, listLibraries } from '../api/generated/kahawai.ts'
+import { endSession, getPrefs } from '../api/generated/kahawai.ts'
+import { listLibraries } from '../api/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { isSourceOffline } from '../domain/recovery.ts'
@@ -196,15 +198,25 @@ async function start() {
       return { prefs: [] as Preference[] }
     })
     const cap = preferences.prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
-    const source =
+    let source =
       typeof route.query.source === 'string' && /^\d+$/.test(route.query.source)
         ? Number(route.query.source)
         : undefined
+    const entry =
+      library.value && typeof route.query.source === 'string' && !/^\d+$/.test(route.query.source)
+        ? route.query.source
+        : undefined
     const previewProfile = buildProfile(cap ? Number(cap) : undefined)
-    const detail = await itemQuery(id.value, {
-      profile: previewProfile,
-      ...(source === undefined ? {} : { source_id: source }),
-    })
+    const detail = await playbackItem(
+      id.value,
+      {
+        profile: previewProfile,
+        media_entry_id: entry ?? null,
+        ...(source === undefined ? {} : { source_id: source }),
+      },
+      library.value,
+    )
+    if (entry) source = detail.negotiated?.source?.source_id
     if (mine !== attempt.value || left) return
     if (detail.id !== id.value) {
       // A first-identification alias is the same item. Let the canonical route
@@ -341,13 +353,22 @@ async function restarted(
     // it with the new session; automatic negotiation may choose another copy.
     const cap = prefs.value.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
     const announced = item.value.sources.flatMap((source) => source.streams?.video ?? [])
-    const detail = await itemQuery(from, {
-      source_id: fresh.source_id,
-      profile: buildProfile(cap ? Number(cap) : undefined, announced),
-      audio_track: choice.audio,
-      video_track: choice.video,
-    })
+    const detail = await playbackItem(
+      from,
+      {
+        source_id: fresh.source_id,
+        media_entry_id: fresh.media_entry_id ?? null,
+        profile: buildProfile(cap ? Number(cap) : undefined, announced),
+        audio_track: choice.audio,
+        video_track: choice.video,
+      },
+      library.value,
+    )
     if (left || mine !== attempt.value || from !== id.value || from !== item.value?.id) return
+    const recoveredSource = fresh.media_entry_id
+      ? detail.sources.find((source) => source.media_entry_id === fresh.media_entry_id)
+      : undefined
+    if (recoveredSource) fresh.source_id = recoveredSource.source_id
     if (!detail.sources.some((source) => source.source_id === fresh.source_id)) {
       throw new Error('The recovered source is no longer listed for this item.')
     }

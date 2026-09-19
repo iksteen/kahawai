@@ -59,7 +59,7 @@ type SectionId = (typeof SECTIONS)[number]['id']
 const tab = ref<SectionId>('satellites')
 const here = computed(() => SECTIONS.find((s) => s.id === tab.value)!)
 
-const admin = useAdmin()
+const admin = useAdmin(computed(() => tab.value === 'sessions'))
 
 /// HUB-11. The poll is the safety net; this is what makes a scan's progress and
 /// a satellite asking to be let in arrive when they happen rather than up to
@@ -202,6 +202,9 @@ function key(event: KeyboardEvent, at: number) {
         <AdminLibraries
           v-else-if="tab === 'libraries'"
           :libraries="admin.libraries.value"
+          :hosts="admin.satellites.value"
+          :loading="!admin.librariesReady.value"
+          :collections-loading="!admin.collectionsReady.value"
           :collections="admin.collections.value"
           :broken="admin.broken.value"
           :act="admin.act"

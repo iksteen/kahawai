@@ -40,6 +40,7 @@ const detail = (selected = 1, secondLanguage = 'jpn') =>
 beforeEach(() => {
   vi.resetAllMocks()
   vi.mocked(buildProfile).mockReturnValue(profile)
+  vi.mocked(api.startSession).mockResolvedValue({ session_id: 'session', source_id: 1 } as never)
 })
 
 describe('final playback selection', () => {
@@ -87,4 +88,24 @@ describe('final playback selection', () => {
     expect(selected.audioTrack).toBe(1)
     expect(api.startSession).not.toHaveBeenCalled()
   })
+})
+
+test('start pins the stable catalogue rendition and maps its response to the displayed group', async () => {
+  const item = detail(2)
+  item.library_id = 'films'
+  item.sources[1]!.media_entry_id = 'rendition-b'
+  vi.mocked(api.startSession).mockResolvedValue({
+    session_id: 'session',
+    source_id: 9,
+    media_entry_id: 'rendition-b',
+  } as never)
+  const result = await startPlaybackSession(item, { prefs: [], sourceId: 2 })
+  expect(api.startSession).toHaveBeenCalledWith(
+    expect.objectContaining({
+      library_id: 'films',
+      item_id: 'film',
+      media_entry_id: 'rendition-b',
+    }),
+  )
+  expect(result.source_id).toBe(2)
 })

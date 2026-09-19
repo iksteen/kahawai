@@ -1,3 +1,4 @@
+vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
 /// The search panel as the keyboard reaches it: through the box it belongs
 /// to, and nowhere else. Scoping these to the search area rather than the
 /// window is what keeps them from arguing with the menus, the dialogs and the
@@ -12,6 +13,8 @@ import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   listItems: vi.fn(),
+  getCatalogueArtworkUrl: (library: string, id: string) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
   getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 

@@ -1,6 +1,6 @@
 import { onScopeDispose, type Ref, ref, shallowRef, watch } from 'vue'
 
-import { artistAlbums, listArtists } from '../api/generated/kahawai.ts'
+import { artistAlbums, listArtists } from '../api/catalogue.ts'
 import type { ArtistSummary } from '../api/generated/model/artistSummary.ts'
 import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
 import { CHUNK } from '../domain/virtual.ts'

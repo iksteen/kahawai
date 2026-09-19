@@ -13,12 +13,12 @@ import { watchedPct } from '../domain/label.ts'
 
 const props = defineProps<{
   item: {
+    library_id?: string | null
     id: string
     kind: string
     title: string
     year: number | null
     art_version: number | null
-    play_count: number
     duration_ms: number | null
     resume_position_ms: number | null
     resume_duration_ms: number | null
@@ -60,8 +60,8 @@ const runtime = computed(() => duration(props.item.duration_ms))
         class="block w-full rounded-md object-cover"
         :class="broken && 'invisible'"
         :style="{ aspectRatio: shape.ratio }"
-        :src="artworkUrl(props.item.id, props.item.art_version, 'card')"
-        :srcset="artworkSrcSet(props.item.id, props.item.art_version)"
+        :src="artworkUrl(props.item.id, props.item.art_version, 'card', props.item.library_id)"
+        :srcset="artworkSrcSet(props.item.id, props.item.art_version, props.item.library_id)"
         alt=""
         @error="broken = true"
       />
@@ -98,9 +98,6 @@ const runtime = computed(() => duration(props.item.duration_ms))
           title="The metadata match was not certain"
         >
           uncertain match
-        </span>
-        <span v-if="props.item.play_count > 0" class="text-teal">
-          seen ×{{ props.item.play_count }}
         </span>
       </div>
 
