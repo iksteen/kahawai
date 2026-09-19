@@ -5,6 +5,7 @@ import type { CatalogueDetail } from './generated/model/catalogueDetail.ts'
 import type { ItemsParams } from './generated/model/itemsParams.ts'
 
 export type ItemSummary = {
+  attribution?: readonly string[]
   art_version: number | null
   artist: string | null
   duration_ms: number | null

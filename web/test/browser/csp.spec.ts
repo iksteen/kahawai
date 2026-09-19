@@ -377,7 +377,10 @@ test('the match selector renders hub-served candidate box art under CSP', async 
   )
   await page.goto('/app/library/movies')
   await page.getByRole('button', { name: /metadata.*X-Men/i }).click({ force: true })
-  const poster = page.getByRole('dialog').locator('img')
+  const poster = page
+    .getByRole('dialog')
+    .getByRole('button', { name: 'X-Men 2000 · tmdb' })
+    .locator('img')
   await expect(poster).toBeVisible()
   await expect
     .poll(() =>

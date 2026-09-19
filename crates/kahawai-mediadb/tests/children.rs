@@ -420,6 +420,8 @@ async fn child_catalogue_precedence_is_separate_from_description_resolution() {
         .remove(0);
     assert_eq!(child.title, "First");
     assert_eq!(child.metadata.description, first.description);
+    assert_eq!(child.metadata.providers[&primary_id], "primary");
+    assert_eq!(child.metadata.providers[&supplement_id], "supplement");
     for key in ["title", "overview", "genres", "cast", "artwork"] {
         assert_eq!(child.metadata.provenance[key], supplement_id);
     }

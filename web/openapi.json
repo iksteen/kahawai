@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "ac74f1af370cc9f2e18b8ad1a0ea37a340759564e16ed9b17b40d1d6d001a745",
+  "x-kahawai-source-sha256": "298c450b1564d044a83ff4b3ea5516d9f7a141018f15f1af0e84d563fd5299da",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -11625,6 +11625,16 @@
           "provenance": {
             "type": "object",
             "description": "Field name -> provider record ID, or \"detected\" for an unassigned copy.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "providers": {
+            "type": "object",
+            "description": "Contributing provider record IDs -> provider names, for attribution without\nextra record lookups. Includes the selected title/year identity.",
             "additionalProperties": {
               "type": "string"
             },

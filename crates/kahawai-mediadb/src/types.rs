@@ -176,6 +176,10 @@ pub struct ResolvedDescription {
     pub description: Description,
     /// Field name -> provider record ID, or "detected" for an unassigned copy.
     pub provenance: std::collections::BTreeMap<String, String>,
+    /// Contributing provider record IDs -> provider names, for attribution without
+    /// extra record lookups. Includes the selected title/year identity.
+    #[serde(default)]
+    pub providers: std::collections::BTreeMap<String, String>,
 }
 /// Playable shape, distinct from a collection's category (anime contains both).
 /// Derived from visible physical entries, not provider descriptions or a stored flag.

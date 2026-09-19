@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import Attribution from '../components/Attribution.vue'
 /// Your settings. Everything here saves the moment you change it, which is
 /// why every control is optimistic and every failure puts the value back —
 /// see `useOptimistic`, which is where the hard part is.
@@ -540,5 +541,9 @@ async function disconnect() {
         </div>
       </section>
     </div>
+    <section aria-labelledby="metadata-credits" class="mt-10">
+      <h2 id="metadata-credits" class="text-lg font-semibold">Metadata credits</h2>
+      <Attribution :providers="['tmdb', 'tvdb', 'musicbrainz', 'anilist', 'anidb']" />
+    </section>
   </main>
 </template>

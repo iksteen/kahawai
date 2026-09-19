@@ -3,6 +3,8 @@
 /// Corrections change a copy's metadata; mediadb owns stable library membership.
 import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
+import Attribution from './Attribution.vue'
+import { descriptionProviders } from '../domain/attribution.ts'
 import Btn from './Btn.vue'
 import {
   enrichmentDetail,
@@ -351,6 +353,13 @@ onBeforeUnmount(() => {
         </li>
         <li v-if="!results.length" class="text-dim">no candidates — try a different query</li>
       </ul>
+      <Attribution
+        :providers="[
+          ...(detail ? descriptionProviders(detail.metadata) : []),
+          ...(current ? [current.record.provider] : []),
+          ...results.map((c) => c.record.provider),
+        ]"
+      />
     </div>
   </div>
 </template>

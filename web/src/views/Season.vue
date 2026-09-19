@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { itemProviders } from '../domain/attribution.ts'
+import Attribution from '../components/Attribution.vue'
 /// One season, browsed by its stills.
 ///
 /// The show page lists episodes as rows, which is the right shape for picking
@@ -319,6 +321,9 @@ function play(id: string, fromStart = false) {
         </div>
       </div>
     </section>
+    <Attribution
+      :providers="itemProviders([show.data.value, picked.data.value, ...(mine ?? [])])"
+    />
   </main>
 </template>
 

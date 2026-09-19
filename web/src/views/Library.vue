@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { itemProviders } from '../domain/attribution.ts'
+import Attribution from '../components/Attribution.vue'
 /// One library, as a grid whose whole height is reserved from the first
 /// answer. Only the rows on screen exist in the DOM.
 ///
@@ -397,6 +399,7 @@ function retryPage() {
     </div>
 
     <MatchDialog v-if="matching" :item="matching" @close="matching = null" @applied="refresh()" />
+    <Attribution :providers="itemProviders(loaded.values())" />
   </main>
 </template>
 

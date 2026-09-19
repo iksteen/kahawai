@@ -254,7 +254,7 @@ describe('mediadb matching', () => {
       '/api/v1/catalogue/collection-items/copy-1/artwork?',
     )
     await w.get('img').trigger('error')
-    expect(w.find('img').exists()).toBe(false)
+    expect(w.find('img[src^="/api/v1/catalogue/collection-items/"]').exists()).toBe(false)
     expect(w.find('.ghost-art').exists()).toBe(true)
   })
   test('closing during a request cannot emit a late navigation', async () => {
@@ -293,7 +293,7 @@ describe('dialog keyboard', () => {
   test('Tab wraps and skips controls inside closed disclosures', async () => {
     const w = dialog()
     await flushPromises()
-    const summary = w.get('ul.grid button').element as HTMLElement
+    const summary = w.findAll('footer a').at(-1)!.element as HTMLElement
     summary.focus()
     const event = new KeyboardEvent('keydown', { key: 'Tab', cancelable: true })
     window.dispatchEvent(event)

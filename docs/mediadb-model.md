@@ -564,7 +564,14 @@ verified provider links retain their explicit namespace.
 
 `Description` is the descriptive payload for provider enrichment and parsed NFOs,
 stored records, and the catalogue API. The API exposes `ResolvedDescription`
-(description plus provenance) directly. The web client uses the generated
+(description, per-field provenance and contributing provider names) directly. The web client uses the generated
 `Description`, including `release_date` and cast `role`, without a second field map.
 Identity, provider IDs, match confidence and episode positions remain outside it.
 Provider-specific wire responses are converted at the enrichment boundary.
+
+Attribution uses the contributing providers, including the selected title/year
+identity, rather than just the primary match. Shadowed supplements are excluded;
+episode credits also retain the parent providers for inherited titles and posters.
+Names travel with the existing response, so rendering credits needs no provider
+lookups. Browse, detail, season, search and matching views share one credits
+component; Settings also has a permanent metadata credits section.

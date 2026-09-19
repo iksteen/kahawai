@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { itemProviders } from '../domain/attribution.ts'
 import { trackKey } from '../domain/queue.ts'
 /// One item's page: a film, a series, or an episode.
 ///
@@ -1046,7 +1047,7 @@ function markSeason(season: number | null, played: boolean) {
       @close="matching = null"
       @applied="matched"
     />
-    <Attribution :provider="item.provider" />
+    <Attribution :providers="itemProviders([item, ...(children.data.value ?? [])])" />
   </main>
 </template>
 

@@ -131,23 +131,32 @@ pub(crate) async fn compatible(c: &mut SqliteConnection, record: &str, kind: &st
 // Local, assigned and supplemental evidence use one eligibility/order rule for
 // descriptions and child catalogues. Child lists are selected whole, never merged.
 async fn evidence(c: &mut SqliteConnection, item: &str) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
-    Ok(sqlx::query("SELECT p.id,p.description_json,p.children_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
+    Ok(sqlx::query("SELECT p.id,p.provider,p.description_json,p.children_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
         AND NOT EXISTS(SELECT 1 FROM metadata_assignments a WHERE a.item_id=l.item_id AND a.manual=1 AND a.record_id<>l.record_id)
         AND NOT EXISTS(SELECT 1 FROM metadata_rejections r WHERE r.item_id=l.item_id AND r.record_id=l.record_id)
-        UNION ALL SELECT p.id,p.description_json,p.children_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
-        UNION ALL SELECT p.id,p.description_json,p.children_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
+        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
+        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
         JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 ORDER BY position")
         .bind(item).fetch_all(&mut *c).await?)
 }
 
+pub(crate) struct ChildCatalogue {
+    pub record_id: String,
+    pub provider: String,
+    pub children: Vec<ProviderChild>,
+}
 pub(crate) async fn resolve_children(
     c: &mut SqliteConnection,
     item: &str,
-) -> Result<Option<(String, Vec<ProviderChild>)>> {
+) -> Result<Option<ChildCatalogue>> {
     for row in evidence(c, item).await? {
         if let Some(json) = row.get::<Option<&str>, _>("children_json") {
-            return Ok(Some((row.get("id"), serde_json::from_str(json)?)));
+            return Ok(Some(ChildCatalogue {
+                record_id: row.get("id"),
+                provider: row.get("provider"),
+                children: serde_json::from_str(json)?,
+            }));
         }
     }
     Ok(None)
@@ -157,6 +166,7 @@ pub(crate) async fn resolve(c: &mut SqliteConnection, item: &str) -> Result<Reso
     let mut result = ResolvedDescription {
         description: Description::default(),
         provenance: BTreeMap::new(),
+        providers: BTreeMap::new(),
     };
     if rows.is_empty() {
         let json: String =
@@ -172,6 +182,14 @@ pub(crate) async fn resolve(c: &mut SqliteConnection, item: &str) -> Result<Reso
                 serde_json::from_str(row.get::<&str, _>("description_json"))?,
                 row.get("id"),
             );
+            let record: &str = row.get("id");
+            // The primary supplies the displayed title/year even when every
+            // descriptive field comes from local metadata or supplements.
+            if row.get::<i64, _>("position") == 0
+                || result.provenance.values().any(|id| id == record)
+            {
+                result.providers.insert(record.into(), row.get("provider"));
+            }
         }
     }
     Ok(result)

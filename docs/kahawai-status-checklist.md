@@ -606,6 +606,11 @@ How something works and why it was built that way belong in
       Each child separates provider identity and numbering from its `Description`.
       Mediadb migration 5 preserves stored and cached answers; library child IDs,
       source coverage and local/primary/supplement precedence are unchanged.
+- [x] Metadata attribution follows resolved contributors and the selected identity,
+      including supplemental providers and episode metadata. Catalogue, search and
+      matching views display deduplicated credits with provider links; Settings
+      includes permanent credits. TMDB retains its logo and non-endorsement notice,
+      TVDB links directly to its site, and AniDB is credited independently of AniList.
 - [x] Library enumeration uses one TanStack query and result shape in the shell,
       browsing, detail, player and admin views. Library writes and hints update the
       shared cache; playback-source queries include preferences, media type and

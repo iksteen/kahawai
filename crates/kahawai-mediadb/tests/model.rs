@@ -145,6 +145,12 @@ async fn fallback_is_per_type_provenance_is_explicit_and_reassignment_drops_supp
     assert_eq!(resolved.description.overview.as_deref(), Some("Third"));
     assert_eq!(resolved.provenance["overview"], r);
     assert_eq!(resolved.provenance["genres"], p);
+    assert_eq!(resolved.providers[&p], "primary");
+    assert_eq!(resolved.providers[&r], "third");
+    assert!(
+        !resolved.providers.contains_key(&q),
+        "shadowed answers receive no credit"
+    );
     let library = s
         .create_library("L", MediaType::Movies, &[col])
         .await
@@ -614,6 +620,35 @@ async fn anime_library_distinguishes_movies_and_series_from_physical_entries() {
             .await
             .unwrap()
             .renditions
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn attribution_includes_title_only_identity_and_clears_with_assignment() {
+    let (_dir, s) = store().await;
+    let col = collection(&s, "c", MediaType::Movies, &["Copy.2000.mkv"]).await;
+    let item = s.collection_items(&col).await.unwrap().remove(0).id;
+    let record = s
+        .put_provider_record(&record(
+            "tmdb",
+            "1",
+            "Chosen",
+            Some(2000),
+            MediaType::Movies,
+        ))
+        .await
+        .unwrap();
+    s.assign_metadata(&item, Some(&record)).await.unwrap();
+    let resolved = s.resolve_metadata(&item).await.unwrap();
+    assert!(resolved.provenance.is_empty());
+    assert_eq!(resolved.providers[&record], "tmdb");
+    s.assign_metadata(&item, None).await.unwrap();
+    assert!(
+        s.resolve_metadata(&item)
+            .await
+            .unwrap()
+            .providers
             .is_empty()
     );
 }

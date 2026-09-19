@@ -6,6 +6,8 @@
 /// you your place and the home screen reloaded when you cleared it. The panel
 /// leaves the screen alone — which is what the design had, and what makes
 /// dismissing it free.
+import Attribution from './Attribution.vue'
+import { itemProviders } from '../domain/attribution.ts'
 import Icon from './Icon.vue'
 import { artworkUrl } from '../api/artwork.ts'
 import { countLabel, SEARCH_LIST_ID, searchOptionId, type SearchRow } from '../domain/search-nav.ts'
@@ -142,6 +144,9 @@ const emit = defineEmits<{
         </button>
       </template>
     </div>
+    <Attribution
+      :providers="itemProviders(props.rows.flatMap((r) => (r.kind === 'item' ? [r.item] : [])))"
+    />
   </div>
 </template>
 

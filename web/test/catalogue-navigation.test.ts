@@ -268,12 +268,17 @@ test('catalogue detail uses the generated description without remapping fields',
   }
   vi.mocked(item).mockResolvedValue({
     ...entry,
-    metadata: { description, provenance: { overview: 'provider-record' } },
+    metadata: {
+      description,
+      provenance: { overview: 'provider-record' },
+      providers: { 'provider-record': 'tmdb', 'primary-record': 'tvdb' },
+    },
     provider: 'tmdb',
     match_confidence: 'weak',
   })
   const result = await catalogueDetail('films', 'film')
   expect(result.metadata).toBe(description)
+  expect(result.attribution).toEqual(['tmdb', 'tvdb'])
   expect(result.provider).toBe('tmdb')
   expect(result.match_confidence).toBe('weak')
 })

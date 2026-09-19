@@ -9,6 +9,7 @@ import {
   catalogueUpNext,
   catalogueChildren as getCatalogueChildren,
 } from './generated/kahawai.ts'
+import { descriptionProviders } from '../domain/attribution.ts'
 import type { ItemQuery } from './generated/model/itemQuery.ts'
 import type { FeedItem } from './generated/model/feedItem.ts'
 import type { LibraryChild } from './generated/model/libraryChild.ts'
@@ -20,6 +21,7 @@ import type { BrowseParams } from './catalogue-model.ts'
 
 export function catalogueRow(entry: CatalogueItem, library: string): ItemSummary {
   return {
+    attribution: descriptionProviders(entry.metadata),
     id: entry.id,
     title: entry.title,
     year: entry.year ?? null,

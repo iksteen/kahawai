@@ -119,7 +119,7 @@ enum Group {
 struct Copy {
     id: String,
     entries: Vec<MediaEntry>,
-    children: Option<(String, Vec<ProviderChild>)>,
+    children: Option<crate::metadata::ChildCatalogue>,
 }
 struct Snapshot {
     parent: LibraryItem,
@@ -229,7 +229,7 @@ impl Snapshot {
         let descriptions = copy
             .children
             .as_ref()
-            .map(|(_, children)| children.as_slice())
+            .map(|catalogue| catalogue.children.as_slice())
             .unwrap_or_default();
         let matches: Vec<_> = descriptions
             .iter()
@@ -270,7 +270,8 @@ impl Snapshot {
             .to_owned();
         let description = matched.map(|d| d.description.clone()).unwrap_or_default();
         let mut provenance = BTreeMap::from([("title".into(), "detected".into())]);
-        if let Some(source) = matched.and_then(|_| copy.children.as_ref().map(|(record, _)| record))
+        if let Some(source) =
+            matched.and_then(|_| copy.children.as_ref().map(|catalogue| &catalogue.record_id))
         {
             for (field, supplied) in [
                 ("title", matched.is_some_and(|d| !d.title.trim().is_empty())),
@@ -287,6 +288,12 @@ impl Snapshot {
                     provenance.insert(field.into(), source.clone());
                 }
             }
+        }
+        // Child cards can show the parent's poster/title too. Preserve those
+        // credits and add the provider that supplies this child's own fields.
+        let mut providers = self.parent.metadata.providers.clone();
+        if let Some(catalogue) = copy.children.as_ref().filter(|_| matched.is_some()) {
+            providers.insert(catalogue.record_id.clone(), catalogue.provider.clone());
         }
         Ok((
             LibraryChild {
@@ -306,6 +313,7 @@ impl Snapshot {
                 metadata: ResolvedDescription {
                     description,
                     provenance,
+                    providers,
                 },
                 representative_id: copy.id.clone(),
                 source_count: renditions.len(),

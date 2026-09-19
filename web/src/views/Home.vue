@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { itemProviders } from '../domain/attribution.ts'
+import Attribution from '../components/Attribution.vue'
 /// What you were part-way through, what follows it, then what arrived lately
 /// in each library.
 ///
@@ -152,5 +154,14 @@ async function grow(shelf: ShelfData) {
         @retry="(done) => retry(shelf).then(done)"
       />
     </template>
+    <Attribution
+      :providers="
+        itemProviders([
+          ...(continuing.data.value ?? []),
+          ...(next.data.value ?? []),
+          ...rows.flatMap((s) => s.items),
+        ])
+      "
+    />
   </main>
 </template>

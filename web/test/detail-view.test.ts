@@ -43,7 +43,9 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
 }))
 const admin = { value: false }
-vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
+vi.mock('../src/api/session.ts', () => ({
+  whoAmI: () => ({ username: 'me', admin: admin.value }),
+}))
 vi.mock('../src/api/capabilities.ts', () => ({
   buildProfile: () => ({ containers: ['mp4'] }),
   loadMask: vi.fn(() => ({})),
@@ -1241,16 +1243,21 @@ describe('the files, in detail', () => {
 describe('who the metadata came from', () => {
   test('is said, because for TMDB that is a term of use', async () => {
     vi.mocked(catalogueDetail).mockResolvedValue(
-      film({ provider: 'tmdb', metadata: { overview: null } }) as never,
+      film({
+        provider: 'tvdb',
+        attribution: ['tvdb', 'tmdb'],
+        metadata: { overview: null },
+      }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('not endorsed, certified')
     expect(wrapper.find('img[alt="TMDB"]').exists()).toBe(true)
+    expect(wrapper.find('a[href="https://thetvdb.com"]').exists()).toBe(true)
   })
 
   test('and each provider is credited in its own words', async () => {
     vi.mocked(catalogueDetail).mockResolvedValue(
-      film({ provider: 'tvdb', metadata: { overview: null } }) as never,
+      film({ provider: 'tvdb', attribution: ['tvdb'], metadata: { overview: null } }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('TheTVDB')

@@ -1,4 +1,6 @@
 <script setup lang="ts">
+import { itemProviders } from '../domain/attribution.ts'
+import Attribution from '../components/Attribution.vue'
 import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -92,6 +94,7 @@ function openAlbum(id: string) {
         />
       </template>
     </PagedGrid>
+    <Attribution :providers="itemProviders(albums.loaded.value.values())" />
   </main>
 </template>
 
