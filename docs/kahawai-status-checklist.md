@@ -698,7 +698,8 @@ How something works and why it was built that way belong in
       chooses seasons in watched-first order and remains the sole persistence
       authority; the owning mediahost performs the decode work locally, yielding
       to scans and viewer leases, so analysis sends no media bytes over a lease.
-      The admin API reports what is left and can run the next season now.
+      The admin API reports what is left; detection runs automatically.
+      Manual triggering has no UI button, API action or CLI option.
       Pending segment counts use the mediahost scheduler's eligibility rules:
       only missing results in groups with two distinct usable episodes count.
       Lone episodes and unparseable files do not appear as stuck work; alternate
@@ -715,6 +716,9 @@ How something works and why it was built that way belong in
       chapter lists without hiding genuinely complete named seasons. Design in
       implementation §4.9; detector parity remains measured against
       intro-skipper in `docs/intro-detection-results.md`.
+- [x] Admin media analysis reports per-collection pending loudness measurements
+      alongside skip-point detection, including movie collections. Missing reports
+      and offline hosts remain distinct from zero pending sources; music uses ReplayGain.
 - [x] HUB-38 Measured audio loudness normalization: the mediahost background-decodes
       every non-music audio stream once and meters the untouched decoded layout
       plus every smaller canonical output matrix playback may choose. The hub

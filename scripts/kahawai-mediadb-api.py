@@ -36,8 +36,7 @@ artists.add_argument("library")
 artists.add_argument("--offset", type=int, default=0)
 artists.add_argument("--limit", type=int, default=200)
 artists.add_argument("--query", default="")
-segments = sub.add_parser("segments")
-segments.add_argument("--run", action="store_true")
+sub.add_parser("segments", help="show pending skip-point and loudness analysis per video collection")
 sub.add_parser("item-log").add_argument("item")
 login = sub.add_parser("login")
 login.add_argument("username")
@@ -122,7 +121,7 @@ match args.command:
     case "artists":
         answer = request("GET", f"{base}/{quote(args.library)}/artists?" + urllib.parse.urlencode({"offset":args.offset,"limit":args.limit,"q":args.query}))
     case "segments":
-        answer = request("POST" if args.run else "GET", "/admin/v1/segments")
+        answer = request("GET", "/admin/v1/segments")
     case "subtitle-search" | "subtitle-download" | "subtitle-delete":
         path = f"{base}/{quote(args.library)}/items/{quote(args.item)}/subtitles"
         source = {"media_entry_id": args.entry, "source_version": args.version}

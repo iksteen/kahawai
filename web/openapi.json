@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "f7e7b360d1a6ec1fc2a34e6a0ab69cb365f332c6ba3f509f10a87fdfb7ce4cf6",
+  "x-kahawai-source-sha256": "2d36ae6eb35cc3405d4a5de854fffff1115afdd79bd871662c545e83ae038d39",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -3091,7 +3091,7 @@
         "tags": [
           "Admin segments"
         ],
-        "summary": "Intro detector status",
+        "summary": "Segment detection and loudness measurement status",
         "description": "Admin only. Reports source-level discovery status from current mediahost links.",
         "operationId": "admin_segments_status",
         "responses": {
@@ -3108,107 +3108,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/SegmentStatusResponse"
-                }
-              }
-            }
-          },
-          "401": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "403": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "500": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          },
-          "503": {
-            "description": "The hub has no administrator yet: `setup_required`",
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ]
-      },
-      "post": {
-        "tags": [
-          "Admin segments"
-        ],
-        "summary": "Wake segment discovery on eligible mediahosts",
-        "description": "Admin only. Wakes connected protocol-4 mediahosts; each mediahost retains\nownership of local cohort selection and priority.",
-        "operationId": "admin_segments_run",
-        "responses": {
-          "200": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/SegmentRunResponse"
                 }
               }
             }
@@ -12056,7 +11955,8 @@
           "mediahost_id",
           "mediahost_name",
           "name",
-          "connected"
+          "connected",
+          "media_type"
         ],
         "properties": {
           "collection_id": {
@@ -12071,6 +11971,9 @@
               "null"
             ]
           },
+          "media_type": {
+            "type": "string"
+          },
           "mediahost_id": {
             "type": "string"
           },
@@ -12080,6 +11983,15 @@
           "name": {
             "type": "string"
           },
+          "pending_loudness": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Sources still awaiting a loudness result; absence means no report yet.",
+            "minimum": 0
+          },
           "pending_sources": {
             "type": [
               "integer",
@@ -12087,24 +11999,6 @@
             ],
             "format": "int64",
             "description": "Last reported source count; absence is unknown, never zero.",
-            "minimum": 0
-          }
-        }
-      },
-      "SegmentRunResponse": {
-        "type": "object",
-        "required": [
-          "asked",
-          "unavailable"
-        ],
-        "properties": {
-          "asked": {
-            "type": "integer",
-            "description": "Mediahost wake messages accepted, not completed analysis jobs.",
-            "minimum": 0
-          },
-          "unavailable": {
-            "type": "integer",
             "minimum": 0
           }
         }

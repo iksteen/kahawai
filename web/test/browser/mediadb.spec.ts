@@ -683,13 +683,13 @@ test('segment administration reports the real mediahost setting in the provider 
   await page.getByLabel('Password', { exact: true }).fill('fixture-password')
   await page.getByRole('button', { name: 'Sign in', exact: true }).click()
   await page.getByRole('tab', { name: 'Providers', exact: true }).click()
-  const panel = page.getByRole('region', { name: 'Skip points', exact: true })
-  await expect(panel.getByText('detection disabled on this mediahost').first()).toBeVisible({
+  const panel = page.getByRole('region', { name: 'Media analysis', exact: true })
+  await expect(panel.getByText('detection disabled', { exact: false }).first()).toBeVisible({
     timeout: 45000,
   })
   await expect(
     panel.getByRole('button', { name: 'Find skip points now', exact: true }),
-  ).toBeDisabled()
+  ).toHaveCount(0)
   await expect(panel).not.toContainText('episodes done since')
   expect(
     (await new AxeBuilder({ page }).include('[aria-labelledby="skip-points"]').analyze())

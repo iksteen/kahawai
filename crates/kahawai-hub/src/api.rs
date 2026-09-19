@@ -165,8 +165,7 @@ pub struct NetOptions {
         admin_end_session,
         admin_session_log,
         admin_item_log,
-        admin_segments_status,
-        admin_segments_run
+        admin_segments_status
     ),
     modifiers(&BearerSecurity)
 )]
@@ -341,10 +340,7 @@ pub fn router(
         );
     admin = admin
         .merge(enrichment::routes())
-        .route(
-            "/admin/v1/segments",
-            get(admin_segments_status).post(admin_segments_run),
-        )
+        .route("/admin/v1/segments", get(admin_segments_status))
         .route("/admin/v1/providers", get(admin_providers))
         .route(
             "/admin/v1/providers/chains/{media_type}",
@@ -732,21 +728,17 @@ struct SegmentCollectionStatus {
     mediahost_name: String,
     name: String,
     connected: bool,
+    media_type: String,
     /// Last reported source count; absence is unknown, never zero.
     pending_sources: Option<u64>,
     enabled: Option<bool>,
+    /// Sources still awaiting a loudness result; absence means no report yet.
+    pending_loudness: Option<u64>,
 }
 
 #[derive(Serialize, ToSchema)]
 struct SegmentStatusResponse {
     collections: Vec<SegmentCollectionStatus>,
-}
-
-#[derive(Serialize, ToSchema)]
-struct SegmentRunResponse {
-    /// Mediahost wake messages accepted, not completed analysis jobs.
-    asked: usize,
-    unavailable: usize,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -3681,10 +3673,7 @@ async fn segment_collections(state: &AppState) -> Result<SegmentStatusResponse, 
         .map_err(internal)?
     {
         let c = row.collection;
-        if !matches!(
-            c.media_type,
-            kahawai_mediadb::MediaType::Series | kahawai_mediadb::MediaType::Anime
-        ) {
+        if c.media_type == kahawai_mediadb::MediaType::Music {
             continue;
         }
         let host = hosts.iter().find(|h| h.module_id == c.mediahost_id);
@@ -3699,7 +3688,9 @@ async fn segment_collections(state: &AppState) -> Result<SegmentStatusResponse, 
             connected: host.is_some_and(|h| h.connected),
             mediahost_id: c.mediahost_id,
             name: c.remote_id,
+            media_type: c.media_type.as_str().to_string(),
             pending_sources: report.as_ref().map(|r| r.pending_segments),
+            pending_loudness: report.as_ref().map(|r| r.pending_loudness),
             enabled: report.and_then(|r| r.segments_enabled),
         });
     }
@@ -3713,7 +3704,7 @@ async fn segment_collections(state: &AppState) -> Result<SegmentStatusResponse, 
     Ok(SegmentStatusResponse { collections })
 }
 
-/// Intro detector status
+/// Segment detection and loudness measurement status
 ///
 /// Admin only. Reports source-level discovery status from current mediahost links.
 #[utoipa::path(
@@ -3731,40 +3722,6 @@ async fn admin_segments_status(
     State(state): State<AppState>,
 ) -> Result<Json<SegmentStatusResponse>, ApiError> {
     Ok(Json(segment_collections(&state).await?))
-}
-
-/// Wake segment discovery on eligible mediahosts
-///
-/// Admin only. Wakes connected protocol-4 mediahosts; each mediahost retains
-/// ownership of local cohort selection and priority.
-#[utoipa::path(
-    post, path = "/admin/v1/segments", tag = "Admin segments",
-    security(("bearer_auth" = [])),
-    responses(
-        (status = 200, body = SegmentRunResponse),
-        (status = 401, body = ApiErrorBody),
-        (status = 403, body = ApiErrorBody),
-        (status = 500, body = ApiErrorBody),
-        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody)
-    )
-)]
-async fn admin_segments_run(
-    State(state): State<AppState>,
-) -> Result<Json<SegmentRunResponse>, ApiError> {
-    let status = segment_collections(&state).await?;
-    let modules: Vec<String> = status
-        .collections
-        .into_iter()
-        .filter(|c| c.enabled != Some(false))
-        .map(|c| c.mediahost_id)
-        .collect::<std::collections::BTreeSet<_>>()
-        .into_iter()
-        .collect();
-    let asked = state.registry.wake_discovery("segments", &modules).await;
-    Ok(Json(SegmentRunResponse {
-        asked,
-        unavailable: modules.len() - asked,
-    }))
 }
 
 /// An accidental start is not something to resume. Requiring both one minute
@@ -4807,7 +4764,6 @@ mod tests {
             ("get", "/admin/v1/sessions/{id}/log"),
             ("get", "/admin/v1/items/{id}/log"),
             ("get", "/admin/v1/segments"),
-            ("post", "/admin/v1/segments"),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

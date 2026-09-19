@@ -834,36 +834,6 @@ impl Registry {
             .cloned()
     }
 
-    /// Administrative wake only. Protocol-4 mediahosts own queue selection;
-    /// the hub broadcasts interest without naming a season or exact source.
-    pub async fn wake_discovery(&self, kind: &str, modules: &[String]) -> usize {
-        let links: Vec<_> = self
-            .links
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(id, _)| modules.contains(id))
-            .map(|(_, link)| link.tx.clone())
-            .collect();
-        let mut accepted = 0;
-        for link in links {
-            if link
-                .try_send(Ok(kahawai_proto::v1::HubToHost {
-                    msg: Some(kahawai_proto::v1::hub_to_host::Msg::DiscoveryWake(
-                        kahawai_proto::v1::DiscoveryWake {
-                            kind: kind.to_string(),
-                            collection_id: String::new(),
-                        },
-                    )),
-                }))
-                .is_ok()
-            {
-                accepted += 1;
-            }
-        }
-        accepted
-    }
-
     /// Best-effort, short-lived demand signal. It is deliberately lossy: the
     /// durable catalogue remains authoritative and the mediahost will still
     /// complete ordinary backfill if this hint misses a reconnect window.

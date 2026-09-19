@@ -41,7 +41,6 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminSetDisabled: vi.fn(),
   adminSetFanart: vi.fn(),
   adminSetTheaudiodb: vi.fn(),
-  adminSegmentsRun: vi.fn(),
   adminSegmentsStatus: vi.fn(),
   adminSetTmdb: vi.fn(),
   adminSetTvdb: vi.fn(),
@@ -1132,7 +1131,7 @@ describe('providers', () => {
     const wrapper = await open()
     expect(api.adminSegmentsStatus).not.toHaveBeenCalled()
     await tab(wrapper, 'Providers')
-    expect(wrapper.text()).toContain('Find skip points now')
+    expect(wrapper.text()).toContain('Media analysis')
     expect(api.adminSegmentsStatus).toHaveBeenCalled()
   })
 
@@ -1296,7 +1295,7 @@ describe('providers', () => {
   })
 })
 
-test('segment controls distinguish unknown, disabled and offline reports and only request work', async () => {
+test('analysis status distinguishes unknown, disabled and offline reports', async () => {
   vi.mocked(api.adminSegmentsStatus).mockResolvedValue({
     collections: [
       {
@@ -1305,6 +1304,8 @@ test('segment controls distinguish unknown, disabled and offline reports and onl
         mediahost_name: 'NAS',
         name: 'shows',
         connected: true,
+        media_type: 'series',
+        pending_loudness: 12,
         pending_sources: 7,
         enabled: true,
       },
@@ -1314,6 +1315,8 @@ test('segment controls distinguish unknown, disabled and offline reports and onl
         mediahost_name: 'Older',
         name: 'anime',
         connected: true,
+        media_type: 'anime',
+        pending_loudness: null,
         pending_sources: null,
         enabled: null,
       },
@@ -1323,6 +1326,8 @@ test('segment controls distinguish unknown, disabled and offline reports and onl
         mediahost_name: 'Disabled',
         name: 'shows',
         connected: true,
+        media_type: 'series',
+        pending_loudness: 12,
         pending_sources: 0,
         enabled: false,
       },
@@ -1332,22 +1337,57 @@ test('segment controls distinguish unknown, disabled and offline reports and onl
         mediahost_name: 'Offline',
         name: 'shows',
         connected: false,
+        media_type: 'series',
+        pending_loudness: null,
         pending_sources: null,
         enabled: null,
       },
+      {
+        collection_id: 'e',
+        mediahost_id: 'host',
+        mediahost_name: 'NAS',
+        name: 'movies',
+        connected: true,
+        media_type: 'movies',
+        pending_sources: 0,
+        pending_loudness: 0,
+        enabled: true,
+      },
     ],
   })
-  vi.mocked(api.adminSegmentsRun).mockResolvedValue({ asked: 2, unavailable: 1 })
   const wrapper = await open()
   await tab(wrapper, 'Providers')
   expect(wrapper.text()).toContain('7 sources awaiting analysis')
+  expect(wrapper.text()).toContain('12 sources awaiting measurement')
+  const movies = wrapper.findAll('li').find((row) => row.text().includes('NAS/movies'))!
+  expect(movies.text()).toContain('0 sources awaiting measurement')
+  expect(movies.text()).not.toContain('Skip points:')
+  const disabled = wrapper.findAll('li').find((row) => row.text().includes('Disabled/shows'))!
+  expect(disabled.text()).toContain('12 sources awaiting measurement')
   expect(wrapper.text()).toContain('waiting for mediahost status')
   expect(wrapper.text()).toContain('detection disabled')
-  await wrapper
-    .findAll('button')
-    .find((b) => b.text() === 'Find skip points now')!
-    .trigger('click')
-  await flushPromises()
-  expect(api.adminSegmentsRun).toHaveBeenCalledOnce()
+  expect(wrapper.text()).not.toContain('Find skip points now')
   expect(wrapper.text()).not.toContain('episodes done since')
+})
+
+test('movie-only analysis reports loudness', async () => {
+  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({
+    collections: [
+      {
+        collection_id: 'movies',
+        mediahost_id: 'host',
+        mediahost_name: 'NAS',
+        name: 'movies',
+        media_type: 'movies',
+        connected: true,
+        pending_sources: 0,
+        pending_loudness: 3,
+        enabled: true,
+      },
+    ],
+  })
+  const wrapper = await open()
+  await tab(wrapper, 'Providers')
+  expect(wrapper.text()).toContain('3 sources awaiting measurement')
+  expect(wrapper.text()).not.toContain('Find skip points now')
 })
