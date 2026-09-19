@@ -69,6 +69,11 @@ pub enum AssBody {
 #[cfg(feature = "ocr")]
 const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
 
+/// How long between text-prewarm rounds. A round only re-reads mediadb and
+/// re-sends what is still cold, so it is cheap; this paces the retry of work
+/// a mediahost is still chewing through rather than the work itself.
+const TEXT_PREWARM_ROUND: std::time::Duration = std::time::Duration::from_secs(900);
+
 #[cfg(feature = "ocr")]
 const OCR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
 
@@ -780,6 +785,81 @@ impl Subtitles {
             }
         }
         retry_earlier_candidates
+    }
+
+    /// Keep the text-subtitle cache warm, so a first play does not pay for
+    /// extraction with the viewer watching a spinner.
+    ///
+    /// Extraction is a whole-container walk: a live host logs
+    /// `tracks=38 elapsed=21.3s` for one episode, and every second of that
+    /// used to land on the first person to press Play. Nothing refilled the
+    /// cache in the background after the mediadb rewrite removed
+    /// `push_subs_worklist` along with the protocol-3 scan handler its two
+    /// call sites lived in — the mediahost end survived intact and simply
+    /// stopped being asked.
+    ///
+    /// A `SubsWorklist`, not the `ExtractSubs` the urgent path sends: the
+    /// mediahost queues those at `Priority::SubtitlePrewarm`, below every
+    /// other background job and interruptible by demand. Sending
+    /// `ExtractSubs` here would file idle work as urgent and let a sweep
+    /// outrank a viewer.
+    ///
+    /// That also means no idle gate on this side, unlike the OCR sweep
+    /// below: OCR burns hub CPU, so it waits for playback to stop, while
+    /// this only publishes work that a scheduler elsewhere already ranks.
+    pub fn spawn_text_prewarm(self: &Arc<Self>, registry: Arc<Registry>) {
+        let subs = self.clone();
+        tokio::spawn(async move {
+            // Let links and reconnect scans settle first, as the OCR sweep does.
+            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            loop {
+                let pending = match subs.catalogue_text_prewarm(&registry).await {
+                    Ok(p) => p,
+                    Err(error) => {
+                        tracing::warn!(%error, "could not read subtitle prewarm work from mediadb");
+                        vec![]
+                    }
+                };
+                // Group per (mediahost, collection): a worklist names one
+                // collection, and the mediahost dedupes what it already holds.
+                let mut by_collection: std::collections::BTreeMap<
+                    (String, String),
+                    Vec<kahawai_proto::v1::SourcePath>,
+                > = Default::default();
+                for (module_id, collection_id, source) in pending {
+                    by_collection
+                        .entry((module_id, collection_id))
+                        .or_default()
+                        .push(source);
+                }
+                for ((module_id, collection_id), sources) in by_collection {
+                    if !registry.is_connected(&module_id) {
+                        continue; // not a failure — the next round retries
+                    }
+                    tracing::info!(%module_id, collection = %collection_id, files = sources.len(),
+                        "sending subtitle prewarm worklist");
+                    // Chunked like the worklist this replaces: one message
+                    // naming every cold file in a large collection is a
+                    // needlessly large frame.
+                    for chunk in sources.chunks(5000) {
+                        let msg = kahawai_proto::v1::HubToHost {
+                            msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
+                                kahawai_proto::v1::SubsWorklist {
+                                    collection_id: collection_id.clone(),
+                                    sources: chunk.to_vec(),
+                                },
+                            )),
+                        };
+                        if let Err(error) = registry.send_to_host(&module_id, msg).await {
+                            tracing::warn!(%module_id, error = format!("{error:#}"),
+                                "subtitle prewarm worklist send failed");
+                            break;
+                        }
+                    }
+                }
+                tokio::time::sleep(TEXT_PREWARM_ROUND).await;
+            }
+        });
     }
 
     /// HUB-32c idle sweep: OCR each physical image subtitle in mediadb

@@ -600,6 +600,7 @@ async fn run_hub_inner(
     enricher.start_catalogue(registry.clone());
     #[cfg(feature = "ocr")]
     subtitles.spawn_ocr_sweep(registry.clone(), sessions.clone());
+    subtitles.spawn_text_prewarm(registry.clone());
     // Protocol 4: the mediahost owns ordering and persistence of source facts.
     // This object remains the hub-side status/projection adapter; it no longer
     // runs the old hub-owned sweep.

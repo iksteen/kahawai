@@ -6,7 +6,6 @@
 //! without repeating extraction/rendering. Atomic publication also records empty
 //! OCR answers. Sessions capture immutable raster paths and OCR text.
 use super::*;
-#[cfg(any(feature = "ocr", test))]
 use crate::sessions::FileId;
 use crate::{sessions::PartSource, tracks::Track};
 use std::path::Path;
@@ -186,6 +185,93 @@ impl Subtitles {
         })
         .await?
     }
+    /// Files whose TEXT subtitles are not extracted yet, one entry per
+    /// file: the mediahost extracts every track of a file in one pass
+    /// (`tracks=38 elapsed=21.3s` is a real line from a live host), so
+    /// naming a file twice would just buy the same 20 seconds twice.
+    ///
+    /// Sidecars are skipped — those are one small read on demand, with no
+    /// container to walk. Only embedded tracks are worth warming.
+    pub(super) async fn catalogue_text_prewarm(
+        &self,
+        registry: &Registry,
+    ) -> Result<Vec<(String, String, kahawai_proto::v1::SourcePath)>> {
+        let mut out = vec![];
+        let mut seen = std::collections::HashSet::new();
+        for summary in registry.catalogue().collection_summaries().await? {
+            let c = summary.collection;
+            if !registry.is_connected(&c.mediahost_id) {
+                continue;
+            }
+            for f in registry.catalogue().files(&c.id).await? {
+                let (Some(info), Some(size)) = (&f.media, f.size) else {
+                    continue;
+                };
+                let part = PartSource {
+                    file_id: FileId::Catalogue(f.id),
+                    module_id: c.mediahost_id.clone(),
+                    collection_id: c.remote_id.clone(),
+                    root_token: f.root_token,
+                    path_rel: f.path,
+                    size,
+                    mtime_unix: f.mtime.unwrap_or(0),
+                    head_xxh3: f.head_hash.unwrap_or(0) as i64,
+                    tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
+                    base_ms: 0,
+                    duration_ms: info.duration_ms.unwrap_or(0),
+                };
+                for track in crate::sessions::catalogue::tracks(
+                    f.item_id.as_deref().unwrap_or(""),
+                    &part,
+                    info,
+                ) {
+                    if crate::tracks::is_image_format(&track.format) || track.origin != "embedded" {
+                        continue;
+                    }
+                    let (Some(source), Ok(revision)) = (&track.physical, track.source_revision())
+                    else {
+                        continue;
+                    };
+                    let cached = self
+                        .dir
+                        .join(format!(
+                            "{}.json",
+                            super::cache_key(
+                                &source.module_id,
+                                &source.collection_id,
+                                &source.root_token,
+                                &source.path_rel,
+                                &track.internal_key(),
+                                revision,
+                            )
+                        ))
+                        .try_exists()?;
+                    if cached {
+                        continue;
+                    }
+                    let file = (
+                        source.module_id.clone(),
+                        source.collection_id.clone(),
+                        source.root_token.clone(),
+                        source.path_rel.clone(),
+                    );
+                    if seen.insert(file) {
+                        out.push((
+                            source.module_id.clone(),
+                            source.collection_id.clone(),
+                            kahawai_proto::v1::SourcePath {
+                                root_token: source.root_token.clone(),
+                                path_rel: source.path_rel.clone(),
+                            },
+                        ));
+                    }
+                    break;
+                }
+            }
+        }
+        Ok(out)
+    }
+
     #[cfg(feature = "ocr")]
     pub(super) async fn catalogue_ocr_candidates(&self, registry: &Registry) -> Result<Vec<Track>> {
         let mut tracks = vec![];
@@ -488,6 +574,187 @@ mod tests {
         parent.artifact_key = Some("replaced-file".into());
         assert!(cached(subs.cache_dir(), &[parent]).unwrap().is_empty());
     }
+    /// A file is named once however many text tracks it carries: the
+    /// mediahost extracts the whole container in one pass, so a second
+    /// entry would buy the same twenty seconds twice. Image tracks belong
+    /// to the OCR sweep and sidecars are read on demand, so neither counts.
+    #[tokio::test]
+    async fn text_prewarm_names_each_cold_file_once_and_ignores_image_tracks() {
+        use kahawai_proto::v1 as p;
+        use prost::Message;
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
+        let store = crate::db::open_catalogue(dir.path()).await.unwrap();
+        store.put_mediahost("host", "Fixture").await.unwrap();
+        store
+            .offer_collection(
+                "host",
+                &p::CatalogCollection {
+                    id: "series".into(),
+                    media_type: "series".into(),
+                    epoch: "epoch".into(),
+                    current_version: 2,
+                    roots: vec![p::CollectionRoot::new("root", "/fixture")],
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        // Three embedded text tracks on one file, and a second file whose
+        // only subtitle is an image track.
+        let many = p::FileRecord {
+            source: Some(p::SourcePath::new("root", "Many.mkv")),
+            size: 10,
+            mtime_unix: 1,
+            streams_json: serde_json::json!({"container":"mkv","subtitles":[
+                {"format":"subrip","language":"eng"},
+                {"format":"ass","language":"nld"},
+                {"format":"subrip","language":"fra"}
+            ]})
+            .to_string(),
+            ..Default::default()
+        };
+        let image_only = p::FileRecord {
+            source: Some(p::SourcePath::new("root", "Image.mkv")),
+            size: 10,
+            mtime_unix: 1,
+            streams_json: serde_json::json!({"container":"mkv","subtitles":[
+                {"format":"pgs","language":"eng"}
+            ]})
+            .to_string(),
+            ..Default::default()
+        };
+        store
+            .apply_catalogue(
+                "host",
+                &p::CatalogDelta {
+                    collection_id: "series".into(),
+                    epoch: "epoch".into(),
+                    snapshot: true,
+                    done: true,
+                    through_version: 2,
+                    records: vec![
+                        p::CatalogRecord {
+                            version: 1,
+                            kind: "file".into(),
+                            key: b"root\0Many.mkv".to_vec(),
+                            payload: p::FileUpsert {
+                                collection_id: "series".into(),
+                                files: vec![many],
+                            }
+                            .encode_to_vec(),
+                            deleted: false,
+                        },
+                        p::CatalogRecord {
+                            version: 2,
+                            kind: "file".into(),
+                            key: b"root\0Image.mkv".to_vec(),
+                            payload: p::FileUpsert {
+                                collection_id: "series".into(),
+                                files: vec![image_only],
+                            }
+                            .encode_to_vec(),
+                            deleted: false,
+                        },
+                    ],
+                },
+            )
+            .await
+            .unwrap();
+        let registry = Registry::new(db, Default::default(), store);
+        registry.connected("host", "mediahost", "Fixture", "fp", "test");
+        let subs = Subtitles::new(dir.path().join("subtitles"));
+
+        let cold = subs.catalogue_text_prewarm(&registry).await.unwrap();
+        assert_eq!(
+            cold.iter()
+                .map(|(_, _, s)| s.path_rel.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Many.mkv"],
+            "one entry for the three-track file, none for the image-only one"
+        );
+
+        // Once every text track of that file is cached, it drops out.
+        let (module, collection, source) = cold[0].clone();
+        for key in ["e0", "e1", "e2"] {
+            subs.store_extracted(
+                &module,
+                &collection,
+                &source.root_token,
+                &source.path_rel,
+                key,
+                revision_of(&subs, &registry, &source).await.as_str(),
+                &kahawai_media::subtitles::Extracted {
+                    cues: vec![],
+                    ass: None,
+                },
+            )
+            .unwrap();
+        }
+        assert!(
+            subs.catalogue_text_prewarm(&registry)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a fully cached file is not swept again"
+        );
+    }
+
+    /// The revision the prewarm keyed its cache path on, read back the same
+    /// way the candidate scan derives it.
+    #[cfg(test)]
+    async fn revision_of(
+        subs: &Subtitles,
+        registry: &Registry,
+        source: &kahawai_proto::v1::SourcePath,
+    ) -> String {
+        let _ = subs;
+        for summary in registry
+            .catalogue()
+            .collection_summaries()
+            .await
+            .unwrap()
+            .into_iter()
+        {
+            for f in registry
+                .catalogue()
+                .files(&summary.collection.id)
+                .await
+                .unwrap()
+            {
+                if f.path != source.path_rel {
+                    continue;
+                }
+                let (Some(info), Some(size)) = (&f.media, f.size) else {
+                    continue;
+                };
+                let part = PartSource {
+                    file_id: FileId::Catalogue(f.id),
+                    module_id: summary.collection.mediahost_id.clone(),
+                    collection_id: summary.collection.remote_id.clone(),
+                    root_token: f.root_token,
+                    path_rel: f.path,
+                    size,
+                    mtime_unix: f.mtime.unwrap_or(0),
+                    head_xxh3: f.head_hash.unwrap_or(0) as i64,
+                    tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
+                    base_ms: 0,
+                    duration_ms: info.duration_ms.unwrap_or(0),
+                };
+                if let Some(t) = crate::sessions::catalogue::tracks(
+                    f.item_id.as_deref().unwrap_or(""),
+                    &part,
+                    info,
+                )
+                .first()
+                {
+                    return t.source_revision().unwrap().to_string();
+                }
+            }
+        }
+        panic!("no revision for {}", source.path_rel);
+    }
+
     #[cfg(feature = "ocr")]
     #[tokio::test]
     async fn empty_ocr_answer_removes_mediadb_source_from_idle_work_after_reopen() {
