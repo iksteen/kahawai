@@ -16,6 +16,21 @@ env:
   RUSTFLAGS: -D warnings
 
 jobs:
+  release-tools:
+    name: release tools cache
+    runs-on: ubuntu-26.04
+    steps:
+      - uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/kahawai-release-tools
+          key: ubuntu-26.04-cargo-edit-0.13.13-rust-1.97.1
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: |
+          tools="$HOME/.local/share/kahawai-release-tools"
+          if ! test -x "$tools/bin/cargo-set-version"; then
+            cargo install --locked cargo-edit --version 0.13.13 --root "$tools"
+          fi
+
   fmt:
     name: rustfmt
     runs-on: ubuntu-26.04

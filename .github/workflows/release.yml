@@ -29,8 +29,18 @@ jobs:
         with:
           fetch-depth: 0
           fetch-tags: true
+      - name: Restore pinned workspace version editor
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.local/share/kahawai-release-tools
+          key: ubuntu-26.04-cargo-edit-0.13.13-rust-1.97.1
       - name: Install pinned workspace version editor
-        run: cargo install --locked cargo-edit --version 0.13.13
+        run: |
+          tools="$HOME/.local/share/kahawai-release-tools"
+          if ! test -x "$tools/bin/cargo-set-version"; then
+            cargo install --locked cargo-edit --version 0.13.13 --root "$tools"
+          fi
+          echo "$tools/bin" >> "$GITHUB_PATH"
       - name: Fetch an existing reproducibility branch
         run: git fetch origin "+refs/heads/$GITHUB_REF_NAME:refs/remotes/origin/$GITHUB_REF_NAME" || true
       - name: Create or verify the stamped branch
@@ -45,6 +55,7 @@ jobs:
       # A release source gate must exercise the same complete binary boundary
       # as the container build, never an accidentally UI-less Rust build.
       KAHAWAI_REQUIRE_WEB: 1
+      KAHAWAI_SKIP_WEB_BUILD: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -75,7 +86,12 @@ jobs:
             ~/.cargo/git/db
             target
           key: ubuntu-26.04-release-source-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: ubuntu-26.04-release-source-rust-1.97.1-
+          # Tags cannot read another tag's cache, but can restore master CI.
+          # https://docs.github.com/en/actions/reference/workflows-and-actions/dependency-caching#restrictions-for-accessing-a-cache
+          restore-keys: |
+            ubuntu-26.04-release-source-rust-1.97.1-
+            ubuntu-26.04-test-rust-1.97.1-
+            ubuntu-26.04-no-default-rust-1.97.1-
       - name: Verify stamped identity
         env:
           EXPECTED_VERSION: ${{ needs.prepare.outputs.version }}
@@ -132,6 +148,7 @@ jobs:
       CARGO_INCREMENTAL: 0
       CARGO_PROFILE_DEV_DEBUG: 0
       KAHAWAI_REQUIRE_WEB: 1
+      KAHAWAI_SKIP_WEB_BUILD: 1
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -153,7 +170,9 @@ jobs:
             ~/.cargo/git/db
             target
           key: macos-15-release-browser-rust-1.97.1-${{ hashFiles('Cargo.lock') }}
-          restore-keys: macos-15-release-browser-rust-1.97.1-
+          restore-keys: |
+            macos-15-release-browser-rust-1.97.1-
+            macos-15-browser-rust-1.97.1-
       - run: npm ci
         working-directory: web
       - run: npm run build
@@ -218,7 +237,7 @@ jobs:
 
   image:
     name: image (${{ matrix.platform }})
-    needs: [prepare, draft-release]
+    needs: prepare
     environment: release
     permissions:
       contents: read
@@ -266,8 +285,11 @@ jobs:
           outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
           provenance: mode=max
           sbom: true
-          cache-from: type=gha,scope=kahawai-release-${{ matrix.cache }}
-          cache-to: type=gha,mode=max,scope=kahawai-release-${{ matrix.cache }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.cache }}
+          # Registry caches are shared across release tags; mode=max retains
+          # the expensive intermediate dependency layers as well as runtime.
+          # https://docs.docker.com/build/cache/backends/registry/
+          cache-to: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.cache }},mode=max
       - name: Smoke-test the exact pushed image
         run: scripts/kahawai-container-smoke.sh -t "$IMAGE@${{ steps.build.outputs.digest }}"
       - name: Verify packaged version
@@ -282,7 +304,7 @@ jobs:
           platforms: ${{ matrix.platform }}
           build-args: KAHAWAI_BUILD=${{ needs.prepare.outputs.tag }}@${{ needs.prepare.outputs.release_commit }}
           outputs: type=local,dest=${{ runner.temp }}/binary
-          cache-from: type=gha,scope=kahawai-release-${{ matrix.cache }}
+          cache-from: type=registry,ref=${{ env.IMAGE }}:buildcache-${{ matrix.cache }}
       - name: Package architecture outputs
         env:
           DIGEST: ${{ steps.build.outputs.digest }}
@@ -310,7 +332,7 @@ jobs:
 
   publish:
     name: publish tested release
-    needs: [prepare, image]
+    needs: [prepare, source-gates, source-gates-webkit, draft-release, image]
     environment: release
     runs-on: ubuntu-26.04
     permissions:

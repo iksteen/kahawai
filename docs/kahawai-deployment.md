@@ -541,3 +541,29 @@ That assertion lives in `kahawai_core::power` and is taken from
 passes through on its way up and nothing else calls: hub, mediahost,
 transcoder and all-in-one, without a per-service call to remember. It is
 a no-op off macOS and idempotent.
+
+## Release build reuse
+
+Release image builds run alongside the stamped Linux and WebKit source gates.
+They may push an untagged digest before those gates finish; publication depends
+on every source gate, both architecture smoke tests, draft creation and the
+release environment approval. A failed gate cannot publish a release.
+
+Docker caches use `buildcache-amd64` and `buildcache-arm64` in the existing image
+repository. GitHub's tag-scoped caches cannot carry work between RC tags. The
+registry cache retains intermediate layers, including a cargo-chef dependency
+recipe whose local package versions are normalized. Compiled Cargo dependencies
+are ordinary layer contents, not ephemeral BuildKit cache mounts. Real workspace
+source and release versions replace the recipe skeleton before building or
+running any tests. GStreamer patch families are copied separately.
+
+The cost model is rebuild time versus restore/export latency at release time:
+rc.1 spent 11m21s rebuilding AMD64 dependencies/GStreamer and 6m34s exporting its
+Actions cache. Retain reusable dependency work; assess changes using consecutive
+cold/warm RC runs, including cache transfer time and the unchanged media tests.
+Source gates can restore compatible master CI Cargo caches. Master CI also seeds
+the pinned cargo-edit binary used during release stamping.
+
+`scripts/kahawai-release-cache-check.py /path/to/cargo-chef` verifies that source
+edits and RC version changes retain the dependency recipe while dependency
+changes invalidate it. Use cargo-chef 0.1.74, matching the Dockerfile.

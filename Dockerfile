@@ -28,6 +28,14 @@ ARG GSTREAMER_REV=070125524a8422e29d3b69a372ed4f62fd343ffa
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
 FROM node:${NODE_VERSION}-bookworm-slim AS node-toolchain
 
+FROM rust-toolchain AS chef
+RUN cargo install --locked cargo-chef --version 0.1.74
+
+FROM chef AS dependency-plan
+WORKDIR /usr/src/kahawai
+COPY . .
+RUN cargo chef prepare --recipe-path /recipe.json
+
 # Build against the same userspace ABI as the runtime while retaining pinned,
 # current Rust and Node toolchains. Their glibc binaries are forward-compatible
 # here.
@@ -74,7 +82,7 @@ RUN set -eux; \
 # The upstream fixes this image carries, with their reports and
 # reproducers: patches/*/. Copied before the plugin builds so a change
 # to a patch rebuilds only what depends on it.
-COPY patches /usr/src/patches
+COPY patches/gstreamer /usr/src/patches/gstreamer
 
 ARG GSTREAMER_VERSION
 ARG GSTREAMER_REV
@@ -176,6 +184,7 @@ ENV PKG_CONFIG_PATH=/usr/local/lib/pkgconfig \
 # stops loading with the renderer empty. So each patch is classified
 # rather than assumed, exactly as scripts/kahawai-gst-rs.sh does, and
 # anything that neither applies nor is present fails the build.
+COPY patches/gst-plugins-rs /usr/src/patches/gst-plugins-rs
 ARG GST_PLUGINS_RS_VERSION
 ARG GST_PLUGINS_RS_REV
 RUN git clone --depth 1 --branch "$GST_PLUGINS_RS_VERSION" \
@@ -216,7 +225,20 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
         /usr/local/lib/gstreamer-1.0/libgsthlssink3.so
 
 WORKDIR /usr/src/kahawai
-COPY . .
+COPY --from=chef /usr/local/cargo/bin/cargo-chef /usr/local/cargo/bin/cargo-chef
+COPY --from=dependency-plan /recipe.json /recipe.json
+# Ordinary layer contents, not cache mounts: exported registry layers must
+# carry compiled dependencies to the next fresh runner. Cargo-chef masks local
+# package versions, so RC stamping does not invalidate third-party dependencies.
+# https://github.com/LukeMathWalker/cargo-chef
+RUN cargo chef cook --release --workspace --all-targets --locked --recipe-path /recipe.json \
+    && rm -rf crates
+
+# The API fingerprint checks Rust inputs as well as the web sources. Keep
+# documentation and deployment scripts out of this layer, but retain that check.
+COPY Cargo.toml Cargo.lock rust-toolchain.toml ./
+COPY crates crates
+COPY web web
 
 # Generated web assets are never committed. Every artifact-producing build
 # creates them from the lockfile before rust-embed compiles them into Kahawai.
@@ -224,10 +246,10 @@ RUN --mount=type=cache,target=/root/.npm \
     npm ci --prefix web \
     && npm run --prefix web build
 
+COPY . .
+ENV KAHAWAI_SKIP_WEB_BUILD=1
 ARG KAHAWAI_BUILD=container
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=kahawai-target-ubuntu2604,target=/usr/src/kahawai/target \
-    KAHAWAI_BUILD="${KAHAWAI_BUILD}" KAHAWAI_REQUIRE_WEB=1 \
+RUN KAHAWAI_BUILD="${KAHAWAI_BUILD}" KAHAWAI_REQUIRE_WEB=1 \
         cargo build --locked --release --bin kahawai \
     && install -D -m 0755 -s target/release/kahawai /out/kahawai
 
@@ -249,9 +271,7 @@ RUN scripts/kahawai-gst-plugins.sh verify \
         --plugin-dir /usr/local/lib/gstreamer-1.0 \
         --exclusive
 
-RUN --mount=type=cache,target=/usr/local/cargo/registry \
-    --mount=type=cache,id=kahawai-target-ubuntu2604,target=/usr/src/kahawai/target \
-    KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace
+RUN KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace
 
 FROM scratch AS binary-artifact
 COPY --from=media-tested /out/kahawai /kahawai
