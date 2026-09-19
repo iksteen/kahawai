@@ -30,7 +30,7 @@ jobs:
           fetch-depth: 0
           fetch-tags: true
       - name: Restore pinned workspace version editor
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: ~/.local/share/kahawai-release-tools
           key: ubuntu-26.04-cargo-edit-0.13.13-rust-1.97.1
@@ -78,7 +78,7 @@ jobs:
             libleptonica-dev libtesseract-dev tesseract-ocr-eng \
             protobuf-compiler clang cmake
       - name: Cache cargo registry and target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index
@@ -162,7 +162,7 @@ jobs:
       # Homebrew: https://formulae.brew.sh/formula/gstreamer
       - run: brew install gstreamer tesseract protobuf cmake pkgconf
       - name: Cache cargo registry and target
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.cargo/registry/index

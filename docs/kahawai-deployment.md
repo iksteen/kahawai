@@ -561,7 +561,8 @@ The cost model is rebuild time versus restore/export latency at release time:
 rc.1 spent 11m21s rebuilding AMD64 dependencies/GStreamer and 6m34s exporting its
 Actions cache. Retain reusable dependency work; assess changes using consecutive
 cold/warm RC runs, including cache transfer time and the unchanged media tests.
-Source gates can restore compatible master CI Cargo caches. Master CI also seeds
+Source gates restore compatible master CI Cargo caches without uploading another
+tag-scoped copy that the next RC cannot read. Master CI also seeds
 the pinned cargo-edit binary used during release stamping.
 
 `scripts/kahawai-release-cache-check.py /path/to/cargo-chef` verifies that source
