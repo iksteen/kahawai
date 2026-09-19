@@ -549,3 +549,10 @@ unavailable hosts. An explicit wake rechecks locally exhausted cohorts, while
 periodic work retains its existing generation-based suppression. No hub season
 queue or completed-job counter is synthesized. The Providers panel restores the
 skip-point controls; `scripts/kahawai-mediadb.sh api segments [--run]` is the CLI.
+
+Manual matching uses one candidates request per search. The hub selects configured
+identity providers, searches them concurrently with independent bounded attempts,
+and returns the refreshed review, the first page of existing identities, and
+provider failures together. Further identity pages use the identities endpoint.
+Video searches follow physical movie/episode kinds, including mixed anime collections;
+verified provider links retain their explicit namespace.

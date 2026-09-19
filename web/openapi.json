@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "f1d99987a1c4e55e55c3374421ccebd2355ec16f4551880ab75a012195722002",
+  "x-kahawai-source-sha256": "f7e7b360d1a6ec1fc2a34e6a0ab69cb365f332c6ba3f509f10a87fdfb7ce4cf6",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -651,10 +651,7 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "type": "array",
-                  "items": {
-                    "$ref": "#/components/schemas/ReviewCandidate"
-                  }
+                  "$ref": "#/components/schemas/CandidateSearchResult"
                 }
               }
             }
@@ -8719,19 +8716,43 @@
         "type": "object",
         "required": [
           "revision",
-          "provider",
           "query"
         ],
         "properties": {
-          "provider": {
-            "type": "string"
-          },
           "query": {
             "type": "string"
           },
           "revision": {
             "type": "integer",
             "format": "int64"
+          }
+        }
+      },
+      "CandidateSearchResult": {
+        "type": "object",
+        "required": [
+          "detail",
+          "identities",
+          "errors"
+        ],
+        "properties": {
+          "detail": {
+            "$ref": "#/components/schemas/EnrichmentDetail"
+          },
+          "errors": {
+            "type": "object",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "identities": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/IdentityChoice"
+            }
           }
         }
       },

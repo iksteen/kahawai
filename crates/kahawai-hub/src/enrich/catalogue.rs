@@ -37,6 +37,34 @@ pub(super) fn now() -> i64 {
 #[error("provider credentials are not configured")]
 struct Unconfigured;
 
+// Verified provider links identify the namespace directly. Otherwise physical
+// entries distinguish movies from series even inside a mixed anime collection.
+fn video_kind(
+    media_type: m::MediaType,
+    entries: &[m::EntryKind],
+    target: Option<&m::RecordLink>,
+) -> &'static str {
+    if let Some(target) = target {
+        return if target.namespace == "movie" {
+            "movie"
+        } else {
+            "show"
+        };
+    }
+    if entries
+        .iter()
+        .any(|e| matches!(e, m::EntryKind::Episode { .. }))
+    {
+        "show"
+    } else if entries.iter().any(|e| matches!(e, m::EntryKind::Movie))
+        || media_type == m::MediaType::Movies
+    {
+        "movie"
+    } else {
+        "show"
+    }
+}
+
 impl Enricher {
     pub fn start_catalogue(self: &Arc<Self>, registry: Arc<Registry>) {
         if self.catalogue_started.swap(true, Ordering::SeqCst) {
@@ -230,6 +258,22 @@ impl Enricher {
                 vec![]
             },
         ))?;
+        let kind = video_kind(input.media_type, &wanted, target.as_ref());
+        let previous_kind = if input.media_type == m::MediaType::Movies
+            || target.as_ref().is_some_and(|t| t.namespace == "movie")
+        {
+            "movie"
+        } else {
+            "show"
+        };
+        // Keep valid cached answers: rebuilding them costs paced provider requests
+        // and delays interactive matching. A cached answer from the WRONG namespace
+        // cannot answer this question; distinguish only those corrected lookups.
+        let question = if matches!(provider, "tmdb" | "tvdb") && kind != previous_kind {
+            serde_json::to_string(&(kind, question))?
+        } else {
+            question
+        };
         if !force
             && let Some(cached) = registry
                 .catalogue()
@@ -241,7 +285,7 @@ impl Enricher {
         provider_ready(registry.catalogue(), provider).await?;
         let answer = match provider {
             "tmdb" | "tvdb" => {
-                self.catalogue_video(registry, provider, input, target.as_ref())
+                self.catalogue_video(registry, provider, input, target.as_ref(), kind)
                     .await?
             }
             "musicbrainz" => self.catalogue_musicbrainz(input, target.as_ref()).await?,
@@ -264,14 +308,8 @@ impl Enricher {
         provider: &str,
         input: &m::EnrichmentInput,
         target: Option<&m::RecordLink>,
+        kind: &str,
     ) -> Result<m::EnrichmentAnswer> {
-        let kind = if input.media_type == m::MediaType::Movies
-            || target.is_some_and(|t| t.namespace == "movie")
-        {
-            "movie"
-        } else {
-            "show"
-        };
         let mut candidates;
         let mut episodes = Vec::new();
         let mut rich: Option<serde_json::Value> = None;
@@ -1242,5 +1280,40 @@ impl Enricher {
             };
         }
         Ok(Default::default())
+    }
+}
+
+#[cfg(test)]
+mod search_kind_tests {
+    use super::*;
+    #[test]
+    fn physical_kind_and_verified_links_choose_the_video_namespace() {
+        assert_eq!(
+            video_kind(m::MediaType::Anime, &[m::EntryKind::Movie], None),
+            "movie"
+        );
+        assert_eq!(
+            video_kind(
+                m::MediaType::Anime,
+                &[m::EntryKind::Episode { episodes: vec![] }],
+                None
+            ),
+            "show"
+        );
+        assert_eq!(video_kind(m::MediaType::Movies, &[], None), "movie");
+        assert_eq!(video_kind(m::MediaType::Series, &[], None), "show");
+        let link = m::RecordLink {
+            provider: "tmdb".into(),
+            namespace: "movie".into(),
+            external_id: "13851".into(),
+        };
+        assert_eq!(
+            video_kind(
+                m::MediaType::Anime,
+                &[m::EntryKind::Episode { episodes: vec![] }],
+                Some(&link)
+            ),
+            "movie"
+        );
     }
 }

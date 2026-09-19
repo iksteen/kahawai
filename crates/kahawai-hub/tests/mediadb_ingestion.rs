@@ -31,7 +31,14 @@ impl Fixture {
         let dir = tempfile::tempdir().unwrap();
         let db = kahawai_hub::db::open(dir.path()).await.unwrap();
         let store = kahawai_hub::db::open_catalogue(dir.path()).await.unwrap();
-        let registry = Arc::new(Registry::new(db.clone(), Default::default(), store));
+        let credentials = Arc::new(
+            kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
+                .await
+                .unwrap(),
+        );
+        let registry = Arc::new(
+            Registry::new(db.clone(), Default::default(), store).with_credentials(credentials),
+        );
         sqlx::query("INSERT INTO satellites(module_id,module_type,name,cert_fingerprint) VALUES('host','mediahost','Fixture','fixture-cert')").execute(&db).await.unwrap();
         let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
         auth.complete_setup("admin", "test-password").await.unwrap();
@@ -2609,4 +2616,150 @@ async fn segment_admin_reports_live_sources_and_wakes_each_eligible_host_once() 
         f.registry.discovery_status("host", "shows").is_none(),
         "old report cannot cross a reconnect"
     );
+}
+
+#[tokio::test]
+async fn matching_search_aggregates_anime_movie_results_and_provider_failures() {
+    use kahawai_mediadb as m;
+    let f = Fixture::new().await;
+    let store = f.registry.catalogue();
+    let mut collection = offer("anime", 1);
+    collection.media_type = "anime".into();
+    store
+        .offer_catalogue(
+            "host",
+            "Fixture",
+            &p::CatalogOffer {
+                collections: vec![collection],
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .apply_catalogue(
+            "host",
+            &delta("anime", 1, "Batman.Gotham.Night.mkv", true, true),
+        )
+        .await
+        .unwrap();
+    let collection = store.collections("host").await.unwrap()[0].id.clone();
+    let (status, _) = f
+        .request(
+            "POST",
+            "/admin/v1/catalogue/libraries",
+            json!({"name":"Animost","media_type":"anime","collection_ids":[collection]}),
+            Some(&f.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::CREATED);
+    let input = store
+        .enrichment_items(None, None, false, "Batman", 0, 10)
+        .await
+        .unwrap();
+    let input = store.enrichment_input(&input[0].id).await.unwrap();
+    let entries = store.media_entries(&input.item_id).await.unwrap();
+    assert!(matches!(entries[0].data.kind, m::EntryKind::Movie));
+    store
+        .set_provider_order(
+            m::MediaType::Anime,
+            &["tmdb".into(), "tvdb".into(), "anidb".into()],
+        )
+        .await
+        .unwrap();
+    for provider in ["tmdb", "tvdb"] {
+        f.registry
+            .credentials()
+            .unwrap()
+            .set_provider(
+                kahawai_hub::secrets::HUB,
+                provider,
+                &std::collections::BTreeMap::from([("api_key", "fixture")]),
+            )
+            .await
+            .unwrap();
+    }
+    let title = "Batman: Gotham Knight";
+    let old_question = serde_json::to_string(&json!([
+        entries.iter().map(|e| &e.data.kind).collect::<Vec<_>>(),
+        [],
+        "anime",
+        title,
+        null,
+        input.artist,
+        null,
+        []
+    ]))
+    .unwrap();
+    let question = serde_json::to_string(&("movie", &old_question)).unwrap();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as i64;
+    let answer = m::EnrichmentAnswer {
+        candidates: vec![m::EnrichmentCandidate {
+            record: m::ProviderRecord {
+                provider: "tmdb".into(),
+                namespace: "movie".into(),
+                external_id: "13851".into(),
+                language: "en".into(),
+                media_type: m::MediaType::Movies,
+                title: title.into(),
+                year: Some(2008),
+                description: Default::default(),
+            },
+            strength: 0,
+            complete: false,
+            links: vec![],
+        }],
+        ..Default::default()
+    };
+    store
+        .put_cache_answer(
+            "tmdb",
+            &old_question,
+            &serde_json::to_string(&m::EnrichmentAnswer::default()).unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .put_cache_answer(
+            "tmdb",
+            &question,
+            &serde_json::to_string(&answer).unwrap(),
+            now,
+        )
+        .await
+        .unwrap();
+    store
+        .put_cache_answer("tvdb", &question, "broken fixture answer", now)
+        .await
+        .unwrap();
+    let path = format!("/admin/v1/enrich/items/{}/candidates", input.item_id);
+    let body = json!({"revision":input.revision,"query":title});
+    assert_eq!(
+        f.request("POST", &path, body.clone(), None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    assert_eq!(
+        f.request(
+            "POST",
+            &path,
+            json!({"revision":-1,"query":title}),
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::CONFLICT
+    );
+    let (status, result) = f.request("POST", &path, body, Some(&f.token)).await;
+    assert_eq!(status, StatusCode::OK, "{result}");
+    assert_eq!(
+        result["detail"]["candidates"][0]["record"]["namespace"], "movie",
+        "{result}"
+    );
+    assert_eq!(result["detail"]["candidates"][0]["record"]["title"], title);
+    assert!(result["identities"].is_array());
+    assert_eq!(result["errors"].as_object().unwrap().len(), 1, "{result}");
+    assert!(result["errors"]["tvdb"].is_string());
 }

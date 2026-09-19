@@ -28,13 +28,13 @@ elif command=="identities" and len(sys.argv)==4:
 elif command=="assign" and len(sys.argv)==5:
     path=f"/admin/v1/enrich/items/{urllib.parse.quote(sys.argv[2],safe='')}/match"; method="POST"
     body={"revision":int(sys.argv[3]),"action":"assign","library_item_id":sys.argv[4]}
-elif command=="search" and len(sys.argv)==6:
+elif command=="search" and len(sys.argv)==5:
     path=f"/admin/v1/enrich/items/{urllib.parse.quote(sys.argv[2],safe='')}/candidates"; method="POST"
-    body={"revision":int(sys.argv[3]),"provider":sys.argv[4],"query":sys.argv[5]}
+    body={"revision":int(sys.argv[3]),"query":sys.argv[4]}
 elif command in ("retry","clear","pick","confirm","reject","restore","supplement") and len(sys.argv)>=4:
     path=f"/admin/v1/enrich/items/{urllib.parse.quote(sys.argv[2],safe='')}/match"; method="POST"
     body={"revision":int(sys.argv[3]),"action":command,"record_id":sys.argv[4] if len(sys.argv)>4 else None}
-else: raise SystemExit("usage: kahawai-enrich.sh status|run|items|detail ITEM|ACTION ITEM REVISION [RECORD]|search ITEM REVISION PROVIDER TITLE|identities ITEM TITLE|assign ITEM REVISION LIBRARY_ITEM|check")
+else: raise SystemExit("usage: kahawai-enrich.sh status|run|items|detail ITEM|ACTION ITEM REVISION [RECORD]|search ITEM REVISION TITLE|identities ITEM TITLE|assign ITEM REVISION LIBRARY_ITEM|check")
 request=urllib.request.Request(base+path,method=method,data=None if body is None else json.dumps(body).encode(),headers={"Authorization":"Bearer "+os.environ["KAHAWAI_TOKEN"],"Content-Type":"application/json"})
 try:
     with urllib.request.urlopen(request,timeout=130) as response: print(json.dumps(json.load(response),indent=2))

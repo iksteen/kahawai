@@ -5,7 +5,6 @@ import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from
 import { useQueryClient } from '@tanstack/vue-query'
 import Btn from './Btn.vue'
 import {
-  adminProviders,
   enrichmentDetail,
   enrichmentCorrect,
   enrichmentSearch,
@@ -108,47 +107,22 @@ async function search() {
   inflight = key
   searching.value = true
   failure.value = ''
-  // The local lookup and each provider answer are independent. A failed provider
-  // leaves existing identities and the previous review snapshot available.
-  await Promise.all([
-    localPage(what, 0, mine).catch((cause) => {
-      if (mine === asked) failure.value = sentence(cause)
-    }),
-    (async () => {
-      try {
-        const configured = await adminProviders()
-        if (mine !== asked) return
-        const providers = (configured.chains[input.media_type]?.order ?? []).filter((name) =>
-          configured.available?.includes(name),
-        )
-        if (!providers.length) throw new Error('No matching providers are configured.')
-        await Promise.all(
-          providers.map(async (provider) => {
-            try {
-              await enrichmentSearch(input.item_id, {
-                revision: input.revision,
-                provider,
-                query: what,
-              })
-            } catch (cause) {
-              if (mine === asked)
-                failure.value = [failure.value, `${provider}: ${sentence(cause)}`]
-                  .filter(Boolean)
-                  .join(' ')
-            }
-          }),
-        )
-        const answer = await enrichmentDetail(input.item_id)
-        if (mine === asked) {
-          detail.value = answer
-          broken.value = new Set()
-        }
-      } catch (cause) {
-        if (mine === asked) failure.value = sentence(cause)
-      }
-    })(),
-  ])
-  if (mine === asked) searching.value = false
+  try {
+    const answer = await enrichmentSearch(input.item_id, { revision: input.revision, query: what })
+    if (mine !== asked) return
+    detail.value = answer.detail
+    local.value = answer.identities
+    localMore.value = answer.identities.length === 200
+    localQuery = what
+    broken.value = new Set()
+    failure.value = Object.entries(answer.errors)
+      .map(([provider, message]) => `${provider}: ${message}`)
+      .join(' ')
+  } catch (cause) {
+    if (mine === asked) failure.value = sentence(cause)
+  } finally {
+    if (mine === asked) searching.value = false
+  }
 }
 async function apply(action: string, record_id?: string, library_item_id?: string) {
   const input = detail.value?.input

@@ -31,8 +31,13 @@ pub struct Correction {
 #[derive(Deserialize, ToSchema)]
 pub struct CandidateSearch {
     revision: i64,
-    provider: String,
     query: String,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CandidateSearchResult {
+    pub detail: EnrichmentDetail,
+    pub identities: Vec<m::IdentityChoice>,
+    pub errors: BTreeMap<String, String>,
 }
 #[derive(Serialize, ToSchema)]
 pub struct EnrichmentProgress {
@@ -196,12 +201,12 @@ pub(super) async fn enrichment_correct(
     s.enricher.request_run(s.registry.clone());
     Ok(Json(OkResponse { ok: true }))
 }
-#[utoipa::path(post,path="/admin/v1/enrich/items/{id}/candidates",tag="Admin enrichment",params(("id"=String,Path)),request_body=CandidateSearch,security(("bearer_auth"=[])),responses((status=200,body=Vec<m::ReviewCandidate>),(status=409,body=ApiErrorBody)))]
+#[utoipa::path(post,path="/admin/v1/enrich/items/{id}/candidates",tag="Admin enrichment",params(("id"=String,Path)),request_body=CandidateSearch,security(("bearer_auth"=[])),responses((status=200,body=CandidateSearchResult),(status=409,body=ApiErrorBody)))]
 pub(super) async fn enrichment_search(
     State(s): State<AppState>,
     ApiPath(id): ApiPath<String>,
     ApiJson(q): ApiJson<CandidateSearch>,
-) -> Result<Json<Vec<m::ReviewCandidate>>, ApiError> {
+) -> Result<Json<CandidateSearchResult>, ApiError> {
     let input = s
         .registry
         .catalogue()
@@ -211,29 +216,80 @@ pub(super) async fn enrichment_search(
     if input.revision != q.revision {
         return Err(error(m::StaleEnrichment.into()));
     }
-    if !matches!(
-        q.provider.as_str(),
-        "tmdb" | "tvdb" | "anidb" | "anilist" | "musicbrainz"
-    ) {
-        return Err(ApiError::new(
-            ErrorCode::BadRequest,
-            "not an identity provider",
-        ));
-    }
     if q.query.trim().is_empty() {
         return Err(ApiError::new(ErrorCode::BadRequest, "enter a search title"));
     }
-    s.enricher
-        .catalogue_search(&s.registry, input, &q.provider, &q.query)
+    let Json(configured) = admin_providers(State(s.clone())).await?;
+    let providers = configured
+        .chains
+        .get(input.media_type.as_str())
+        .map(|chain| {
+            chain
+                .order
+                .iter()
+                .filter(|p| {
+                    configured.available.contains(p)
+                        && matches!(
+                            p.as_str(),
+                            "tmdb" | "tvdb" | "anidb" | "anilist" | "musicbrainz"
+                        )
+                })
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let mut searches = tokio::task::JoinSet::new();
+    for provider in providers {
+        let s = s.clone();
+        let input = input.clone();
+        let query = q.query.clone();
+        searches.spawn(async move {
+            let result = s
+                .enricher
+                .catalogue_search(&s.registry, input, &provider, query.trim())
+                .await;
+            (provider, result)
+        });
+    }
+    let mut errors = BTreeMap::new();
+    if searches.is_empty() {
+        errors.insert(
+            "providers".into(),
+            "No matching providers are configured.".into(),
+        );
+    }
+    let identities = match s
+        .registry
+        .catalogue()
+        .matching_identities(&id, q.query.trim(), 0, 200)
         .await
-        .map_err(error)?;
-    Ok(Json(
-        s.registry
-            .catalogue()
-            .review_candidates(&id)
-            .await
-            .map_err(error)?,
-    ))
+    {
+        Ok(identities) => identities,
+        Err(cause) => {
+            tracing::warn!(error = %cause, "matching existing identities failed");
+            errors.insert(
+                "library".into(),
+                "Existing identities could not be loaded.".into(),
+            );
+            Vec::new()
+        }
+    };
+    while let Some(result) = searches.join_next().await {
+        let (provider, result) = result.map_err(internal)?;
+        if let Err(cause) = result {
+            tracing::warn!(%provider, error = %cause, "candidate search failed");
+            errors.insert(
+                provider,
+                "Search failed; retry or check provider status.".into(),
+            );
+        }
+    }
+    let Json(detail) = enrichment_detail(State(s), ApiPath(id)).await?;
+    Ok(Json(CandidateSearchResult {
+        detail,
+        identities,
+        errors,
+    }))
 }
 #[utoipa::path(get,path="/admin/v1/enrich/progress",tag="Admin enrichment",security(("bearer_auth"=[])),responses((status=200,body=EnrichmentProgress)))]
 pub(super) async fn enrichment_progress(

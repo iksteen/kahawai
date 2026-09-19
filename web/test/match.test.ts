@@ -77,21 +77,13 @@ function button(wrapper: ReturnType<typeof mount>, text: string) {
 }
 beforeEach(() => {
   vi.resetAllMocks()
-  vi.mocked(api.adminProviders).mockResolvedValue({
-    tmdb: { configured: true },
-    tvdb: { configured: true },
-    anidb: { configured: false },
-    fanart: { configured: false },
-    theaudiodb: { premium_key_configured: false },
-    available: ['tmdb', 'tvdb', 'musicbrainz'],
-    chains: {
-      movies: { order: ['tmdb', 'tvdb'], default: [] },
-      music: { order: ['musicbrainz'], default: [] },
-    },
-  } as Awaited<ReturnType<typeof api.adminProviders>>)
   vi.mocked(api.enrichmentDetail).mockResolvedValue(snapshot())
   vi.mocked(api.enrichmentCorrect).mockResolvedValue({ ok: true })
-  vi.mocked(api.enrichmentSearch).mockResolvedValue([])
+  vi.mocked(api.enrichmentSearch).mockResolvedValue({
+    detail: snapshot(),
+    identities: [],
+    errors: {},
+  })
   vi.mocked(api.enrichmentIdentities).mockResolvedValue([])
 })
 afterEach(() => {
@@ -131,20 +123,21 @@ describe('mediadb matching', () => {
   test('search refreshes the revision and picking emits the resulting stable library ID', async () => {
     const w = dialog()
     await flushPromises()
-    vi.mocked(api.enrichmentDetail).mockResolvedValue(snapshot({ revision: 8 }))
+    vi.mocked(api.enrichmentSearch).mockResolvedValue({
+      detail: snapshot({ revision: 8 }),
+      identities: [],
+      errors: {},
+    })
     await w.get('input').setValue('Heat 1995')
     await w.get('form').trigger('submit')
     await flushPromises()
-    expect(api.enrichmentSearch).toHaveBeenCalledWith('copy-1', {
+    expect(api.enrichmentSearch).toHaveBeenCalledExactlyOnceWith('copy-1', {
       revision: 7,
-      provider: 'tmdb',
       query: 'Heat 1995',
     })
-    expect(api.enrichmentSearch).toHaveBeenCalledWith('copy-1', {
-      revision: 7,
-      provider: 'tvdb',
-      query: 'Heat 1995',
-    })
+    expect(api.adminProviders).not.toHaveBeenCalled()
+    expect(api.enrichmentDetail).toHaveBeenCalledTimes(1)
+    expect(api.enrichmentIdentities).toHaveBeenCalledTimes(1)
     vi.mocked(api.enrichmentDetail).mockResolvedValue(
       snapshot({ revision: 9, library_item_id: 'work-2' }),
     )
@@ -171,42 +164,23 @@ describe('mediadb matching', () => {
     expect(button(w, 'Search').attributes('disabled')).toBeUndefined()
     expect(button(w, 'Reload matches').exists()).toBe(true)
   })
-  test('search skips providers without configuration', async () => {
-    vi.mocked(api.adminProviders).mockResolvedValue({
-      tmdb: { configured: false },
-      tvdb: { configured: true },
-      anidb: { configured: false },
-      fanart: { configured: false },
-      theaudiodb: { premium_key_configured: false },
-      available: ['tvdb', 'musicbrainz'],
-      chains: { movies: { order: ['tmdb', 'tvdb'], default: [] } },
-    } as Awaited<ReturnType<typeof api.adminProviders>>)
-    const w = dialog()
-    await flushPromises()
-    await w.get('form').trigger('submit')
-    await flushPromises()
-    expect(api.enrichmentSearch).toHaveBeenCalledExactlyOnceWith('copy-1', {
-      revision: 7,
-      provider: 'tvdb',
-      query: 'Heat',
-    })
-  })
   test('provider failure preserves results from another configured provider', async () => {
     const w = dialog()
     await flushPromises()
-    vi.mocked(api.enrichmentSearch).mockImplementation(async (_id, request) => {
-      if (request.provider === 'tmdb') throw new Error('Unavailable')
-      vi.mocked(api.enrichmentDetail).mockResolvedValue({
+    vi.mocked(api.enrichmentSearch).mockResolvedValue({
+      detail: {
         ...snapshot(),
         candidates: [
           { id: 'tv', record: { ...record, provider: 'tvdb' }, strength: 0, rejected: false },
         ],
-      })
-      return []
+      },
+      identities: [{ id: 'existing', title: 'Existing Heat', year: 1995 }],
+      errors: { tmdb: 'Unavailable' },
     })
     await w.get('form').trigger('submit')
     await flushPromises()
-    expect(api.enrichmentSearch).toHaveBeenCalledTimes(2)
+    expect(api.enrichmentSearch).toHaveBeenCalledTimes(1)
+    expect(w.text()).toContain('Existing Heat')
     expect(w.get('ul.grid').text()).toContain('tvdb')
     expect(w.get('[role=alert]').text()).toContain('tmdb: Unavailable')
   })
@@ -245,7 +219,6 @@ describe('mediadb matching', () => {
     await flushPromises()
     expect(api.enrichmentSearch).toHaveBeenCalledExactlyOnceWith('copy-1', {
       revision: 7,
-      provider: 'musicbrainz',
       query: 'Heat',
     })
   })

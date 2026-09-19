@@ -46,7 +46,7 @@ scripts/kahawai-mediadb.sh api rescan LIBRARY --deep
 scripts/kahawai-library.sh copies LIBRARY ITEM
 scripts/kahawai-enrich.sh items --library LIBRARY --offset 0 --limit 200
 scripts/kahawai-enrich.sh detail COPY
-scripts/kahawai-enrich.sh search COPY REVISION PROVIDER "title"
+scripts/kahawai-enrich.sh search COPY REVISION "title"
 scripts/kahawai-enrich.sh pick COPY REVISION RECORD_ID
 scripts/kahawai-library.sh match COPY correction.json
 scripts/kahawai-mediadb.sh api item-log ITEM

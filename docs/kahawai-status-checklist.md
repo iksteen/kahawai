@@ -969,7 +969,8 @@ not describe this branch's current runtime.
       retained answers, manual pins/rejections and revision-guarded admin review.
       Provider failures release claims; cached answers and independent work continue.
 - [x] Original per-item matching screen serves library cards and detail sources,
-      with mediadb search across configured providers and saved identity selection. Manual title/year
+      with mediadb search across configured providers and saved identity selection. One search request
+      aggregates results and provider errors; movie/series searches follow physical kinds. Manual title/year
       creation is removed. Candidate images load under the existing CSP; the separate
       Enrichment admin tab is removed. Copy context, revision conflicts, stable
       membership and keyboard navigation are checked.
