@@ -3,34 +3,51 @@ import { describe, expect, test } from 'vitest'
 
 import ArtistCard from '../src/components/ArtistCard.vue'
 
-const artist = (art_version: number | null) => ({
-  key: 'bjork',
+const artist = (key = 'bjork') => ({
+  key,
   name: 'Björk',
   album_count: 12,
-  art_version,
 })
 
 describe('Album Artist portrait', () => {
-  test('does not request an image the API says is unavailable', () => {
+  test('encodes artist names as one URL path component in both image sizes', () => {
     const wrapper = mount(ArtistCard, {
-      props: { artist: artist(null), library: 'music' },
+      props: { artist: artist('AC/DC'), library: 'music' },
     })
-
-    expect(wrapper.find('img').exists()).toBe(false)
+    const image = wrapper.find('img')
+    expect(image.attributes('src')).toBe(
+      '/api/v1/catalogue/libraries/music/artists/AC%2FDC/artwork?size=card',
+    )
+    expect(image.attributes('srcset')).toBe(
+      '/api/v1/catalogue/libraries/music/artists/AC%2FDC/artwork?size=card1x 1x, /api/v1/catalogue/libraries/music/artists/AC%2FDC/artwork?size=card 2x',
+    )
   })
 
-  test('tries a new version after an earlier image failed', async () => {
+  test('requests catalogue artwork without a legacy artwork version', async () => {
     const wrapper = mount(ArtistCard, {
-      props: { artist: artist(1), library: 'music' },
+      props: { artist: artist(), library: 'music' },
+    })
+
+    const image = wrapper.find('img')
+    expect(image.attributes('src')).toBe(
+      '/api/v1/catalogue/libraries/music/artists/bjork/artwork?size=card',
+    )
+    await image.trigger('error')
+    expect(image.classes()).toContain('invisible')
+  })
+
+  test('tries a different artist after an earlier image failed', async () => {
+    const wrapper = mount(ArtistCard, {
+      props: { artist: artist(), library: 'music' },
     })
     const first = wrapper.find('img')
     await first.trigger('error')
     expect(first.classes()).toContain('invisible')
 
-    await wrapper.setProps({ artist: artist(2) })
+    await wrapper.setProps({ artist: artist('other') })
 
     const second = wrapper.find('img')
-    expect(second.attributes('src')).toContain('v=2')
+    expect(second.attributes('src')).toContain('/artists/other/artwork')
     expect(second.classes()).not.toContain('invisible')
   })
 })

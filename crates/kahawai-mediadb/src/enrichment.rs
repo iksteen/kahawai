@@ -800,8 +800,11 @@ impl Store {
         sqlx::query("INSERT INTO artist_artwork VALUES(?,?,?,?) ON CONFLICT(artist_id,provider) DO UPDATE SET image_url=excluded.image_url,updated_at=excluded.updated_at").bind(artist).bind(provider).bind(url).bind(now).execute(&self.db).await?;
         Ok(())
     }
-    pub async fn artist_artwork(&self, item: &str) -> Result<Vec<String>> {
-        Ok(sqlx::query_scalar("SELECT aa.image_url FROM artist_artwork aa JOIN collection_item_artists ca ON ca.artist_id=aa.artist_id JOIN collection_items i ON i.id=ca.item_id WHERE i.id=? AND ca.revision=i.enrichment_revision AND aa.image_url IS NOT NULL ORDER BY CASE aa.provider WHEN 'fanart' THEN 0 ELSE 1 END").bind(item).fetch_all(self.db.read_pool()).await?)
+    /// Artist navigation groups exact imported album-artist names within a library.
+    /// Any current identity in that group can supply its portrait; an unenriched
+    /// first album must not hide images learned from the other albums.
+    pub async fn artist_artwork(&self, item: &str, library: &str) -> Result<Vec<String>> {
+        Ok(sqlx::query_scalar("SELECT DISTINCT aa.image_url,CASE aa.provider WHEN 'fanart' THEN 0 ELSE 1 END AS priority FROM collection_items target JOIN library_collections visible ON visible.collection_id=target.collection_id AND visible.library_id=?2 JOIN collection_items i ON i.artist=target.artist JOIN library_collections lc ON lc.collection_id=i.collection_id AND lc.library_id=?2 JOIN collection_item_artists ca ON ca.item_id=i.id AND ca.revision=i.enrichment_revision JOIN artist_artwork aa ON aa.artist_id=ca.artist_id WHERE target.id=?1 AND aa.image_url IS NOT NULL ORDER BY priority,aa.image_url").bind(item).bind(library).fetch_all(self.db.read_pool()).await?)
     }
 }
 async fn put_candidate(

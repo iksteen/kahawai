@@ -17,9 +17,7 @@ test('loads artist rows by the chunks requested by the virtual grid', async () =
   vi.mocked(listArtists).mockImplementation(async (params) => {
     const offset = params?.offset ?? 0
     return {
-      artists: [
-        { key: `artist-${offset}`, name: `Artist ${offset}`, album_count: 1, art_version: null },
-      ],
+      artists: [{ key: `artist-${offset}`, name: `Artist ${offset}`, album_count: 1 }],
       total: 201,
       limit: 100,
       offset,
@@ -47,7 +45,7 @@ test('keeps a fresh later chunk when it lands before replacement page zero', asy
   vi.mocked(listArtists).mockImplementation(async (params) => {
     if (params.sort === 'name') {
       return {
-        artists: [{ key: 'old', name: 'Old', album_count: 1, art_version: null }],
+        artists: [{ key: 'old', name: 'Old', album_count: 1 }],
         total: 101,
         limit: 100,
         offset: 0,
@@ -71,14 +69,14 @@ test('keeps a fresh later chunk when it lands before replacement page zero', asy
   await nextTick()
   artists.need([1])
   pending.get(100)!({
-    artists: [{ key: 'new-100', name: 'New 100', album_count: 1, art_version: null }],
+    artists: [{ key: 'new-100', name: 'New 100', album_count: 1 }],
     total: 101,
     limit: 100,
     offset: 100,
   })
   await flushPromises()
   pending.get(0)!({
-    artists: [{ key: 'new-0', name: 'New 0', album_count: 1, art_version: null }],
+    artists: [{ key: 'new-0', name: 'New 0', album_count: 1 }],
     total: 101,
     limit: 100,
     offset: 0,
@@ -94,7 +92,7 @@ test('clears another library’s clickable artists while the new route loads', a
   vi.mocked(listArtists).mockImplementation(async (params) => {
     if (params.library === 'first') {
       return {
-        artists: [{ key: 'old-artist', name: 'Old Artist', album_count: 1, art_version: null }],
+        artists: [{ key: 'old-artist', name: 'Old Artist', album_count: 1 }],
         total: 1,
         limit: 100,
         offset: 0,
@@ -121,7 +119,7 @@ test('clears another library’s clickable artists while the new route loads', a
   expect(artists.loaded.value.size).toBe(0)
 
   landSecond({
-    artists: [{ key: 'new-artist', name: 'New Artist', album_count: 1, art_version: null }],
+    artists: [{ key: 'new-artist', name: 'New Artist', album_count: 1 }],
     total: 1,
     limit: 100,
     offset: 0,
@@ -135,7 +133,7 @@ test('clears another artist’s clickable albums while the new route loads', asy
   vi.mocked(artistAlbums).mockImplementation(async (key) => {
     if (key === 'first') {
       return {
-        artist: { key, name: 'First', album_count: 1, art_version: null },
+        artist: { key, name: 'First', album_count: 1 },
         albums: [{ id: 'old-album', title: 'Old Album' } as never],
         total: 1,
         limit: 100,
@@ -164,7 +162,7 @@ test('clears another artist’s clickable albums while the new route loads', asy
   expect(albums.loaded.value.size).toBe(0)
 
   landSecond({
-    artist: { key: 'second', name: 'Second', album_count: 1, art_version: null },
+    artist: { key: 'second', name: 'Second', album_count: 1 },
     albums: [{ id: 'new-album', title: 'New Album' } as never],
     total: 1,
     limit: 100,

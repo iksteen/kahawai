@@ -89,7 +89,7 @@ export async function artistAlbums(
   return {
     ...result,
     albums: result.items.map((entry) => catalogueRow(entry, library)),
-    artist: { key, name: key, album_count: result.total, art_version: null },
+    artist: { key, name: key, album_count: result.total },
   }
 }
 

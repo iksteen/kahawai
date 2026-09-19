@@ -11,7 +11,7 @@ const props = defineProps<{
 }>()
 const emit = defineEmits<{ open: [artist: ArtistSummary] }>()
 const broken = ref(false)
-watch([() => props.artist?.key, () => props.artist?.art_version], () => (broken.value = false))
+watch([() => props.artist?.key, () => props.library], () => (broken.value = false))
 
 function albums(artist: ArtistSummary): string {
   return `${artist.album_count} ${artist.album_count === 1 ? 'album' : 'albums'}`
@@ -24,11 +24,10 @@ function albums(artist: ArtistSummary): string {
     <template #art>
       <span class="art-box">
         <img
-          v-if="artist.art_version !== null"
           class="art"
           :class="broken && 'invisible'"
-          :src="artistArtworkUrl(artist.key, library, artist.art_version, 'card')"
-          :srcset="artistArtworkSrcSet(artist.key, library, artist.art_version)"
+          :src="artistArtworkUrl(artist.key, library, 'card')"
+          :srcset="artistArtworkSrcSet(artist.key, library)"
           loading="lazy"
           alt=""
           @error="broken = true"

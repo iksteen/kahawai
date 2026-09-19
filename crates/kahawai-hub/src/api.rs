@@ -1247,9 +1247,6 @@ struct ArtistSummary {
     /// Stored Album Artist spelling used for display.
     name: String,
     album_count: i64,
-    /// Changes when the selected portrait or generated album collage changes.
-    #[schema(required)]
-    art_version: Option<i64>,
 }
 
 #[derive(Serialize, ToSchema)]
@@ -5313,7 +5310,7 @@ struct ArtistArtworkQuery {
     /// Music library providing both navigation and grant context.
     library: String,
     size: Option<String>,
-    /// Client cache-buster from `ArtistSummary.art_version`.
+    /// Legacy client cache-buster.
     v: Option<String>,
 }
 
@@ -6064,9 +6061,6 @@ async fn list_artists(
             .map(|row| {
                 let key: String = row.get("key");
                 ArtistSummary {
-                    art_version: row
-                        .get::<Option<i64>, _>("portrait_version")
-                        .or_else(|| state.artwork.artist_collage_version(&q.library, &key)),
                     key,
                     name: row.get("name"),
                     album_count: row.get("album_count"),
@@ -6135,9 +6129,6 @@ async fn artist_albums(
         key: key.clone(),
         name: artist_row.get("name"),
         album_count: artist_row.get("album_count"),
-        art_version: artist_row
-            .get::<Option<i64>, _>("portrait_version")
-            .or_else(|| state.artwork.artist_collage_version(&q.library, &key)),
     };
     let limit = q.limit.unwrap_or(ITEMS_PAGE_DEFAULT).min(ITEMS_PAGE_MAX);
     let offset = q.offset.unwrap_or(0);

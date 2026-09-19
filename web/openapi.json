@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "425c74650cd2727e368fc5f7f64283c2f522d775056313d180dfe61f140de15c",
+  "x-kahawai-source-sha256": "2f688b1ae75e604a747e451e497131b84af12487ec086e4db94259cd3b607818",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -7262,7 +7262,7 @@
           {
             "name": "v",
             "in": "query",
-            "description": "Client cache-buster from `ArtistSummary.art_version`.",
+            "description": "Legacy client cache-buster.",
             "required": false,
             "schema": {
               "type": "string"
@@ -13924,21 +13924,12 @@
         "required": [
           "key",
           "name",
-          "album_count",
-          "art_version"
+          "album_count"
         ],
         "properties": {
           "album_count": {
             "type": "integer",
             "format": "int64"
-          },
-          "art_version": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Changes when the selected portrait or generated album collage changes."
           },
           "key": {
             "type": "string",

@@ -41,19 +41,13 @@ export function artworkSrcSet(
   return `${artworkUrl(id, version, 'card1x', library)} 1x, ${artworkUrl(id, version, 'card', library)} 2x`
 }
 
-export function artistArtworkUrl(
-  key: string,
-  library: string,
-  version?: number | null,
-  size?: ArtSize,
-): string {
+export function artistArtworkUrl(key: string, library: string, size?: ArtSize): string {
   const params = new URLSearchParams({
-    ...(version ? { v: String(version) } : {}),
     ...(size ? { size } : {}),
   })
-  return `${getCatalogueArtistArtworkUrl(library, key)}${params.size ? `?${params}` : ''}`
+  return `${getCatalogueArtistArtworkUrl(encodeURIComponent(library), encodeURIComponent(key))}${params.size ? `?${params}` : ''}`
 }
 
-export function artistArtworkSrcSet(key: string, library: string, version?: number | null): string {
-  return `${artistArtworkUrl(key, library, version, 'card1x')} 1x, ${artistArtworkUrl(key, library, version, 'card')} 2x`
+export function artistArtworkSrcSet(key: string, library: string): string {
+  return `${artistArtworkUrl(key, library, 'card1x')} 1x, ${artistArtworkUrl(key, library, 'card')} 2x`
 }

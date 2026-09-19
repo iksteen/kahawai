@@ -297,24 +297,6 @@ impl Artwork {
         Ok(std::fs::read(path).ok().map(|bytes| (bytes, "image/jpeg")))
     }
 
-    /// The version of a complete, library-scoped Album Artist collage.
-    ///
-    /// Manifests make readiness durable across a restart without copying a
-    /// cache projection into SQLite. A miss is memoised too: listing a page of
-    /// coverless artists must not turn into one filesystem probe per render.
-    pub(crate) fn artist_collage_version(&self, library: &str, artist_key: &str) -> Option<i64> {
-        let identity = (library.to_string(), artist_key.to_string());
-        if let Some(version) = self.collages.lock().unwrap().get(&identity) {
-            return *version;
-        }
-        let manifest = self.read_artist_collage_manifest(library, artist_key);
-        let version = manifest
-            .as_ref()
-            .map(|manifest| artist_collage_version(&manifest.revision));
-        self.collages.lock().unwrap().insert(identity, version);
-        version
-    }
-
     /// Serve a generated artist fallback strictly from the durable cache.
     ///
     /// The manifest is also the authorization provenance: every album whose
@@ -1167,7 +1149,7 @@ impl Artwork {
         {
             return Ok(None);
         }
-        for url in registry.catalogue().artist_artwork(item).await? {
+        for url in registry.catalogue().artist_artwork(item, library).await? {
             if let Some(image) = self.get_cached_remote_at(&url, Some("card")).await? {
                 return Ok(Some(image));
             }
@@ -1407,7 +1389,6 @@ mod tests {
             artist_collage_cache_key("music", &key),
             artist_collage_cache_key("private", &key)
         );
-        assert!(artwork.artist_collage_version("music", &key).is_some());
         for (name, px) in SIZES {
             assert!(
                 cache

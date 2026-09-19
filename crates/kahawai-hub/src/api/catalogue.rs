@@ -1013,7 +1013,6 @@ pub(super) async fn catalogue_artists(
                 key: name.clone(),
                 name,
                 album_count,
-                art_version: None,
             })
             .collect(),
         total,

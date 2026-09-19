@@ -578,7 +578,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
     let first = page(&api, &token, "/api/v1/artists?library=M&limit=1").await;
     assert_eq!(first["total"], 2, "the group count must precede paging");
     assert_eq!(first["artists"][0]["name"], "Björk");
-    assert!(first["artists"][0]["art_version"].is_null());
+    assert!(first["artists"][0].get("art_version").is_none());
     let second = page(&api, &token, "/api/v1/artists?library=M&limit=1&offset=1").await;
     assert_eq!(second["artists"][0]["name"], "Various Artists");
     assert_eq!(second["artists"][0]["album_count"], 2);
@@ -594,7 +594,7 @@ async fn artist_browse_groups_before_paging_and_albums_are_chronological() {
     .await
     .unwrap();
     let with_art = page(&api, &token, "/api/v1/artists?library=M&limit=1").await;
-    assert_eq!(with_art["artists"][0]["art_version"], 1234);
+    assert!(with_art["artists"][0].get("art_version").is_none());
 
     let cache_key = format!(
         "fanart-{:016x}",

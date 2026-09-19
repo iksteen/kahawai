@@ -740,6 +740,104 @@ async fn manual_matching_keeps_albums_separate_and_rejects_cross_type_assignment
 }
 
 #[tokio::test]
+async fn artist_portrait_uses_other_visible_albums_but_not_hidden_or_stale_identities() {
+    let (_dir, store) = store().await;
+    let mut copies = Vec::new();
+    let mut collections = Vec::new();
+    for album in ["Known", "Unknown"] {
+        let (col, _) = store
+            .offer_collection("host", &offer(album, MediaType::Music, 1))
+            .await
+            .unwrap();
+        store
+            .apply_catalogue(
+                "host",
+                &delta(
+                    album,
+                    true,
+                    true,
+                    1,
+                    vec![file_media(1, "01.flac", tagged(album, 1, 1))],
+                ),
+            )
+            .await
+            .unwrap();
+        copies.push(store.collection_items(&col).await.unwrap()[0].id.clone());
+        collections.push(col);
+    }
+    let private = store
+        .create_library("Private", MediaType::Music, &collections[..1])
+        .await
+        .unwrap();
+    let job = store
+        .claim_enrichment("musicbrainz", 1, 30)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(job.item_id, copies[0]);
+    store
+        .finish_enrichment(
+            &job,
+            &EnrichmentAnswer {
+                artist: Some(ArtistIdentity {
+                    id: "artist".into(),
+                    name: "Album Artist".into(),
+                }),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    store
+        .put_artist_artwork(
+            "artist",
+            "fanart",
+            Some("https://example.test/portrait.jpg"),
+            1,
+        )
+        .await
+        .unwrap();
+    let public = store
+        .create_library("Public", MediaType::Music, &collections[1..])
+        .await
+        .unwrap();
+    assert!(
+        store
+            .artist_artwork(&copies[1], &public)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    assert!(
+        store
+            .artist_artwork(&copies[1], &private)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    store
+        .set_library_collections(&public, &collections)
+        .await
+        .unwrap();
+    assert_eq!(
+        store.artist_artwork(&copies[1], &public).await.unwrap(),
+        ["https://example.test/portrait.jpg"]
+    );
+    let revision = store.enrichment_input(&copies[0]).await.unwrap().revision;
+    store
+        .correct_metadata(&copies[0], revision, "retry", None)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .artist_artwork(&copies[1], &public)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn corrected_nfo_replaces_only_an_automatic_local_identity() {
     for pinned in [false, true] {
         let (_dir, store, col, item) = fixture().await;

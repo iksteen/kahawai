@@ -186,8 +186,8 @@ beforeEach(() => {
   })
   vi.mocked(listArtists).mockResolvedValue({
     artists: [
-      { key: 'bjork', name: 'Björk', album_count: 12, art_version: 77 },
-      { key: 'various artists', name: 'Various Artists', album_count: 4, art_version: null },
+      { key: 'bjork', name: 'Björk', album_count: 12 },
+      { key: 'various artists', name: 'Various Artists', album_count: 4 },
     ],
     total: 2,
     limit: 100,
@@ -237,7 +237,7 @@ describe('opening a library', () => {
 
   test('does not turn artist API paging into a load-more interaction', async () => {
     vi.mocked(listArtists).mockResolvedValue({
-      artists: [{ key: 'bjork', name: 'Björk', album_count: 12, art_version: null }],
+      artists: [{ key: 'bjork', name: 'Björk', album_count: 12 }],
       total: 101,
       limit: 100,
       offset: 0,
@@ -463,9 +463,9 @@ describe('once the page has been measured', () => {
     expect(wrapper.text()).toContain('Björk')
     expect(wrapper.text()).toContain('12 albums')
     const portrait = wrapper.find('.artist-grid img')
-    expect(wrapper.findAll('.artist-grid img')).toHaveLength(1)
+    expect(wrapper.findAll('.artist-grid img')).toHaveLength(2)
     expect(portrait.attributes('src')).toContain(
-      '/api/v1/catalogue/libraries/music/artists/bjork/artwork?v=77&size=card',
+      '/api/v1/catalogue/libraries/music/artists/bjork/artwork?size=card',
     )
     expect(portrait.attributes('srcset')).toContain('size=card1x')
     expect(portrait.attributes('srcset')).toContain('size=card')

@@ -968,6 +968,11 @@ not describe this branch's current runtime.
       virtual poster and artist grids with representative-copy match confidence,
       sorting/search, scoped artwork and metadata
       detail, physical source lists, runtime/chapters, reload/back navigation and browser checks.
+      Artist cards request catalogue portraits directly; the unused artist `art_version`
+      field is removed from the API and UI.
+      Artist image URLs encode names as path components, including slashes in AC/DC.
+      Portrait lookup uses current artist identities across the selected library's
+      albums, so an unenriched first album cannot hide an available portrait.
 - [x] Stable episode/track identities derived from parent and native position, with
       physical-only child lists, scoped rendition details, interval-based pagination,
       exact counts and stable child URLs. No child identity tables or migration.
