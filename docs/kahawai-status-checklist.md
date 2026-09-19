@@ -962,3 +962,22 @@ How something works and why it was built that way belong in
 - [x] 3. Modular three-machine deployment (dev box hub + NAS + macOS transcoder)
 - [x] 4. Mediahost kill mid-playback: unavailability surfaces, reconnect restores
 - [x] 5. Enrollment / deletion / re-enroll with watch-state + match restore
+
+## Media database crate
+
+The checks above describe the current hub. `kahawai-mediadb` is a separate
+foundation; its model and deliberate differences are in [mediadb-model.md](mediadb-model.md).
+These entries track the isolated database layer, not deployed hub requirements.
+
+- [x] Fresh schema and Rust operations for collection import, physical
+      occurrences/ordered media parts, provider assignments and supplements,
+      ordered library composition, and stable library-item IDs with copy-owned
+      membership and derived archival. Corrections move copies; matching identities
+      reuse archived IDs. Albums remain separate; deleted assignments are not restored.
+- [x] Separate-process archive/reopen/resurrection proof and release browse checks
+      with 50k active items, 50k archived items and 250k files.
+- [x] Independent embedded SQLx migrations on create/open, immutable checksum
+      validation, foreign-database rejection and transactional upgrade/retry checks.
+      The hub's user/watch-state database remains separate.
+- [ ] Integrate the hub's mediahost ingestion, providers, HTTP API, playback and
+      watch history with `kahawai-mediadb`. Runtime orchestration remains in the hub.

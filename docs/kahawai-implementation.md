@@ -1123,3 +1123,23 @@ The web UI is built in vertical slices alongside its backend features rather tha
 **Planned (post-v1, spec'd).** Per-session text-over-tiles subtitle preference for overlay-capable clients (HUB-32c case b, remembered per user), and the bandwidth-threshold automatic selection — both waiting on hub-side bandwidth measurement (quality-ladder machinery).
 
 **Post-v1 candidates.** Delegated direct delivery (AR-8), LL-HLS/DASH, offline pre-transcode (TC-7), Dolby Vision profile handling beyond fallback, OIDC, sync-play.
+
+## Media database crate
+
+`kahawai-mediadb` owns the media catalogue, metadata storage and library model.
+It is an independent component for the hub to consume. Satellite connections,
+provider execution, HTTP and playback orchestration belong to the hub. Its model,
+interfaces and runnable checks are described in [Media database](mediadb-model.md).
+The current hub and its schema remain the implementation described by the existing sections above. Mediadb
+uses physical collection occurrences and provider assignments as inputs;
+each occurrence references a stable library item selected by its current identity,
+with albums always separate. Library items survive their last copy's removal;
+archival is derived from absent references, without a stored flag or restoration
+procedure. Ordered libraries select accessible copies and their descriptions.
+
+Mediadb's numbered SQLx migrations are embedded in its own crate and applied on
+create/open before the Store is exposed. They use the media database's own history;
+the hub database continues to own users, watch state and its separate migration
+history. A read-only initial-migration checksum check rejects foreign paths before
+any writer opens. Pre-migration development media databases must be recreated once;
+subsequent schema changes append migrations rather than changing the baseline.
