@@ -98,6 +98,11 @@ pub struct MediaInfo {
     /// costs a lease read to actually parse one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub nfo: Option<String>,
+    /// Revision of the selected external subtitles, artwork and NFO (paths,
+    /// sizes and modification times). Changes publish sidecar edits without
+    /// changing the media content identity or repeating discovery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidecar_revision: Option<String>,
     /// Container-level tags (title, artist, album, track number, …).
     #[serde(default)]
     pub tags: BTreeMap<String, String>,

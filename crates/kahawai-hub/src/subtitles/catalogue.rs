@@ -18,6 +18,11 @@ pub(crate) fn key(
 ) -> String {
     use sha2::Digest;
     let mut info = info.clone();
+    // The scanner's companion-file revision must not invalidate expensive
+    // embedded/downloaded artifacts. Only external subtitle parents read it.
+    if !parent.starts_with("sidecar:") {
+        info.sidecar_revision = None;
+    }
     info.external_subtitles
         .retain(|s| !s.path_rel.starts_with("mediadb-download:"));
     let identity = format!(
@@ -357,6 +362,33 @@ mod tests {
             .await,
             ImageSetsState::RetryOnReconnect
         ));
+    }
+
+    #[test]
+    fn sidecar_revision_only_changes_external_artifact_keys() {
+        let part = PartSource {
+            file_id: FileId::Catalogue("file-a".into()),
+            module_id: "host".into(),
+            collection_id: "movies".into(),
+            root_token: "root".into(),
+            path_rel: "film.mkv".into(),
+            size: 10,
+            mtime_unix: 1,
+            head_xxh3: 12,
+            tail_xxh3: 34,
+            base_ms: 0,
+            duration_ms: 1000,
+        };
+        let before = kahawai_core::media::MediaInfo::default();
+        let mut after = before.clone();
+        after.sidecar_revision = Some("edited external subtitle".into());
+        for parent in ["embedded:0", "download:42"] {
+            assert_eq!(key(&part, &before, parent), key(&part, &after, parent));
+        }
+        assert_ne!(
+            key(&part, &before, "sidecar:0"),
+            key(&part, &after, "sidecar:0")
+        );
     }
 
     #[test]

@@ -91,7 +91,15 @@ How something works and why it was built that way belong in
 - [x] MH-2 Scan on start/demand + watching + sweeps; on-demand scans are
       collection-scoped only (the global rescan is gone), with interim
       progress reports every 500 files. Files and failures commit to the local
-      SQLite catalogue before any hub observes them
+      SQLite catalogue before any hub observes them. Complete root inventories
+      publish deletions before media discovery; failed walks retain their sources.
+      Watcher renames probe only new paths; exact content-write events bypass
+      timestamp checks only for the affected file. Sidecar associations and
+      size/mtime revisions refresh independently without re-probing unchanged
+      media. Missing initial sidecar fingerprints are recorded locally in batches,
+      without republishing unchanged catalogue entries. Watches install before
+      startup scans acquire storage, so long scans cannot hide rename events.
+      User-requested deep scans still probe every file.
 - [x] MH-3 GStreamer discovery for technical metadata, including exact PAR,
       normalized display orientation and resulting display dimensions, and
       distinct recording Artist and Album Artist tags. Existing music rows

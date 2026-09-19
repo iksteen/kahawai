@@ -180,11 +180,16 @@ def check_segment_admin(host):
     def reported():
         result = api("GET", "/admin/v1/segments")
         rows = [r for r in result["collections"] if r["mediahost_id"] == host]
-        return rows if len(rows) == 2 and all(r["enabled"] is False for r in rows) else None
+        return rows if len(rows) == 3 and all(r["enabled"] is False for r in rows) else None
     rows = until(reported, "mediahost segment status reaches admin API")
     assert all(r["connected"] and r["pending_sources"] == 0 for r in rows), rows
-    assert {r["name"] for r in rows} == {"series", "anime"}
-    assert api("POST", "/admin/v1/segments") == {"asked":0,"unavailable":0}
+    assert {r["name"] for r in rows} == {"movies", "series", "anime"}
+    try:
+        api("POST", "/admin/v1/segments")
+    except urllib.error.HTTPError as error:
+        assert error.code == 405, error
+    else:
+        raise AssertionError("manual segment detection endpoint must remain removed")
     print("PASS: live segment status reports disabled detection without fake completion")
 
 
@@ -205,6 +210,77 @@ def check_rescans(library, count=2):
         assert row[2] == (count if deep else 0), row
         assert row[3] == (0 if deep else count), row
     print("PASS: normal skips, deep re-probes, next normal skips again")
+
+
+def check_subtitle_and_nfo_revisions(library, item, copies, roots):
+    """Exercise corrections through the watcher, real leases, API and cache."""
+    def subtitle_text():
+        playback = api("POST", "/api/v1/playback/sessions", {"library_id": library, "item_id": item, "mode": "direct"})
+        try:
+            track = next(t for t in playback['subtitle_listing'] if t['origin'] == 'sidecar' and t['format'] == 'srt')
+            path = f"/api/v1/playback/sessions/{playback['session_id']}/subtitles/{track['id']}.vtt"
+            request = urllib.request.Request(url + path, headers={"Authorization": "Bearer " + token})
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return response.read().decode()
+        finally:
+            api("DELETE", f"/api/v1/playback/sessions/{playback['session_id']}")
+
+    assert "Catalogue playback subtitle" in subtitle_text()
+    revisions = query("mediadb.db", "SELECT media_json FROM files WHERE path='Dark.City.1998.mkv' ORDER BY id")
+    for root in roots:
+        (root / "Dark.City.1998.en.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\nCorrected playback subtitle\n")
+    until(lambda: all(a != b for a, b in zip(revisions, query("mediadb.db", "SELECT media_json FROM files WHERE path='Dark.City.1998.mkv' ORDER BY id"))), "edited subtitle revisions ingested")
+    assert "Corrected playback subtitle" in subtitle_text()
+
+    nfos = {root / "Dark.City.1998.nfo": (root / "Dark.City.1998.nfo").read_text() for root in roots}
+    for path in nfos:
+        path.write_text('<movie><title>Corrected Film</title><year>2001</year><uniqueid default="true">corrected-id</uniqueid></movie>')
+    def selected_title(copy):
+        selected = api("GET", f"/admin/v1/enrich/items/{copy}")["input"]["selected"]
+        return selected[1]['title'] if selected else None
+    until(lambda: all(selected_title(copy) == "Corrected Film" for copy in copies), "corrected NFO identities assigned")
+    page = api("GET", f"/api/v1/catalogue/libraries/{library}/items")
+    assert len(page['items']) == 1 and page['items'][0]['id'] != item, page
+    for path, text in nfos.items():
+        path.write_text(text)
+    until(lambda: all(selected_title(copy) == "Dark City" for copy in copies), "original NFO identities restored")
+    assert api("GET", f"/api/v1/catalogue/libraries/{library}/items")['items'][0]['id'] == item
+    print("PASS: cached sidecar edits and NFO identity corrections through real processes")
+
+
+def check_watcher_scans(media, log):
+    """Real watcher → local catalogue → hub, modifying disposable fixtures only."""
+    def local_file(path):
+        with sqlite3.connect(f"file:{work / 'mediahost' / 'catalog.db'}?mode=ro", uri=True) as db:
+            rows = db.execute("SELECT streams_json FROM catalog_files WHERE collection_id='movies' AND path_rel=? AND error=''", (path.name,)).fetchall()
+            return [json.loads(row[0]) for row in rows]
+
+    def changed_scan(action, probed, refreshed):
+        offset = len(log.read_text())
+        action()
+        def completed():
+            lines = re.sub(r"\x1b\[[0-9;]*m", "", log.read_text()[offset:]).splitlines()
+            return next((line for line in lines if "local catalogue scan complete" in line and "collection=movies" in line), None)
+        line = until(completed, "watcher scan completion")
+        assert re.search(rf"\bscanned={probed}\b", line), line
+        assert re.search(rf"\brefreshed={refreshed}\b", line), line
+        assert "failed=0" in line, line
+
+    sidecar = media.with_suffix('.zz.srt')
+    changed_scan(lambda: sidecar.write_text("1\n00:00:00,000 --> 00:00:01,000\nFirst text\n"), 0, 1)
+    first = local_file(media)
+    assert any(any(s['path_rel'] == sidecar.name for s in row.get('external_subtitles', [])) for row in first)
+    revisions = {row.get('sidecar_revision') for row in first}
+    changed_scan(lambda: sidecar.write_text("1\n00:00:00,000 --> 00:00:01,000\nEdited subtitle text\n"), 0, 1)
+    assert {row.get('sidecar_revision') for row in local_file(media)} != revisions
+    changed_scan(sidecar.unlink, 0, 1)
+    renamed = media.with_name("Renamed (2009).mkv")
+    changed_scan(lambda: media.rename(renamed), 1, 0)
+    assert local_file(renamed)
+    until(lambda: query("mediadb.db", "SELECT count(*) FROM files WHERE path='Renamed (2009).mkv'") == [(1,)], "renamed source ingested")
+    changed_scan(lambda: renamed.rename(media), 1, 0)
+    until(lambda: query("mediadb.db", "SELECT count(*) FROM files WHERE path='Renamed (2009).mkv'") == [(0,)], "old name removed at hub")
+    print("PASS: watcher sidecar add/edit/remove probes zero media; rename probes only the renamed file")
 
 
 def collections():
@@ -286,6 +362,8 @@ roots = {json.dumps([str(r) for r in roots])}
     until(lambda: api("GET", "/admin/v1/enrollments")["pending"], "pending enrollment")
     api("POST", "/admin/v1/enrollments/approve", {"code": code})
     col = until(ready_collection, "remote mediahost import")
+    startup_log = mh_log.read_text()
+    assert startup_log.index("filesystem watches installed") < startup_log.index("local catalogue scan complete"), "startup scans ran before rename detection was ready"
     until(lambda: len([c for c in collections() if c["file_count"] == 2 and not c["snapshot"]]) == 4, "episode, track and anime import")
     anime_source = next(c for c in collections() if c["remote_id"] == "anime")
     anime_library = api("POST", "/admin/v1/catalogue/libraries", {"name": "Fixture anime", "media_type": "anime", "collection_ids": [anime_source["id"]]})
@@ -342,7 +420,9 @@ roots = {json.dumps([str(r) for r in roots])}
     copies = page["items"][0]["copy_ids"]
     assert query("hub.db", "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'") == [(0,)]
     assert query("mediadb.db", "SELECT COUNT(*) FROM files") == [(8,)]
-    assert query("mediadb.db", "SELECT MAX(version) FROM _sqlx_migrations")[0][0] == 4
+    migrations = Path(__file__).resolve().parent.parent / "crates/kahawai-mediadb/migrations"
+    expected_version = max(int(path.name.split('_', 1)[0]) for path in migrations.glob('*.sql'))
+    assert query("mediadb.db", "SELECT MAX(version) FROM _sqlx_migrations")[0][0] == expected_version
     until(lambda: all(api("GET", f"/admin/v1/enrich/items/{copy}")["input"]["selected"] for copy in copies), "local NFO enrichment despite unavailable remote providers")
     until(lambda: query("mediadb.db", f"SELECT count(*) FROM enrichment_jobs j JOIN collection_items i ON i.id=j.item_id WHERE i.collection_id='{col['id']}' AND j.provider='local' AND j.state='done'")[0][0] == len(copies),
           "local enrichment settled after library membership changes")
@@ -350,6 +430,7 @@ roots = {json.dumps([str(r) for r in roots])}
     # already be done. The durable provider block proves the failure occurred.
     assert query("mediadb.db", "SELECT COUNT(*) FROM enrichment_providers WHERE provider IN ('tmdb','tvdb') AND due_at>0")[0][0] > 0
     assert api("GET", f"/admin/v1/enrich/items/{copies[0]}")["metadata"]["description"]["overview"] == "Metadata from the remote mediahost."
+    check_subtitle_and_nfo_revisions(library['id'], item, copies, roots)
     check_cli(library['id'], item, child_checks)
     if os.environ.get('KAHAWAI_MEDIADB_CLI_CHECK') == '1':
         sys.exit(0)
@@ -395,6 +476,7 @@ roots = {json.dumps([str(r) for r in roots])}
     until(lambda: ready_collection(col["mediahost_id"]), "mediahost replay")
     until(lambda: "filesystem watches installed" in replay_log.read_text(), "mediahost watches ready")
     assert api("GET", items_path)["items"][0]["id"] == item
+    check_watcher_scans(other, replay_log)
     # Only generated test fixtures are modified.
     other.unlink()
     until(lambda: ready_collection(col["mediahost_id"], count=1), "file tombstone")

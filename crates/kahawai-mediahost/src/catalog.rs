@@ -91,6 +91,9 @@ struct SegmentCandidate {
 
 #[derive(Debug, Clone)]
 pub struct KnownFile {
+    pub head_xxh3: u64,
+    pub tail_xxh3: u64,
+    pub oshash: u64,
     pub size: u64,
     pub mtime_unix: i64,
     pub streams_json: String,
@@ -391,7 +394,7 @@ impl Catalog {
         collection: &str,
     ) -> Result<HashMap<(String, String), KnownFile>> {
         let rows = sqlx::query(
-            "SELECT root_token,path_rel,size,mtime_unix,streams_json,music_tag_generation
+            "SELECT root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,music_tag_generation
                FROM catalog_files WHERE collection_id=? AND error=''",
         )
         .bind(collection)
@@ -403,6 +406,9 @@ impl Catalog {
                 (
                     (row.get("root_token"), row.get("path_rel")),
                     KnownFile {
+                        head_xxh3: row.get::<i64, _>("head_xxh3") as u64,
+                        tail_xxh3: row.get::<i64, _>("tail_xxh3") as u64,
+                        oshash: row.get::<i64, _>("oshash") as u64,
                         size: row.get::<i64, _>("size") as u64,
                         mtime_unix: row.get("mtime_unix"),
                         streams_json: row.get("streams_json"),
@@ -562,32 +568,6 @@ impl Catalog {
         .bind(path_rel)
         .execute(&self.db)
         .await?;
-        Ok(())
-    }
-
-    pub async fn mark_seen_batch(
-        &self,
-        collection: &str,
-        sources: &[(String, String)],
-        generation: i64,
-    ) -> Result<()> {
-        if sources.is_empty() {
-            return Ok(());
-        }
-        let mut tx = self.db.begin().await?;
-        for (root_token, path_rel) in sources {
-            sqlx::query(
-                "UPDATE catalog_files SET seen_generation=?
-                  WHERE collection_id=? AND root_token=? AND path_rel=?",
-            )
-            .bind(generation)
-            .bind(collection)
-            .bind(root_token)
-            .bind(path_rel)
-            .execute(&mut *tx)
-            .await?;
-        }
-        tx.commit().await?;
         Ok(())
     }
 
@@ -854,6 +834,91 @@ impl Catalog {
         Ok(version)
     }
 
+    /// Initialise missing local sidecar stat baselines in bounded scan batches.
+    /// Existing associations have not changed, so neither catalogue versions nor
+    /// replicated facts advance. The next real edit publishes the new revision.
+    pub(crate) async fn baseline_sidecars(
+        &self,
+        collection: &str,
+        root: &str,
+        baselines: &[(String, String)],
+    ) -> Result<()> {
+        if baselines.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin().await?;
+        for (path, revision) in baselines {
+            sqlx::query("UPDATE catalog_files SET streams_json=json_set(streams_json,'$.sidecar_revision',?)
+                WHERE collection_id=? AND root_token=? AND path_rel=? AND error=''
+                  AND json_extract(streams_json,'$.sidecar_revision') IS NULL")
+                .bind(revision).bind(collection).bind(root).bind(path)
+                .execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    /// Reconcile a completely enumerated root before any discovery runs.
+    /// Never call this on a failed/partial walk: an unavailable mount is not
+    /// evidence that its sources have disappeared. Cancellation after this
+    /// commit is safe: every deletion was confirmed by the completed walk.
+    pub(crate) async fn reconcile_root(
+        &self,
+        collection: &str,
+        root: &str,
+        present: &[String],
+        generation: i64,
+    ) -> Result<()> {
+        let mut tx = self.db.begin().await?;
+        for path in present {
+            sqlx::query("UPDATE catalog_files SET seen_generation=? WHERE collection_id=? AND root_token=? AND path_rel=?")
+                .bind(generation)
+                .bind(collection)
+                .bind(root)
+                .bind(path)
+                .execute(&mut *tx)
+                .await?;
+        }
+        let absent: Vec<String> = sqlx::query_scalar(
+            "SELECT path_rel FROM catalog_files WHERE collection_id=? AND root_token=? AND seen_generation!=?",
+        )
+        .bind(collection)
+        .bind(root)
+        .bind(generation)
+        .fetch_all(&mut *tx)
+        .await?;
+        let mut published = None;
+        for path in absent {
+            published = Some(Self::remove_file(&mut tx, collection, root, &path).await?);
+        }
+        tx.commit().await?;
+        if let Some(version) = published {
+            self.publish_version(collection, version, false);
+        }
+        Ok(())
+    }
+
+    async fn remove_file(
+        tx: &mut sqlx::SqliteConnection,
+        collection: &str,
+        root: &str,
+        path: &str,
+    ) -> Result<u64> {
+        let key = source_key(root, path);
+        Self::tombstone_derived_records(tx, collection, &key).await?;
+        let version = Self::next_version(tx, collection).await?;
+        sqlx::query(
+            "DELETE FROM catalog_files WHERE collection_id=? AND root_token=? AND path_rel=?",
+        )
+        .bind(collection)
+        .bind(root)
+        .bind(path)
+        .execute(&mut *tx)
+        .await?;
+        Self::put_record(tx, collection, "file", &key, version, Vec::new(), true).await?;
+        Ok(version)
+    }
+
     pub async fn finish_scan(
         &self,
         collection: &str,
@@ -875,18 +940,7 @@ impl Catalog {
                 continue;
             }
             let path: String = row.get("path_rel");
-            let key = source_key(&root, &path);
-            Self::tombstone_derived_records(&mut tx, collection, &key).await?;
-            let version = Self::next_version(&mut tx, collection).await?;
-            sqlx::query(
-                "DELETE FROM catalog_files WHERE collection_id=? AND root_token=? AND path_rel=?",
-            )
-            .bind(collection)
-            .bind(&root)
-            .bind(&path)
-            .execute(&mut *tx)
-            .await?;
-            Self::put_record(&mut tx, collection, "file", &key, version, Vec::new(), true).await?;
+            Self::remove_file(&mut tx, collection, &root, &path).await?;
         }
         sqlx::query(
             "UPDATE catalog_collections

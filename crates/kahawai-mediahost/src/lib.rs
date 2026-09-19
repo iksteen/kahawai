@@ -156,6 +156,9 @@ impl LocalRuntime {
         let mut triggers = std::collections::HashMap::new();
         let mut guards = Vec::new();
         let catalog_versions = catalog.subscribe_versions();
+        // Install watches before admitting startup scans. A large collection
+        // must not hold the shared storage permit while changes go unobserved.
+        let (watch_ready, watch_waiter) = tokio::sync::watch::channel(false);
         let discovery_status: std::sync::Arc<
             std::sync::RwLock<
                 std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>,
@@ -200,15 +203,21 @@ impl LocalRuntime {
             let catalog = catalog.clone();
             let scan_scheduler = scheduler.clone();
             let overflow = sink.overflow.clone();
+            let mut watch_waiter = watch_waiter.clone();
             guards.push(tokio::spawn(async move {
+                if watch_waiter.wait_for(|ready| *ready).await.is_err() {
+                    return;
+                }
                 while let Some(mut trigger) = rx.recv().await {
                     while let Ok(more) = rx.try_recv() {
                         trigger.force_dirs.extend(more.force_dirs);
+                        trigger.changed_files.extend(more.changed_files);
                         trigger.demand |= more.demand;
                         trigger.deep |= more.deep;
                     }
                     if let Some(more) = overflow.lock().unwrap().take() {
                         trigger.force_dirs.extend(more.force_dirs);
+                        trigger.changed_files.extend(more.changed_files);
                         trigger.demand |= more.demand;
                         trigger.deep |= more.deep;
                     }
@@ -238,7 +247,7 @@ impl LocalRuntime {
                     if let Err(error) = scan::scan_local_collection(
                         collection.clone(),
                         catalog.clone(),
-                        trigger.force_dirs,
+                        trigger.changed_files,
                         trigger.deep,
                         permit,
                     )
@@ -284,7 +293,10 @@ impl LocalRuntime {
                 return;
             }
             for path in event.paths {
-                let _ = event_tx.send(path);
+                let _ = event_tx.send((
+                    path,
+                    matches!(event.kind, EventKind::Modify(ModifyKind::Data(_))),
+                ));
             }
         }) {
             Ok(watcher) => {
@@ -343,26 +355,29 @@ impl LocalRuntime {
                         watcher
                     })
                     .await;
+                    // Even an installation failure must release startup scans;
+                    // periodic reconciliation remains the fallback.
+                    watch_ready.send_replace(true);
                     let Ok(watcher) = watcher else { return };
                     let _watcher = watcher;
+                    // Watcher events request reconciliation, never a deep probe.
+                    // The scanner independently checks media and sidecar revisions.
                     let mut dirty: std::collections::HashMap<
                         String,
-                        (
-                            std::collections::HashSet<std::path::PathBuf>,
-                            tokio::time::Instant,
-                        ),
+                        (std::collections::HashSet<std::path::PathBuf>, tokio::time::Instant),
                     > = Default::default();
                     let mut tick = tokio::time::interval(Duration::from_secs(1));
                     loop {
                         tokio::select! {
                             event = event_rx.recv() => {
-                                let Some(path) = event else { return };
-                                let directory = path.parent().unwrap_or(&path).to_path_buf();
+                                let Some((path, content_changed)) = event else { return };
                                 for (collection, _) in routes.iter().filter(|(_, root)| path.starts_with(root)) {
                                     let entry = dirty.entry(collection.clone()).or_insert_with(|| {
                                         (Default::default(), tokio::time::Instant::now())
                                     });
-                                    entry.0.insert(directory.clone());
+                                    if content_changed {
+                                        entry.0.insert(path.clone());
+                                    }
                                     entry.1 = tokio::time::Instant::now();
                                 }
                             }
@@ -373,13 +388,14 @@ impl LocalRuntime {
                                     .map(|(collection, _)| collection.clone())
                                     .collect();
                                 for collection in ready {
-                                    if let Some((force_dirs, _)) = dirty.remove(&collection)
+                                    if let Some((changed_files, _)) = dirty.remove(&collection)
                                         && let Some(trigger) = watch_triggers.get(&collection)
                                     {
-                                        tracing::info!(%collection, dirs = force_dirs.len(),
+                                        tracing::info!(%collection,
                                             "watcher triggered rescan");
                                         trigger.send(ScanTrigger {
-                                            force_dirs,
+                                            changed_files,
+                                            force_dirs: Default::default(),
                                             initial: false,
                                             demand: false,
                                             deep: false,
@@ -391,7 +407,10 @@ impl LocalRuntime {
                     }
                 }));
             }
-            Err(error) => tracing::warn!(%error, "no filesystem watcher; using periodic scans"),
+            Err(error) => {
+                tracing::warn!(%error, "no filesystem watcher; using periodic scans");
+                watch_ready.send_replace(true);
+            }
         }
 
         // Source-owned discovery workers publish into the catalogue, never to
@@ -1583,12 +1602,17 @@ impl Drop for SchedulerOwnerGuard {
     }
 }
 
-/// A request for one incremental scan cycle. `force_dirs` bypasses the
+/// A request for one incremental scan cycle. Only the legacy link scanner
+/// uses `force_dirs`; the durable scanner compares sidecars independently.
+/// In that legacy path, `force_dirs` bypasses the
 /// unchanged-skip for media files in those directories — how sidecar
 /// subtitle/artwork changes get noticed (the media file's own
 /// size/mtime doesn't change when a cover.jpg appears next to it).
 #[derive(Default)]
 struct ScanTrigger {
+    /// Exact paths with a content-write notification. Bypass coarse media
+    /// timestamps for those files only; sidecars never force a media probe.
+    changed_files: std::collections::HashSet<std::path::PathBuf>,
     force_dirs: std::collections::HashSet<std::path::PathBuf>,
     /// Startup trigger: eligible for the sync-version handshake (skip
     /// the scan when the hub already reflects our last completed one).
@@ -1616,6 +1640,7 @@ impl TriggerSink {
             let mut slot = self.overflow.lock().unwrap();
             let merged = slot.get_or_insert_with(ScanTrigger::default);
             merged.force_dirs.extend(t.force_dirs);
+            merged.changed_files.extend(t.changed_files);
             merged.demand |= t.demand;
             merged.deep |= t.deep;
             drop(slot);
@@ -1910,6 +1935,7 @@ impl Engine {
                                         tracing::info!(collection = %k, dirs = dirs.len(), "watcher triggered rescan");
                                         t.send(ScanTrigger {
                                             force_dirs: dirs,
+                                            changed_files: Default::default(),
                                             initial: false,
                                             demand: false,
                                             deep: false,
@@ -2398,6 +2424,80 @@ mod scheduler_integration_tests {
         let overflow = sink.overflow.lock().unwrap().take().unwrap();
         assert!(overflow.deep && overflow.demand);
         assert!(!rx.recv().await.unwrap().deep);
+    }
+
+    #[tokio::test]
+    async fn watcher_catches_rename_while_initial_scan_is_paused() {
+        if !kahawai_media::testutil::require_h264_aac_fixture() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let original = root.path().join("00-original.mkv");
+        kahawai_media::testutil::render_h264_aac_mkv(&original);
+        for n in 1..20 {
+            std::fs::copy(&original, root.path().join(format!("{n:02}-other.mkv"))).unwrap();
+        }
+        let collections = vec![CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        }];
+        let scheduler = scheduler::Scheduler::new(&collections, &Default::default()).unwrap();
+        let token = collections[0].resolved_roots().next().unwrap().token;
+        let runtime = super::LocalRuntime::start_with_scheduler(
+            state.path(),
+            collections,
+            0,
+            scheduler.clone(),
+            false,
+        )
+        .await
+        .unwrap();
+        let mut versions = runtime.catalog.subscribe_versions();
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if versions
+                    .borrow_and_update()
+                    .get("movies")
+                    .is_some_and(|v| v.1 > 0)
+                {
+                    break;
+                }
+                versions.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("initial scan never published its first file");
+        // Hold storage while the initial inventory is being processed. This
+        // used to hold watcher installation as well, losing the rename below.
+        let hold = scheduler.enter_interactive(
+            scheduler.resources([token.as_str()], false),
+            "pause initial scan",
+        );
+        assert!(
+            runtime
+                .catalog
+                .discovery_status("movies")
+                .await
+                .unwrap()
+                .scanning
+        );
+        std::fs::rename(&original, root.path().join("renamed.mkv")).unwrap();
+        drop(hold);
+        tokio::time::timeout(std::time::Duration::from_secs(15), async {
+            loop {
+                let known = runtime.catalog.known_files("movies").await.unwrap();
+                if known.contains_key(&(token.clone(), "renamed.mkv".into()))
+                    && !known.contains_key(&(token.clone(), "00-original.mkv".into()))
+                {
+                    break;
+                }
+                versions.changed().await.unwrap();
+            }
+        })
+        .await
+        .expect("rename during initial scan was lost; periodic sweeps are disabled");
     }
 
     #[tokio::test]

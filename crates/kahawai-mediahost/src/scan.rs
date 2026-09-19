@@ -1,4 +1,4 @@
-//! Collection scanner (MH-2/3/5/8, minimal first cut): walk roots, discover
+//! Collection scanner (MH-2/3/5/8): walk roots, discover
 //! technical metadata, compute content identity + oshash in one read pass,
 //! and push FileUpsert batches up the link.
 //! Scans reserve storage, not the sustained-analysis CPU slot: discovery is
@@ -6,8 +6,10 @@
 //! container declarations read headers/indexes. Full-file analysis is queued
 //! separately. This lets catalogue freshness progress during playback.
 //!
-//! ponytail: full rescan on every (re)connect; the journaled resumable scan
-//! + fs watcher (MH-2/MH-7) land when libraries get big enough to hurt.
+//! The durable scanner reconciles complete directory inventories before probing.
+//! Unchanged media reuses its stored probe and hashes; sidecars are refreshed
+//! independently. Only new/changed media, stale discovery generations and an
+//! explicit deep scan invoke discovery. Failed root walks never remove sources.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -77,18 +79,19 @@ where
 pub(crate) async fn scan_local_collection(
     cfg: CollectionConfig,
     catalog: crate::catalog::Catalog,
-    force_dirs: std::collections::HashSet<std::path::PathBuf>,
+    changed_files: std::collections::HashSet<PathBuf>,
     deep: bool,
     permit: crate::scheduler::JobPermit,
 ) -> Result<u64> {
     let generation = catalog.begin_scan(&cfg.name).await?;
     let known = std::sync::Arc::new(catalog.known_files(&cfg.name).await?);
-    let force_dirs = std::sync::Arc::new(force_dirs);
+    let changed_files = std::sync::Arc::new(changed_files);
     let include_audio = cfg.media_type == "music";
     let music = cfg.media_type == "music";
     let mut unavailable_roots = std::collections::HashSet::new();
-    let (mut scanned, mut failed, mut skipped) = (0u32, 0u32, 0u32);
+    let (mut scanned, mut failed, mut skipped, mut refreshed) = (0u32, 0u32, 0u32, 0u32);
 
+    let mut inventories = Vec::new();
     for configured_root in cfg.resolved_roots() {
         let root_token = configured_root.token;
         let root = configured_root.path;
@@ -109,10 +112,25 @@ pub(crate) async fn scan_local_collection(
                 continue;
             }
         };
+        let present: Vec<String> = paths
+            .iter()
+            .map(|(root, path)| {
+                path.strip_prefix(root)
+                    .unwrap_or(path)
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .collect();
+        catalog
+            .reconcile_root(&cfg.name, &root_token, &present, generation)
+            .await?;
+        inventories.push((root_token, paths));
+    }
+    for (root_token, paths) in inventories {
         for batch in paths.chunks(250) {
             let batch = batch.to_vec();
             let known = known.clone();
-            let force_dirs = force_dirs.clone();
+            let changed_files = changed_files.clone();
             let batch_root_token = root_token.clone();
             let verdicts = scan_blocking(&permit, move |permit| {
                 batch
@@ -124,52 +142,42 @@ pub(crate) async fn scan_local_collection(
                             .unwrap_or(&path)
                             .to_string_lossy()
                             .into_owned();
-                        let physically_unchanged = !deep
-                            && !path
-                                .parent()
-                                .is_some_and(|parent| force_dirs.contains(parent))
-                            && known
-                                .get(&(batch_root_token.clone(), rel.clone()))
-                                .is_some_and(|old| {
-                                    std::fs::metadata(&path).is_ok_and(|meta| {
-                                        meta.len() == old.size
-                                            && meta
-                                                .modified()
-                                                .ok()
-                                                .and_then(|time| {
-                                                    time.duration_since(std::time::UNIX_EPOCH).ok()
-                                                })
-                                                .map(|duration| duration.as_secs() as i64)
-                                                == Some(old.mtime_unix)
-                                            && sidecar_sig(&root_local, &path)
-                                                == stored_sidecar_sig(&old.streams_json)
-                                    })
-                                });
-                        let music_tags_stale = physically_unchanged
-                            && music
-                            && known
-                                .get(&(batch_root_token.clone(), rel.clone()))
-                                .is_some_and(|old| {
-                                    old.music_tag_generation < kahawai_media::MUSIC_TAG_GENERATION
-                                });
-                        Ok((
-                            root_local,
-                            path,
-                            rel,
-                            physically_unchanged && !music_tags_stale,
-                            music_tags_stale,
-                        ))
+                        let old = known.get(&(batch_root_token.clone(), rel.clone()));
+                        let action = classify_file(
+                            &root_local,
+                            &path,
+                            old,
+                            deep || changed_files.contains(&path),
+                            music,
+                        );
+                        Ok((root_local, path, rel, action))
                     })
                     .collect::<Result<Vec<_>>>()
             })
             .await??;
-            let mut seen_batch = Vec::new();
-            for (root_local, path, rel, unchanged, music_tags_stale) in verdicts {
-                if unchanged {
-                    skipped += 1;
-                    seen_batch.push((root_token.clone(), rel));
-                    continue;
-                }
+            let mut baselines = Vec::new();
+            for (root_local, path, rel, action) in verdicts {
+                let music_tags_stale = match action {
+                    ScanAction::Unchanged => {
+                        skipped += 1;
+                        continue;
+                    }
+                    ScanAction::Baseline(revision) => {
+                        skipped += 1;
+                        baselines.push((rel, revision));
+                        continue;
+                    }
+                    ScanAction::Sidecars(mut record) => {
+                        refreshed += 1;
+                        record.source = Some(kahawai_proto::v1::SourcePath {
+                            root_token: root_token.clone(),
+                            path_rel: rel,
+                        });
+                        catalog.upsert_file(&cfg.name, &record, generation).await?;
+                        continue;
+                    }
+                    ScanAction::Probe { music_tags_stale } => music_tags_stale,
+                };
                 let (root2, path2) = (root_local.clone(), path.clone());
                 match scan_blocking(&permit, move |_permit| inspect(&root2, &path2)).await? {
                     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info)) => {
@@ -209,7 +217,6 @@ pub(crate) async fn scan_local_collection(
                             // refresh into media loss.
                             tracing::warn!(path = %path.display(), error = format!("{error:#}"),
                                 "music metadata refresh failed; retaining previous source");
-                            seen_batch.push((root_token.clone(), rel));
                             continue;
                         }
                         tracing::warn!(path = %path.display(), error = format!("{error:#}"),
@@ -232,44 +239,91 @@ pub(crate) async fn scan_local_collection(
                 }
             }
             catalog
-                .mark_seen_batch(&cfg.name, &seen_batch, generation)
+                .baseline_sidecars(&cfg.name, &root_token, &baselines)
                 .await?;
-            if (scanned + failed + skipped).is_multiple_of(500) {
+            if (scanned + refreshed + failed + skipped).is_multiple_of(500) {
                 catalog
-                    .scan_progress(&cfg.name, scanned, failed, skipped)
+                    .scan_progress(&cfg.name, scanned + refreshed, failed, skipped)
                     .await?;
             }
         }
     }
     catalog
-        .scan_progress(&cfg.name, scanned, failed, skipped)
+        .scan_progress(&cfg.name, scanned + refreshed, failed, skipped)
         .await?;
     let version = catalog
         .finish_scan(&cfg.name, generation, &unavailable_roots)
         .await?;
-    tracing::info!(collection = %cfg.name, scanned, failed, skipped, version,
+    tracing::info!(collection = %cfg.name, scanned, refreshed, failed, skipped, version,
         "local catalogue scan complete");
     Ok(version)
 }
 
-fn stored_sidecar_sig(streams_json: &str) -> String {
-    let Ok(info) = serde_json::from_str::<kahawai_core::media::MediaInfo>(streams_json) else {
-        return String::new();
+enum ScanAction {
+    Unchanged,
+    Baseline(String),
+    Sidecars(FileRecord),
+    Probe { music_tags_stale: bool },
+}
+
+fn classify_file(
+    root: &Path,
+    path: &Path,
+    old: Option<&crate::catalog::KnownFile>,
+    deep: bool,
+    music: bool,
+) -> ScanAction {
+    let probe = ScanAction::Probe {
+        music_tags_stale: false,
     };
-    let mut subtitles: Vec<String> = info
-        .external_subtitles
-        .into_iter()
-        .map(|subtitle| subtitle.path_rel)
-        .collect();
-    subtitles.sort();
-    subtitles.dedup();
-    let nfo = info.nfo.unwrap_or_default();
-    let artwork = info.artwork.unwrap_or_default();
-    if nfo.is_empty() && artwork.is_empty() && subtitles.is_empty() {
-        String::new()
-    } else {
-        format!("n:{nfo}|a:{artwork}|s:{}", subtitles.join(","))
+    let Some(old) = old else { return probe };
+    if deep
+        || !std::fs::metadata(path).is_ok_and(|meta| {
+            meta.len() == old.size
+                && meta
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                    .map(|duration| duration.as_secs() as i64)
+                    == Some(old.mtime_unix)
+        })
+    {
+        return probe;
     }
+    if music && old.music_tag_generation < kahawai_media::MUSIC_TAG_GENERATION {
+        return ScanAction::Probe {
+            music_tags_stale: true,
+        };
+    }
+    let Ok(mut info) = serde_json::from_str::<kahawai_core::media::MediaInfo>(&old.streams_json)
+    else {
+        return probe;
+    };
+    let previous = info.clone();
+    refresh_sidecars(root, path, &mut info);
+    if info == previous {
+        return ScanAction::Unchanged;
+    }
+    if previous.sidecar_revision.is_none() {
+        let revision = info.sidecar_revision.take();
+        if info == previous
+            && let Some(revision) = revision
+        {
+            // Learning the initial stat baseline is not a sidecar change.
+            // Keep it local instead of republishing every existing album/movie.
+            return ScanAction::Baseline(revision);
+        }
+        info.sidecar_revision = revision;
+    }
+    ScanAction::Sidecars(FileRecord {
+        source: None,
+        size: old.size,
+        mtime_unix: old.mtime_unix,
+        head_xxh3: old.head_xxh3,
+        tail_xxh3: old.tail_xxh3,
+        oshash: old.oshash,
+        streams_json: serde_json::to_string(&info).expect("media info serializes"),
+    })
 }
 
 /// Scan one collection, sending batches over the link. Errors only when the
@@ -626,9 +680,7 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
         .unwrap_or(0);
     let (head_xxh3, tail_xxh3, oshash) = identity_hashes(path, size)?;
     let mut info = kahawai_media::discover(path, DISCOVER_TIMEOUT)?;
-    info.external_subtitles = find_sidecars(root, path);
-    info.artwork = find_artwork(root, path);
-    info.nfo = find_nfo(root, path);
+    refresh_sidecars(root, path, &mut info);
     // The longest keyframe gap, from the container index — kilobytes of
     // reads, and the only honest bound on a copy session's segment
     // length (and so on EXT-X-TARGETDURATION). Failure is not fatal:
@@ -670,6 +722,60 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
         }
     }
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))
+}
+
+/// Refresh only facts about companion files. No media content reads or
+/// discovery. Include sub-second timestamps and sizes so in-place edits are
+/// visible on ordinary sweeps too, even if a watcher event was missed.
+fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::MediaInfo) {
+    info.external_subtitles = find_sidecars(root, path);
+    info.artwork = find_artwork(root, path);
+    info.nfo = find_nfo(root, path);
+    let mut paths: Vec<String> = info
+        .external_subtitles
+        .iter()
+        .map(|s| s.path_rel.clone())
+        .chain(info.artwork.iter().cloned())
+        .chain(info.nfo.iter().cloned())
+        .collect();
+    // VobSub's index and payload are one external subtitle.
+    paths.extend(
+        info.external_subtitles
+            .iter()
+            .filter(|s| s.path_rel.ends_with(".idx"))
+            .map(|s| {
+                Path::new(&s.path_rel)
+                    .with_extension("sub")
+                    .to_string_lossy()
+                    .into_owned()
+            }),
+    );
+    paths.sort();
+    paths.dedup();
+    info.sidecar_revision = if paths.is_empty() {
+        None
+    } else {
+        let stamps: Vec<_> = paths
+            .into_iter()
+            .map(|rel| {
+                let stamp = std::fs::metadata(root.join(&rel)).ok().map(|meta| {
+                    (
+                        meta.len(),
+                        meta.modified()
+                            .ok()
+                            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok()),
+                    )
+                });
+                (rel, stamp)
+            })
+            .collect();
+        Some(format!(
+            "{:016x}",
+            xxhash_rust::xxh3::xxh3_64(
+                &serde_json::to_vec(&stamps).expect("sidecar stamps serialize")
+            )
+        ))
+    };
 }
 
 /// Local artwork (MH-4): a cover image in the media file's directory.
@@ -888,6 +994,309 @@ mod tests {
             crate::scheduler::Priority::CatalogFreshness,
             None,
         )
+    }
+
+    async fn run_local_scan(
+        cfg: &CollectionConfig,
+        catalog: &crate::catalog::Catalog,
+        deep: bool,
+    ) -> u64 {
+        let admission = scan_admission(cfg);
+        let permit = admission
+            .scheduler
+            .acquire(
+                admission.priority,
+                admission.resources,
+                None,
+                "scan regression",
+            )
+            .await
+            .unwrap();
+        scan_local_collection(
+            cfg.clone(),
+            catalog.clone(),
+            Default::default(),
+            deep,
+            permit,
+        )
+        .await
+        .unwrap()
+    }
+
+    async fn seed_scan_file(
+        catalog: &crate::catalog::Catalog,
+        root: &Path,
+        name: &str,
+    ) -> FileRecord {
+        let path = root.join(name);
+        // Deliberately unprobeable: a sidecar refresh that accidentally invokes
+        // discovery will fail, rather than silently passing this regression.
+        std::fs::write(&path, b"stored media facts are authoritative").unwrap();
+        let meta = path.metadata().unwrap();
+        let mut info = kahawai_core::media::MediaInfo {
+            container: Some("mp4".into()),
+            duration_ms: Some(1234),
+            ..Default::default()
+        };
+        refresh_sidecars(root, &path, &mut info);
+        let file = FileRecord {
+            source: Some(kahawai_proto::v1::SourcePath {
+                root_token: kahawai_core::media::root_token(root),
+                path_rel: name.into(),
+            }),
+            size: meta.len(),
+            mtime_unix: meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            head_xxh3: 11,
+            tail_xxh3: 22,
+            oshash: 33,
+            streams_json: serde_json::to_string(&info).unwrap(),
+        };
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        catalog
+            .upsert_file("movies", &file, generation)
+            .await
+            .unwrap();
+        file
+    }
+
+    #[tokio::test]
+    async fn learning_sidecar_baselines_does_not_republish_the_catalogue() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        std::fs::write(root.path().join("Movie.nfo"), "<movie/>").unwrap();
+        let mut file = seed_scan_file(&catalog, root.path(), "Movie.mp4").await;
+        let mut info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&file.streams_json).unwrap();
+        info.sidecar_revision = None;
+        file.streams_json = serde_json::to_string(&info).unwrap();
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        let before = catalog
+            .upsert_file("movies", &file, generation)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(run_local_scan(&cfg, &catalog, false).await, before);
+        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!((status.scanned, status.skipped, status.failed), (0, 1, 0));
+        let known = catalog.known_files("movies").await.unwrap();
+        let info: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&known.values().next().unwrap().streams_json).unwrap();
+        assert!(info.sidecar_revision.is_some());
+        assert_eq!(run_local_scan(&cfg, &catalog, false).await, before);
+        std::fs::write(
+            root.path().join("Movie.nfo"),
+            "<movie><plot>changed</plot></movie>",
+        )
+        .unwrap();
+        assert!(run_local_scan(&cfg, &catalog, false).await > before);
+        assert_eq!(catalog.discovery_status("movies").await.unwrap().failed, 0);
+    }
+
+    #[tokio::test]
+    async fn sidecar_edits_refresh_without_probing_and_deep_scan_still_probes() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        let original = seed_scan_file(&catalog, root.path(), "Movie.mp4").await;
+        seed_scan_file(&catalog, root.path(), "Neighbour.mp4").await;
+        run_local_scan(&cfg, &catalog, false).await;
+        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!((status.scanned, status.skipped, status.failed), (0, 2, 0));
+        let subtitle = root.path().join("Movie.en.srt");
+        let nfo = root.path().join("Movie.nfo");
+        let cover = root.path().join("cover.jpg");
+        let key = (
+            original.source.as_ref().unwrap().root_token.clone(),
+            "Movie.mp4".into(),
+        );
+        let mut previous = original.streams_json.clone();
+        for (path, content, affected) in [
+            (&subtitle, Some("subtitle"), 1),
+            (&subtitle, Some("edited subtitle text"), 1),
+            (&nfo, Some("<movie/>"), 1),
+            (&nfo, Some("<movie><plot>new</plot></movie>"), 1),
+            (&cover, Some("shared artwork"), 2),
+            (&cover, Some("updated shared artwork"), 2),
+            (&cover, None, 2),
+            (&subtitle, None, 1),
+            (&nfo, None, 1),
+        ] {
+            match content {
+                Some(bytes) => std::fs::write(path, bytes).unwrap(),
+                None => std::fs::remove_file(path).unwrap(),
+            }
+            run_local_scan(&cfg, &catalog, false).await;
+            let status = catalog.discovery_status("movies").await.unwrap();
+            assert_eq!(
+                (status.scanned, status.skipped, status.failed),
+                (affected, 2 - affected, 0)
+            );
+            let known = catalog.known_files("movies").await.unwrap();
+            let current = &known[&key];
+            assert_ne!(current.streams_json, previous);
+            assert_eq!(
+                (current.head_xxh3, current.tail_xxh3, current.oshash),
+                (11, 22, 33)
+            );
+            let info: kahawai_core::media::MediaInfo =
+                serde_json::from_str(&current.streams_json).unwrap();
+            assert_eq!(info.duration_ms, Some(1234));
+            previous = current.streams_json.clone();
+            run_local_scan(&cfg, &catalog, false).await;
+            assert_eq!(catalog.discovery_status("movies").await.unwrap().skipped, 2);
+        }
+        // A content-write event is stronger evidence than a matching second-
+        // resolution mtime, but must never force a neighbour to be probed.
+        let admission = scan_admission(&cfg);
+        let permit = admission
+            .scheduler
+            .acquire(
+                admission.priority,
+                admission.resources,
+                None,
+                "exact content write",
+            )
+            .await
+            .unwrap();
+        scan_local_collection(
+            cfg.clone(),
+            catalog.clone(),
+            [root.path().join("Movie.mp4")].into(),
+            false,
+            permit,
+        )
+        .await
+        .unwrap();
+        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!((status.skipped, status.failed), (1, 1));
+        // The remaining unchanged neighbour must actually be probed when the
+        // user forces a deep scan; the failed source is retried as well.
+        run_local_scan(&cfg, &catalog, true).await;
+        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!((status.scanned, status.skipped, status.failed), (0, 0, 2));
+    }
+
+    #[tokio::test]
+    async fn renamed_sources_are_removed_before_discovery_and_unavailable_roots_survive() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let missing = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into(), missing.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        let old = seed_scan_file(&catalog, root.path(), "Movie (2019).mp4").await;
+        seed_scan_file(&catalog, root.path(), "Neighbour.mp4").await;
+        let unavailable = seed_scan_file(&catalog, missing.path(), "Keep.mp4").await;
+        std::fs::rename(
+            root.path().join("Movie (2019).mp4"),
+            root.path().join("Movie (2009).mp4"),
+        )
+        .unwrap();
+        std::fs::remove_dir_all(missing.path()).unwrap();
+        let before = catalog
+            .delta("movies", 0, true)
+            .await
+            .unwrap()
+            .current_version;
+        let generation = catalog.begin_scan("movies").await.unwrap();
+        let token = old.source.as_ref().unwrap().root_token.clone();
+        catalog
+            .reconcile_root(
+                "movies",
+                &token,
+                &["Movie (2009).mp4".into(), "Neighbour.mp4".into()],
+                generation,
+            )
+            .await
+            .unwrap();
+        // No probe and no finish_scan call: the tombstone is already durable
+        // and streamable while the collection is still marked scanning.
+        assert!(catalog.discovery_status("movies").await.unwrap().scanning);
+        let delta = catalog.delta("movies", before, false).await.unwrap();
+        assert!(delta.records.iter().any(|r| r.kind == "file" && r.deleted));
+        let known = catalog.known_files("movies").await.unwrap();
+        assert!(!known.contains_key(&(token.clone(), "Movie (2019).mp4".into())));
+        assert!(known.contains_key(&(token, "Neighbour.mp4".into())));
+        let source = unavailable.source.unwrap();
+        assert!(known.contains_key(&(source.root_token.clone(), source.path_rel.clone())));
+        run_local_scan(&cfg, &catalog, false).await;
+        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!((status.skipped, status.failed), (1, 2)); // new invalid file + unavailable root
+        assert!(
+            catalog
+                .known_files("movies")
+                .await
+                .unwrap()
+                .contains_key(&(source.root_token, source.path_rel))
+        );
+    }
+
+    #[test]
+    fn changed_media_and_corrupt_stored_probes_require_discovery() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("Movie.mp4");
+        std::fs::write(&path, b"media").unwrap();
+        let meta = path.metadata().unwrap();
+        let mut old = crate::catalog::KnownFile {
+            size: meta.len(),
+            mtime_unix: meta
+                .modified()
+                .unwrap()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_secs() as i64,
+            head_xxh3: 1,
+            tail_xxh3: 2,
+            oshash: 3,
+            streams_json: "{}".into(),
+            music_tag_generation: 0,
+        };
+        assert!(matches!(
+            classify_file(root.path(), &path, Some(&old), false, false),
+            ScanAction::Unchanged
+        ));
+        old.mtime_unix -= 1;
+        assert!(matches!(
+            classify_file(root.path(), &path, Some(&old), false, false),
+            ScanAction::Probe { .. }
+        ));
+        old.mtime_unix += 1;
+        old.streams_json = "invalid".into();
+        assert!(matches!(
+            classify_file(root.path(), &path, Some(&old), false, false),
+            ScanAction::Probe { .. }
+        ));
+        old.streams_json = "{}".into();
+        std::fs::write(&path, b"changed media bytes").unwrap();
+        assert!(matches!(
+            classify_file(root.path(), &path, Some(&old), false, false),
+            ScanAction::Probe { .. }
+        ));
     }
 
     /// The two sides compare this as a STRING, so they must spell it the
