@@ -7,9 +7,9 @@
       "name": "MIT",
       "identifier": "MIT"
     },
-    "version": "0.0.0-dev"
+    "version": "0.0.14-rc.2"
   },
-  "x-kahawai-source-sha256": "34878d7a14a1d86cd2992899ca73593efe6e54f1786337e5b701244aaf5fd6fe",
+  "x-kahawai-source-sha256": "464d583271945d2d8d6f45d381362362cde89850408db1a32229ca293cdcef1a",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
