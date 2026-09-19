@@ -357,7 +357,7 @@ impl AnilistMedia {
         }
     }
 
-    pub fn premiered(&self) -> Option<String> {
+    pub fn release_date(&self) -> Option<String> {
         let d = self.start_date.as_ref()?;
         Some(format!(
             "{:04}-{:02}-{:02}",
@@ -695,7 +695,7 @@ mod tests {
             relations: None,
         };
         assert_eq!(m.plain_description().unwrap(), "Line one.\n\n\nNote.");
-        assert_eq!(m.premiered().unwrap(), "2011-04-01");
+        assert_eq!(m.release_date().unwrap(), "2011-04-01");
         assert_eq!(m.display_title().unwrap(), "X");
     }
 }

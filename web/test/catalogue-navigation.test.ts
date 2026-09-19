@@ -40,7 +40,7 @@ const entry = {
   year: 1998,
   copy_ids: ['copy1', 'copy2'],
   representative_id: 'copy1',
-  metadata: { description: { overview: 'A city without daylight.', rating: 7.5 } },
+  metadata: { description: { overview: 'A city without daylight.', rating: 7.5 }, provenance: {} },
 }
 beforeEach(() => vi.resetAllMocks())
 test.each(['auto', 'manual', 'weak', null])('grid preserves match confidence %s', (confidence) => {
@@ -253,5 +253,27 @@ test.each(['movie', 'series'] as const)('anime preserves its %s shape in the gri
 test('catalogue detail preserves provider IDs for the client community lookup', async () => {
   vi.mocked(item).mockResolvedValue({ ...entry, tmdb_id: 2666, tvdb_id: 123 } as never)
   const result = await catalogueDetail('films', 'film')
-  expect(result.metadata).toMatchObject({ tmdb_id: 2666, tvdb_id: 123 })
+  expect(result).toMatchObject({ tmdb_id: 2666, tvdb_id: 123 })
+})
+
+test('catalogue detail uses the generated description without remapping fields', async () => {
+  const description = {
+    overview: 'A city without daylight.',
+    release_date: '1998-02-27',
+    genres: [],
+    cast: [{ name: 'Rufus Sewell', role: 'John Murdoch' }],
+    original_title: 'Dark City',
+    original_language: 'en',
+    artwork: null,
+  }
+  vi.mocked(item).mockResolvedValue({
+    ...entry,
+    metadata: { description, provenance: { overview: 'provider-record' } },
+    provider: 'tmdb',
+    match_confidence: 'weak',
+  })
+  const result = await catalogueDetail('films', 'film')
+  expect(result.metadata).toBe(description)
+  expect(result.provider).toBe('tmdb')
+  expect(result.match_confidence).toBe('weak')
 })

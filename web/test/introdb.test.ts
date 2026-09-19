@@ -20,7 +20,10 @@ const film = (over: Record<string, unknown> = {}) => ({
   season: null,
   episode: null,
   episode_end: null,
-  metadata: { tmdb_id: 949, tvdb_id: null, proj_season: null, proj_episode: null },
+  tmdb_id: 949,
+  tvdb_id: null,
+  proj_season: null,
+  proj_episode: null,
   ...over,
 })
 
@@ -213,7 +216,7 @@ describe('what spends quota', () => {
     const wire = answer({ error: 'rate limited' }, 429, { 'retry-after': '900' })
     vi.stubGlobal('fetch', wire)
     expect(await introdbSegments(film(), DUR)).toEqual([])
-    const other = film({ metadata: { tmdb_id: 550, tvdb_id: null } })
+    const other = film({ tmdb_id: 550, tvdb_id: null })
     expect(await introdbSegments(other as never, DUR)).toEqual([])
     expect(wire).toHaveBeenCalledTimes(1)
     // The WINDOW is theirs — 900s, distinct from the 600s default, so this
@@ -264,10 +267,8 @@ describe('what spends quota', () => {
   test('no identity, no duration, or the wrong shape: no request', async () => {
     const wire = answer({})
     vi.stubGlobal('fetch', wire)
-    expect(await introdbSegments(film({ metadata: null }), DUR)).toEqual([])
-    expect(
-      await introdbSegments(film({ metadata: { tmdb_id: null, tvdb_id: null } }) as never, DUR),
-    ).toEqual([])
+    expect(await introdbSegments(film({ tmdb_id: null, tvdb_id: null }), DUR)).toEqual([])
+    expect(await introdbSegments(film({ tmdb_id: null, tvdb_id: null }) as never, DUR)).toEqual([])
     expect(await introdbSegments(film(), 0)).toEqual([])
     // An episode missing its numbers, a multi-episode file, and a kind
     // their database does not describe are all unaskable.
@@ -291,7 +292,10 @@ describe('the request itself', () => {
         kind: 'episode',
         season: 1,
         episode: 13,
-        metadata: { tmdb_id: 1403, tvdb_id: null, proj_season: 2, proj_episode: 1 },
+        tmdb_id: 1403,
+        tvdb_id: null,
+        proj_season: 2,
+        proj_episode: 1,
       }),
       2_700_000,
     )
@@ -310,7 +314,10 @@ describe('the request itself', () => {
         kind: 'episode',
         season: 1,
         episode: 1,
-        metadata: { tmdb_id: null, tvdb_id: 81189, proj_season: null, proj_episode: null },
+        tmdb_id: null,
+        tvdb_id: 81189,
+        proj_season: null,
+        proj_episode: null,
       }),
       2_700_000,
     )
@@ -601,7 +608,7 @@ describe('the hold across tabs and time', () => {
       vi.fn((_url: RequestInfo | URL) => wires[n++]),
     )
     const day = introdbSegments(film(), DUR)
-    const burst = introdbSegments(film({ metadata: { tmdb_id: 550, tvdb_id: null } }), DUR)
+    const burst = introdbSegments(film({ tmdb_id: 550, tvdb_id: null }), DUR)
     settleDay(new Response('', { status: 429, headers: { 'retry-after': '3600' } }))
     await day
     const standing = Number(localStorage.getItem('kahawai.introdb.hold'))
@@ -647,14 +654,10 @@ describe('the hold across tabs and time', () => {
       resetIntrodbHoldOnly()
       const wire = answer({ intro: [{ start_ms: 0, end_ms: 30_000 }] })
       vi.stubGlobal('fetch', wire)
-      expect(
-        await introdbSegments(film({ metadata: { tmdb_id: 550, tvdb_id: null } }), DUR),
-      ).toEqual([])
+      expect(await introdbSegments(film({ tmdb_id: 550, tvdb_id: null }), DUR)).toEqual([])
       expect(wire).not.toHaveBeenCalled()
       vi.advanceTimersByTime(3 * 60_000)
-      expect(
-        await introdbSegments(film({ metadata: { tmdb_id: 550, tvdb_id: null } }), DUR),
-      ).toHaveLength(1)
+      expect(await introdbSegments(film({ tmdb_id: 550, tvdb_id: null }), DUR)).toHaveLength(1)
     } finally {
       vi.useRealTimers()
     }

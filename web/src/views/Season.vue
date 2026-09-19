@@ -282,8 +282,8 @@ function play(id: string, fromStart = false) {
       <div class="min-w-[240px] flex-1">
         <div class="font-mono text-[13px] text-dim">{{ pickedNumber }}</div>
         <h2 class="text-[17px] font-[650]">{{ picked.data.value.title }}</h2>
-        <div v-if="picked.data.value.metadata?.premiered" class="font-mono text-[13px] text-dim">
-          {{ picked.data.value.metadata.premiered }}
+        <div v-if="picked.data.value.metadata?.release_date" class="font-mono text-[13px] text-dim">
+          {{ picked.data.value.metadata.release_date }}
         </div>
         <p v-if="picked.data.value.metadata?.overview" class="mt-2 max-w-[70ch] text-prose">
           {{ picked.data.value.metadata.overview }}

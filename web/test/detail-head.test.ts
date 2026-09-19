@@ -40,7 +40,8 @@ describe('what it says', () => {
 
   test('and the facts everybody checks', () => {
     const wrapper = head({
-      metadata: { premiered: '1995-12-15', rating: 8.3, confidence: 'weak' },
+      metadata: { release_date: '1995-12-15', rating: 8.3 },
+      match_confidence: 'weak',
     })
     expect(wrapper.text()).toContain('1995-12-15')
     expect(wrapper.text()).toContain('8.3')

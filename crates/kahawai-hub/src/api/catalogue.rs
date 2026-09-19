@@ -60,7 +60,7 @@ pub struct CatalogueItem {
     representative_id: String,
     copy_ids: Vec<String>,
     /// Resolved descriptive fields and their per-field evidence IDs.
-    metadata: serde_json::Value,
+    metadata: m::ResolvedDescription,
 }
 impl From<m::LibraryItem> for CatalogueItem {
     fn from(i: m::LibraryItem) -> Self {
@@ -75,7 +75,7 @@ impl From<m::LibraryItem> for CatalogueItem {
             match_confidence: i.match_confidence,
             representative_id: i.representative_id,
             copy_ids: i.copy_ids,
-            metadata: serde_json::to_value(i.metadata).expect("serializable catalogue description"),
+            metadata: i.metadata,
         }
     }
 }

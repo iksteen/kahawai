@@ -33,7 +33,7 @@ impl FeedItem {
             item.title = c.title.clone();
             item.artist = c.artist.clone();
             item.representative_id = c.representative_id.clone();
-            item.metadata = serde_json::to_value(&c.metadata).expect("serializable description");
+            item.metadata = c.metadata.clone();
         }
         Self {
             library_id: library.into(),

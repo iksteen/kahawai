@@ -4431,6 +4431,20 @@ mod tests {
     use std::collections::BTreeMap;
 
     #[test]
+    fn catalogue_description_schema_uses_mediadb_types() {
+        let document = serde_json::to_value(openapi_document()).unwrap();
+        let schemas = &document["components"]["schemas"];
+        assert_eq!(
+            schemas["CatalogueItem"]["allOf"][1]["properties"]["metadata"]["$ref"],
+            "#/components/schemas/ResolvedDescription"
+        );
+        assert_eq!(
+            schemas["ResolvedDescription"]["properties"]["description"]["$ref"],
+            "#/components/schemas/Description"
+        );
+    }
+
+    #[test]
     fn source_audio_track_schema_accepts_json_property_names() {
         let document = serde_json::to_value(openapi_document()).unwrap();
         let schema =

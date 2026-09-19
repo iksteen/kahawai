@@ -2,15 +2,18 @@ mod common;
 use common::*;
 use kahawai_mediadb::*;
 
-fn episode(season: Option<u32>, episode: u32, title: &str) -> ChildMetadata {
-    ChildMetadata {
-        season,
-        episode: Some(episode),
+fn episode(season: Option<u32>, episode: u32, title: &str) -> ProviderChild {
+    ProviderChild {
+        position: ProviderChildPosition {
+            season,
+            episode: Some(episode),
+            ..Default::default()
+        },
         title: title.into(),
         ..Default::default()
     }
 }
-async fn describe(s: &Store, copy: &str, title: &str, children: Vec<ChildMetadata>) -> String {
+async fn describe(s: &Store, copy: &str, title: &str, children: Vec<ProviderChild>) -> String {
     let r = s
         .put_provider_record(&ProviderRecord {
             provider: "fixture".into(),
@@ -20,10 +23,8 @@ async fn describe(s: &Store, copy: &str, title: &str, children: Vec<ChildMetadat
             media_type: MediaType::Series,
             title: title.into(),
             year: Some(2000),
-            description: Description {
-                children: Some(children),
-                ..Default::default()
-            },
+            description: Description::default(),
+            children: Some(children),
         })
         .await
         .unwrap();
@@ -368,4 +369,86 @@ async fn tracks_keep_album_boundaries_unknown_positions_and_physical_titles() {
         );
     }
     assert!(ChildId::parse("parent:description:1").is_err());
+}
+
+#[tokio::test]
+async fn child_catalogue_precedence_is_separate_from_description_resolution() {
+    let (_dir, s) = store().await;
+    let collection = collection(&s, "a", MediaType::Series, &["Show (2000)/Show.S01E01.mkv"]).await;
+    let lib = s
+        .create_library(
+            "Shows",
+            MediaType::Series,
+            std::slice::from_ref(&collection),
+        )
+        .await
+        .unwrap();
+    let copy = s.collection_items(&collection).await.unwrap().remove(0);
+    let mut primary = record("primary", "1", "Show", Some(2000), MediaType::Series);
+    primary.description.overview = Some("Parent synopsis".into());
+    let primary_id = s.put_provider_record(&primary).await.unwrap();
+    s.assign_metadata(&copy.id, Some(&primary_id))
+        .await
+        .unwrap();
+    let mut supplement = record("supplement", "1", "Show", Some(2000), MediaType::Series);
+    let mut first = episode(Some(1), 1, "First");
+    first.provider_id = Some("external-episode".into());
+    first.description = Description {
+        overview: Some("Episode synopsis".into()),
+        genres: Some(vec!["Drama".into()]),
+        cast: Some(vec![Credit {
+            name: "Actor".into(),
+            role: Some("Role".into()),
+        }]),
+        artwork: Some(vec!["still-a".into(), "still-b".into()]),
+        ..Default::default()
+    };
+    supplement.children = Some(vec![first.clone()]);
+    let supplement_id = s.put_provider_record(&supplement).await.unwrap();
+    s.set_provider_order(MediaType::Series, &["primary".into(), "supplement".into()])
+        .await
+        .unwrap();
+    s.set_supplements(&copy.id, std::slice::from_ref(&supplement_id))
+        .await
+        .unwrap();
+    let parent = s.enrichment_input(&copy.id).await.unwrap().library_item_id;
+    let child = s
+        .library_children(&lib, &parent, 0, 20, &ChildFilter::default())
+        .await
+        .unwrap()
+        .children
+        .remove(0);
+    assert_eq!(child.title, "First");
+    assert_eq!(child.metadata.description, first.description);
+    for key in ["title", "overview", "genres", "cast", "artwork"] {
+        assert_eq!(child.metadata.provenance[key], supplement_id);
+    }
+    let metadata = s.resolve_metadata(&copy.id).await.unwrap();
+    assert_eq!(metadata.description.overview, primary.description.overview);
+    assert!(!metadata.provenance.contains_key("children"));
+    assert!(
+        serde_json::to_value(metadata.description)
+            .unwrap()
+            .get("children")
+            .is_none()
+    );
+    // An explicit empty primary answer suppresses supplements, without deleting
+    // the physical child or changing its ID. Removing that answer restores them.
+    primary.children = Some(vec![]);
+    s.put_provider_record(&primary).await.unwrap();
+    let empty = s.library_child(&lib, &child.id).await.unwrap().child;
+    assert_eq!(empty.id, child.id);
+    assert_eq!(empty.metadata.description, Description::default());
+    assert_eq!(empty.metadata.provenance["title"], "detected");
+    primary.children = None;
+    s.put_provider_record(&primary).await.unwrap();
+    assert_eq!(
+        s.library_child(&lib, &child.id)
+            .await
+            .unwrap()
+            .child
+            .metadata
+            .description,
+        first.description
+    );
 }

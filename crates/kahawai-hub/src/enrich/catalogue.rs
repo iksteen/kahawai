@@ -448,7 +448,7 @@ impl Enricher {
                 });
             }
             if !episodes.is_empty() {
-                record.description.children = Some(episodes.iter().map(child).collect());
+                record.children = Some(episodes.iter().map(child).collect());
             }
             answer.candidates.push(m::EnrichmentCandidate {
                 complete: target.is_some(),
@@ -529,7 +529,7 @@ impl Enricher {
                 overview: media.plain_description(),
                 original_title: media.title.romaji.clone(),
                 original_language: media.original_language().map(str::to_owned),
-                release_date: media.premiered(),
+                release_date: media.release_date(),
                 rating: media.average_score.map(|s| s / 10.0),
                 genres: media.genres.clone(),
                 artwork: media
@@ -608,12 +608,15 @@ impl Enricher {
             record.year = info.year.and_then(|y| i32::try_from(y).ok());
             let children =
                 crate::anime::anidb_episode_titles(&self.http, &self.data_dir, aid, &[]).await?;
-            record.description.children = Some(
+            record.children = Some(
                 children
                     .into_iter()
-                    .map(|(episode, title)| m::ChildMetadata {
+                    .map(|(episode, title)| m::ProviderChild {
+                        position: m::ProviderChildPosition {
+                            episode: u32::try_from(episode).ok(),
+                            ..Default::default()
+                        },
                         title,
-                        episode: u32::try_from(episode).ok(),
                         ..Default::default()
                     })
                     .collect(),
@@ -652,10 +655,13 @@ impl Enricher {
         let mut children = Vec::new();
         for entry in registry.catalogue().media_entries(&input.item_id).await? {
             if let m::EntryKind::Track { disc, track } = entry.data.kind {
-                children.push(m::ChildMetadata {
+                children.push(m::ProviderChild {
+                    position: m::ProviderChildPosition {
+                        disc,
+                        track,
+                        ..Default::default()
+                    },
                     title: entry.data.title,
-                    disc,
-                    track,
                     ..Default::default()
                 });
             }
@@ -694,30 +700,34 @@ impl Enricher {
                             .find(|n| n.has_tag_name(name))
                             .and_then(|n| n.text())
                     };
-                    children.push(m::ChildMetadata {
+                    children.push(m::ProviderChild {
+                        description: m::Description {
+                            overview: value("plot").map(str::to_owned),
+                            ..Default::default()
+                        },
+                        position: m::ProviderChildPosition {
+                            season: value("season").and_then(|n| n.parse().ok()),
+                            episode: value("episode").and_then(|n| n.parse().ok()),
+                            ..Default::default()
+                        },
                         title: value("title").unwrap_or_default().into(),
-                        season: value("season").and_then(|n| n.parse().ok()),
-                        episode: value("episode").and_then(|n| n.parse().ok()),
-                        overview: value("plot").map(str::to_owned),
                         ..Default::default()
                     });
                     continue;
                 }
-                if let Some((fields, claim)) = parse_nfo(&text) {
+                if let Some((title, mut description, claim)) = parse_nfo(&text) {
                     record.external_id =
                         format!("{}:nfo:{}", input.item_id, claim.as_deref().unwrap_or(nfo));
-                    if let Some(title) = fields.title {
+                    if let Some(title) = title {
                         record.title = title;
                     }
-                    record.year = fields.premiered.as_deref().and_then(year).or(input.year);
-                    record.description.overview = fields.overview;
-                    record.description.release_date = fields.premiered;
-                    record.description.rating = fields.rating;
-                    record.description.genres = fields
-                        .genres
+                    record.year = description
+                        .release_date
                         .as_deref()
-                        .map(serde_json::from_str)
-                        .transpose()?;
+                        .and_then(year)
+                        .or(input.year);
+                    description.artwork = record.description.artwork.take();
+                    record.description = description;
                     answer.candidates = vec![m::EnrichmentCandidate {
                         complete: true,
                         record: record.clone(),
@@ -728,11 +738,11 @@ impl Enricher {
             }
         }
         if !children.is_empty() {
-            record.description.children = Some(children);
+            record.children = Some(children);
         }
         if !answer.candidates.is_empty()
             || record.description.artwork.is_some()
-            || record.description.children.is_some()
+            || record.children.is_some()
         {
             answer.local = Some(record);
         }
@@ -841,6 +851,7 @@ fn base_record(
     media_type: m::MediaType,
 ) -> m::ProviderRecord {
     m::ProviderRecord {
+        children: None,
         provider: provider.into(),
         namespace: namespace.into(),
         external_id: id.into(),
@@ -887,18 +898,23 @@ fn candidate_record(
     };
     r
 }
-fn child(e: &EpisodeData) -> m::ChildMetadata {
-    m::ChildMetadata {
+fn child(e: &EpisodeData) -> m::ProviderChild {
+    m::ProviderChild {
+        description: m::Description {
+            artwork: e.image.clone().map(|image| vec![image]),
+            release_date: e.aired.clone(),
+            rating: e.rating,
+            overview: e.overview.clone(),
+            ..Default::default()
+        },
+        position: m::ProviderChildPosition {
+            absolute: e.absolute.and_then(|n| u32::try_from(n).ok()),
+            season: e.season.and_then(|s| u32::try_from(s).ok()),
+            episode: u32::try_from(e.episode).ok(),
+            ..Default::default()
+        },
         provider_id: Some(e.provider_id.clone()),
-        absolute: e.absolute.and_then(|n| u32::try_from(n).ok()),
-        artwork: e.image.clone(),
-        release_date: e.aired.clone(),
-        rating: e.rating,
         title: e.title.clone().unwrap_or_default(),
-        season: e.season.and_then(|s| u32::try_from(s).ok()),
-        episode: u32::try_from(e.episode).ok(),
-        overview: e.overview.clone(),
-        ..Default::default()
     }
 }
 impl Enricher {

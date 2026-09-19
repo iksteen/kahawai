@@ -1683,7 +1683,8 @@ describe('chapter marks on the bar', () => {
         duration_ms: 999_000, // deliberately NOT the session's 600_000
         season: null,
         episode: null,
-        metadata: { tmdb_id: 949, tvdb_id: null },
+        tmdb_id: 949,
+        tvdb_id: null,
       }) as never,
       prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
     })
@@ -1720,7 +1721,7 @@ describe('chapter marks on the bar', () => {
         season: 1,
         episode: 1,
         segments: [],
-        metadata: { tmdb_id: 1403 },
+        tmdb_id: 1403,
         copies: [
           { assignment: { library_item_ids: ['ep1'] } },
           { assignment: { library_item_ids: ['ep1', 'ep2'] } },
@@ -1754,7 +1755,8 @@ describe('chapter marks on the bar', () => {
     const { wrapper, element } = await watching({
       item: film({
         segments: [{ kind: 'intro', start_ms: 5_000, end_ms: 65_000, source: 'chromaprint' }],
-        metadata: { tmdb_id: 949, tvdb_id: null },
+        tmdb_id: 949,
+        tvdb_id: null,
       }) as never,
       prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
     })
@@ -1777,7 +1779,8 @@ describe('chapter marks on the bar', () => {
     await watching({
       item: film({
         segments: [],
-        metadata: { tmdb_id: 949, tvdb_id: null },
+        tmdb_id: 949,
+        tvdb_id: null,
       }) as never,
     })
     await flushPromises()
@@ -1785,7 +1788,8 @@ describe('chapter marks on the bar', () => {
     await watching({
       item: film({
         segments: [],
-        metadata: { tmdb_id: 949, tvdb_id: null },
+        tmdb_id: 949,
+        tvdb_id: null,
       }) as never,
       prefs: [{ scope: 'films', key: 'introdb', value: '1' }] as never,
     })
@@ -1794,7 +1798,8 @@ describe('chapter marks on the bar', () => {
     await watching({
       item: film({
         segments: [{ kind: 'intro', start_ms: 0, end_ms: 30_000, source: 'chromaprint' }],
-        metadata: { tmdb_id: 949, tvdb_id: null },
+        tmdb_id: 949,
+        tvdb_id: null,
       }) as never,
       prefs: [{ scope: '', key: 'introdb', value: '1' }] as never,
     })

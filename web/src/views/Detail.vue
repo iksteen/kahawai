@@ -775,7 +775,7 @@ function markSeason(season: number | null, played: boolean) {
         >
           <li v-for="person in item.metadata.cast" :key="person.name">
             {{ person.name }}
-            <span v-if="person.character" class="text-dim">as {{ person.character }}</span>
+            <span v-if="person.role" class="text-dim">as {{ person.role }}</span>
           </li>
         </ul>
       </section>
@@ -1055,7 +1055,7 @@ function markSeason(season: number | null, played: boolean) {
       @close="matching = null"
       @applied="matched"
     />
-    <Attribution :provider="item.metadata?.provider" />
+    <Attribution :provider="item.provider" />
   </main>
 </template>
 

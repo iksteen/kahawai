@@ -33,26 +33,30 @@ pub struct Credit {
     pub name: String,
     pub role: Option<String>,
 }
+/// Provider evidence for one episode or track, not a library child identity.
+/// Position associates this record with physical entries; editing the description
+/// cannot create a child or change its stable ID.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
-pub struct ChildMetadata {
-    #[serde(default)]
+pub struct ProviderChild {
     pub provider_id: Option<String>,
-    #[serde(default)]
-    pub absolute: Option<u32>,
-    #[serde(default)]
-    pub artwork: Option<String>,
-    #[serde(default)]
-    pub release_date: Option<String>,
-    #[serde(default)]
-    pub rating: Option<f64>,
     pub title: String,
+    pub position: ProviderChildPosition,
+    pub description: Description,
+}
+/// Provider numbering can be incomplete and may include both seasonal and absolute
+/// episode numbers. It is evidence, unlike a library child's native ChildPosition.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderChildPosition {
+    pub absolute: Option<u32>,
     pub season: Option<u32>,
     pub episode: Option<u32>,
     pub disc: Option<u32>,
     pub track: Option<u32>,
-    pub overview: Option<String>,
 }
-/// None means no answer. An explicit empty list is an answer, not a gap.
+/// Canonical descriptive metadata, from enrichment through storage and the API.
+/// Identity (title/year, provider IDs), confidence and provenance belong to the
+/// containing record, not this description. None means no answer; an explicit
+/// empty list is an answer, not a gap.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct Description {
     pub overview: Option<String>,
@@ -63,7 +67,6 @@ pub struct Description {
     pub artwork: Option<Vec<String>>,
     pub genres: Option<Vec<String>>,
     pub cast: Option<Vec<Credit>>,
-    pub children: Option<Vec<ChildMetadata>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct ProviderRecord {
@@ -75,6 +78,10 @@ pub struct ProviderRecord {
     pub title: String,
     pub year: Option<i32>,
     pub description: Description,
+    /// None is no answer; an empty list is an explicit answer. Child catalogues
+    /// follow the same evidence precedence as descriptions but resolve separately.
+    #[serde(default)]
+    pub children: Option<Vec<ProviderChild>>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DetectedMetadata {

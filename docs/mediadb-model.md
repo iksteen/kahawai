@@ -16,7 +16,7 @@ Schema meaning lives in the Rust module documentation beside the enforcing
 operations. Numbered, append-only SQL migrations live in
 `crates/kahawai-mediadb/migrations/`; `0001_media_catalogue.sql` establishes the catalogue and
 `0002_enrichment.sql` adds durable enrichment; `0003_downloaded_subtitles.sql` adds source-owned subtitle assets. `0004_media_entry_episodes.sql` renames the physical episode coverage table from
-`entry_episodes` to `media_entry_episodes`. SQLx embeds them at build time and records their versions,
+`entry_episodes` to `media_entry_episodes`; `0005_provider_children.sql` separates provider child identities from descriptions. SQLx embeds them at build time and records their versions,
 checksums and completion in this database's `_sqlx_migrations` table. There is no
 second schema-version table.
 
@@ -119,8 +119,9 @@ Use `scripts/kahawai-mediadb.sh api children LIBRARY PARENT` and the existing
 `api item LIBRARY CHILD` command to inspect them.
 
 The existing episode/season/album layouts use these responses and load additional
-pages incrementally. Playback and watch-state operations remain disconnected.
-No migration or rewriting of existing media or user state is required.
+pages incrementally. Playback and watch state use the stable library/child IDs.
+Media files are never rewritten. Legacy catalogue and watch-state IDs are not
+converted; see the [upgrade procedure](kahawai-deployment.md#upgrading-to-mediadb).
 
 ## Metadata and library grouping
 
@@ -261,10 +262,10 @@ Disconnects preserve data. Host deletion removes the media catalogue before
 revoking enrollment, so an interruption can be recovered by an enrolled host's
 reimport without an outbox or distributed transaction.
 
-Users, enrollment, credentials and old watch history stay in `hub.db`. Old catalogue
-rows remain inert so their history references remain valid. Existing library setup,
-provider assignments and watch history are not converted; remapping history is not
-a required follow-up. A new media database starts with no libraries. The hub's
+Users, enrollment, credentials and current catalogue watch state stay in `hub.db`.
+Migration 0089 removes the legacy catalogue and historical watch tables. Existing
+legacy library setup, provider assignments and watch history are not converted;
+remapping history is not a required follow-up. A new media database starts with no libraries. The hub's
 migration 87 detaches grants from its old libraries table while retaining the user
 foreign key and existing grant rows. New grants are validated against Store;
 nonexistent library IDs grant nothing. Admins and unrestricted users retain their
@@ -383,8 +384,8 @@ provides progress, search, saved-identity lookup, correction and retry commands;
 `scripts/kahawai-enrich.sh check` runs the queue and runtime checks.
 
 Content-keyed legacy AniDB hash answers are imported once, without associating
-old per-copy assignments or history. Remaining viewer features, playback, watch-state, subtitles,
-segment detection and backup cutovers remain separate work.
+old per-copy assignments or history. Browsing, playback, watch state, subtitles,
+segment administration and backup/restore all use mediadb.
 
 
 ### Viewer library navigation
@@ -403,7 +404,8 @@ The hub owns `catalogue_watch_state`, keyed by `(user_id, item_id)`, with the
 stable mediadb parent ID recorded alongside child IDs. There is no library ID in
 that key: the same identity exposed by multiple libraries shares user state.
 There is no FK into mediadb and no automatic history deletion when sources or
-libraries disappear. User deletion cascades. Legacy watch history stays separate.
+libraries disappear. User deletion cascades. Migration 0089 removes legacy watch
+history; it is not attached to the new identities.
 Schema semantics and write rules live in `kahawai-hub/src/watch.rs`.
 
 Catalogue lists, children and details include the current user's state. Watched
@@ -556,3 +558,12 @@ and returns the refreshed review, the first page of existing identities, and
 provider failures together. Further identity pages use the identities endpoint.
 Video searches follow physical movie/episode kinds, including mixed anime collections;
 verified provider links retain their explicit namespace.
+
+### Shared descriptive type
+
+`Description` is the descriptive payload for provider enrichment and parsed NFOs,
+stored records, and the catalogue API. The API exposes `ResolvedDescription`
+(description plus provenance) directly. The web client uses the generated
+`Description`, including `release_date` and cast `role`, without a second field map.
+Identity, provider IDs, match confidence and episode positions remain outside it.
+Provider-specific wire responses are converted at the enrichment boundary.

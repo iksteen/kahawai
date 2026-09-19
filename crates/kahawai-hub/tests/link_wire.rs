@@ -381,6 +381,7 @@ async fn enrolled_mediahost_links_and_disconnect_is_tracked() {
         .registry
         .catalogue()
         .put_provider_record(&kahawai_mediadb::ProviderRecord {
+            children: None,
             provider: "tmdb".into(),
             namespace: "movies".into(),
             external_id: "123".into(),

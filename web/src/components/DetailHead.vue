@@ -5,6 +5,7 @@
 /// One shape for all four kinds rather than three near-copies — only the
 /// artwork's proportions differ, and they follow what the artwork IS.
 import { computed, ref } from 'vue'
+import type { Description } from '../api/generated/model/description.ts'
 
 import { artShape } from '../domain/detail.ts'
 import { artworkSrcSet, artworkUrl } from '../api/artwork.ts'
@@ -22,15 +23,8 @@ const props = defineProps<{
     duration_ms: number | null
     resume_position_ms: number | null
     resume_duration_ms: number | null
-    metadata?:
-      | {
-          overview?: string | null
-          premiered?: string | null
-          rating?: number | null
-          confidence?: string | null
-        }
-      | null
-      | undefined
+    match_confidence?: string | null
+    metadata?: Description | null | undefined
   }
   /// The mono line under the title. Different per kind, so the caller writes
   /// it — a show counts episodes, an album counts tracks, a film says how long
@@ -86,14 +80,14 @@ const runtime = computed(() => duration(props.item.duration_ms))
 
       <!-- The facts nobody needs in a heading but everybody checks. -->
       <div class="mt-3 flex flex-wrap gap-3 font-mono text-[12px]">
-        <span v-if="props.item.metadata?.premiered" class="text-dim">
-          {{ props.item.metadata.premiered }}
+        <span v-if="props.item.metadata?.release_date" class="text-dim">
+          {{ props.item.metadata.release_date }}
         </span>
         <span v-if="props.item.metadata?.rating != null" class="text-sand">
           ★ {{ props.item.metadata.rating.toFixed(1) }}
         </span>
         <span
-          v-if="props.item.metadata?.confidence === 'weak'"
+          v-if="props.item.match_confidence === 'weak'"
           class="text-sand"
           title="The metadata match was not certain"
         >

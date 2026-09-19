@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "2d36ae6eb35cc3405d4a5de854fffff1115afdd79bd871662c545e83ae038d39",
+  "x-kahawai-source-sha256": "049c76d3f99a3afbf70d8ea0770abb06a64d31b778a0165937a332493cd2057d",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -9020,6 +9020,7 @@
                 "type": "string"
               },
               "metadata": {
+                "$ref": "#/components/schemas/ResolvedDescription",
                 "description": "Resolved descriptive fields and their per-field evidence IDs."
               },
               "representative_id": {
@@ -9233,88 +9234,6 @@
           "total": {
             "type": "integer",
             "format": "int64",
-            "minimum": 0
-          }
-        }
-      },
-      "ChildMetadata": {
-        "type": "object",
-        "required": [
-          "title"
-        ],
-        "properties": {
-          "absolute": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "artwork": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "disc": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "episode": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "overview": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "provider_id": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "rating": {
-            "type": [
-              "number",
-              "null"
-            ],
-            "format": "double"
-          },
-          "release_date": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "season": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
-            "minimum": 0
-          },
-          "title": {
-            "type": "string"
-          },
-          "track": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int32",
             "minimum": 0
           }
         }
@@ -9993,7 +9912,7 @@
       },
       "Description": {
         "type": "object",
-        "description": "None means no answer. An explicit empty list is an answer, not a gap.",
+        "description": "Canonical descriptive metadata, from enrichment through storage and the API.\nIdentity (title/year, provider IDs), confidence and provenance belong to the\ncontaining record, not this description. None means no answer; an explicit\nempty list is an answer, not a gap.",
         "properties": {
           "artwork": {
             "type": [
@@ -10011,15 +9930,6 @@
             ],
             "items": {
               "$ref": "#/components/schemas/Credit"
-            }
-          },
-          "children": {
-            "type": [
-              "array",
-              "null"
-            ],
-            "items": {
-              "$ref": "#/components/schemas/ChildMetadata"
             }
           },
           "genres": {
@@ -10256,6 +10166,16 @@
                   "description"
                 ],
                 "properties": {
+                  "children": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "$ref": "#/components/schemas/ProviderChild"
+                    },
+                    "description": "None is no answer; an empty list is an explicit answer. Child catalogues\nfollow the same evidence precedence as descriptions but resolve separately."
+                  },
                   "description": {
                     "$ref": "#/components/schemas/Description"
                   },
@@ -11337,6 +11257,78 @@
           }
         }
       },
+      "ProviderChild": {
+        "type": "object",
+        "description": "Provider evidence for one episode or track, not a library child identity.\nPosition associates this record with physical entries; editing the description\ncannot create a child or change its stable ID.",
+        "required": [
+          "title",
+          "position",
+          "description"
+        ],
+        "properties": {
+          "description": {
+            "$ref": "#/components/schemas/Description"
+          },
+          "position": {
+            "$ref": "#/components/schemas/ProviderChildPosition"
+          },
+          "provider_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "title": {
+            "type": "string"
+          }
+        }
+      },
+      "ProviderChildPosition": {
+        "type": "object",
+        "description": "Provider numbering can be incomplete and may include both seasonal and absolute\nepisode numbers. It is evidence, unlike a library child's native ChildPosition.",
+        "properties": {
+          "absolute": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "disc": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "episode": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "season": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          },
+          "track": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "minimum": 0
+          }
+        }
+      },
       "ProviderConfiguration": {
         "type": "object",
         "required": [
@@ -11360,6 +11352,16 @@
           "description"
         ],
         "properties": {
+          "children": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ProviderChild"
+            },
+            "description": "None is no answer; an empty list is an explicit answer. Child catalogues\nfollow the same evidence precedence as descriptions but resolve separately."
+          },
           "description": {
             "$ref": "#/components/schemas/Description"
           },

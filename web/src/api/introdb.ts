@@ -1,3 +1,4 @@
+import type { ItemDetail } from './catalogue-model.ts'
 /// theintrodb.org: community skip timestamps, used only where the hub's own
 /// detector has nothing — movies (never analysed locally) and seasons the
 /// sweep has not reached. Their terms want exactly this shape: "The API is
@@ -209,18 +210,13 @@ export function normalize(body: unknown, durationMs: number): Segment[] {
   return out.sort((a, b) => a.start_ms - b.start_ms)
 }
 
-export type IntrodbItem = {
-  kind: string
-  season?: number | null
-  episode?: number | null
-  episode_end?: number | null
-  metadata?: {
-    tmdb_id?: number | null
-    tvdb_id?: number | null
-    proj_season?: number | null
-    proj_episode?: number | null
-  } | null
-}
+export type IntrodbItem = Pick<ItemDetail, 'kind'> &
+  Partial<
+    Pick<
+      ItemDetail,
+      'season' | 'episode' | 'episode_end' | 'tmdb_id' | 'tvdb_id' | 'proj_season' | 'proj_episode'
+    >
+  >
 
 /// `durationMs` is the duration of what is PLAYING (the session's), not the
 /// item's minimum across renditions: it discriminates the release version on
@@ -244,15 +240,10 @@ export async function introdbSegments(
   // hub only curates absolute-numbered releases (a file with no season of
   // its own); a split-cour file that names a season the provider disagrees
   // with still looks up under the file's numbering.
-  const season = tv ? (item.metadata?.proj_season ?? item.season) : null
-  const episode = tv ? (item.metadata?.proj_episode ?? item.episode) : null
+  const season = tv ? (item.proj_season ?? item.season) : null
+  const episode = tv ? (item.proj_episode ?? item.episode) : null
   if (tv && (season == null || episode == null)) return []
-  const key = cacheKey(
-    { tmdb: item.metadata?.tmdb_id, tvdb: item.metadata?.tvdb_id },
-    season,
-    episode,
-    durationMs,
-  )
+  const key = cacheKey({ tmdb: item.tmdb_id, tvdb: item.tvdb_id }, season, episode, durationMs)
   if (!key) return [] // no usable identity — AniList and MusicBrainz land here
   const known = cached(key)
   // Re-bounded on every read: the cache validates what it CAN without a
@@ -283,8 +274,8 @@ export async function introdbSegments(
   if (now < holdUntil) return []
 
   const query = new URLSearchParams()
-  if (item.metadata?.tmdb_id != null) query.set('tmdb_id', String(item.metadata.tmdb_id))
-  else query.set('tvdb_id', String(item.metadata!.tvdb_id))
+  if (item.tmdb_id != null) query.set('tmdb_id', String(item.tmdb_id))
+  else query.set('tvdb_id', String(item.tvdb_id))
   if (tv) {
     query.set('season', String(season))
     query.set('episode', String(episode))

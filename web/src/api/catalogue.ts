@@ -15,7 +15,6 @@ import type { FeedItem } from './generated/model/feedItem.ts'
 import type { LibraryChild } from './generated/model/libraryChild.ts'
 import type { CatalogueChildrenParams } from './generated/model/catalogueChildrenParams.ts'
 import type { CatalogueItem } from './generated/model/catalogueItem.ts'
-import type { Description } from './generated/model/description.ts'
 import type { ItemSummary } from './catalogue-model.ts'
 import type { ItemDetail } from './catalogue-model.ts'
 import type { BrowseParams } from './catalogue-model.ts'
@@ -46,7 +45,6 @@ export function catalogueRow(entry: CatalogueItem, library: string): ItemSummary
     proj_episode: null,
     proj_season: null,
     played: entry.played ?? false,
-    premiered: null,
     duration_ms: null,
     resume_duration_ms: entry.resume_duration_ms ?? null,
     resume_position_ms: entry.resume_position_ms ?? null,
@@ -93,17 +91,12 @@ export async function artistAlbums(
   }
 }
 
-export function descriptionOf(entry: CatalogueItem): Description {
-  return (entry.metadata as { description?: Description } | null)?.description ?? {}
-}
-
 export async function catalogueDetail(
   library: string,
   id: string,
   query?: ItemQuery,
 ): Promise<ItemDetail> {
   const entry = query ? await cataloguePlayback(library, id, query) : await item(library, id)
-  const description = descriptionOf(entry)
   const row = entry.child
     ? childRow(entry.child, library, entry.parent_title)
     : catalogueRow(entry, library)
@@ -121,25 +114,10 @@ export async function catalogueDetail(
     negotiated: entry.negotiated ?? null,
     ...(entry.unavailable ? { unavailable: entry.unavailable } : {}),
     segments: entry.segments ?? [],
-    metadata: {
-      overview: description.overview ?? null,
-      genres: description.genres ?? null,
-      cast:
-        description.cast?.map((credit) => ({
-          name: credit.name,
-          character: credit.role ?? null,
-        })) ?? null,
-      original_language: description.original_language ?? null,
-      premiered: description.release_date ?? null,
-      rating: description.rating ?? null,
-      confidence:
-        entry.copies.find((copy) => copy.id === entry.representative_id)?.match_confidence ?? '',
-      provider: entry.provider ?? null,
-      proj_episode: null,
-      proj_season: null,
-      tmdb_id: entry.tmdb_id ?? null,
-      tvdb_id: entry.tvdb_id ?? null,
-    },
+    metadata: entry.metadata.description,
+    provider: entry.provider ?? null,
+    tmdb_id: entry.tmdb_id ?? null,
+    tvdb_id: entry.tvdb_id ?? null,
   }
 }
 
@@ -172,7 +150,6 @@ function childRow(entry: LibraryChild, library: string, parentTitle?: string | n
         : position.kind === 'track'
           ? position.track
           : null,
-    premiered: entry.metadata.description.release_date ?? null,
   }
 }
 

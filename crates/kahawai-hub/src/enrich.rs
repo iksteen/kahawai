@@ -1938,7 +1938,7 @@ impl Enricher {
         })
     }
 }
-fn parse_nfo(xml: &str) -> Option<(crate::providers::Fields, Option<String>)> {
+fn parse_nfo(xml: &str) -> Option<(Option<String>, kahawai_mediadb::Description, Option<String>)> {
     let doc = roxmltree::Document::parse(xml).ok()?;
     let root = doc.root_element();
     // <movie>, <tvshow>, <episodedetails> — the tag names differ, the
@@ -1959,7 +1959,7 @@ fn parse_nfo(xml: &str) -> Option<(crate::providers::Fields, Option<String>)> {
         .filter(|s| !s.is_empty())
         .collect();
     // A year on its own is enough to date an item; premiered wins.
-    let premiered = text("premiered").or_else(|| text("year").map(|y| format!("{y}-01-01")));
+    let release_date = text("premiered").or_else(|| text("year").map(|y| format!("{y}-01-01")));
     // The id a human curated, if any: <uniqueid> first, then the older
     // dedicated tags. It becomes this answer's provider_id, so a local
     // record is as identifiable as any other.
@@ -1973,21 +1973,22 @@ fn parse_nfo(xml: &str) -> Option<(crate::providers::Fields, Option<String>)> {
         .map(str::to_string)
         .or_else(|| text("tmdbid"))
         .or_else(|| text("imdbid"));
-    let fields = crate::providers::Fields {
-        title: text("title").or_else(|| text("originaltitle")),
+    let title = text("title").or_else(|| text("originaltitle"));
+    let description = kahawai_mediadb::Description {
+        original_title: text("originaltitle"),
         overview: text("plot").or_else(|| text("outline")),
         rating: text("rating")
             .and_then(|r| r.parse::<f64>().ok())
             .filter(|r| *r > 0.0),
-        premiered,
-        genres: (!genres.is_empty()).then(|| serde_json::to_string(&genres).unwrap_or_default()),
+        release_date,
+        genres: (!genres.is_empty()).then_some(genres),
         ..Default::default()
     };
     // A file with nothing usable in it is not an answer.
-    if fields.title.is_none() && fields.overview.is_none() && fields.premiered.is_none() {
+    if title.is_none() && description.overview.is_none() && description.release_date.is_none() {
         return None;
     }
-    Some((fields, unique))
+    Some((title, description, unique))
 }
 
 /// Drain a (small) .nfo through a lease. Capped: a file claiming to be
@@ -2009,7 +2010,7 @@ mod nfo_tests {
     /// A Kodi .nfo, and the half-filled ones people actually have.
     #[test]
     fn reads_what_a_human_wrote() {
-        let (f, id) = parse_nfo(
+        let (title, f, id) = parse_nfo(
             r#"<?xml version="1.0"?>
             <movie>
               <title>Solaris</title>
@@ -2022,11 +2023,14 @@ mod nfo_tests {
             </movie>"#,
         )
         .expect("a full nfo is an answer");
-        assert_eq!(f.title.as_deref(), Some("Solaris"));
+        assert_eq!(title.as_deref(), Some("Solaris"));
         assert_eq!(f.rating, Some(8.1));
         // A bare <year> still dates the item.
-        assert_eq!(f.premiered.as_deref(), Some("1972-01-01"));
-        assert_eq!(f.genres.as_deref(), Some(r#"["Science Fiction","Drama"]"#));
+        assert_eq!(f.release_date.as_deref(), Some("1972-01-01"));
+        assert_eq!(
+            f.genres.as_deref(),
+            Some(["Science Fiction".to_string(), "Drama".to_string()].as_slice())
+        );
         assert_eq!(
             id.as_deref(),
             Some("593"),
@@ -2034,11 +2038,11 @@ mod nfo_tests {
         );
 
         // <premiered> beats a <year>, and a file with only a title counts.
-        let (f, id) = parse_nfo(
+        let (_, f, id) = parse_nfo(
             "<tvshow><title>Andor</title><year>2021</year><premiered>2022-09-21</premiered></tvshow>",
         )
         .unwrap();
-        assert_eq!(f.premiered.as_deref(), Some("2022-09-21"));
+        assert_eq!(f.release_date.as_deref(), Some("2022-09-21"));
         assert_eq!(
             id, None,
             "no id in the file: the caller falls back to the path"
@@ -2048,8 +2052,15 @@ mod nfo_tests {
         assert!(parse_nfo("<movie><thumb>poster.jpg</thumb></movie>").is_none());
         assert!(parse_nfo("not xml at all").is_none());
         // A zero rating means unrated here too.
-        let (f, _) = parse_nfo("<movie><title>x</title><rating>0.0</rating></movie>").unwrap();
+        let (_, f, _) = parse_nfo("<movie><title>x</title><rating>0.0</rating></movie>").unwrap();
         assert_eq!(f.rating, None);
+        assert_eq!(f.genres, None);
+        let (title, description, _) = parse_nfo(
+            "<movie><title>Solaris</title><originaltitle>Solyaris</originaltitle></movie>",
+        )
+        .unwrap();
+        assert_eq!(title.as_deref(), Some("Solaris"));
+        assert_eq!(description.original_title.as_deref(), Some("Solyaris"));
     }
 }
 

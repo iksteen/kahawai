@@ -119,7 +119,7 @@ enum Group {
 struct Copy {
     id: String,
     entries: Vec<MediaEntry>,
-    metadata: ResolvedDescription,
+    children: Option<(String, Vec<ProviderChild>)>,
 }
 struct Snapshot {
     parent: LibraryItem,
@@ -163,7 +163,7 @@ impl Snapshot {
             copies.push(Copy {
                 id: id.clone(),
                 entries,
-                metadata: crate::metadata::resolve(c, id).await?,
+                children: crate::metadata::resolve_children(c, id).await?,
             });
         }
         for intervals in ranges.values_mut() {
@@ -227,10 +227,9 @@ impl Snapshot {
         }
         let (copy, entry) = representative.ok_or(crate::NotFound)?;
         let descriptions = copy
-            .metadata
-            .description
             .children
-            .as_deref()
+            .as_ref()
+            .map(|(_, children)| children.as_slice())
             .unwrap_or_default();
         let matches: Vec<_> = descriptions
             .iter()
@@ -238,16 +237,16 @@ impl Snapshot {
                 ChildPosition::Episode {
                     season: Some(s),
                     episode,
-                } => d.season == Some(*s) && d.episode == Some(*episode),
+                } => d.position.season == Some(*s) && d.position.episode == Some(*episode),
                 ChildPosition::Episode {
                     season: None,
                     episode,
                 } => {
-                    d.absolute == Some(*episode)
-                        || (d.season.is_none() && d.episode == Some(*episode))
+                    d.position.absolute == Some(*episode)
+                        || (d.position.season.is_none() && d.position.episode == Some(*episode))
                 }
                 ChildPosition::Track { disc, track } => {
-                    d.track == Some(*track) && (disc.is_none() || d.disc == *disc)
+                    d.position.track == Some(*track) && (disc.is_none() || d.position.disc == *disc)
                 }
                 ChildPosition::UnnumberedTrack { .. } => false,
             })
@@ -269,21 +268,20 @@ impl Snapshot {
             .filter(|t| !t.trim().is_empty())
             .unwrap_or(&fallback_title)
             .to_owned();
-        let mut description = Description::default();
-        if let Some(d) = matched {
-            description.overview = d.overview.clone();
-            description.rating = d.rating;
-            description.release_date = d.release_date.clone();
-            description.artwork = d.artwork.clone().map(|a| vec![a]);
-        }
+        let description = matched.map(|d| d.description.clone()).unwrap_or_default();
         let mut provenance = BTreeMap::from([("title".into(), "detected".into())]);
-        if let Some(source) = matched.and_then(|_| copy.metadata.provenance.get("children")) {
+        if let Some(source) = matched.and_then(|_| copy.children.as_ref().map(|(record, _)| record))
+        {
             for (field, supplied) in [
                 ("title", matched.is_some_and(|d| !d.title.trim().is_empty())),
                 ("overview", description.overview.is_some()),
                 ("rating", description.rating.is_some()),
                 ("release_date", description.release_date.is_some()),
                 ("artwork", description.artwork.is_some()),
+                ("original_title", description.original_title.is_some()),
+                ("original_language", description.original_language.is_some()),
+                ("genres", description.genres.is_some()),
+                ("cast", description.cast.is_some()),
             ] {
                 if supplied {
                     provenance.insert(field.into(), source.clone());

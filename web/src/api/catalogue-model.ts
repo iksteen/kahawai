@@ -1,3 +1,4 @@
+import type { Description } from './generated/model/description.ts'
 // View models used by the catalogue presentation adapter. Wire types remain generated.
 import type { ClientReplayGain } from './generated/model/clientReplayGain.ts'
 import type { CatalogueDetail } from './generated/model/catalogueDetail.ts'
@@ -19,7 +20,6 @@ export type ItemSummary = {
   parent_id: string | null
   parent_title: string | null
   played: boolean
-  premiered: string | null
   proj_episode: number | null
   proj_season: number | null
   replay_gain: ClientReplayGain | null
@@ -29,26 +29,6 @@ export type ItemSummary = {
   sources: number
   title: string
   year: number | null
-}
-
-export type ItemDescription = {
-  cast:
-    | {
-        character: string | null
-        name: string
-      }[]
-    | null
-  confidence: string
-  genres: string[] | null
-  original_language: string | null
-  overview: string | null
-  premiered: string | null
-  proj_episode: number | null
-  proj_season: number | null
-  provider: string | null
-  rating: number | null
-  tmdb_id: number | null
-  tvdb_id: number | null
 }
 
 export type ItemDetail = Omit<ItemSummary, 'sources'> &
@@ -61,9 +41,12 @@ export type ItemDetail = Omit<ItemSummary, 'sources'> &
     | 'unavailable'
     | 'subtitle_source'
     | 'segments'
+    | 'provider'
+    | 'tmdb_id'
+    | 'tvdb_id'
   > & {
     related?: { kind: string; title: string | null; item_id: string | null }[]
     show_title: string | null
-    metadata?: ItemDescription | null
+    metadata?: Description | null
   }
 export type BrowseParams = ItemsParams & { library?: string; in_progress?: boolean }

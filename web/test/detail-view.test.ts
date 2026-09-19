@@ -1241,7 +1241,7 @@ describe('the files, in detail', () => {
 describe('who the metadata came from', () => {
   test('is said, because for TMDB that is a term of use', async () => {
     vi.mocked(catalogueDetail).mockResolvedValue(
-      film({ metadata: { provider: 'tmdb', overview: null } }) as never,
+      film({ provider: 'tmdb', metadata: { overview: null } }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('not endorsed, certified')
@@ -1250,7 +1250,7 @@ describe('who the metadata came from', () => {
 
   test('and each provider is credited in its own words', async () => {
     vi.mocked(catalogueDetail).mockResolvedValue(
-      film({ metadata: { provider: 'tvdb', overview: null } }) as never,
+      film({ provider: 'tvdb', metadata: { overview: null } }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('TheTVDB')

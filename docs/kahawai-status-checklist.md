@@ -594,6 +594,15 @@ How something works and why it was built that way belong in
       match review
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
+- [x] Descriptive metadata shares mediadb's `Description` across enrichment, NFO
+      parsing, the typed catalogue API and generated UI types; no hub `Fields`
+      or handwritten UI description mirror remains. Dates use `release_date`,
+      credits use `role`, and descriptive arrays stay typed through this path;
+      the unused UI `premiered` summary field is removed.
+- [x] Provider child catalogues live alongside the provider record's description.
+      Each child separates provider identity and numbering from its `Description`.
+      Mediadb migration 5 preserves stored and cached answers; library child IDs,
+      source coverage and local/primary/supplement precedence are unchanged.
 - [x] HUB-28 Web UI is a pure client of the public API — including session
       recovery, which is driven by the owner-scoped 404 contract rather than by
       any client-side copy of the hub's idle timeout. Every 4xx/5xx is

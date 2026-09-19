@@ -1,3 +1,10 @@
+//! Provider descriptions and child catalogues are separate answers. Description
+//! resolution merges absent fields; child resolution selects one whole catalogue
+//! using the same local/primary/supplement order. Provider positions are evidence
+//! for attaching descriptions to physical entries, never a source of library IDs.
+//! `children_json` preserves missing versus explicitly empty answers. Migration 5
+//! moves existing records and cached enrichment answers without refetching providers
+//! or scheduling artwork work for a structural change.
 use crate::*;
 use anyhow::{Result, ensure};
 use sqlx::{Row, SqliteConnection};
@@ -121,15 +128,32 @@ pub(crate) async fn compatible(c: &mut SqliteConnection, record: &str, kind: &st
     );
     Ok(())
 }
-pub(crate) async fn resolve(c: &mut SqliteConnection, item: &str) -> Result<ResolvedDescription> {
-    let rows=sqlx::query("SELECT p.id,p.description_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
+// Local, assigned and supplemental evidence use one eligibility/order rule for
+// descriptions and child catalogues. Child lists are selected whole, never merged.
+async fn evidence(c: &mut SqliteConnection, item: &str) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query("SELECT p.id,p.description_json,p.children_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
         AND NOT EXISTS(SELECT 1 FROM metadata_assignments a WHERE a.item_id=l.item_id AND a.manual=1 AND a.record_id<>l.record_id)
         AND NOT EXISTS(SELECT 1 FROM metadata_rejections r WHERE r.item_id=l.item_id AND r.record_id=l.record_id)
-        UNION ALL SELECT p.id,p.description_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
-        UNION ALL SELECT p.id,p.description_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
+        UNION ALL SELECT p.id,p.description_json,p.children_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
+        UNION ALL SELECT p.id,p.description_json,p.children_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
         JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 ORDER BY position")
-        .bind(item).fetch_all(&mut *c).await?;
+        .bind(item).fetch_all(&mut *c).await?)
+}
+
+pub(crate) async fn resolve_children(
+    c: &mut SqliteConnection,
+    item: &str,
+) -> Result<Option<(String, Vec<ProviderChild>)>> {
+    for row in evidence(c, item).await? {
+        if let Some(json) = row.get::<Option<&str>, _>("children_json") {
+            return Ok(Some((row.get("id"), serde_json::from_str(json)?)));
+        }
+    }
+    Ok(None)
+}
+pub(crate) async fn resolve(c: &mut SqliteConnection, item: &str) -> Result<ResolvedDescription> {
+    let rows = evidence(c, item).await?;
     let mut result = ResolvedDescription {
         description: Description::default(),
         provenance: BTreeMap::new(),
@@ -164,8 +188,7 @@ fn fill(target: &mut ResolvedDescription, source: Description, record: &str) {
         rating,
         artwork,
         genres,
-        cast,
-        children
+        cast
     );
 }
 
@@ -175,17 +198,25 @@ impl Store {
             .bind(id)
             .fetch_one(self.db.read_pool())
             .await?;
-        Ok(ProviderRecord {
-            provider: row.get("provider"),
-            namespace: row.get("namespace"),
-            external_id: row.get("external_id"),
-            language: row.get("language"),
-            media_type: MediaType::parse(row.get("media_type"))?,
-            title: row.get("title"),
-            year: row.get("year"),
-            description: serde_json::from_str(row.get("description_json"))?,
-        })
+        record(&row)
     }
+}
+
+pub(crate) fn record(row: &sqlx::sqlite::SqliteRow) -> Result<ProviderRecord> {
+    Ok(ProviderRecord {
+        children: row
+            .get::<Option<&str>, _>("children_json")
+            .map(serde_json::from_str)
+            .transpose()?,
+        provider: row.get("provider"),
+        namespace: row.get("namespace"),
+        external_id: row.get("external_id"),
+        language: row.get("language"),
+        media_type: MediaType::parse(row.get("media_type"))?,
+        title: row.get("title"),
+        year: row.get("year"),
+        description: serde_json::from_str(row.get("description_json"))?,
+    })
 }
 
 pub(crate) async fn put_record(
@@ -204,9 +235,10 @@ pub(crate) async fn put_record(
         .as_ref()
         .is_some_and(|r| title_key(&r.2) != title_key(&record.title) || r.3 != record.year);
     let record_id = existing.map(|r| r.0).unwrap_or_else(id);
-    sqlx::query("INSERT INTO provider_records VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json")
+    sqlx::query("INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,year,description_json,children_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json,children_json=excluded.children_json")
             .bind(&record_id).bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language)
             .bind(record.media_type.as_str()).bind(&record.title).bind(record.year).bind(serde_json::to_string(&record.description)?)
+            .bind(record.children.as_ref().map(serde_json::to_string).transpose()?)
             .execute(&mut *c).await?;
     if identity_changed {
         let copies: Vec<String> =

@@ -6,8 +6,9 @@
 //! development databases have no such history and must be recreated explicitly.
 //!
 //! SQLx applies and records each migration transactionally, checks immutable
-//! checksums and rejects unknown applied versions. Only the serialized writer runs
-//! migrations; no Store escapes until they finish. A failed upgrade closes the
+//! checksums and rejects unknown applied versions. A startup connection runs
+//! migrations before the reader pool opens; no Store escapes until they finish.
+//! A failed upgrade closes the
 //! database and leaves earlier migrations intact, so a later open can retry.
 //! An initial creation failure leaves an uninitialized file, not a usable Store.
 //! Add numbered migrations; never edit an applied file or its history. Schema
@@ -37,15 +38,7 @@ impl Store {
             .in_memory(true)
             .shared_cache(true)
             .foreign_keys(true);
-        let db = Database::connect_with(options.clone(), options, 1).await?;
-        db.write("mediadb migrations", |c| {
-            Box::pin(async move {
-                MIGRATOR.run_direct(None, c, false).await?;
-                Ok(())
-            })
-        })
-        .await?;
-        Ok(Self { db })
+        initialized(options.clone(), options, 1, MIGRATOR).await
     }
 
     /// Create a new mediadb and run its migrations. Never overwrite an existing file.
@@ -90,22 +83,31 @@ async fn connect(path: &Path, migrator: Migrator) -> Result<Store> {
         .filename(path)
         .foreign_keys(true)
         .journal_mode(SqliteJournalMode::Wal);
-    let db = Database::connect_with(options.clone(), options.read_only(true), 3).await?;
-    let result = db
-        .write("mediadb migrations", move |connection| {
-            Box::pin(async move {
-                migrator
-                    .run_direct(None, connection, false)
-                    .await
-                    .context("running mediadb migrations")
-            })
+    initialized(options.clone(), options.read_only(true), 3, migrator).await
+}
+
+async fn initialized(
+    writer: SqliteConnectOptions,
+    reader: SqliteConnectOptions,
+    readers: u32,
+    migrator: Migrator,
+) -> Result<Store> {
+    // Readers must not prepare against the pre-migration schema: an ALTER can
+    // change SELECT *'s column count between preparation and execution. Keep the
+    // startup connection until the writer opens, also retaining in-memory data.
+    let mut startup = sqlx::SqliteConnection::connect_with(&writer).await?;
+    let result = async {
+        migrator
+            .run_direct(None, &mut startup, false)
+            .await
+            .context("running mediadb migrations")?;
+        Ok(Store {
+            db: Database::connect_with(writer, reader, readers).await?,
         })
-        .await;
-    if let Err(error) = result {
-        db.close().await;
-        return Err(error);
     }
-    Ok(Store { db })
+    .await;
+    startup.close().await?;
+    result
 }
 
 #[cfg(test)]
@@ -137,6 +139,102 @@ mod tests {
         )
         .await
         .unwrap()
+    }
+
+    #[tokio::test]
+    async fn provider_children_upgrade_preserves_records_and_cached_answers() {
+        use serde_json::json;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mediadb.db");
+        std::fs::File::create(&path).unwrap();
+        let old =
+            Migrator::with_migrations(MIGRATOR.iter().filter(|m| m.version < 5).cloned().collect());
+        let s = connect(&path, old).await.unwrap();
+        let children = json!([
+            {"provider_id":"ep-1", "title":"First", "season":1, "episode":2,
+             "absolute":14, "disc":null, "track":null, "overview":"Story",
+             "artwork":"https://example.test/still.jpg", "release_date":"2000-01-02", "rating":8.5},
+            {"title":"Track", "disc":2, "track":3}
+        ]);
+        let description = json!({"overview":"Show", "children":children});
+        let provider = json!({"provider":"fixture", "namespace":"show", "external_id":"42",
+            "language":"en", "media_type":"series", "title":"Show", "year":2000,
+            "description":description});
+        let mut empty_provider = provider.clone();
+        empty_provider["description"] = json!({"children":[]});
+        let mut tx = s.db.begin().await.unwrap();
+        sqlx::query("INSERT INTO provider_records VALUES('record','fixture','show','42','en','series','Show',2000,?)")
+            .bind(description.to_string()).execute(&mut *tx).await.unwrap();
+        // The cache also contains unrelated raw-provider payloads. Preserve them,
+        // and preserve explicit empty vs missing child catalogues in typed answers.
+        for (key, answer) in [
+            (
+                "full",
+                json!({"candidates":[{"record":provider,"strength":10,"complete":true}], "local":provider}),
+            ),
+            (
+                "empty",
+                json!({"candidates":[{"record":empty_provider, "strength":0}], "local":null}),
+            ),
+            ("raw", json!([{"title":"A raw episode", "episode":2}])),
+        ] {
+            sqlx::query("INSERT INTO enrichment_cache VALUES('fixture',?,?,123)")
+                .bind(key)
+                .bind(answer.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
+        tx.commit().await.unwrap();
+        s.close().await;
+        for _ in 0..2 {
+            let s = Store::open(&path).await.unwrap();
+            let record = s.provider_record("record").await.unwrap();
+            let child = &record.children.as_ref().unwrap()[0];
+            assert_eq!(child.provider_id.as_deref(), Some("ep-1"));
+            assert_eq!(child.position.season, Some(1));
+            assert_eq!(child.position.episode, Some(2));
+            assert_eq!(child.position.absolute, Some(14));
+            assert_eq!(
+                child.description.artwork.as_ref().unwrap(),
+                &["https://example.test/still.jpg"]
+            );
+            assert_eq!(child.description.overview.as_deref(), Some("Story"));
+            assert_eq!(
+                child.description.release_date.as_deref(),
+                Some("2000-01-02")
+            );
+            assert_eq!(child.description.rating, Some(8.5));
+            assert_eq!(record.children.as_ref().unwrap()[1].position.track, Some(3));
+            assert_eq!(record.description.overview.as_deref(), Some("Show"));
+            assert!(
+                serde_json::to_value(&record.description)
+                    .unwrap()
+                    .get("children")
+                    .is_none()
+            );
+            let cached: crate::EnrichmentAnswer =
+                serde_json::from_str(&s.cache_answer("fixture", "full").await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(cached.candidates[0].record.children, record.children);
+            assert_eq!(cached.local.unwrap().children, record.children);
+            assert_eq!(cached.candidates[0].strength, 10);
+            let cached: crate::EnrichmentAnswer =
+                serde_json::from_str(&s.cache_answer("fixture", "empty").await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(cached.candidates[0].record.children, Some(vec![]));
+            let raw: serde_json::Value =
+                serde_json::from_str(&s.cache_answer("fixture", "raw").await.unwrap().unwrap())
+                    .unwrap();
+            assert_eq!(raw, json!([{"title":"A raw episode", "episode":2}]));
+            let updated: i64 =
+                sqlx::query_scalar("SELECT updated_at FROM enrichment_cache WHERE question='full'")
+                    .fetch_one(s.db.read_pool())
+                    .await
+                    .unwrap();
+            assert_eq!(updated, 123);
+            s.close().await;
+        }
     }
 
     #[tokio::test]

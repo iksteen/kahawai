@@ -1622,6 +1622,7 @@ async fn movie_playback_case(kind: MediaType) {
     assert_eq!(feed["items"][0]["id"], item);
     let record = store
         .put_provider_record(&kahawai_mediadb::ProviderRecord {
+            children: None,
             provider: "fixture".into(),
             namespace: "movie".into(),
             external_id: "matrix".into(),
@@ -2014,6 +2015,7 @@ async fn catalogue_exposes_selected_and_linked_video_ids_in_the_correct_namespac
             .unwrap();
         let copy = store.collection_items(&collection).await.unwrap().remove(0);
         let record = |provider: &str, namespace: &str, id: &str| kahawai_mediadb::ProviderRecord {
+            children: None,
             provider: provider.into(),
             namespace: namespace.into(),
             external_id: id.into(),
@@ -2297,6 +2299,7 @@ async fn downloaded_subtitle_case(format: &str) {
     // Correcting metadata moves the copy, not its source-owned subtitle.
     let record = store
         .put_provider_record(&kahawai_mediadb::ProviderRecord {
+            children: None,
             provider: "fixture".into(),
             namespace: "movie".into(),
             external_id: "matrix".into(),
@@ -2698,6 +2701,7 @@ async fn matching_search_aggregates_anime_movie_results_and_provider_failures() 
     let answer = m::EnrichmentAnswer {
         candidates: vec![m::EnrichmentCandidate {
             record: m::ProviderRecord {
+                children: None,
                 provider: "tmdb".into(),
                 namespace: "movie".into(),
                 external_id: "13851".into(),

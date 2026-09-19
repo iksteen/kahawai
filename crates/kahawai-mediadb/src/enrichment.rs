@@ -125,18 +125,7 @@ impl std::fmt::Display for StaleEnrichment {
 }
 impl std::error::Error for StaleEnrichment {}
 
-fn record(row: &sqlx::sqlite::SqliteRow) -> Result<ProviderRecord> {
-    Ok(ProviderRecord {
-        provider: row.get("provider"),
-        namespace: row.get("namespace"),
-        external_id: row.get("external_id"),
-        language: row.get("language"),
-        media_type: MediaType::parse(row.get("media_type"))?,
-        title: row.get("title"),
-        year: row.get("year"),
-        description: serde_json::from_str(row.get("description_json"))?,
-    })
-}
+use crate::metadata::record;
 
 impl Store {
     pub async fn provider_order(&self, kind: MediaType) -> Result<Vec<String>> {
@@ -616,6 +605,7 @@ impl Store {
         let record = crate::metadata::put_record(
             &mut tx,
             &ProviderRecord {
+                children: None,
                 provider: "manual".into(),
                 namespace: kind.as_str().into(),
                 external_id: id(),
