@@ -1488,8 +1488,16 @@ async fn movie_playback_case(kind: MediaType) {
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
     let route = format!("/api/v1/catalogue/libraries/{library}/items/{item}");
+    let (status, facts) = f.request("GET", &route, Value::Null, Some(&f.token)).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(facts["negotiated"].is_null());
+    assert!(!facts["sources"].as_array().unwrap().is_empty());
+    let (status, refusal) = f.request("POST", &route, json!({}), Some(&f.token)).await;
+    assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED);
+    assert_eq!(refusal["code"], "method_not_allowed");
+
     let (status, preview) = f
-        .request("POST", &route, json!({"mode":"direct"}), Some(&f.token))
+        .request("QUERY", &route, json!({"mode":"direct"}), Some(&f.token))
         .await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     assert_eq!(preview["kind"], "movie", "{preview}");
@@ -1897,7 +1905,7 @@ async fn skip_segments_follow_the_selected_medium_and_multipart_timeline() {
         let body = json!({"library_id":library,"item_id":item,"media_entry_id":rendition.entry.id,"mode":"direct"});
         let (status, preview) = f
             .request(
-                "POST",
+                "QUERY",
                 &format!("/api/v1/catalogue/libraries/{library}/items/{item}"),
                 body.clone(),
                 Some(&f.token),
@@ -1954,7 +1962,7 @@ async fn skip_segments_follow_the_selected_medium_and_multipart_timeline() {
         .unwrap();
     let (status, preview) = f
         .request(
-            "POST",
+            "QUERY",
             &format!("/api/v1/catalogue/libraries/{library}/items/{item}"),
             json!({"media_entry_id":replaced.entry.id,"mode":"direct"}),
             Some(&f.token),
@@ -1981,7 +1989,7 @@ async fn skip_segments_follow_the_selected_medium_and_multipart_timeline() {
         store.apply_catalogue("host", &update).await.unwrap();
         let (status, preview) = f
             .request(
-                "POST",
+                "QUERY",
                 &format!("/api/v1/catalogue/libraries/{library}/items/{item}"),
                 json!({"media_entry_id":replaced.entry.id,"mode":"direct"}),
                 Some(&f.token),
@@ -2215,7 +2223,7 @@ async fn downloaded_subtitle_case(format: &str) {
     for (i, source) in sources.iter().enumerate() {
         let (status, preview) = f
             .request(
-                "POST",
+                "QUERY",
                 &route,
                 json!({"mode":"direct","media_entry_id":source["media_entry_id"]}),
                 Some(&f.token),
@@ -2499,7 +2507,7 @@ async fn library_rescan_uses_committed_membership_and_negotiated_deep_support() 
 }
 
 #[tokio::test]
-async fn segment_admin_reports_live_sources_and_wakes_each_eligible_host_once() {
+async fn segment_admin_reports_live_sources_without_a_manual_trigger() {
     let f = Fixture::new().await;
     let store = f.registry.catalogue();
     for host in ["host", "offline"] {
@@ -2531,14 +2539,14 @@ async fn segment_admin_reports_live_sources_and_wakes_each_eligible_host_once() 
     );
     assert_eq!(
         f.request("POST", path, json!({}), None).await.0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::METHOD_NOT_ALLOWED
     );
     let (code, status) = f.request("GET", path, json!({}), Some(&f.token)).await;
     assert_eq!(code, StatusCode::OK);
     assert_eq!(
         status["collections"].as_array().unwrap().len(),
-        4,
-        "movies excluded"
+        6,
+        "movies included for loudness"
     );
     assert!(
         status["collections"]
@@ -2576,33 +2584,14 @@ async fn segment_admin_reports_live_sources_and_wakes_each_eligible_host_once() 
         rows.iter()
             .any(|c| c["name"] == "anime" && c["pending_sources"] == 3 && c["enabled"].is_null())
     );
-    let (code, result) = f.request("POST", path, json!({}), Some(&f.token)).await;
-    assert_eq!(code, StatusCode::OK);
-    assert_eq!(result, json!({"asked":1,"unavailable":1}));
-    let p::hub_to_host::Msg::DiscoveryWake(wake) = receive(&mut rx).await else {
-        panic!("expected discovery wake")
-    };
-    assert_eq!(wake.kind, "segments");
+    assert_eq!(
+        f.request("POST", path, json!({}), Some(&f.token)).await.0,
+        StatusCode::METHOD_NOT_ALLOWED
+    );
     assert!(
         rx.try_recv().is_err(),
-        "one wake per host, not per collection"
+        "status reads never trigger discovery"
     );
-    for name in ["shows", "anime"] {
-        f.registry.report_discovery(
-            "host",
-            generation,
-            p::DiscoveryStatus {
-                collection_id: name.into(),
-                segments_enabled: Some(false),
-                ..Default::default()
-            },
-        );
-    }
-    assert_eq!(
-        f.request("POST", path, json!({}), Some(&f.token)).await.1,
-        json!({"asked":0,"unavailable":1})
-    );
-    assert!(rx.try_recv().is_err(), "disabled detector is not woken");
     let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
     f.registry
         .register_link("host", new_tx, kahawai_proto::PROTOCOL_MINOR, 0);

@@ -136,7 +136,7 @@ match args.command:
         if args.profile:
             with open(args.profile) as profile:
                 body["profile"] = json.load(profile)
-        answer = request("POST", f"{base}/{quote(args.library)}/items/{quote(args.item)}", body)
+        answer = request("QUERY", f"{base}/{quote(args.library)}/items/{quote(args.item)}", body)
     case "start":
         body = {"library_id": args.library, "item_id": args.item, "media_entry_id": args.entry, "mode": args.mode, "resume": args.position is None}
         if args.position is not None:

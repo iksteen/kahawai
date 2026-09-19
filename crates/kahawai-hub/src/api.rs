@@ -219,6 +219,13 @@ impl Modify for BearerSecurity {
 /// Build the exact OpenAPI document served by the hub.
 pub fn openapi_document() -> utoipa::openapi::OpenApi {
     let mut openapi = ApiDoc::openapi();
+    // utoipa models QUERY but its path macro still requires the POST arm.
+    let item = openapi
+        .paths
+        .paths
+        .get_mut("/api/v1/catalogue/libraries/{id}/items/{item_id}")
+        .expect("catalogue QUERY path is generated");
+    item.query = item.post.take();
     for item in openapi.paths.paths.values_mut() {
         for operation in [
             item.get.as_mut(),
@@ -4734,7 +4741,7 @@ mod tests {
             ("delete", "/api/v1/playback/sessions/{id}"),
             ("post", "/api/v1/playback/sessions/{id}/progress"),
             ("post", "/api/v1/playback/sessions/{id}/seek"),
-            ("post", "/api/v1/catalogue/libraries/{id}/items/{item_id}"),
+            ("query", "/api/v1/catalogue/libraries/{id}/items/{item_id}"),
             (
                 "get",
                 "/api/v1/catalogue/libraries/{library}/items/{item}/next",

@@ -470,7 +470,7 @@ describe('choosing a playback source', () => {
 
   beforeEach(() => {
     vi.mocked(catalogueDetail).mockImplementation(
-      async (_library, _id, body) => rendition(body?.source_id ?? 2) as never,
+      async (_library, id, body) => ({ ...rendition(body?.source_id ?? 2), id }) as never,
     )
   })
 

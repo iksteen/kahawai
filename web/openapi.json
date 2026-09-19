@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "049c76d3f99a3afbf70d8ea0770abb06a64d31b778a0165937a332493cd2057d",
+  "x-kahawai-source-sha256": "ac74f1af370cc9f2e18b8ad1a0ea37a340759564e16ed9b17b40d1d6d001a745",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -5777,7 +5777,7 @@
           }
         ]
       },
-      "post": {
+      "query": {
         "tags": [
           "Catalogue"
         ],

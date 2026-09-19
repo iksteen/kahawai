@@ -592,6 +592,9 @@ How something works and why it was built that way belong in
 - [x] HUB-26 Admin UI: enrollments, satellites, libraries (with per-library
       refresh + live per-collection scan progress), providers, users,
       match review
+- [x] Catalogue playback uses GET for source facts, then QUERY for negotiation
+      with source-specific capabilities and audio preferences. Item POST is rejected;
+      session creation remains POST. CLI and generated clients use the same contract.
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
 - [x] Descriptive metadata shares mediadb's `Description` across enrichment, NFO

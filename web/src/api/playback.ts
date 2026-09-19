@@ -62,14 +62,16 @@ export async function selectPlaybackSource(
   preview: ItemDetail,
   prefs: Preference[],
   mediaType: string,
-  previewProfile: CapabilityProfile,
+  previewProfile: CapabilityProfile | undefined,
   sourceId?: number,
+  mediaEntryId?: string | null,
 ) {
   let item = preview
   let profile = playbackProfile(item, prefs)
   let audio = sourceAudioTracks(item, prefs, mediaType)
   const same = (a: unknown, b: unknown) => JSON.stringify(a) === JSON.stringify(b)
   let needsQuery =
+    previewProfile === undefined ||
     !same(profile, previewProfile) ||
     (sourceId === undefined
       ? Object.values(audio).some((track) => track !== 0)
@@ -96,7 +98,9 @@ export async function selectPlaybackSource(
           : {
               source_id: sourceId,
               media_entry_id:
-                item.sources.find((s) => s.source_id === sourceId)?.media_entry_id ?? null,
+                mediaEntryId ??
+                item.sources.find((s) => s.source_id === sourceId)?.media_entry_id ??
+                null,
             }),
       },
       item.library_id,
@@ -111,9 +115,9 @@ export async function selectPlaybackSource(
   }
 }
 
-/// Detail previews and subtitle defaults need the same preference-aware
-/// source choice as Play. Capture the preview profile with its request so a
-/// later capability change cannot make an old negotiation look current.
+/// Fetch catalogue facts first, then negotiate once with the source-aware
+/// capabilities and audio preferences. Only a concurrent source change needs
+/// another negotiation.
 export async function queryPlaybackItem(
   id: string,
   prefs: Preference[],
@@ -122,18 +126,10 @@ export async function queryPlaybackItem(
   library?: string,
   mediaEntryId?: string | null,
 ): Promise<ItemDetail> {
-  const cap = prefs.find((pref) => pref.scope === '' && pref.key === 'bandwidth_kbps')?.value
-  const profile = buildProfile(cap ? Number(cap) : undefined)
-  const preview = await playbackItem(
-    id,
-    {
-      profile,
-      ...(sourceId === undefined ? {} : { source_id: sourceId }),
-      media_entry_id: mediaEntryId ?? null,
-    },
-    library,
-  )
-  return (await selectPlaybackSource(preview, prefs, mediaType, profile, sourceId)).item
+  if (!library) throw new Error('Playback requires a library.')
+  const preview = await catalogueDetail(library, id)
+  return (await selectPlaybackSource(preview, prefs, mediaType, undefined, sourceId, mediaEntryId))
+    .item
 }
 
 /// Start a session for an item, with everything the hub needs to negotiate.

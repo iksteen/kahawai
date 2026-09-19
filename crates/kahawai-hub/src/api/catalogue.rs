@@ -6,7 +6,7 @@ pub(super) mod playback;
 pub(super) mod subtitles;
 use crate::watch::{self, WatchState};
 use kahawai_mediadb as m;
-pub(super) use playback::{catalogue_playback, playback_routes};
+pub(super) use playback::playback_routes;
 
 #[derive(Serialize, ToSchema)]
 pub struct CatalogueLibrary {
@@ -148,7 +148,7 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
         )
         .route(
             "/api/v1/catalogue/libraries/{id}/items/{item_id}",
-            get(item).post(catalogue_playback),
+            get(item).fallback(playback::catalogue_method),
         )
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),

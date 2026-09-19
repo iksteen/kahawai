@@ -299,7 +299,7 @@ roots = {json.dumps([str(r) for r in roots])}
         fixture_db.execute("INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,year,description_json) VALUES('community-fixture','tmdb','movie','1234','en','movies',?,?, '{}')", (movie["title"], movie["year"]))
         fixture_db.execute("INSERT OR REPLACE INTO metadata_assignments(item_id,record_id,manual,strength) VALUES(?,'community-fixture',1,100)", (movie["representative_id"],))
     assert api("GET", f"{anime_path}/{movie['id']}")["tmdb_id"] == 1234
-    assert api("POST", f"{anime_path}/{movie['id']}", {"mode": "direct"})["negotiated"]["mode"] == "direct"
+    assert api("QUERY", f"{anime_path}/{movie['id']}", {"mode": "direct"})["negotiated"]["mode"] == "direct"
     child_checks = []
     for kind in ["series", "music"]:
         source = next(c for c in collections() if c["remote_id"] == kind)
@@ -360,7 +360,7 @@ roots = {json.dumps([str(r) for r in roots])}
     # Seed only this disposable fixture; no external provider quota is spent.
     # The provider boundary is covered by the injected-provider router test.
     subtitle_path = f"{items_path}/{item}"
-    preview = api("POST", subtitle_path, {"mode": "direct"})
+    preview = api("QUERY", subtitle_path, {"mode": "direct"})
     subtitle_source = preview["subtitle_source"]
     subtitle_owner = query("hub.db", "SELECT id FROM users WHERE is_admin=1")[0][0]
     payload = json.dumps({"cues": [{"start_ms": 0, "end_ms": 10000, "text": "Source-bound live subtitle"}], "ass": None})
@@ -377,7 +377,7 @@ roots = {json.dumps([str(r) for r in roots])}
     for path in watch_paths:
         assert api("GET", path)["played"] is True, path
         assert "play_count" not in api("GET", path)
-    preview = api("POST", subtitle_path, {"mode": "direct", "media_entry_id": subtitle_source["media_entry_id"]})
+    preview = api("QUERY", subtitle_path, {"mode": "direct", "media_entry_id": subtitle_source["media_entry_id"]})
     assert any(t["id"] == -downloaded_id for t in preview["negotiated"]["subtitles"]), preview
     playback = api("POST", "/api/v1/playback/sessions", {"library_id":library["id"], "item_id":item, "mode":"direct", "media_entry_id":subtitle_source["media_entry_id"]})
     subtitle_url = f"/api/v1/playback/sessions/{playback['session_id']}/subtitles/{-downloaded_id}.vtt"

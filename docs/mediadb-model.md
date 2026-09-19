@@ -464,8 +464,9 @@ its existing codec/capability negotiation, cost ordering, user limits and execut
 placement. Direct byte ranges, HLS remux/transcoding, seeking, track switches,
 recovery and the audio queue use the existing engine.
 
-`POST /api/v1/catalogue/libraries/{library}/items/{item}` takes the playback
-profile and returns detail with negotiation. `POST /api/v1/playback/sessions`
+`QUERY /api/v1/catalogue/libraries/{library}/items/{item}` takes the playback
+profile and returns detail with negotiation. The UI first GETs catalogue facts,
+then resolves source-specific capabilities and audio preferences before QUERY. `POST /api/v1/playback/sessions`
 requires `library_id` and a stable movie/episode/track `item_id`; optional
 `media_entry_id` pins a rendition. The old numeric source groups remain local to
 presentation, and the player translates selections to the stable rendition ID.

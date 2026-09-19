@@ -58,7 +58,7 @@ async fn query_and_a_real_session_agree_on_the_ass_rung() {
         .clone()
         .oneshot(
             Request::builder()
-                .method("POST")
+                .method("QUERY")
                 .uri(format!(
                     "/api/v1/catalogue/libraries/{}/items/{}",
                     h.library_id, h.item_id

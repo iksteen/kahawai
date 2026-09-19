@@ -593,7 +593,7 @@ test('rendered ASS overlays use the selected catalogue source and session URL', 
     await (await request.get(`/api/v1/catalogue/libraries/${library.id}/items`, { headers })).json()
   ).items[0]
   const path = `/api/v1/catalogue/libraries/${library.id}/items/${item.id}`
-  const preview = await (await request.post(path, { headers, data: {} })).json()
+  const preview = await (await request.fetch(path, { method: 'QUERY', headers, data: {} })).json()
   const source = preview.sources.find((s: { streams?: { subtitles: { format: string }[] } }) =>
     s.streams?.subtitles.some((t) => t.format === 'ass'),
   )
@@ -657,7 +657,11 @@ test('rendered ASS overlays use the selected catalogue source and session URL', 
       (s: { media_entry_id: string }) => s.media_entry_id !== source.media_entry_id,
     )
     const otherPreview = await (
-      await request.post(path, { headers, data: { media_entry_id: other.media_entry_id } })
+      await request.fetch(path, {
+        method: 'QUERY',
+        headers,
+        data: { media_entry_id: other.media_entry_id },
+      })
     ).json()
     expect(
       otherPreview.negotiated.subtitles.some((t: { origin: string }) => t.origin === 'raster'),

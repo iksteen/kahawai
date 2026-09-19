@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
-# Ask an item what THIS client would be served: POST /api/v1/catalogue/libraries/{library}/items/{id}
-# GET answers what the scan found; POST answers what
+# Ask an item what THIS client would be served: QUERY /api/v1/catalogue/libraries/{library}/items/{id}
+# GET answers what the scan found; QUERY answers what
 # negotiation would do about it, for the capabilities you declare here.
 #
 #   kahawai-query.sh -l library [-e entry] [-a host:port] [-c caps] [-m mode] [-j] <username> <password> <item-id>
@@ -119,7 +119,7 @@ PY
 )
 
 ITEM_PATH=$(python3 -c 'import sys,urllib.parse;print("/api/v1/catalogue/libraries/"+urllib.parse.quote(sys.argv[1],safe="")+"/items/"+urllib.parse.quote(sys.argv[2],safe=""))' "$LIBRARY" "$ITEM")
-RESP=$(curl -sf -X POST "http://$API$ITEM_PATH" \
+RESP=$(curl -sf -X QUERY "http://$API$ITEM_PATH" \
     -H "Authorization: Bearer $TOKEN" -H content-type:application/json \
     -d "$BODY") || { echo "playback query failed (check the library and item IDs)" >&2; exit 1; }
 

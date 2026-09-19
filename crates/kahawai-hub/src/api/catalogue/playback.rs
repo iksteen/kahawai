@@ -70,6 +70,36 @@ async fn start(
     start_session(state, claims, body).await
 }
 
+/// GET serves catalogue facts; QUERY negotiates with a client profile.
+/// Check the method before extracting a body so every other method gets 405.
+pub(super) async fn catalogue_method(
+    State(s): State<AppState>,
+    path: ApiPath<(String, String)>,
+    claims: axum::Extension<crate::auth::Claims>,
+    request: Request,
+) -> Result<Response, ApiError> {
+    if request.method().as_str() != "QUERY" {
+        return Ok((
+            StatusCode::METHOD_NOT_ALLOWED,
+            [
+                ("allow", "GET, HEAD, QUERY"),
+                ("accept-query", "application/json"),
+            ],
+            Json(ApiErrorBody::new(
+                ErrorCode::MethodNotAllowed,
+                "use GET or QUERY on an item",
+            )),
+        )
+            .into_response());
+    }
+    let body =
+        <ApiJson<ItemQuery> as axum::extract::FromRequest<AppState>>::from_request(request, &s)
+            .await?;
+    Ok(catalogue_playback(State(s), path, claims, body)
+        .await?
+        .into_response())
+}
+
 #[utoipa::path(post,path="/api/v1/catalogue/libraries/{id}/items/{item_id}",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path)),request_body=ItemQuery,responses((status=200,body=CatalogueDetail),(status=404,body=ApiErrorBody)))]
 pub(crate) async fn catalogue_playback(
     State(s): State<AppState>,

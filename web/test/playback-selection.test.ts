@@ -12,7 +12,8 @@ vi.mock('../src/api/capabilities.ts', () => ({ buildProfile: vi.fn() }))
 
 const api = await import('./api-fixture.ts')
 const { buildProfile } = await import('../src/api/capabilities.ts')
-const { selectPlaybackSource, startPlaybackSession } = await import('../src/api/playback.ts')
+const { queryPlaybackItem, selectPlaybackSource, startPlaybackSession } =
+  await import('../src/api/playback.ts')
 const profile = { containers: ['mp4'], video: [{ codec: 'h264' }] } as never
 const detail = (selected = 1, secondLanguage = 'jpn') =>
   ({
@@ -107,4 +108,16 @@ test('start pins the stable catalogue rendition and maps its response to the dis
     }),
   )
   expect(result.source_id).toBe(2)
+})
+
+test('detail first GETs source facts then QUERYs once with resolved capabilities and audio', async () => {
+  const facts = { ...detail(), negotiated: null }
+  vi.mocked(api.catalogueDetail).mockResolvedValueOnce(facts).mockResolvedValueOnce(detail())
+  await queryPlaybackItem('film', [], 'movies', undefined, 'films')
+  expect(api.catalogueDetail).toHaveBeenCalledTimes(2)
+  expect(api.catalogueDetail).toHaveBeenNthCalledWith(1, 'films', 'film')
+  expect(api.catalogueDetail).toHaveBeenNthCalledWith(2, 'films', 'film', {
+    profile,
+    source_audio_tracks: { 1: 0, 2: 0 },
+  })
 })
