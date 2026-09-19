@@ -229,6 +229,9 @@ try:
     shutil.copyfile(poster, roots[1] / poster.name)
     other = roots[1] / film.name
     shutil.copyfile(film, other)
+    # Prefer the copy we later delete in the newest-first loudness queue,
+    # exercising file removal while background analysis may be starting.
+    os.utime(other, (film.stat().st_atime, film.stat().st_mtime + 10))
     for root in roots:
         (root / "Dark.City.1998.en.srt").write_text("1\n00:00:00,000 --> 00:00:05,000\nCatalogue playback subtitle\n")
         (root / "Dark.City.1998.nfo").write_text("<movie><title>Dark City</title><year>1998</year><plot>Metadata from the remote mediahost.</plot></movie>")

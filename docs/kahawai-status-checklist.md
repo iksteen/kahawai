@@ -737,6 +737,9 @@ How something works and why it was built that way belong in
       A 60-second no-buffer watchdog advances past decoders that produce neither
       audio, EOS nor an error; active callbacks are exempt so intentional
       foreground/segment pauses remain unbounded.
+      Failed pipeline startup also tears down callbacks and releases scheduler
+      permits, so removing a file during loudness startup cannot block rescans.
+      A callback-lifetime regression and the live ingestion removal check cover it.
       One cross-collection queue chooses movie files before series/anime and
       newer source mtimes first within each category, re-evaluated after every
       file and after scheduler waits; an in-flight file pauses at decoder

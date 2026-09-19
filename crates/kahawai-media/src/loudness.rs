@@ -499,9 +499,11 @@ pub fn measure_file(
     decode.install(&pipeline, &source, &audio_sink.static_pad("sink").unwrap())?;
     let bus = pipeline.bus().context("loudness pipeline has no bus")?;
     recording.store(true, Ordering::Release);
-    pipeline.set_state(gst::State::Playing)?;
 
     let result = (|| -> Result<()> {
+        // Even a failed startup needs Null teardown: the appsink callback can
+        // otherwise retain the caller's scheduler permit indefinitely.
+        pipeline.set_state(gst::State::Playing)?;
         loop {
             let Some(message) = bus.timed_pop_filtered(
                 gst::ClockTime::from_seconds(10),
@@ -580,6 +582,27 @@ pub fn measure_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_pipeline_start_releases_callback_resources() {
+        let dir = tempfile::tempdir().unwrap();
+        let resource = Arc::new(());
+        let captured = resource.clone();
+        let result = measure_file(
+            &dir.path().join("removed.mkv"),
+            0,
+            AudioLayout::new(2, 3),
+            move || {
+                let _ = &captured;
+                Ok(())
+            },
+        );
+        let error = result.expect_err("starting a removed file must fail");
+        assert!(error.is::<gst::StateChangeError>(), "{error:#}");
+        // The mediahost callback owns a scheduler permit. Retaining it after
+        // failure prevents the rescan that removes this file from running.
+        assert_eq!(Arc::strong_count(&resource), 1);
+    }
 
     #[test]
     fn mono_and_standard_surround_positions_use_bs1770_weights() {
