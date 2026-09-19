@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -20,6 +19,7 @@ import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
 }))

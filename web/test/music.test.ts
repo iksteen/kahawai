@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -11,7 +10,9 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { defineComponent, h, nextTick, ref } from 'vue'
 import { afterEach, expect, test, vi } from 'vitest'
 
-vi.mock('../src/api/generated/kahawai.ts', () => ({}))
+vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
+}))
 
 const { artistAlbums, listArtists } = await import('./api-fixture.ts')
 const { useArtistAlbums, useArtists } = await import('../src/composables/music.ts')

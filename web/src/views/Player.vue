@@ -27,7 +27,7 @@ import type { Preference } from '../api/generated/model/preference.ts'
 import type { StartSessionResponse } from '../api/generated/model/startSessionResponse.ts'
 import { buildProfile } from '../api/capabilities.ts'
 import { endSession, getPrefs } from '../api/generated/kahawai.ts'
-import { listLibraries } from '../api/catalogue.ts'
+import { librariesQuery } from '../composables/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { isSourceOffline } from '../domain/recovery.ts'
@@ -243,13 +243,11 @@ async function start() {
     const at = asked ?? detail.resume_position_ms ?? 0
     prefs.value = preferences.prefs
     carried.value = null
-    const libraries =
-      cache.getQueryData<{ libraries: { id: string; media_type: string }[] }>(['libraries']) ??
-      (await listLibraries().catch((cause: unknown) => {
-        notify(`Could not load the library details: ${sentence(cause)}`)
-        return { libraries: [] }
-      }))
-    mediaType.value = libraries.libraries.find((l) => l.id === library.value)?.media_type ?? ''
+    const libraries = await cache.fetchQuery(librariesQuery).catch((cause: unknown) => {
+      notify(`Could not load the library details: ${sentence(cause)}`)
+      return []
+    })
+    mediaType.value = libraries.find((l) => l.id === library.value)?.media_type ?? ''
     const selected = await selectPlaybackSource(
       detail,
       prefs.value,

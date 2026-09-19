@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -22,12 +21,13 @@ import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
 }))
 vi.mock('../src/api/session.ts', () => ({ whoAmI: vi.fn(() => ({ username: 'x', admin: false })) }))
 
-const { listItems, listLibraries, upNext } = await import('./api-fixture.ts')
+const { listItems, libraries, upNext } = await import('./api-fixture.ts')
 const { whoAmI } = await import('../src/api/session.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Home = (await import('../src/views/Home.vue')).default
@@ -109,9 +109,9 @@ function shelvesThat(answers: Record<string, ItemSummary[] | 'fails'>, { pagesFa
 }
 
 beforeEach(() => {
-  vi.mocked(listLibraries).mockResolvedValue({
-    libraries: LIBS.map((library) => ({ ...library, collection_ids: [] })),
-  })
+  vi.mocked(libraries).mockResolvedValue(
+    LIBS.map((library) => ({ ...library, collection_ids: [] })),
+  )
   vi.mocked(upNext).mockResolvedValue(page([]))
   vi.mocked(whoAmI).mockReturnValue({ username: 'x', admin: false })
   clearNotices()
@@ -199,7 +199,7 @@ describe('a library that would not load', () => {
 
 describe('the libraries themselves', () => {
   test('failing is the whole screen, because there is no home screen without them', async () => {
-    vi.mocked(listLibraries).mockRejectedValue(new ApiError(503, 'restarting'))
+    vi.mocked(libraries).mockRejectedValue(new ApiError(503, 'restarting'))
     shelvesThat({})
     const { wrapper } = home()
     await flushPromises()
@@ -208,7 +208,7 @@ describe('the libraries themselves', () => {
   })
 
   test('and none of them is not a failure', async () => {
-    vi.mocked(listLibraries).mockResolvedValue({ libraries: [] })
+    vi.mocked(libraries).mockResolvedValue([])
     shelvesThat({})
     const { wrapper } = home()
     await flushPromises()
@@ -217,7 +217,7 @@ describe('the libraries themselves', () => {
   })
 
   test('which says something different to whoever runs the hub', async () => {
-    vi.mocked(listLibraries).mockResolvedValue({ libraries: [] })
+    vi.mocked(libraries).mockResolvedValue([])
     vi.mocked(whoAmI).mockReturnValue({ username: 'x', admin: true })
     shelvesThat({})
     const { wrapper } = home()

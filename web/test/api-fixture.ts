@@ -1,7 +1,6 @@
 // Shared imports for tests mocking the HTTP bindings and catalogue presentation separately.
 export * from '../src/api/generated/kahawai.ts'
 export {
-  listLibraries,
   listItems,
   listArtists,
   artistAlbums,

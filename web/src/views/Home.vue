@@ -14,7 +14,8 @@ import { emptyHomeText, type Shelf as ShelfData, shown } from '../domain/shelves
 import { metaLine, targetOf, watchedPct } from '../domain/label.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
-import { useContinueWatching, useLibraries, useShelves, useUpNext } from '../composables/home.ts'
+import { useLibraries } from '../composables/catalogue.ts'
+import { useContinueWatching, useShelves, useUpNext } from '../composables/home.ts'
 import { whoAmI } from '../api/session.ts'
 
 const router = useRouter()

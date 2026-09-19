@@ -233,7 +233,7 @@ describe('a session that ends while the app is open', () => {
     const boot = booted(queryClient)
     await boot.start()
     const seed = () => {
-      queryClient.setQueryData(['libraries'], { libraries: [{ id: 'theirs' }] })
+      queryClient.setQueryData(['libraries'], [{ id: 'theirs' }])
       queryClient.setQueryData(['prefs'], { prefs: [] })
     }
     const ended = vi.mocked(onTokensCleared).mock.calls[0]![0]!

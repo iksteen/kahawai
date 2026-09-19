@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -19,7 +18,9 @@ import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 import { CHUNK } from '../src/domain/virtual.ts'
 
-vi.mock('../src/api/generated/kahawai.ts', () => ({}))
+vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
+}))
 
 const { listItems } = await import('./api-fixture.ts')
 const { useLibraryItems } = await import('../src/composables/library.ts')

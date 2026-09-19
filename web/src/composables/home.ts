@@ -11,7 +11,7 @@ import { computed, type Ref, ref } from 'vue'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import type { ItemSummary } from '../api/catalogue-model.ts'
-import { listItems, listLibraries, upNext } from '../api/catalogue.ts'
+import { listItems, upNext } from '../api/catalogue.ts'
 import {
   appendPage,
   hasMore,
@@ -30,18 +30,6 @@ export const PER_SHELF = 20
 /// the screen.
 export const CONTINUING = 12
 export const UP_NEXT = 12
-
-/// The libraries you can see. `enabled` because the shell asks for these as
-/// soon as it exists, and before the session is restored that is a guaranteed
-/// 401 — two of them on the first-run setup screen, where no cookie can exist.
-export function useLibraries(enabled: Ref<boolean>) {
-  return useQuery({
-    queryKey: ['libraries'],
-    queryFn: () => listLibraries(),
-    select: (r) => r.libraries,
-    enabled,
-  })
-}
 
 /// Cross-library and in one request, because recency only means anything
 /// across the whole set: per-library calls would each be ordered correctly and

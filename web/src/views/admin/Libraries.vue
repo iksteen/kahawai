@@ -14,6 +14,7 @@ import {
   setCollections,
   refreshLibrary,
 } from '../../api/generated/kahawai.ts'
+import { librariesQuery } from '../../composables/catalogue.ts'
 import { notify } from '../../composables/notices.ts'
 
 const props = defineProps<{
@@ -26,7 +27,7 @@ const props = defineProps<{
   act: (what: () => Promise<unknown>) => Promise<boolean>
 }>()
 const client = useQueryClient()
-const queryKey = ['admin', 'libraries']
+const queryKey = librariesQuery.queryKey
 const MEDIA_TYPES = ['movies', 'series', 'anime', 'music']
 const name = ref('')
 const mediaType = ref('movies')
@@ -60,6 +61,12 @@ function label(id: string) {
 function valid(ids: string[], type: string) {
   return ids.every((id) => info(id)?.media_type === type)
 }
+async function retryReads() {
+  await Promise.all([
+    client.invalidateQueries({ queryKey }),
+    client.invalidateQueries({ queryKey: ['admin', 'collections'] }),
+  ])
+}
 async function commit(write: () => Promise<(rows: CatalogueLibrary[]) => CatalogueLibrary[]>) {
   if (blocked.value) return false
   busy.value = true
@@ -70,9 +77,7 @@ async function commit(write: () => Promise<(rows: CatalogueLibrary[]) => Catalog
       await client.cancelQueries({ queryKey })
       client.setQueryData<CatalogueLibrary[]>(queryKey, (rows) => update(rows ?? props.libraries))
       await Promise.all(
-        ['catalogue', 'libraries', 'shelf', 'item', 'children'].map((key) =>
-          client.invalidateQueries({ queryKey: [key] }),
-        ),
+        ['shelf', 'item', 'children'].map((key) => client.invalidateQueries({ queryKey: [key] })),
       )
     })
   } finally {
@@ -190,7 +195,7 @@ async function rescan(library: CatalogueLibrary, deep: boolean) {
       No libraries yet. Create one from the collections your mediahosts announce.
     </p>
     <p v-if="failed || collectionsFailed">
-      <Btn ghost small @click="client.invalidateQueries({ queryKey: ['admin'] })">Try again</Btn>
+      <Btn ghost small @click="retryReads">Try again</Btn>
     </p>
     <ul class="flex flex-col gap-3">
       <li

@@ -5,7 +5,6 @@ const detailForEnrichment = vi.hoisted(() =>
 // unavailable states. The real catalogue adapter is covered separately and live.
 
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -27,6 +26,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   enrichmentDetail: vi.fn(),
   enrichmentIdentities: vi.fn().mockResolvedValue([]),
   getEnrichmentArtworkUrl: (id: string) => `/api/v1/catalogue/collection-items/${id}/artwork`,
@@ -60,7 +60,7 @@ const {
   catalogueChildren,
   catalogueDetail,
   catalogueSetWatched,
-  listLibraries,
+  libraries,
   catalogueSubtitleDelete,
   catalogueSubtitleDownload,
   catalogueSubtitleSearch,
@@ -230,9 +230,9 @@ beforeEach(() => {
   vi.mocked(catalogueChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(catalogueSetWatched).mockResolvedValue({ updated: 1 } as never)
   vi.mocked(loadMask).mockReturnValue({})
-  vi.mocked(listLibraries).mockResolvedValue({
-    libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
-  } as never)
+  vi.mocked(libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies' },
+  ] as never)
   vi.mocked(getPrefs).mockResolvedValue({ prefs: [] } as never)
   vi.mocked(catalogueSubtitleSearch).mockResolvedValue({
     candidates: [],

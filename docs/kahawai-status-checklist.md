@@ -606,6 +606,12 @@ How something works and why it was built that way belong in
       Each child separates provider identity and numbering from its `Description`.
       Mediadb migration 5 preserves stored and cached answers; library child IDs,
       source coverage and local/primary/supplement precedence are unchanged.
+- [x] Library enumeration uses one TanStack query and result shape in the shell,
+      browsing, detail, player and admin views. Library writes and hints update the
+      shared cache; playback-source queries include preferences, media type and
+      rendition identity in their keys. Match corrections invalidate home feeds
+      and search results as well as item views. Navigation reuses the library list;
+      mutations, network reconnects and admin polling refresh it.
 - [x] HUB-28 Web UI is a pure client of the public API — including session
       recovery, which is driven by the owner-scoped 404 contract rather than by
       any client-side copy of the hub's idle timeout. Every 4xx/5xx is

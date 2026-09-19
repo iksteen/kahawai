@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -30,6 +29,7 @@ import { CHUNK, GAP } from '../src/domain/virtual.ts'
 import { defineComponent, h } from 'vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   enrichmentCorrect: vi.fn(),
   item: vi.fn(),
   enrichmentDetail: vi.fn(),
@@ -56,7 +56,7 @@ const {
   enrichmentSearch,
   listArtists,
   listItems,
-  listLibraries,
+  libraries,
 } = await import('./api-fixture.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
@@ -182,12 +182,10 @@ function laidOut({ cols = 10, cellH = 186, viewport = 3000 } = {}) {
 beforeEach(() => {
   vi.mocked(enrichmentIdentities).mockResolvedValue([])
   hub(250)
-  vi.mocked(listLibraries).mockResolvedValue({
-    libraries: [
-      { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
-      { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
-    ],
-  })
+  vi.mocked(libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+    { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
+  ])
   vi.mocked(listArtists).mockResolvedValue({
     artists: [
       { key: 'bjork', name: 'Björk', album_count: 12 },
@@ -297,7 +295,7 @@ describe('when something will not load', () => {
 
   test('the library details failing is a notice, not the screen', async () => {
     // This request failing alone leaves a perfectly good grid underneath it.
-    vi.mocked(listLibraries).mockRejectedValue(new ApiError(500, 'nope'))
+    vi.mocked(libraries).mockRejectedValue(new ApiError(500, 'nope'))
     const { wrapper } = await grid()
     expect(wrapper.text()).toContain('i0')
     expect(notice.value).toContain('library details')

@@ -31,11 +31,11 @@ import type { UsersResponse } from '../api/generated/model/usersResponse.ts'
 import {
   collections,
   adminEnrollments,
-  libraries,
   adminSatellites,
   adminSessions,
   adminUsers,
 } from '../api/generated/kahawai.ts'
+import { librariesQuery } from './catalogue.ts'
 import { andList, enrolled } from '../domain/admin.ts'
 import { sentence } from '../domain/refusal.ts'
 
@@ -57,7 +57,7 @@ export function useAdmin(showSessions: Ref<boolean>) {
       { queryKey: ['admin', 'enrollments'], queryFn: () => adminEnrollments() },
       { queryKey: ['admin', 'satellites'], queryFn: () => adminSatellites() },
       { queryKey: ['admin', 'sessions'], queryFn: () => adminSessions(), enabled: showSessions },
-      { queryKey: ['admin', 'libraries'], queryFn: () => libraries() },
+      librariesQuery,
       { queryKey: ['admin', 'collections'], queryFn: () => collections() },
       { queryKey: ['admin', 'users'], queryFn: () => adminUsers() },
     ].map((q) => ({ ...q, refetchInterval: POLL_MS })),
@@ -97,7 +97,16 @@ export function useAdmin(showSessions: Ref<boolean>) {
   /// about the session list, and making it wait for five other requests is
   /// what put a six-request round trip in front of clearing a form.
   async function reload(section?: 'users' | 'satellites' | 'libraries' | 'sessions') {
-    await client.invalidateQueries({ queryKey: section ? ['admin', section] : ['admin'] })
+    if (section === 'libraries') {
+      await client.invalidateQueries({ queryKey: librariesQuery.queryKey })
+    } else {
+      await Promise.all([
+        client.invalidateQueries({ queryKey: section ? ['admin', section] : ['admin'] }),
+        ...(!section || section === 'users'
+          ? [client.invalidateQueries({ queryKey: librariesQuery.queryKey })]
+          : []),
+      ])
+    }
   }
 
   /// Every mutation goes through here, so that a success clears the last

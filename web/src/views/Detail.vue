@@ -44,10 +44,9 @@ import {
 } from '../domain/label.ts'
 import { chapterTitle } from '../domain/chapters.ts'
 import { adminItemLog } from '../api/generated/kahawai.ts'
-import { listLibraries } from '../api/catalogue.ts'
+import { useLibraries } from '../composables/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { loadMask } from '../api/capabilities.ts'
-import { queryPlaybackItem } from '../api/playback.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
 import { sentence } from '../domain/refusal.ts'
 import { saveAs } from '../api/download.ts'
@@ -55,7 +54,7 @@ import { itemName } from '../domain/titles.ts'
 import { seasonSegment } from '../domain/routes.ts'
 import { useScreenName } from '../composables/title.ts'
 import { whoAmI } from '../api/session.ts'
-import { useChildren, useItem, useWatched } from '../composables/item.ts'
+import { playbackItemQuery, useChildren, useItem, useWatched } from '../composables/item.ts'
 import { usePrefs } from '../composables/prefs.ts'
 import { useQueue } from '../composables/queue.ts'
 
@@ -80,11 +79,7 @@ async function matched(ids: string[]) {
 // These inputs choose both the automatic playback source and the default
 // subtitle target. Do not expose a provisional source before they arrive.
 const prefs = usePrefs()
-const libraries = useQuery({
-  queryKey: ['libraries'],
-  queryFn: () => listLibraries(),
-  select: (answer) => answer.libraries,
-})
+const libraries = useLibraries()
 const mediaType = computed(
   () => libraries.data.value?.find((l) => l.id === library.value)?.media_type ?? '',
 )
@@ -102,24 +97,19 @@ watch(
   },
   { flush: 'sync' },
 )
-const sourceQuery = useQuery({
-  queryKey: computed(() => [
-    'item',
-    id.value,
-    library.value,
-    { source: sourceOverride.value, prefs: playbackPrefs.value, mediaType: mediaType.value },
-  ]),
-  enabled: computed(() => sourceOverride.value !== undefined && playbackReady.value),
-  queryFn: () =>
-    queryPlaybackItem(
+const sourceQuery = useQuery(
+  computed(() => ({
+    ...playbackItemQuery(
       id.value,
+      library.value,
       playbackPrefs.value,
       mediaType.value,
       sourceOverride.value,
-      library.value,
       query.data.value?.sources.find((s) => s.source_id === sourceOverride.value)?.media_entry_id,
     ),
-})
+    enabled: sourceOverride.value !== undefined && playbackReady.value,
+  })),
+)
 // Keep the item and source choices on screen if checking an override fails.
 const item = computed(() =>
   sourceOverride.value === undefined
@@ -229,18 +219,19 @@ const subtitleNeedsQuery = computed(
     subtitleSourceOverride.value !== undefined &&
     subtitleSource.value !== item.value?.negotiated?.source?.source_id,
 )
-const subtitleQuery = useQuery({
-  queryKey: computed(() => ['item', id.value, library.value, { source: subtitleSource.value }]),
-  enabled: subtitleNeedsQuery,
-  queryFn: () =>
-    queryPlaybackItem(
+const subtitleQuery = useQuery(
+  computed(() => ({
+    ...playbackItemQuery(
       id.value,
+      library.value,
       playbackPrefs.value,
       mediaType.value,
       subtitleSource.value,
-      library.value,
+      query.data.value?.sources.find((s) => s.source_id === subtitleSource.value)?.media_entry_id,
     ),
-})
+    enabled: subtitleNeedsQuery.value && playbackReady.value,
+  })),
+)
 const subtitleDetail = computed(() =>
   subtitleNeedsQuery.value ? subtitleQuery.data.value : item.value,
 )

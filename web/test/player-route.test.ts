@@ -14,6 +14,7 @@ import { ApiError } from '../src/api/errors.ts'
 import { createQueryClient } from '../src/api/query.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   putPref: vi.fn(),
   getPrefs: vi.fn(),
   startSession: vi.fn(),
@@ -26,7 +27,6 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   getSessionFileUrl: (id: string, file: string) => `/session/${id}/${file}`,
 }))
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -134,9 +134,9 @@ beforeEach(() => {
   vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
   vi.mocked(api.catalogueChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(api.getPrefs).mockResolvedValue({ prefs: [] } as never)
-  vi.mocked(api.listLibraries).mockResolvedValue({
-    libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
-  } as never)
+  vi.mocked(api.libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies' },
+  ] as never)
   vi.mocked(api.startSession).mockResolvedValue(session() as never)
   vi.mocked(api.endSession).mockResolvedValue(undefined as never)
   vi.mocked(api.postProgress).mockResolvedValue({} as never)
@@ -421,9 +421,11 @@ describe('opening the player', () => {
   })
 
   test('and the library details failing costs only the media type', async () => {
-    vi.mocked(api.listLibraries).mockRejectedValue(new ApiError(500, 'nope'))
+    vi.mocked(api.libraries).mockRejectedValue(new ApiError(500, 'nope'))
     await open()
-    expect(notice.value).toContain('Could not load the library details')
+    await vi.waitFor(() => expect(notice.value).toContain('Could not load the library details'), {
+      timeout: 5000,
+    })
     expect(api.startSession).toHaveBeenCalled()
   })
 })

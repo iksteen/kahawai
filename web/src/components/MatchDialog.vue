@@ -139,7 +139,9 @@ async function apply(action: string, record_id?: string, library_item_id?: strin
     const answer = await enrichmentDetail(input.item_id)
     await client.invalidateQueries({
       predicate: (q) =>
-        ['catalogue', 'item', 'children', 'shelf', 'libraries'].includes(String(q.queryKey[0])),
+        ['item', 'children', 'shelf', 'search', 'continuing', 'up-next'].includes(
+          String(q.queryKey[0]),
+        ),
       refetchType: 'none',
     })
     if (disposed) return

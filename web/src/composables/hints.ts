@@ -12,6 +12,7 @@
 import { onScopeDispose } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 
+import { librariesQuery } from './catalogue.ts'
 import { getEventsUrl } from '../api/generated/kahawai.ts'
 
 /// Hints arrive in BURSTS — the hub emits one every five hundred files during
@@ -53,7 +54,10 @@ export function useHints(sections: {
     if (!stale.length) return
     clearTimeout(debounce)
     debounce = setTimeout(() => {
-      for (const section of stale) void client.invalidateQueries({ queryKey: ['admin', section] })
+      for (const section of stale)
+        void client.invalidateQueries({
+          queryKey: section === 'libraries' ? librariesQuery.queryKey : ['admin', section],
+        })
     }, DEBOUNCE_MS)
   }
 

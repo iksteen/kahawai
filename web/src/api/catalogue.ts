@@ -1,7 +1,6 @@
 /// Translate catalogue descriptions into the existing presentation models.
 /// User state comes from the hub alongside the descriptions; playback is separate.
 import {
-  libraries,
   items,
   item,
   cataloguePlayback,
@@ -18,10 +17,6 @@ import type { CatalogueItem } from './generated/model/catalogueItem.ts'
 import type { ItemSummary } from './catalogue-model.ts'
 import type { ItemDetail } from './catalogue-model.ts'
 import type { BrowseParams } from './catalogue-model.ts'
-
-export async function listLibraries() {
-  return { libraries: await libraries() }
-}
 
 export function catalogueRow(entry: CatalogueItem, library: string): ItemSummary {
   return {

@@ -1,5 +1,4 @@
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   catalogueDetail: vi.fn(),
   catalogueChildren: vi.fn(),
 }))
@@ -19,6 +18,7 @@ import { ApiError } from '../src/api/errors.ts'
 import { IDLE_LIMIT_MS, PING_MS } from '../src/domain/keepalive.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   catalogueNext: vi.fn(),
   sessionFonts: vi.fn(async () => ({ fonts: [] })),
   getSessionFontUrl: vi.fn(),
@@ -213,9 +213,9 @@ beforeEach(() => {
   vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
   vi.mocked(api.catalogueChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(api.getPrefs).mockResolvedValue({ prefs: [] } as never)
-  vi.mocked(api.listLibraries).mockResolvedValue({
-    libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
-  } as never)
+  vi.mocked(api.libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies' },
+  ] as never)
   vi.mocked(api.startSession).mockResolvedValue(session('s2') as never)
   vi.mocked(api.endSession).mockResolvedValue(undefined as never)
   vi.mocked(api.postProgress).mockResolvedValue({} as never)

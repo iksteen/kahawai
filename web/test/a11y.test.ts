@@ -2,7 +2,6 @@
 // unavailable states. The real catalogue adapter is covered separately and live.
 
 vi.mock('../src/api/catalogue.ts', () => ({
-  listLibraries: vi.fn(),
   listItems: vi.fn(),
   listArtists: vi.fn(),
   artistAlbums: vi.fn(),
@@ -27,6 +26,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { defineComponent, h, nextTick, ref } from 'vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
+  libraries: vi.fn(),
   catalogueSetWatched: vi.fn(),
   getPrefs: vi.fn(async () => ({ prefs: [] })),
   putPref: vi.fn(),
@@ -193,9 +193,9 @@ beforeEach(() => {
     total: 0,
   } as never)
   vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
-  vi.mocked(api.listLibraries).mockResolvedValue({
-    libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
-  } as never)
+  vi.mocked(api.libraries).mockResolvedValue([
+    { id: 'films', name: 'Films', media_type: 'movies' },
+  ] as never)
 })
 afterEach(() => {
   for (const wrapper of live.reverse()) wrapper.unmount()
@@ -333,7 +333,7 @@ describe('and a screen that could not load says so', () => {
     // underneath it, so the screen is the library either way — but it is a
     // library whose real name is never arriving, and the screen still has to
     // answer "where am I".
-    vi.mocked(api.listLibraries).mockRejectedValue(new Error('nope'))
+    vi.mocked(api.libraries).mockRejectedValue(new Error('nope'))
     forgetScreenName()
     expect(screenShowing.value).toBe(null)
     await screen(Library, '/library/films')

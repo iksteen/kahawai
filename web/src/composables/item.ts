@@ -16,7 +16,7 @@
 /// false: the item had loaded, and it was the play that failed.
 
 import { computed, type Ref, ref } from 'vue'
-import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query'
+import { queryOptions, useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import { catalogueChildren } from '../api/catalogue.ts'
 import type { ItemDetail } from '../api/catalogue-model.ts'
@@ -32,6 +32,21 @@ import { sentence } from '../domain/refusal.ts'
 /// and the profile is a body. The verdicts it comes back with are the hub's
 /// own — the point of asking the item what it would serve is that the answer
 /// comes from the code that will serve it.
+export function playbackItemQuery(
+  id: string,
+  library: string | undefined,
+  prefs: Preference[],
+  mediaType: string,
+  source?: number,
+  mediaEntryId?: string | null,
+) {
+  return queryOptions({
+    queryKey: ['item', id, library, { prefs, mediaType, source, mediaEntryId }],
+    queryFn: (): Promise<ItemDetail> =>
+      queryPlaybackItem(id, prefs, mediaType, source, library, mediaEntryId),
+  })
+}
+
 export function useItem(
   id: Ref<string>,
   playback?: {
@@ -41,28 +56,18 @@ export function useItem(
   },
   library?: Ref<string>,
 ) {
-  return useQuery({
-    queryKey: computed(() => [
-      'item',
-      id.value,
-      ...(library ? [library.value] : []),
-      ...(playback ? [{ prefs: playback.prefs.value, mediaType: playback.mediaType.value }] : []),
-    ]),
-    // Nothing is asked for an id nobody has chosen — the season page's open
-    // panel has none until a still is picked, and asking anyway sent a QUERY
-    // for the empty id on every visit and after every mark.
-    enabled: computed(() => id.value !== '' && (playback?.ready.value ?? true)),
-    queryFn: (): Promise<ItemDetail> =>
-      playback
-        ? queryPlaybackItem(
-            id.value,
-            playback.prefs.value,
-            playback.mediaType.value,
-            undefined,
-            library?.value,
-          )
-        : queryPlaybackItem(id.value, [], '', undefined, library?.value),
-  })
+  return useQuery(
+    computed(() => ({
+      ...playbackItemQuery(
+        id.value,
+        library?.value,
+        playback?.prefs.value ?? [],
+        playback?.mediaType.value ?? '',
+      ),
+      // An unopened episode panel has no item to ask for.
+      enabled: id.value !== '' && (playback?.ready.value ?? true),
+    })),
+  )
 }
 
 /// A show's episodes or an album's tracks.

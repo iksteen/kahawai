@@ -8,7 +8,6 @@
 /// below it changes.
 import { computed, nextTick, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
-import { useQuery } from '@tanstack/vue-query'
 
 import Btn from '../components/Btn.vue'
 import Card from '../components/Card.vue'
@@ -28,7 +27,7 @@ import {
   visibleRows,
 } from '../domain/virtual.ts'
 import type { ItemSummary } from '../api/catalogue-model.ts'
-import { listLibraries } from '../api/catalogue.ts'
+import { useLibraries } from '../composables/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'
@@ -49,11 +48,7 @@ const artistSort = ref('name')
 
 /// Resolve the media type before choosing the browse shape. Music starts at
 /// artists; every other library retains the virtual item grid.
-const details = useQuery({
-  queryKey: ['libraries'],
-  queryFn: () => listLibraries(),
-  select: (r) => r.libraries,
-})
+const details = useLibraries()
 watch(
   () => details.isError.value,
   (failed) =>

@@ -95,7 +95,7 @@ describe('listening for hints', () => {
     })
     source.send('scan')
     vi.advanceTimersByTime(DEBOUNCE_MS)
-    expect(asked).toEqual(['admin/libraries', 'admin/collections'])
+    expect(asked).toEqual(['libraries', 'admin/collections'])
   })
 
   test('but anything else does', () => {
