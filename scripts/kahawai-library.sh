@@ -25,7 +25,7 @@ case "${1:-test}" in
     test)
         [[ $# == 0 ]] || shift
         cargo test --manifest-path "$HERE/../Cargo.toml" -p kahawai-mediadb "$@"
-        KAHAWAI_SKIP_WEB_BUILD=1 cargo test --manifest-path "$HERE/../Cargo.toml" -p kahawai-hub --test mediadb_ingestion --test admin_api --test segment_scans "$@"
+        KAHAWAI_SKIP_WEB_BUILD=1 cargo test --manifest-path "$HERE/../Cargo.toml" -p kahawai-hub --test mediadb_ingestion --test retired_catalogue --test catalogue_watch "$@"
         ;;
     -h|--help) sed -n '2,/^set /{ /^#/s/^# \{0,1\}//p; }' "$0" ;;
     *) echo 'usage: kahawai-library.sh test|audit DATA_DIRECTORY|copies LIBRARY ITEM|match COPY JSON_FILE' >&2; exit 2 ;;

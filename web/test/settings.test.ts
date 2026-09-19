@@ -21,7 +21,7 @@ const {
   getPrefs,
   putPref,
   setAccountOpensubtitles,
-} = await import('../src/api/generated/kahawai.ts')
+} = await import('./api-fixture.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Settings = (await import('../src/views/Settings.vue')).default
 

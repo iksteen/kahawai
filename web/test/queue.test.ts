@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import {
   advance,
   appendAlbum,
@@ -18,7 +18,7 @@ import {
 } from '../src/domain/queue.ts'
 
 const track = (id: string, gain?: Record<string, number | null>) =>
-  ({ id, title: id, replay_gain: gain ?? null }) as ItemRowI64
+  ({ id, title: id, replay_gain: gain ?? null }) as ItemSummary
 
 const three = [track('a'), track('b'), track('c')]
 

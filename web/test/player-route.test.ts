@@ -15,10 +15,7 @@ import { createQueryClient } from '../src/api/query.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   putPref: vi.fn(),
-  itemQuery: vi.fn(),
-  itemChildren: vi.fn(),
   getPrefs: vi.fn(),
-  listLibraries: vi.fn(),
   startSession: vi.fn(),
   endSession: vi.fn(),
   postProgress: vi.fn(),
@@ -26,20 +23,17 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminSessionLog: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/art/${id}`,
-  getItemFontUrl: (id: string, n: number) => `/font/${id}/${n}`,
-  getItemSubtitleFileUrl: (id: string, file: string) => `/subs/${id}/${file}`,
   getSessionFileUrl: (id: string, file: string) => `/session/${id}/${file}`,
-  itemFonts: vi.fn(async () => ({ fonts: [] })),
 }))
-vi.mock('../src/api/catalogue.ts', async () => {
-  const api = await import('../src/api/generated/kahawai.ts')
-  return {
-    listLibraries: api.listLibraries,
-    catalogueDetail: (_library: string, id: string, query: Parameters<typeof api.itemQuery>[1]) =>
-      api.itemQuery(id, query),
-  }
-})
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 vi.mock('../src/api/session.ts', () => ({
   whoAmI: () => ({ username: 'me', admin: false }),
   accessToken: () => 'token',
@@ -57,7 +51,7 @@ vi.mock('../src/api/capabilities.ts', () => ({
   }),
 }))
 
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 const Player = (await import('../src/views/Player.vue')).default
 const Picture = (await import('../src/components/Picture.vue')).default
@@ -65,6 +59,7 @@ const Picture = (await import('../src/components/Picture.vue')).default
 const film = (over: Record<string, unknown> = {}) => {
   const item = {
     id: 'heat',
+    library_id: 'films',
     kind: 'movie',
     title: 'Heat',
     parent_id: null,
@@ -136,8 +131,8 @@ beforeEach(() => {
     'fetch',
     vi.fn(async () => new Response('', { status: 404 })),
   )
-  vi.mocked(api.itemQuery).mockResolvedValue(film() as never)
-  vi.mocked(api.itemChildren).mockResolvedValue({ children: [] } as never)
+  vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
+  vi.mocked(api.catalogueChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(api.getPrefs).mockResolvedValue({ prefs: [] } as never)
   vi.mocked(api.listLibraries).mockResolvedValue({
     libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
@@ -183,7 +178,7 @@ describe('opening the player', () => {
       vi.mocked(api.getPrefs).mockResolvedValue({
         prefs: [{ scope: '', key: 'audio.movies', value: 'jpn' }],
       } as never)
-      vi.mocked(api.itemQuery).mockImplementation(async (_id, body) => {
+      vi.mocked(api.catalogueDetail).mockImplementation(async (_library, _id, body) => {
         // Simulate the hub judging each candidate's announced AAC/DTS stream.
         // A preview sees index0; only the final map can choose Japanese on B.
         const chosen =
@@ -202,7 +197,8 @@ describe('opening the player', () => {
       const { wrapper } = await open(`/library/films/item/heat/play${override ? '?source=1' : ''}`)
       const chosen = override ? 1 : 2
       const index = override || !swapped ? 1 : 0
-      expect(api.itemQuery).toHaveBeenLastCalledWith(
+      expect(api.catalogueDetail).toHaveBeenLastCalledWith(
+        expect.any(String),
         'heat',
         expect.objectContaining({
           source_audio_tracks: { 1: 1, 2: swapped ? 0 : 1 },
@@ -235,7 +231,7 @@ describe('opening the player', () => {
           { scope: 'heat', key: 'audio', value: '#1' },
         ],
       } as never)
-      vi.mocked(api.itemQuery).mockResolvedValue(
+      vi.mocked(api.catalogueDetail).mockResolvedValue(
         film({
           negotiated: { source: { source_id: 1 } },
           sources: [
@@ -263,7 +259,7 @@ describe('opening the player', () => {
   )
 
   test('adopts a first-identification alias and retains its chapter request', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({ id: 'canonical', title: 'Canonical' }) as never,
     )
     const { router, wrapper } = await open('/library/films/item/heat/play?start=470512&source=1')
@@ -286,14 +282,14 @@ describe('opening the player', () => {
     // `/play` is an ADDRESS, not an instruction to the item page: a deep link, a
     // reload and a forward all have to land where pressing Play does.
     await open()
-    expect(api.itemQuery).toHaveBeenCalledWith('heat', expect.anything())
+    expect(api.catalogueDetail).toHaveBeenCalledWith(expect.any(String), 'heat', expect.anything())
     expect(api.startSession).toHaveBeenCalledWith(
       expect.objectContaining({ item_id: 'heat', start_ms: 0 }),
     )
   })
 
   test('and resumes where the film was left', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     await open()
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 90_000 }))
   })
@@ -301,7 +297,7 @@ describe('opening the player', () => {
   test('unless the button that was pressed said otherwise', async () => {
     // A bare URL always resumes, which is the safe default; the query is the
     // hint from "from start".
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     await open('/library/films/item/heat/play?start=0')
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 0 }))
   })
@@ -313,11 +309,15 @@ describe('opening the player', () => {
   ])(
     'uses the chosen source and preserves item/chapter positioning (%s)',
     async (position, resume) => {
-      vi.mocked(api.itemQuery).mockResolvedValue(
+      vi.mocked(api.catalogueDetail).mockResolvedValue(
         film({ negotiated: { source: { source_id: 2 } } }) as never,
       )
       const { router } = await open(`/library/films/item/heat/play?source=2${position}`)
-      expect(api.itemQuery).toHaveBeenCalledWith('heat', expect.objectContaining({ source_id: 2 }))
+      expect(api.catalogueDetail).toHaveBeenCalledWith(
+        expect.any(String),
+        'heat',
+        expect.objectContaining({ source_id: 2 }),
+      )
       expect(api.startSession).toHaveBeenCalledWith(
         expect.objectContaining({ source_id: 2, resume }),
       )
@@ -326,7 +326,7 @@ describe('opening the player', () => {
   )
 
   test('a chapter position starts there, and is spent on arrival', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     const { router } = await open('/library/films/item/heat/play?start=470512')
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 470_512 }))
     // Spent: an hour later a reload must resume from progress, not jump the
@@ -338,7 +338,7 @@ describe('opening the player', () => {
     // The chapter position is spent only once the session is UP: spent on
     // arrival, a transient 503 plus Try again silently resumed mid-film
     // instead of at the chapter that was pressed.
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     vi.mocked(api.startSession).mockRejectedValueOnce(new ApiError(503, 'host away'))
     const { router, wrapper } = await open('/library/films/item/heat/play?start=470512')
     expect(router.currentRoute.value.query.start).toBe('470512')
@@ -358,7 +358,7 @@ describe('opening the player', () => {
   test('a start at or past the end is not a position, so it resumes', async () => {
     // Stale bookmark, hand-edited URL, or a file replaced by a shorter cut:
     // a position the file does not contain must not open a session there.
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({ resume_position_ms: 90_000, duration_ms: 600_000 }) as never,
     )
     await open('/library/films/item/heat/play?start=600000')
@@ -368,7 +368,7 @@ describe('opening the player', () => {
   test('an unknown running time lets the asked-for position through', async () => {
     // The range check needs a range; without one the hub clamps, which is
     // strictly better than silently resuming somewhere else.
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({ resume_position_ms: 90_000, duration_ms: null }) as never,
     )
     await open('/library/films/item/heat/play?start=470512')
@@ -378,13 +378,13 @@ describe('opening the player', () => {
   test('a mangled start is not a position, so it resumes', async () => {
     // Number('') is 0: a truncated ?start= would otherwise silently mean
     // "from the beginning".
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ resume_position_ms: 90_000 }) as never)
     await open('/library/films/item/heat/play?start=')
     expect(api.startSession).toHaveBeenCalledWith(expect.objectContaining({ start_ms: 90_000 }))
   })
 
   test('and asks for the track the viewer’s preferences name (HUB-33)', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({
         negotiated: { source: { source_id: 1 } },
         sources: [
@@ -446,7 +446,7 @@ describe('a session nobody will play', () => {
     // new id: each pass overwrote the session and left a live one nobody could
     // reach. Four of those and the account is at its per-user cap.
     const { router } = await open()
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'other' }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ id: 'other' }) as never)
     vi.mocked(api.startSession).mockResolvedValue(session('s2') as never)
     await router.push('/library/films/item/other/play')
     await flushPromises()
@@ -462,7 +462,7 @@ describe('a session nobody will play', () => {
     expect(wrapper.find('h1').text()).toBe('Heat')
 
     const late = held(film({ id: 'other', title: 'Sleepers' }))
-    vi.mocked(api.itemQuery).mockReturnValue(late.promise as never)
+    vi.mocked(api.catalogueDetail).mockReturnValue(late.promise as never)
     await router.push('/library/films/item/other/play')
     await flushPromises()
     expect(wrapper.find('h1').text()).toBe('Starting playback')
@@ -484,7 +484,7 @@ describe('a session nobody will play', () => {
       return {} as never
     })
     const { router } = await open()
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'other' }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ id: 'other' }) as never)
     vi.mocked(api.startSession).mockResolvedValue(session('s2') as never)
     await router.push('/library/films/item/other/play')
     await flushPromises()
@@ -602,8 +602,8 @@ describe('refreshing the physical source after recovery', () => {
       const slow = held(recovered(sourceId))
       // Automatic negotiation would choose a third copy. The recovery must ask
       // for the actual source in its response, not the original/default copy.
-      vi.mocked(api.itemQuery).mockImplementation(
-        (_id, body) =>
+      vi.mocked(api.catalogueDetail).mockImplementation(
+        (_library, _id, body) =>
           (body?.source_id === sourceId
             ? slow.promise
             : Promise.resolve(film({ negotiated: { source: { source_id: 2 } } }))) as never,
@@ -624,7 +624,8 @@ describe('refreshing the physical source after recovery', () => {
       })
       wrapper.findComponent(Picture).vm.$emit('restart', 'heat', fresh, 999, choice)
       await flushPromises()
-      expect(api.itemQuery).toHaveBeenLastCalledWith(
+      expect(api.catalogueDetail).toHaveBeenLastCalledWith(
+        expect.any(String),
         'heat',
         expect.objectContaining({
           source_id: sourceId,
@@ -668,8 +669,10 @@ describe('refreshing the physical source after recovery', () => {
     async (failure) => {
       const { wrapper } = await open()
       if (failure === 'refusal')
-        vi.mocked(api.itemQuery).mockRejectedValueOnce(new ApiError(503, 'refresh unavailable'))
-      else vi.mocked(api.itemQuery).mockResolvedValueOnce(film() as never)
+        vi.mocked(api.catalogueDetail).mockRejectedValueOnce(
+          new ApiError(503, 'refresh unavailable'),
+        )
+      else vi.mocked(api.catalogueDetail).mockResolvedValueOnce(film() as never)
       wrapper
         .findComponent(Picture)
         .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
@@ -677,7 +680,7 @@ describe('refreshing the physical source after recovery', () => {
       expect(api.endSession).toHaveBeenCalledWith('s2', { keepalive: true })
       expect(wrapper.text()).toContain('Could not refresh playback details')
       expect(wrapper.findComponent(Picture).exists()).toBe(false)
-      vi.mocked(api.itemQuery).mockResolvedValue(film() as never)
+      vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
       vi.mocked(api.startSession).mockResolvedValue(session('s3') as never)
       await wrapper
         .findAll('button')
@@ -693,12 +696,12 @@ describe('refreshing the physical source after recovery', () => {
   test('a route change cancels a pending refresh without adopting its late answer', async () => {
     const { wrapper, router } = await open()
     const slow = held(recovered())
-    vi.mocked(api.itemQuery).mockReturnValueOnce(slow.promise as never)
+    vi.mocked(api.catalogueDetail).mockReturnValueOnce(slow.promise as never)
     wrapper
       .findComponent(Picture)
       .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
     await flushPromises()
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'other' }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ id: 'other' }) as never)
     vi.mocked(api.startSession).mockResolvedValue(session('s3') as never)
     await router.push('/library/films/item/other/play')
     await flushPromises()
@@ -715,7 +718,7 @@ describe('refreshing the physical source after recovery', () => {
     const { wrapper } = await open()
     const old = held(recovered(98))
     const latest = held(recovered(99))
-    vi.mocked(api.itemQuery)
+    vi.mocked(api.catalogueDetail)
       .mockReturnValueOnce(old.promise as never)
       .mockReturnValueOnce(latest.promise as never)
     const picture = wrapper.findComponent(Picture)
@@ -735,7 +738,10 @@ describe('refreshing the physical source after recovery', () => {
 
   test('a refreshed canonical identity updates the route without starting another session', async () => {
     const { wrapper, router } = await open()
-    vi.mocked(api.itemQuery).mockResolvedValueOnce({ ...recovered(), id: 'canonical' } as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValueOnce({
+      ...recovered(),
+      id: 'canonical',
+    } as never)
     wrapper
       .findComponent(Picture)
       .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
@@ -750,7 +756,7 @@ describe('refreshing the physical source after recovery', () => {
   test('unmount releases a pending recovery before its metadata request completes', async () => {
     const { wrapper } = await open()
     const slow = held(recovered())
-    vi.mocked(api.itemQuery).mockReturnValueOnce(slow.promise as never)
+    vi.mocked(api.catalogueDetail).mockReturnValueOnce(slow.promise as never)
     wrapper
       .findComponent(Picture)
       .vm.$emit('restart', 'heat', session('s2', { source_id: 99 }), 0, choice)
@@ -797,7 +803,7 @@ describe('when it cannot start', () => {
     // failure that keeps the old session makes Try again return early and hand
     // the picture one item's metadata over another item's stream.
     const { router, wrapper } = await open()
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'other' }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ id: 'other' }) as never)
     vi.mocked(api.startSession).mockRejectedValue(new ApiError(500, 'nope'))
     await router.push('/library/films/item/other/play')
     await flushPromises()
@@ -845,7 +851,7 @@ describe('the frame', () => {
 
   test('and the starting box is the shape the picture will be', async () => {
     // The alternative is a visible jump the moment the video arrives.
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({ negotiated: { source: { display_width: 1920, display_height: 800 } } }) as never,
     )
     vi.mocked(api.startSession).mockReturnValue(new Promise(() => {}) as never)

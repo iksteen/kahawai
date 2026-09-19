@@ -72,9 +72,7 @@ fn post_authed(uri: &str, token: &str, body: serde_json::Value) -> Request<Body>
 #[tokio::test]
 async fn setup_maps_validation_and_storage_failures_separately() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let local = kahawai_hub::api::setup_router(auth.clone(), None);
     let request = |username: &str, password: &str| {
@@ -103,9 +101,7 @@ async fn setup_maps_validation_and_storage_failures_separately() {
 #[tokio::test]
 async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy_hashes() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
 
     assert_eq!(
@@ -165,9 +161,7 @@ async fn password_establishment_uses_twelve_unicode_scalars_and_preserves_legacy
 #[tokio::test]
 async fn setup_then_auth_flow() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
@@ -187,7 +181,11 @@ async fn setup_then_auth_flow() {
     // Setup mode: nothing else is reachable (OPS-1)…
     let resp = api
         .clone()
-        .oneshot(Request::get("/api/v1/items").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/catalogue/libraries")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -289,13 +287,17 @@ async fn setup_then_auth_flow() {
     // Protected route: no token → 401; with token → 200.
     let resp = api
         .clone()
-        .oneshot(Request::get("/api/v1/items").body(Body::empty()).unwrap())
+        .oneshot(
+            Request::get("/api/v1/catalogue/libraries")
+                .body(Body::empty())
+                .unwrap(),
+        )
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
     let resp = api
         .clone()
-        .oneshot(get_authed("/api/v1/items", &access))
+        .oneshot(get_authed("/api/v1/catalogue/libraries", &access))
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::OK);
@@ -426,7 +428,7 @@ async fn setup_then_auth_flow() {
     let resp = api
         .clone()
         .oneshot(
-            Request::get("/api/v1/items")
+            Request::get("/api/v1/catalogue/libraries")
                 .header("cookie", "kahawai_media=garbage")
                 .body(Body::empty())
                 .unwrap(),
@@ -507,7 +509,7 @@ fn test_router_with_net(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::legacy_router_fixture(
+    kahawai_hub::api::router(
         registry,
         auth,
         sessions,
@@ -524,22 +526,19 @@ fn test_router_with_net(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        Arc::new(kahawai_hub::segments::Detector::new()),
         net,
     )
 }
 
 async fn auth_harness() -> (
     tempfile::TempDir,
-    kahawai_hub::library::Database,
+    kahawai_sqlite::Database,
     Arc<Auth>,
     axum::Router,
     kahawai_hub::auth::TokenPair,
 ) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let credentials = Arc::new(
         kahawai_hub::secrets::Credentials::open(dir.path(), db.clone())
             .await
@@ -824,7 +823,7 @@ async fn media_cookie_is_limited_to_the_explicit_read_allowlist() {
         StatusCode::OK
     );
     for (method, uri) in [
-        (axum::http::Method::GET, "/api/v1/items"),
+        (axum::http::Method::GET, "/api/v1/catalogue/libraries"),
         (axum::http::Method::GET, "/admin/v1/users"),
         (axum::http::Method::POST, "/api/v1/playback/sessions"),
     ] {
@@ -1068,9 +1067,7 @@ async fn configured_origin_controls_validation_and_request_metadata_controls_coo
 #[tokio::test]
 async fn concurrent_local_setup_has_exactly_one_winner() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let (a, b) = tokio::join!(
         auth.complete_setup("browser", "hunter222222"),
@@ -1088,179 +1085,9 @@ async fn concurrent_local_setup_has_exactly_one_winner() {
 }
 
 #[tokio::test]
-async fn items_filter_by_library() {
-    use kahawai_hub::registry::FileUpsertRecord;
-    let rec = |root: &str, path: &str, size: u64| FileUpsertRecord {
-        root_token: kahawai_core::media::root_token(std::path::Path::new(root)),
-        path_rel: path.into(),
-        size,
-        mtime_unix: 1,
-        head_xxh3: size,
-        tail_xxh3: size + 1,
-        oshash: size + 2,
-        streams_json: "{}".into(),
-    };
-
-    let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
-    let registry = Arc::new(Registry::new(
-        db.clone(),
-        Default::default(),
-        kahawai_mediadb::Store::in_memory().await.unwrap(),
-    ));
-    let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
-    let api = test_router(
-        registry.clone(),
-        auth.clone(),
-        Arc::new(kahawai_hub::sessions::Sessions::new(
-            tempfile::tempdir().unwrap().keep(),
-        )),
-    );
-    auth.complete_setup("ingmar", "hunter222222").await.unwrap();
-    let token = auth
-        .login("ingmar", "hunter222222")
-        .await
-        .unwrap()
-        .access_token;
-
-    registry
-        .record_satellite("01HOST", "mediahost", "nas", "fp")
-        .await
-        .unwrap();
-    registry
-        .announce_collection("01HOST", "movies", "movies", &["/srv/movies".into()])
-        .await
-        .unwrap();
-    registry
-        .announce_collection("01HOST", "series", "series", &["/srv/series".into()])
-        .await
-        .unwrap();
-    registry
-        .upsert_files(
-            "01HOST",
-            "movies",
-            vec![rec("/srv/movies", "Heat (1995).mkv", 100)],
-        )
-        .await
-        .unwrap();
-    registry
-        .upsert_files(
-            "01HOST",
-            "series",
-            vec![rec("/srv/series", "Andor/Season 1/Andor.S01E01.mkv", 200)],
-        )
-        .await
-        .unwrap();
-
-    let libs = body_json(
-        api.clone()
-            .oneshot(get_authed("/api/v1/libraries", &token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let lib_id = |name: &str| {
-        libs["libraries"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|l| l["name"] == name)
-            .unwrap()["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
-    };
-
-    // Unfiltered: movie + show. Per-library: exactly one each — the show
-    // matches through its episodes' sources, not its own (it has none).
-    let titles = |v: &serde_json::Value| {
-        v["items"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .map(|i| i["title"].as_str().unwrap().to_string())
-            .collect::<Vec<_>>()
-    };
-    let all = body_json(
-        api.clone()
-            .oneshot(get_authed("/api/v1/items", &token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(titles(&all), ["Andor", "Heat"]);
-    let movies = body_json(
-        api.clone()
-            .oneshot(get_authed(
-                &format!("/api/v1/items?library={}", lib_id("movies")),
-                &token,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(titles(&movies), ["Heat"]);
-    let series = body_json(
-        api.clone()
-            .oneshot(get_authed(
-                &format!("/api/v1/items?library={}", lib_id("series")),
-                &token,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(titles(&series), ["Andor"]);
-    // Unknown library id → empty, not everything.
-    let none = body_json(
-        api.clone()
-            .oneshot(get_authed("/api/v1/items?library=NOPE", &token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(titles(&none), Vec::<String>::new());
-
-    // Item detail carries navigation lineage: episode → its parent show.
-    let movie_id = movies["items"][0]["id"].as_str().unwrap();
-    let detail = body_json(
-        api.clone()
-            .oneshot(get_authed(&format!("/api/v1/items/{movie_id}"), &token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert!(detail["parent_id"].is_null());
-    let show_id = series["items"][0]["id"].as_str().unwrap();
-    let children = body_json(
-        api.clone()
-            .oneshot(get_authed(
-                &format!("/api/v1/items/{show_id}/children"),
-                &token,
-            ))
-            .await
-            .unwrap(),
-    )
-    .await;
-    let ep_id = children["children"][0]["id"].as_str().unwrap();
-    let detail = body_json(
-        api.clone()
-            .oneshot(get_authed(&format!("/api/v1/items/{ep_id}"), &token))
-            .await
-            .unwrap(),
-    )
-    .await;
-    assert_eq!(detail["parent_id"].as_str().unwrap(), show_id);
-}
-
-#[tokio::test]
 async fn admin_creates_users() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
@@ -1342,9 +1169,7 @@ async fn login_throttles_after_repeated_failures() {
     // OPS-2: five consecutive bad passwords lock the account — the
     // sixth attempt gets 429 even with the CORRECT password.
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
@@ -1411,9 +1236,7 @@ async fn login_throttles_after_repeated_failures() {
 #[tokio::test]
 async fn bootstrap_states_setup_without_authentication() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
@@ -1496,9 +1319,7 @@ async fn bootstrap_states_setup_without_authentication() {
 #[tokio::test]
 async fn expired_refresh_families_prune_at_open() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Auth::new(db.clone(), dir.path()).await.unwrap();
     auth.complete_setup("u", "hunter22222hunter").await.unwrap();
     sqlx::query(
@@ -1566,14 +1387,9 @@ async fn refresh_family_migration_invalidates_legacy_tokens() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(
-        kahawai_hub::db::open_legacy_fixture(dir.path())
-            .await
-            .unwrap(),
-        dir.path(),
-    )
-    .await
-    .unwrap();
+    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
+        .await
+        .unwrap();
     assert!(matches!(
         auth.refresh(legacy).await,
         Err(kahawai_hub::auth::RefreshError::Invalid)
@@ -1775,14 +1591,9 @@ async fn auth_version_migration_invalidates_existing_access_and_refresh() {
     .unwrap();
 
     AUTH_MIGRATOR.run(&pool).await.unwrap();
-    let auth = Auth::new(
-        kahawai_hub::db::open_legacy_fixture(dir.path())
-            .await
-            .unwrap(),
-        dir.path(),
-    )
-    .await
-    .unwrap();
+    let auth = Auth::new(kahawai_hub::db::open(dir.path()).await.unwrap(), dir.path())
+        .await
+        .unwrap();
     assert!(auth.authenticate(&access).await.is_err());
     assert!(matches!(
         auth.refresh(refresh).await,
@@ -2069,9 +1880,7 @@ async fn password_reset_revokes_all_families_across_restart() {
     let second = auth.login("root", "hunter22222hunter").await.unwrap();
     // A distinct pool is the separate CLI process: no Auth state is shared with
     // the running hub, only the durable database transaction.
-    let cli_db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let cli_db = kahawai_hub::db::open(dir.path()).await.unwrap();
     kahawai_hub::auth::reset_password(&cli_db, "root", "new-password-22")
         .await
         .unwrap();
@@ -2118,9 +1927,7 @@ async fn password_reset_revokes_all_families_across_restart() {
 #[tokio::test]
 async fn delete_racing_demotion_keeps_an_admin() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
 
     // Re-run the actual race, not merely its two statements in a chosen order.
@@ -2176,9 +1983,7 @@ async fn delete_racing_demotion_keeps_an_admin() {
 #[tokio::test]
 async fn admin_deletes_users() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
@@ -2221,21 +2026,7 @@ async fn admin_deletes_users() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO collections(module_id,collection_id,media_type)
-                 VALUES('fixture','default','movies')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
-                 VALUES('i1','movie','M','m','fixture','default')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query("INSERT INTO user_item_state (user_id, item_id, position_ms) VALUES (?, 'i1', 5)")
+    sqlx::query("INSERT INTO catalogue_watch_state (user_id, item_id, parent_id, position_ms) VALUES (?, 'i1', 'i1', 5)")
         .bind(&victim)
         .execute(&db)
         .await
@@ -2245,16 +2036,6 @@ async fn admin_deletes_users() {
         .execute(&db)
         .await
         .unwrap();
-    // Keyed to content identity (MH-5), not to an item.
-    sqlx::query(
-        "INSERT INTO watch_state_archive
-           (user_id, size, head_xxh3, tail_xxh3, position_ms, played, play_count)
-         VALUES (?, 1, 2, 3, 5, 0, 0)",
-    )
-    .bind(&victim)
-    .execute(&db)
-    .await
-    .unwrap();
     // A sealed credential has no foreign key either — owner_id is a user id
     // or HUB. Raw rows: this is about the delete, not about the cipher.
     for owner in [victim.as_str(), admin_id.as_str()] {
@@ -2364,17 +2145,12 @@ async fn admin_deletes_users() {
         0
     );
     assert_eq!(
-        count("SELECT COUNT(*) FROM user_item_state WHERE user_id = ?").await,
+        count("SELECT COUNT(*) FROM catalogue_watch_state WHERE user_id = ?").await,
         0
     );
     assert_eq!(
         count("SELECT COUNT(*) FROM user_prefs WHERE user_id = ?").await,
         0
-    );
-    assert_eq!(
-        count("SELECT COUNT(*) FROM watch_state_archive WHERE user_id = ?").await,
-        0,
-        "archived rows outlived the user and would break a later restore"
     );
     assert_eq!(
         count("SELECT COUNT(*) FROM credentials WHERE owner_id = ?").await,
@@ -2396,7 +2172,7 @@ async fn admin_deletes_users() {
     let resp = api
         .clone()
         .oneshot(
-            Request::get("/api/v1/items")
+            Request::get("/api/v1/catalogue/libraries")
                 .header("authorization", format!("Bearer {bob}"))
                 .body(Body::empty())
                 .unwrap(),

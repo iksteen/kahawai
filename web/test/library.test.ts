@@ -1,4 +1,12 @@
-vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The library grid, mounted.
 ///
 /// happy-dom does no layout, so the two numbers the virtualiser measures —
@@ -16,15 +24,12 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 import { CHUNK, GAP } from '../src/domain/virtual.ts'
 import { defineComponent, h } from 'vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  listItems: vi.fn(),
-  listLibraries: vi.fn(),
-  listArtists: vi.fn(),
   enrichmentCorrect: vi.fn(),
   item: vi.fn(),
   enrichmentDetail: vi.fn(),
@@ -35,7 +40,6 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
     `/api/v1/catalogue/libraries/${library}/artists/${key}/artwork`,
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
   getArtistArtworkUrl: (key: string, params: { library: string; size?: string; v?: string }) =>
     `/api/v1/artists/${key}/artwork?${new URLSearchParams(
       Object.entries(params).filter((entry): entry is [string, string] => entry[1] !== undefined),
@@ -53,7 +57,7 @@ const {
   listArtists,
   listItems,
   listLibraries,
-} = await import('../src/api/generated/kahawai.ts')
+} = await import('./api-fixture.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Library = (await import('../src/views/Library.vue')).default
 const Card = (await import('../src/components/Card.vue')).default
@@ -61,7 +65,7 @@ const MatchDialog = (await import('../src/components/MatchDialog.vue')).default
 const { DEBOUNCE_MS, useSearch } = await import('../src/composables/search.ts')
 
 const item = (id: string, over: Record<string, unknown> = {}) =>
-  ({ id, library_id: 'films', title: id, kind: 'movie', played: false, ...over }) as ItemRowI64
+  ({ id, library_id: 'films', title: id, kind: 'movie', played: false, ...over }) as ItemSummary
 
 /// A card's row, with the fields the card actually reads.
 const row = (over: Record<string, unknown>) =>
@@ -180,8 +184,8 @@ beforeEach(() => {
   hub(250)
   vi.mocked(listLibraries).mockResolvedValue({
     libraries: [
-      { id: 'films', name: 'Films', media_type: 'movies' },
-      { id: 'music', name: 'Music', media_type: 'music' },
+      { id: 'films', name: 'Films', media_type: 'movies', collection_ids: [] },
+      { id: 'music', name: 'Music', media_type: 'music', collection_ids: [] },
     ],
   })
   vi.mocked(listArtists).mockResolvedValue({

@@ -5,13 +5,13 @@
 /// library genuinely has no shelf and is dropped; conflating the two deleted
 /// whole libraries from the home screen with nothing said.
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 
 export type LibrarySummary = { id: string; name: string; media_type: string }
 
 export type Shelf = {
   library: LibrarySummary
-  items: ItemRowI64[]
+  items: ItemSummary[]
   /// How many the library holds, which is not how many arrived: a shelf pages
   /// as it is scrolled and stops when it has them all.
   total: number
@@ -41,7 +41,7 @@ export function shown(shelves: Shelf[]): Shelf[] {
 ///
 /// By id, not by length: a rescan between two pages can shift what sits at an
 /// offset, and appending a duplicate gives two rows the same key.
-export function appendPage(have: ItemRowI64[], arrived: ItemRowI64[]): ItemRowI64[] {
+export function appendPage(have: ItemSummary[], arrived: ItemSummary[]): ItemSummary[] {
   const seen = new Set(have.map((i) => i.id))
   return [...have, ...arrived.filter((i) => !seen.has(i.id))]
 }

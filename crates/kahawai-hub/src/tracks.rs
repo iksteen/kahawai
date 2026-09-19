@@ -1,50 +1,9 @@
-//! Subtitle tracks as first-class rows — ONE keyspace for what used to
-//! be three (`e{n}` embedded, `s{n}` sidecar, `d{id}` downloaded/OCR),
-//! per the 2026-07-31 unification: "downloaded tracks, OCR tracks etc.
-//! should just be extra tracks available to pick from."
-//!
-//! ## `subtitle_tracks` schema (authority for migration 0046)
-//!
-//! - `id` — THE subtitle key, everywhere: listing, serving
-//!   (`/items/{id}/subtitles/{track_id}.vtt|.ass`), OCR generation,
-//!   deletion, session selection, and per-item preference memory
-//!   (`subs.track`). Stable across rescans (the stream upsert preserves
-//!   ids while a stream keeps its position).
-//! - `origin` — `embedded` (a stream inside the media container),
-//!   `sidecar` (a file next to it: .srt/.ass/.vtt, or an .idx/.sub
-//!   VobSub pair), `downloaded` (HUB-24 provider fetch), `ocr`
-//!   (HUB-32c machine-read text), `raster` (HUB-32d: a styled script
-//!   rendered to display sets, served item-level rather than through
-//!   the session tap).
-//! - ownership — exactly one of `source_id` or `item_id`. Embedded/sidecar
-//!   rows and derivatives of them follow the stable physical `files.id`;
-//!   independently acquired tracks and their derivatives follow the collection
-//!   item. `derived_from` records lineage, never a second ownership rule.
-//!   `payload_id` preserves immutable cache-file identity across migrations.
-//! - `stream_index` — embedded: index into `streams_json.subtitles`;
-//!   sidecar: index into `streams_json.external_subtitles`. The
-//!   pipeline's tap files (`subs-e{n}.*`) and the burn plan still
-//!   speak stream indexes; this column is the translation.
-//! - `label` — provider release name, or the OCR row's legacy
-//!   `ocr:{key}:{model}` tag (superseded by `derived_from`).
-//! - `machine` — machine-generated AND IMPERFECT, user-visible as such
-//!   (HUB-32c OCR). Not merely "derived": a HUB-32d `raster` row is
-//!   generated too, but it renders the author's own typesetting
-//!   exactly, so it is not flagged.
-//! - `derived_from` — OCR rows point at the exact image-track row they
-//!   were read from. Replaces string-parsing `label`, and is
-//!   per-source correct where the old item+index tie was not.
-//!
-//! ## Delivery
-//!
-//! What a track means FOR THIS CLIENT is computed per request, never
-//! stored: capability changes a track's delivery, not its existence
-//! (owner decision: the API always lists; the UI disables). See
-//! [`delivery`].
+//! Subtitle tracks and client-specific delivery. Mediadb supplies physical
+//! streams and source-bound acquired artifacts; this module presents them in
+//! the playback API and applies the user's ASS preference. Delivery depends
+//! on the client, while track ownership remains attached to its source.
 
-use anyhow::Result;
 use serde::Serialize;
-use sqlx::Row;
 
 #[derive(Debug, Clone, Serialize, utoipa::ToSchema)]
 pub struct Track {
@@ -60,8 +19,6 @@ pub struct Track {
     pub id: i64,
     pub item_id: String,
     pub origin: String,
-    #[serde(skip)]
-    pub source_id: Option<i64>,
     #[serde(skip)]
     pub module_id: Option<String>,
     #[serde(skip)]
@@ -82,8 +39,6 @@ pub struct Track {
     pub machine: bool,
     #[schema(required)]
     pub derived_from: Option<i64>,
-    #[serde(skip)]
-    pub payload_id: Option<i64>,
     /// Who created a hub-stored row. Never serialised — it decides
     /// `TrackListing::deletable` server-side rather than telling every
     /// client which user fetched which subtitle.
@@ -244,186 +199,15 @@ pub fn delivery(
     }
 }
 
-/// Resolve a track without an HTTP item context. This is intentionally only
-/// for internal derivative workers that start from a trusted parent row ID;
-/// user-facing and session paths must use [`get_for_item`].
-pub(crate) async fn get_internal(db: &sqlx::SqlitePool, id: i64) -> Result<Option<Track>> {
-    Ok(sqlx::query(
-        "SELECT t.id,COALESCE(t.item_id,(SELECT MIN(s.item_id) FROM playable_source_parts p
-                                         JOIN playable_sources s ON s.id=p.playable_source_id
-                                        WHERE p.file_id=t.source_id)) AS item_id,
-                t.origin,t.source_id,f.module_id,f.collection_id,r.root_token,
-                f.path_rel AS source_path,f.path_rel,t.stream_index,t.format,t.language,
-                t.label,t.machine,t.derived_from,t.payload_id,t.created_by
-         FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
-         LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.id=? AND (t.item_id IS NOT NULL OR EXISTS(
-             SELECT 1 FROM playable_source_parts p WHERE p.file_id=t.source_id))",
-    )
-    .bind(id)
-    .fetch_optional(db)
-    .await?
-    .map(row_to_track))
-}
-
-/// Resolve a track beneath one item route. Physical tracks derive their current
-/// item from `files`; an unbound or foreign source is deliberately invisible.
-pub async fn get_for_item(db: &sqlx::SqlitePool, item_id: &str, id: i64) -> Result<Option<Track>> {
-    Ok(sqlx::query(
-        "SELECT t.id,?1 AS item_id,t.origin,t.source_id,
-                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
-                t.derived_from,t.payload_id,t.created_by
-         FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
-         LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.id=?2 AND (t.item_id=?1 OR EXISTS(
-             SELECT 1 FROM playable_source_parts p JOIN playable_sources s
-               ON s.id=p.playable_source_id WHERE p.file_id=t.source_id AND s.item_id=?1))",
-    )
-    .bind(item_id)
-    .bind(id)
-    .fetch_optional(db)
-    .await?
-    .map(row_to_track))
-}
-
-pub async fn get_for_library_item(
-    db: &crate::library::Database,
-    user: &str,
-    item: &str,
-    id: i64,
-) -> Result<Option<Track>> {
-    for copy in crate::library::copies(db, user, item).await? {
-        if let Some(track) = get_for_item(db, &copy, id).await? {
-            return Ok(Some(track));
-        }
-    }
-    Ok(None)
-}
-
-/// Every item-owned track or physical track bound to the source `source_row`
-/// picked, so the list matches what a session would actually play.
-pub async fn for_item_source(
-    db: &sqlx::SqlitePool,
-    item_id: &str,
-    module_id: &str,
-    collection_id: &str,
-    root_token: &str,
-    source_path: &str,
-) -> Result<Vec<Track>> {
-    Ok(sqlx::query(
-        "SELECT t.id,? AS item_id,t.origin,t.source_id,
-                f.module_id,f.collection_id,r.root_token,f.path_rel AS source_path,
-                f.path_rel,t.stream_index,t.format,t.language,t.label,t.machine,
-                t.derived_from,t.payload_id,t.created_by
-         FROM subtitle_tracks t LEFT JOIN files f ON f.id=t.source_id
-         LEFT JOIN collection_roots r ON r.id=f.root_id
-         WHERE t.item_id=? OR (EXISTS(
-              SELECT 1 FROM playable_source_parts p JOIN playable_sources s
-                ON s.id=p.playable_source_id WHERE p.file_id=t.source_id AND s.item_id=?) AND
-              (f.module_id,f.collection_id,r.root_token,f.path_rel)=(?,?,?,?))
-         ORDER BY t.origin='embedded' DESC,t.origin='sidecar' DESC,t.id",
-    )
-    .bind(item_id)
-    .bind(item_id)
-    .bind(item_id)
-    .bind(module_id)
-    .bind(collection_id)
-    .bind(root_token)
-    .bind(source_path)
-    .fetch_all(db)
-    .await?
-    .into_iter()
-    .map(row_to_track)
-    .collect())
-}
-
 impl Track {
-    /// The legacy notation the caches, extraction ladder and pipeline
-    /// still speak internally: `e{n}` / `s{n}` / `d{row id}`.
+    /// The notation shared by caches, extraction and the pipeline: `e{n}` / `s{n}` / `d{row id}`.
     pub fn internal_key(&self) -> String {
         match self.origin.as_str() {
             "embedded" => format!("e{}", self.stream_index.unwrap_or(0)),
             "sidecar" => format!("s{}", self.stream_index.unwrap_or(0)),
-            _ => format!("d{}", self.payload_id.unwrap_or(self.id)),
+            _ => format!("d{}", self.id),
         }
     }
-}
-
-fn row_to_track(r: sqlx::sqlite::SqliteRow) -> Track {
-    Track {
-        acquired: None,
-        artifact_key: None,
-        raster: None,
-        physical: None,
-        id: r.get("id"),
-        item_id: r.get("item_id"),
-        origin: r.get("origin"),
-        source_id: r.get("source_id"),
-        module_id: r.get("module_id"),
-        collection_id: r.get("collection_id"),
-        root_token: r.get("root_token"),
-        source_path: r.get("source_path"),
-        path_rel: r.get("path_rel"),
-        stream_index: r.get("stream_index"),
-        format: r.get("format"),
-        language: r.get("language"),
-        label: r.get("label"),
-        machine: r.get::<i64, _>("machine") != 0,
-        derived_from: r.get("derived_from"),
-        payload_id: r.get("payload_id"),
-        created_by: r.get("created_by"),
-    }
-}
-
-/// Sync embedded/sidecar rows for one stable physical source. Track ids remain
-/// stable while stream positions remain stable, independent of root adoption.
-pub async fn sync_source_tracks(
-    tx: &mut sqlx::SqliteConnection,
-    source_id: i64,
-    info: &kahawai_core::media::MediaInfo,
-) -> Result<()> {
-    for (origin, count) in [
-        ("embedded", info.subtitles.len() as i64),
-        ("sidecar", info.external_subtitles.len() as i64),
-    ] {
-        sqlx::query(
-            "DELETE FROM subtitle_tracks WHERE source_id=? AND origin=? AND stream_index>=?",
-        )
-        .bind(source_id)
-        .bind(origin)
-        .bind(count)
-        .execute(&mut *tx)
-        .await?;
-    }
-
-    let upsert = "INSERT INTO subtitle_tracks
-            (source_id,origin,stream_index,format,language)
-         VALUES (?,?,?,?,?)
-         ON CONFLICT(source_id,origin,stream_index)
-           WHERE origin IN ('embedded','sidecar') DO UPDATE SET
-             format=excluded.format,language=excluded.language";
-    for (i, s) in info.subtitles.iter().enumerate() {
-        sqlx::query(upsert)
-            .bind(source_id)
-            .bind("embedded")
-            .bind(i as i64)
-            .bind(&s.format)
-            .bind(&s.language)
-            .execute(&mut *tx)
-            .await?;
-    }
-    for (i, s) in info.external_subtitles.iter().enumerate() {
-        sqlx::query(upsert)
-            .bind(source_id)
-            .bind("sidecar")
-            .bind(i as i64)
-            .bind(&s.format)
-            .bind(&s.language)
-            .execute(&mut *tx)
-            .await?;
-    }
-    Ok(())
 }
 
 impl Track {
@@ -454,7 +238,6 @@ mod tests {
             id: 1,
             item_id: "i".into(),
             origin: origin.into(),
-            source_id: Some(1),
             module_id: Some("m".into()),
             collection_id: Some("c".into()),
             root_token: Some("root".into()),
@@ -466,7 +249,6 @@ mod tests {
             label: None,
             machine: false,
             derived_from: None,
-            payload_id: None,
             created_by: None,
         }
     }

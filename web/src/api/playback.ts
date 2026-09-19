@@ -8,17 +8,14 @@
 import { catalogueDetail } from './catalogue.ts'
 import type { ItemQuery } from './generated/model/itemQuery.ts'
 import type { CapabilityProfile } from './generated/model/capabilityProfile.ts'
-import type { ItemQueryResponse } from './generated/model/itemQueryResponse.ts'
+import type { ItemDetail } from './catalogue-model.ts'
 import type { PlaybackStreams } from './generated/model/playbackStreams.ts'
 import type { Preference } from './generated/model/preference.ts'
 import type { StartSessionResponse } from './generated/model/startSessionResponse.ts'
 import type { TrackListing } from './generated/model/trackListing.ts'
 import {
-  getItemFontUrl,
   getPrefs,
-  getItemSubtitleFileUrl,
   getSessionFileUrl,
-  itemQuery as legacyItemQuery,
   seekSession as seek,
   startSession,
 } from './generated/kahawai.ts'
@@ -31,17 +28,18 @@ export function playbackItem(
   id: string,
   query: ItemQuery,
   library?: string | null,
-): Promise<ItemQueryResponse> {
-  return library ? catalogueDetail(library, id, query) : legacyItemQuery(id, query)
+): Promise<ItemDetail> {
+  if (!library) throw new Error('Playback requires a library.')
+  return catalogueDetail(library, id, query)
 }
 
-function playbackProfile(item: ItemQueryResponse, prefs: Preference[]): CapabilityProfile {
+function playbackProfile(item: ItemDetail, prefs: Preference[]): CapabilityProfile {
   const cap = prefs.find((p) => p.scope === '' && p.key === 'bandwidth_kbps')?.value
   const announced = item.sources.flatMap((source) => source.streams?.video ?? [])
   return buildProfile(cap ? Number(cap) : undefined, announced)
 }
 
-function sourceAudioTracks(item: ItemQueryResponse, prefs: Preference[], mediaType: string) {
+function sourceAudioTracks(item: ItemDetail, prefs: Preference[], mediaType: string) {
   return Object.fromEntries(
     [...new Set(item.sources.map((source) => source.source_id))].map((id) => [
       id,
@@ -61,7 +59,7 @@ function sourceAudioTracks(item: ItemQueryResponse, prefs: Preference[], mediaTy
 /// source-aware profile agree with it. Let the hub rank each rendition on its
 /// own preferred audio index, then pin that source/index pair for START.
 export async function selectPlaybackSource(
-  preview: ItemQueryResponse,
+  preview: ItemDetail,
   prefs: Preference[],
   mediaType: string,
   previewProfile: CapabilityProfile,
@@ -123,7 +121,7 @@ export async function queryPlaybackItem(
   sourceId?: number,
   library?: string,
   mediaEntryId?: string | null,
-): Promise<ItemQueryResponse> {
+): Promise<ItemDetail> {
   const cap = prefs.find((pref) => pref.scope === '' && pref.key === 'bandwidth_kbps')?.value
   const profile = buildProfile(cap ? Number(cap) : undefined)
   const preview = await playbackItem(
@@ -145,7 +143,7 @@ export async function queryPlaybackItem(
 /// preferences to pass. Reading them here preserves the viewer's bandwidth
 /// cap whenever a session is recreated.
 export async function startPlaybackSession(
-  item: ItemQueryResponse,
+  item: ItemDetail,
   {
     startMs = 0,
     audioTrack = 0,
@@ -222,24 +220,16 @@ export function seekSession(
   }) as Promise<{ part_base_ms: number; streams?: PlaybackStreams | null }>
 }
 
-/// A subtitle file on the ITEM: whole-file extraction, streamed. `shiftMs`
-/// moves the cues to meet a timeline that starts mid-file.
+/// Source-bound subtitle files are addressed through the captured session.
 export const subtitleFileUrl = (
-  itemId: string,
+  _itemId: string,
   file: string,
   shiftMs?: number,
   session?: StartSessionResponse,
-) =>
-  session?.media_entry_id
-    ? `/api/v1/playback/sessions/${session.session_id}/subtitles/${file}${shiftMs === undefined ? '' : `?shift_ms=${shiftMs}`}`
-    : getItemSubtitleFileUrl(
-        itemId,
-        file,
-        shiftMs === undefined ? undefined : { shift_ms: shiftMs },
-      )
-
-export const fontUrl = (itemId: string, index: number, sourceId: number) =>
-  getItemFontUrl(itemId, index, { source_id: sourceId })
+) => {
+  if (!session) throw new Error('Subtitle streaming requires a session.')
+  return `/api/v1/playback/sessions/${session.session_id}/subtitles/${file}${shiftMs === undefined ? '' : `?shift_ms=${shiftMs}`}`
+}
 
 /// Where a track's display sets come from. An embedded image track is decoded
 /// by the RUNNING pipeline and tail-followed off the session; a rasterised one

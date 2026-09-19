@@ -10,7 +10,7 @@
 /// Existing atomic watch-operation bound, also used when capturing combined coverage.
 pub const MAX_BATCH_ITEMS: usize = 2000;
 
-use crate::library::Database;
+use kahawai_sqlite::Database;
 use serde::Serialize;
 use sqlx::Row;
 use std::collections::BTreeMap;

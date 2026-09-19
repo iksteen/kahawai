@@ -19,9 +19,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
 
     // A hub with state worth keeping: a user, a satellite's fingerprint,
     // the CA that admits it, a downloaded subtitle, and a token secret.
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     sqlx::query(
         "INSERT INTO satellites(module_id,module_type,name,cert_fingerprint)
                  VALUES('fixture','mediahost','fixture','fp')",
@@ -29,20 +27,10 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     .execute(&db)
     .await
     .unwrap();
-    sqlx::query(
-        "INSERT INTO collections(module_id,collection_id,media_type)
-                 VALUES('fixture','default','movies')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
-    sqlx::query(
-        "INSERT INTO collection_items(id,kind,title,norm_title,module_id,collection_id)
-         VALUES('i1','movie','Solaris','solaris','fixture','default')",
-    )
-    .execute(&db)
-    .await
-    .unwrap();
+    sqlx::query("INSERT INTO settings(key,value) VALUES('fixture-title','Solaris')")
+        .execute(&db)
+        .await
+        .unwrap();
     db.close().await;
     write(&live.path().join("pki/ca.crt"), "CERTIFICATE");
     write(&live.path().join("pki/ca.key"), "PRIVATE KEY");
@@ -123,13 +111,12 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
     assert!(fresh.path().join("subtitles/abc/def.srt").exists());
 
     // And the database is a working one, not just bytes.
-    let db = kahawai_hub::db::open_legacy_fixture(fresh.path())
-        .await
-        .unwrap();
-    let title: String = sqlx::query_scalar("SELECT title FROM collection_items WHERE id = 'i1'")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(fresh.path()).await.unwrap();
+    let title: String =
+        sqlx::query_scalar("SELECT value FROM settings WHERE key = 'fixture-title'")
+            .fetch_one(&db)
+            .await
+            .unwrap();
     assert_eq!(title, "Solaris");
     db.close().await;
 }
@@ -137,7 +124,7 @@ async fn a_snapshot_restores_the_database_pki_and_subtitles() {
 #[tokio::test]
 async fn a_format_three_restore_rejects_size_and_hash_damage_before_live_state() {
     let live = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -180,7 +167,7 @@ async fn a_format_three_restore_rejects_size_and_hash_damage_before_live_state()
 #[tokio::test]
 async fn a_format_three_restore_rejects_unsafe_and_duplicate_artifact_paths() {
     let live = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -227,7 +214,7 @@ async fn a_format_three_restore_rejects_unsafe_and_duplicate_artifact_paths() {
 #[tokio::test]
 async fn a_format_two_snapshot_without_artifacts_remains_restorable() {
     let live = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -253,7 +240,7 @@ async fn a_format_two_snapshot_without_artifacts_remains_restorable() {
         .expect("format-2 snapshots predate the artifact inventory");
     assert_eq!(restored.format, 2);
     assert!(restored.artifacts.is_empty());
-    kahawai_hub::db::open_legacy_fixture(into.path())
+    kahawai_hub::db::open(into.path())
         .await
         .unwrap()
         .close()
@@ -267,9 +254,7 @@ async fn a_format_two_snapshot_without_artifacts_remains_restorable() {
 async fn a_snapshot_is_not_readable_by_anyone_else() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     db.close().await;
     let dest = tempfile::tempdir().unwrap().keep().join("snapshot");
 
@@ -297,9 +282,7 @@ async fn a_snapshot_is_not_readable_by_anyone_else() {
 #[tokio::test]
 async fn a_snapshot_carries_the_metrics_token() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     db.close().await;
     for name in kahawai_hub::backup::SECRET_FILES {
         std::fs::write(dir.path().join(name), format!("secret-{name}")).unwrap();
@@ -327,7 +310,7 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
     let live = tempfile::tempdir().unwrap();
     let snap = tempfile::tempdir().unwrap();
     let snap = snap.path().join("snapshot");
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -363,7 +346,7 @@ async fn a_restore_refuses_to_overwrite_without_being_told() {
 async fn backup_refuses_an_existing_destination() {
     let live = tempfile::tempdir().unwrap();
     let dest = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -383,21 +366,17 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
     let live = tempfile::tempdir().unwrap();
     let snap = tempfile::tempdir().unwrap();
     let snap = snap.path().join("snapshot");
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     let writer = {
         let db = db.clone();
         tokio::spawn(async move {
             for n in 0..200 {
-                let _ = sqlx::query(
-                    "INSERT INTO collection_items (id, kind, title, norm_title) VALUES (?, 'movie', ?, ?)",
-                )
-                .bind(format!("w{n}"))
-                .bind(format!("Film {n}"))
-                .bind(format!("film {n}"))
-                .execute(&db)
-                .await;
+                sqlx::query("INSERT INTO settings(key,value) VALUES(?,?)")
+                    .bind(format!("w{n}"))
+                    .bind(format!("Film {n}"))
+                    .execute(&db)
+                    .await
+                    .unwrap();
             }
         })
     };
@@ -413,10 +392,8 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
     kahawai_hub::backup::restore(&snap, restored.path(), false)
         .await
         .unwrap();
-    let db2 = kahawai_hub::db::open_legacy_fixture(restored.path())
-        .await
-        .unwrap();
-    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM collection_items")
+    let db2 = kahawai_hub::db::open(restored.path()).await.unwrap();
+    let n: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM settings")
         .fetch_one(&db2)
         .await
         .unwrap();
@@ -436,9 +413,7 @@ async fn a_snapshot_is_taken_while_the_hub_keeps_writing() {
 #[tokio::test]
 async fn a_snapshot_missing_what_its_manifest_lists_is_refused() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     db.close().await;
     for name in kahawai_hub::backup::SECRET_FILES {
         std::fs::write(dir.path().join(name), b"pretend-secret").unwrap();
@@ -483,9 +458,7 @@ async fn a_snapshot_missing_what_its_manifest_lists_is_refused() {
 #[tokio::test]
 async fn a_restore_refuses_a_key_that_does_not_match_the_snapshot_database() {
     let live = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
         .await
         .unwrap();
@@ -540,9 +513,7 @@ async fn a_restore_refuses_a_key_that_does_not_match_the_snapshot_database() {
 #[tokio::test]
 async fn a_backup_refuses_a_seeded_database_without_its_key() {
     let live = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
         .await
         .unwrap();
@@ -566,9 +537,7 @@ async fn a_backup_refuses_a_seeded_database_without_its_key() {
 #[tokio::test]
 async fn a_backup_refuses_a_key_that_does_not_match_its_database() {
     let live = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
         .await
         .unwrap();
@@ -594,9 +563,7 @@ async fn a_snapshot_carries_the_credential_key() {
     let snap = tempfile::tempdir().unwrap();
     let snap = snap.path().join("snapshot");
 
-    let db = kahawai_hub::db::open_legacy_fixture(live.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(live.path()).await.unwrap();
     let secrets = kahawai_hub::secrets::Secrets::load_or_create(live.path(), &db)
         .await
         .unwrap();
@@ -619,9 +586,7 @@ async fn a_snapshot_carries_the_credential_key() {
         0o600,
         "a restored key wider than the one it came from is a new leak"
     );
-    let db = kahawai_hub::db::open_legacy_fixture(fresh.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(fresh.path()).await.unwrap();
     let restored = kahawai_hub::secrets::Secrets::load_or_create(fresh.path(), &db)
         .await
         .unwrap();
@@ -637,7 +602,7 @@ async fn a_restore_replaces_a_standing_key() {
     let live = tempfile::tempdir().unwrap();
     let snap = tempfile::tempdir().unwrap();
     let snap = snap.path().join("snapshot");
-    kahawai_hub::db::open_legacy_fixture(live.path())
+    kahawai_hub::db::open(live.path())
         .await
         .unwrap()
         .close()
@@ -651,7 +616,7 @@ async fn a_restore_replaces_a_standing_key() {
         .unwrap();
 
     let onto = tempfile::tempdir().unwrap();
-    kahawai_hub::db::open_legacy_fixture(onto.path())
+    kahawai_hub::db::open(onto.path())
         .await
         .unwrap()
         .close()

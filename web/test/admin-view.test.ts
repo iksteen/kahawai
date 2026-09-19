@@ -53,7 +53,7 @@ vi.mock('../src/api/session.ts', () => ({
   refreshTokens: vi.fn(async () => true),
 }))
 
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 const Admin = (await import('../src/views/Admin.vue')).default
 

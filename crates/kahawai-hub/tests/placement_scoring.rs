@@ -49,9 +49,7 @@ async fn registry_with_local_video_executor(
     enabled: bool,
 ) -> (tempfile::TempDir, std::sync::Arc<Registry>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let allowed = kahawai_transport::mtls::AllowedCerts::default();
     (
         dir,

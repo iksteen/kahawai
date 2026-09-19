@@ -7,7 +7,7 @@
 /// track the artist meant to be quiet; a queue of singles wants every track at
 /// the same loudness.
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 
 export type GainMode = 'album' | 'track'
 
@@ -17,7 +17,7 @@ export type GainMode = 'album' | 'track'
 /// can hold both. A record added whole wants album gain; a single track
 /// dropped in beside it wants track gain, so it does not arrive at a different
 /// loudness from its neighbours.
-export type QueueEntry = { track: ItemRowI64; gain: GainMode }
+export type QueueEntry = { track: ItemSummary; gain: GainMode }
 
 export type Queue = { entries: QueueEntry[]; at: number }
 
@@ -29,7 +29,7 @@ export const EMPTY: Queue = { entries: [], at: 0 }
 /// Never louder than the peak allows: a positive gain applied to a track that
 /// already reaches full scale would clip it, so it is capped at whatever
 /// leaves the peak at 1.0.
-export function replayGainFactor(track: ItemRowI64 | undefined, mode: GainMode): number {
+export function replayGainFactor(track: ItemSummary | undefined, mode: GainMode): number {
   const gain = track?.replay_gain
   if (!gain) return 1
   // Fall back to the other measurement rather than to nothing: an album rip
@@ -48,11 +48,11 @@ export function replayGainFactor(track: ItemRowI64 | undefined, mode: GainMode):
 
 /// Playing a record replaces the queue; adding one leaves what is playing
 /// alone. Both are what somebody asked for, and neither is the other.
-export function playAlbum(tracks: ItemRowI64[], from: number): Queue {
+export function playAlbum(tracks: ItemSummary[], from: number): Queue {
   return { entries: tracks.map((track) => ({ track, gain: 'album' })), at: from }
 }
 
-export function appendAlbum(queue: Queue, tracks: ItemRowI64[]): Queue {
+export function appendAlbum(queue: Queue, tracks: ItemSummary[]): Queue {
   return {
     entries: [...queue.entries, ...tracks.map((track): QueueEntry => ({ track, gain: 'album' }))],
     at: queue.at,
@@ -60,7 +60,7 @@ export function appendAlbum(queue: Queue, tracks: ItemRowI64[]): Queue {
 }
 
 /// One track, levelled by itself: it is not arriving as part of a record.
-export function appendTrack(queue: Queue, track: ItemRowI64): Queue {
+export function appendTrack(queue: Queue, track: ItemSummary): Queue {
   return { entries: [...queue.entries, { track, gain: 'track' }], at: queue.at }
 }
 
@@ -100,6 +100,5 @@ export function upNext(queue: Queue): QueueEntry | undefined {
   return queue.entries[queue.at + 1]
 }
 
-/// One album position can share its song with another position.
-export const trackKey = (track: ItemRowI64): string =>
-  track.album_track_id == null ? track.id : `album-track:${track.album_track_id}`
+/// Mediadb gives each album position its own stable track identity.
+export const trackKey = (track: ItemSummary): string => track.id

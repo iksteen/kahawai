@@ -536,11 +536,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
-        let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM subtitle_tracks")
-            .fetch_one(registry.db())
-            .await
-            .unwrap();
-        assert_eq!(legacy, 0);
     }
     #[cfg(feature = "ocr")]
     #[tokio::test]

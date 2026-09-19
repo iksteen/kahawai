@@ -31,7 +31,7 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif self.path == '/api/v1/playback/sessions':
             self.reply({'code':'unplayable', 'message':'fixture has no playback source'}, 400)
         else:
-            self.reply({'message':'retired route'}, 501)
+            self.reply({'message':'retired route'}, 404)
 
     def do_GET(self):
         url = urllib.parse.urlsplit(self.path)

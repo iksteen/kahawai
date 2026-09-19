@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import {
   countLabel,
   type LibraryHits,
@@ -16,10 +16,10 @@ import {
 
 const films = { id: 'films', name: 'Films', media_type: 'movies' }
 const music = { id: 'music', name: 'Music', media_type: 'music' }
-const item = (id: string) => ({ id, title: id }) as ItemRowI64
+const item = (id: string) => ({ id, title: id }) as ItemSummary
 const hits = (
   library: typeof films,
-  items: ItemRowI64[],
+  items: ItemSummary[],
   total = items.length,
   failure = '',
 ): LibraryHits => ({ library, items, total, failure })

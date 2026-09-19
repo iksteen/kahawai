@@ -603,21 +603,18 @@ async fn run_hub_inner(
     // Protocol 4: the mediahost owns ordering and persistence of source facts.
     // This object remains the hub-side status/projection adapter; it no longer
     // runs the old hub-owned sweep.
-    let segments = Arc::new(kahawai_hub::segments::Detector::new());
     if let Some(mh) = local_mediahost {
         const LOCAL_ID: &str = "local";
         registry.ensure_local_satellite(LOCAL_ID, &mh.name).await?;
         let local_registry = registry.clone();
         let local_subtitles = subtitles.clone();
         let local_enricher = enricher.clone();
-        let local_segments = segments.clone();
         let local_name = mh.name.clone();
         let local_link: kahawai_mediahost::LocalLinkFactory = Arc::new(move || {
             kahawai_hub::link_service::local_link(
                 local_registry.clone(),
                 local_subtitles.clone(),
                 local_enricher.clone(),
-                local_segments.clone(),
                 LOCAL_ID,
                 &local_name,
             )
@@ -760,7 +757,6 @@ async fn run_hub_inner(
         subtitles.clone(),
         artwork,
         enricher.clone(),
-        segments.clone(),
         net,
     );
     tokio::spawn(async move {
@@ -791,12 +787,11 @@ async fn run_hub_inner(
             .into_server(),
         )
         .add_service(
-            kahawai_hub::link_service::MediahostLinkService::new_with_segments(
+            kahawai_hub::link_service::MediahostLinkService::new(
                 registry.clone(),
                 sessions.clone(),
                 subtitles.clone(),
                 enricher.clone(),
-                segments,
             )
             .into_server(),
         )

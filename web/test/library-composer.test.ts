@@ -103,8 +103,6 @@ test('reads only the active catalogue APIs and names local/offline collections w
   await client.invalidateQueries({ queryKey: ['admin', 'collections'] })
   await flushPromises()
   expect(positions()).toEqual(['a', 'b'])
-  expect(api.adminLibraries).not.toHaveBeenCalled()
-  expect(api.adminCollections).not.toHaveBeenCalled()
   expect(api.adminSessions).not.toHaveBeenCalled()
   expect(wrapper.text()).toContain('This hub/movies')
   expect(wrapper.text()).toContain('Attic/movies')

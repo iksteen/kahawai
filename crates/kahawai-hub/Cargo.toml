@@ -23,7 +23,6 @@ kahawai-transport = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
 tokio-stream = { workspace = true }
-parking_lot = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 rcgen = { workspace = true }

@@ -36,7 +36,7 @@ import Btn from './Btn.vue'
 import CapabilityDebug from './CapabilityDebug.vue'
 import Icon from './Icon.vue'
 import PlayerNote from './PlayerNote.vue'
-import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { ItemDetail } from '../api/catalogue-model.ts'
 import type { CarriedTracks } from '../domain/player-tracks.ts'
 import type { PlayerMode } from '../domain/player-keys.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
@@ -49,13 +49,7 @@ import {
   producedEndMs,
 } from '../domain/player-time.ts'
 import { accessToken, refreshTokens, whoAmI } from '../api/session.ts'
-import {
-  adminSessionLog,
-  endSession,
-  getPrefs,
-  itemChildren,
-  postProgress,
-} from '../api/generated/kahawai.ts'
+import { adminSessionLog, endSession, getPrefs, postProgress } from '../api/generated/kahawai.ts'
 import { buildProfile, loadMask } from '../api/capabilities.ts'
 import { pipPhase, pipSupported } from '../domain/pip.ts'
 import { deliveryPlan, sourcePreferenceScope, sourceStreams } from '../domain/source.ts'
@@ -94,7 +88,7 @@ import { subtitleRoute } from '../domain/subtitle-route.ts'
 import { useSubtitleRenderers } from '../composables/subtitles.ts'
 
 const props = defineProps<{
-  item: ItemQueryResponse
+  item: ItemDetail
   session: StartSessionResponse
   resumeMs: number
   libraryId: string
@@ -130,12 +124,7 @@ const emit = defineEmits<{
   /// ran out or it was asked for. Carries the preferences it resolved that
   /// episode's tracks from: they were read a moment ago, and the page holding
   /// them would otherwise hand the remounted player a staler set.
-  playNext: [
-    from: string,
-    item: ItemQueryResponse,
-    session: StartSessionResponse,
-    prefs: Preference[],
-  ]
+  playNext: [from: string, item: ItemDetail, session: StartSessionResponse, prefs: Preference[]]
 }>()
 
 /// Seconds of lead-in before the next episode starts by itself. Long enough to
@@ -1416,26 +1405,19 @@ function labelSide(pct: number) {
 
 // ---- the next episode -----------------------------------------------------
 
-const next = ref<ItemQueryResponse | null>(null)
+const next = ref<ItemDetail | null>(null)
 const upNextOff = ref(false)
 const startingNext = ref(false)
 
 onMounted(async () => {
   if (props.item.kind !== 'episode' || !props.item.parent_id) return
   try {
-    let after
-    if (props.item.library_id)
-      after = await catalogueNext(
-        props.item.library_id,
-        props.item.id,
-        props.session.media_entry_id ? { media_entry_id: props.session.media_entry_id } : undefined,
-      )
-    else {
-      const siblings = await itemChildren(props.item.parent_id)
-      const covered = new Set(props.session.library_item_ids ?? [props.item.id])
-      const at = siblings.children.findLastIndex((e) => covered.has(e.id))
-      after = at >= 0 ? siblings.children[at + 1] : undefined
-    }
+    if (!props.item.library_id) return
+    const after = await catalogueNext(
+      props.item.library_id,
+      props.item.id,
+      props.session.media_entry_id ? { media_entry_id: props.session.media_entry_id } : undefined,
+    )
     if (!after || goneAway) return
     const full = await playbackItem(after.id, { profile: buildProfile() }, props.item.library_id)
     if (!goneAway) next.value = full

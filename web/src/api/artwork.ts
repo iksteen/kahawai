@@ -4,28 +4,20 @@
 /// generated bindings; the decisions ABOUT artwork — whose poster an episode
 /// shows, and which version pins it — are in the components that read them.
 
-import {
-  getCatalogueArtistArtworkUrl,
-  getItemArtworkUrl,
-  getCatalogueArtworkUrl,
-} from './generated/kahawai.ts'
+import { getCatalogueArtistArtworkUrl, getCatalogueArtworkUrl } from './generated/kahawai.ts'
 
 export type ArtSize = 'thumb' | 'card1x' | 'card'
 
 export function artworkUrl(
   id: string,
-  version?: number | null,
+  _version?: number | null,
   size?: ArtSize,
   library?: string | null,
 ): string {
   // Spread rather than assigned: with `exactOptionalPropertyTypes`, an
   // explicit `undefined` is not the same as an absent key, and the generated
   // params type says the key may be absent — not that it may be undefined.
-  if (library) return getCatalogueArtworkUrl(library, id, size ? { size } : undefined)
-  return getItemArtworkUrl(id, {
-    ...(size ? { size } : {}),
-    ...(version ? { v: String(version) } : {}),
-  })
+  return library ? getCatalogueArtworkUrl(library, id, size ? { size } : undefined) : ''
 }
 
 /// One poster at both densities, for the `srcset` of anything that shows a

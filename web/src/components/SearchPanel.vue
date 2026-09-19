@@ -130,7 +130,11 @@ const emit = defineEmits<{
                replaced: in here those images never loaded at all. A dropdown is
                at most fifteen thumbnails that are all on screen the instant it
                opens, so deferring them was never buying anything. -->
-          <img class="thumb" :src="artworkUrl(row.item.id, row.item.art_version, 'thumb')" alt="" />
+          <img
+            class="thumb"
+            :src="artworkUrl(row.item.id, row.item.art_version, 'thumb', row.library.id)"
+            alt=""
+          />
           <span class="flex min-w-0 flex-col">
             <span class="truncate text-[15px]">{{ row.item.title }}</span>
             <span class="truncate font-mono text-[12px] text-dim">{{ metaLine(row.item) }}</span>

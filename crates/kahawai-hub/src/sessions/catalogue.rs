@@ -5,16 +5,9 @@ use super::*;
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum FileId {
-    Legacy(i64),
     Catalogue(String),
 }
 impl FileId {
-    pub fn legacy(&self) -> Result<i64> {
-        match self {
-            Self::Legacy(id) => Ok(*id),
-            Self::Catalogue(_) => bail!("not a legacy file"),
-        }
-    }
     pub(super) async fn audio_loudness(
         &self,
         registry: &Registry,
@@ -22,9 +15,7 @@ impl FileId {
         size: u64,
         mtime: i64,
     ) -> Result<Option<kahawai_media::loudness::AudioLoudnessMeasurement>> {
-        let Self::Catalogue(id) = self else {
-            return registry.audio_loudness(self.legacy()?, stream).await;
-        };
+        let Self::Catalogue(id) = self;
         use kahawai_media::loudness::*;
         for fact in registry.catalogue().source_facts(id).await? {
             if let kahawai_mediadb::SourceFact::Loudness(fact) = fact
@@ -339,7 +330,6 @@ pub(crate) fn tracks(
                 id: at as i64 + 1,
                 item_id: item.into(),
                 origin: origin.into(),
-                source_id: None,
                 physical: Some(physical(part, info)),
                 module_id: Some(part.module_id.clone()),
                 collection_id: Some(part.collection_id.clone()),
@@ -352,7 +342,6 @@ pub(crate) fn tracks(
                 label: None,
                 machine: false,
                 derived_from: None,
-                payload_id: None,
                 created_by: None,
             },
         )
@@ -394,7 +383,7 @@ impl Session {
     pub(crate) fn catalogue_track(&self, id: i64) -> Option<crate::tracks::Track> {
         tracks(&self.item_id, self.parts.first()?, &self.info)
             .into_iter()
-            .chain(self.catalogue.as_ref()?.subtitles.iter().cloned())
+            .chain(self.catalogue.subtitles.iter().cloned())
             .find(|t| t.id == id)
     }
     pub(crate) fn catalogue_listing(&self) -> Vec<crate::subtitles::TrackListing> {
@@ -404,11 +393,7 @@ impl Session {
             &self.info,
             self.effective_profile(),
             self.ass_policy(),
-            &self
-                .catalogue
-                .as_ref()
-                .expect("catalogue session")
-                .subtitles,
+            &self.catalogue.subtitles,
         )
     }
     pub(crate) fn physical_source(&self) -> Option<crate::subtitles::FileSource> {
@@ -515,7 +500,6 @@ fn downloaded_tracks(
                 physical: Some(physical(part, info)),
                 item_id: item.into(),
                 origin: "downloaded".into(),
-                source_id: None,
                 module_id: Some(part.module_id.clone()),
                 collection_id: Some(part.collection_id.clone()),
                 root_token: Some(part.root_token.clone()),
@@ -527,7 +511,6 @@ fn downloaded_tracks(
                 label: d.label.clone(),
                 machine: false,
                 derived_from: None,
-                payload_id: None,
                 created_by: Some(d.created_by.clone()),
             })
         })

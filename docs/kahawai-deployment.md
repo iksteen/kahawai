@@ -199,12 +199,75 @@ and mediahosts together: the major-version handshake rejects protocol-3 peers.
 No catalogue migration from a hub is attempted. Preserve the mediahost
 `state_dir`, start the new mediahost, and let its initial scan populate
 `catalog.db`; each connected hub then reconciles its physical projection
-from that live snapshot while stable item IDs retain hub-owned users, libraries,
-watch state, metadata, matches and subtitle payloads. Named multi-hub
+from that live snapshot. Within a mediadb deployment, persisted library/child IDs
+retain current watch state across reconnects. The legacy hub-to-mediadb upgrade
+does not convert old catalogue identities or their history; follow the procedure below. Named multi-hub
 credentials live under `state_dir/hubs/<id>`;
 the legacy `[mediahost].hub` identity remains at the old state-directory root.
 Move `detect_segments` from `[hub]` to `[mediahost]`; the old hub key is rejected
 so an expensive local-analysis policy cannot silently change during upgrade.
+
+## Upgrading to mediadb
+
+The hub now keeps users, enrollment, credentials and current watch state in
+`hub.db`, and catalogue/library/metadata data in `mediadb.db`. Both live under
+`[hub] data_dir` and migrate independently at startup. Hub migration 0089 drops
+the retired catalogue and historical watch tables. It does not import legacy
+libraries, manual matches or watch history. Recreate library composition and
+restricted-user library access after the mediahosts import their collections;
+legacy grant rows do not grant access to new library IDs. Existing mediadb
+installations retain their libraries, assignments, downloads and current history.
+
+1. Stop the hub/AIO and keep its existing binary and configuration. **Use that
+   old binary** to create the pre-upgrade backup:
+   `OLD_KAHAWAI --config /path/kahawai.toml hub backup /path/pre-mediadb-backup`.
+   The new binary's backup command opens and migrates the hub database, so it
+   must not be used to obtain the pre-upgrade recovery snapshot. Also preserve
+   each mediahost's `state_dir` and configuration, including enrollment keys and
+   its local `catalog.db`, while that mediahost is stopped. Hub backups do not
+   include satellite state directories.
+2. Install the matching hub and mediahost builds. Protocol-3 peers cannot connect
+   to protocol 4. Within protocol 4, priority hints need 4.1, deep rescans need
+   4.2, and revision-tagged subtitle extraction needs 4.3. Update mediahosts to
+   4.3 for image extraction/OCR; older peers retain lease-based text extraction.
+   For silence: `scripts/kahawai-silence.sh silence --mediahost-only`.
+3. Start the mediahosts with their preserved state directories, then the hub.
+   Verify both database migration histories, satellite connections, collection
+   inventory and library access. On the first legacy conversion, create libraries
+   from the imported collections and allow enrichment to populate metadata.
+   Test playback and subtitle delivery from a remote source as well as local media.
+4. Create a post-upgrade backup. Its format-4 manifest must include both `hub.db`
+   and `mediadb.db`. Restore it into an isolated data directory and start a test
+   hub with separate listener addresses before relying on it for recovery.
+
+Backups include PKI, secret files, configuration and the subtitle file tree, plus
+provider metadata and downloaded subtitle payloads held in mediadb. Filesystem
+artwork/provider caches are excluded. Online backups are supported, but the two
+database snapshots are sequential; stop the hub first for a quiescent snapshot.
+Restore always requires a stopped hub. The CLI validates both databases and
+artifact checksums before replacing either; `--force` only permits overwriting
+an existing destination. A legacy hub-only snapshot cannot overwrite an existing
+mediadb, even with `--force`.
+
+To roll back the legacy conversion, stop the new hub, keep its data directory
+intact, and use the **old binary** to restore the pre-upgrade snapshot into a
+fresh directory. Point the old configuration at that directory before starting
+it. Do not run the old binary against the upgraded database or mix its hub-only
+snapshot with the new mediadb. If rolling back satellite builds, restore their
+saved state/configuration as a set. Changes made after the recovery snapshot
+are not present in the rollback.
+
+Runnable checks: `scripts/kahawai-backup-cycle.sh` exercises format-4 backup,
+restore and corruption refusal; `scripts/kahawai-mediadb.sh check-live` checks
+real-process ingestion, playback, source edits and restart/replay. For the legacy
+cutover, run `python3 scripts/kahawai-upgrade-check.py OLD_BINARY NEW_BINARY`;
+it creates disposable profiles and checks upgrade, two-database restore, and
+rollback using the old binary. With a deployed mediahost, run
+`KAHAWAI_BIN=NEW_BINARY python3 scripts/kahawai-remote-subtitles-check.py silence`.
+That check uses `~/.ssh/id_rsa_agent` by default (an optional second argument
+overrides it), creates its own remote mediahost and generated media, and checks
+embedded text, OCR and ASS overlays across a replacement at the same path.
+It requires local ffmpeg, Tesseract's English model, and an OCR-enabled hub.
 
 ## Capping what a transcode costs the box (TC-6)
 

@@ -1,7 +1,7 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import type { EnrichmentDetail } from '../src/api/generated/model/enrichmentDetail.ts'
 import MatchDialog from '../src/components/MatchDialog.vue'
 import Card from '../src/components/Card.vue'
@@ -17,9 +17,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   item: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/art/${id}`,
 }))
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const record = {
   provider: 'tmdb',
   external_id: '949',
@@ -342,7 +341,7 @@ describe('the card’s match affordance', () => {
       played: false,
       art_version: 1,
       ...over,
-    }) as unknown as ItemRowI64 & { played: boolean }
+    }) as unknown as ItemSummary & { played: boolean }
 
   test('is not offered unless the caller says so', async () => {
     // Only an admin has the endpoint, and only a work has an identity of its

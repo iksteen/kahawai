@@ -20,7 +20,7 @@ import { useRoute, useRouter } from 'vue-router'
 import Btn from '../components/Btn.vue'
 import Failed from '../components/Failed.vue'
 import Picture from '../components/Picture.vue'
-import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { ItemDetail } from '../api/catalogue-model.ts'
 import type { CarriedTracks } from '../domain/player-tracks.ts'
 import type { PlayerMode } from '../domain/player-keys.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
@@ -54,7 +54,7 @@ const startAt = computed(() => {
   return typeof asked === 'string' && /^\d+$/.test(asked) ? Number(asked) : null
 })
 
-const item = ref<ItemQueryResponse | null>(null)
+const item = ref<ItemDetail | null>(null)
 /// Read once, on the way in, and handed to the picture: the preferences that
 /// chose the audio track and the media type that shaped that choice. The
 /// picture used to fetch both again to draw its selectors with, which is the
@@ -395,7 +395,7 @@ async function restarted(
 /// throwing away the session it has already started.
 function advanced(
   from: string,
-  nextItem: ItemQueryResponse,
+  nextItem: ItemDetail,
   fresh: StartSessionResponse,
   nextPrefs: Preference[],
 ) {

@@ -19,16 +19,10 @@ import { computed, type Ref, ref } from 'vue'
 import { useInfiniteQuery, useQuery, useQueryClient } from '@tanstack/vue-query'
 
 import { catalogueChildren } from '../api/catalogue.ts'
-import { buildProfile } from '../api/capabilities.ts'
-import type { ItemQueryResponse } from '../api/generated/model/itemQueryResponse.ts'
+import type { ItemDetail } from '../api/catalogue-model.ts'
 import type { Preference } from '../api/generated/model/preference.ts'
 import { queryPlaybackItem } from '../api/playback.ts'
-import {
-  catalogueSetWatched,
-  itemChildren,
-  itemQuery,
-  itemSetWatched,
-} from '../api/generated/kahawai.ts'
+import { catalogueSetWatched } from '../api/generated/kahawai.ts'
 import { notify } from './notices.ts'
 import { sentence } from '../domain/refusal.ts'
 
@@ -58,7 +52,7 @@ export function useItem(
     // panel has none until a still is picked, and asking anyway sent a QUERY
     // for the empty id on every visit and after every mark.
     enabled: computed(() => id.value !== '' && (playback?.ready.value ?? true)),
-    queryFn: (): Promise<ItemQueryResponse> =>
+    queryFn: (): Promise<ItemDetail> =>
       playback
         ? queryPlaybackItem(
             id.value,
@@ -67,9 +61,7 @@ export function useItem(
             undefined,
             library?.value,
           )
-        : library
-          ? queryPlaybackItem(id.value, [], '', undefined, library.value)
-          : itemQuery(id.value, { profile: buildProfile() }),
+        : queryPlaybackItem(id.value, [], '', undefined, library?.value),
   })
 }
 
@@ -109,7 +101,8 @@ function useChildPages(
     enabled,
     initialPageParam: 0,
     queryFn: async ({ pageParam }) => {
-      if (library?.value) {
+      if (!library?.value) throw new Error('Children require a library.')
+      {
         const page = await catalogueChildren(library.value, id.value, {
           offset: pageParam,
           limit: 200,
@@ -122,8 +115,6 @@ function useChildPages(
           groups: page.groups ?? [],
         }
       }
-      const page = await itemChildren(id.value)
-      return { ...page, offset: 0, total: page.children.length, groups: [] }
     },
     getNextPageParam: (last) => {
       const next = last.offset + last.children.length
@@ -157,7 +148,8 @@ export function useWatched(library?: Ref<string>) {
     if (busy.value.has(id)) return false
     busy.value = new Set(busy.value).add(id)
     try {
-      if (library?.value) {
+      if (!library?.value) throw new Error('Watch state requires a library.')
+      {
         await catalogueSetWatched(library.value, id, {
           played,
           ...(season !== undefined
@@ -166,7 +158,7 @@ export function useWatched(library?: Ref<string>) {
               ? { items }
               : {}),
         })
-      } else await itemSetWatched(id, items ? { played, items } : { played })
+      }
       // Both, because a mark changes the child's own row and the parent's
       // count of watched children.
       //

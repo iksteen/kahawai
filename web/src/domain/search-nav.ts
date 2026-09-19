@@ -3,7 +3,7 @@
 /// One flat list, because the keyboard walks headings and hits alike: a
 /// heading is a row you can land on and press.
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import type { LibrarySummary } from './shelves.ts'
 
 /// Shared because a mismatch is silent: the input points
@@ -16,7 +16,7 @@ export const searchOptionId = (i: number) => `search-opt-${i}`
 /// Hits from one library, as the search returns them.
 export type LibraryHits = {
   library: LibrarySummary
-  items: ItemRowI64[]
+  items: ItemSummary[]
   total: number
   /// Empty when it answered. A library that could not be asked is a different
   /// answer from one with no matches, and an empty list gives the first when
@@ -27,7 +27,7 @@ export type LibraryHits = {
 /// A row the panel renders and the keyboard can land on.
 export type SearchRow =
   | { kind: 'library'; library: LibrarySummary; total: number; shown: number }
-  | { kind: 'item'; item: ItemRowI64; library: LibrarySummary }
+  | { kind: 'item'; item: ItemSummary; library: LibrarySummary }
 
 /// Heading, then that library's items. An empty library contributes no
 /// heading: one over nothing reads as "we looked and found some".

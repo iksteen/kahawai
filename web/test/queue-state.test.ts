@@ -3,11 +3,11 @@
 
 import { afterEach, beforeEach, describe, expect, test } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { clearNotices, notice } from '../src/composables/notices.ts'
 import { clearQueue, useQueue } from '../src/composables/queue.ts'
 
-const track = (id: string) => ({ id, title: id.toUpperCase() }) as ItemRowI64
+const track = (id: string) => ({ id, title: id.toUpperCase() }) as ItemSummary
 
 const queue = useQueue()
 

@@ -9,7 +9,7 @@
 
 import { onScopeDispose, type Ref, ref, watch } from 'vue'
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import { CHUNK } from '../domain/virtual.ts'
 import { listItems } from '../api/catalogue.ts'
 import { sentence } from '../domain/refusal.ts'
@@ -23,7 +23,7 @@ export function useLibraryItems(
   /// Sparse, keyed by item index. A `Map` rather than an array: the grid holds
   /// the whole library's height from the first answer, and most of it has
   /// never been fetched.
-  const loaded = ref(new Map<number, ItemRowI64>())
+  const loaded = ref(new Map<number, ItemSummary>())
   const total = ref<number | null>(null)
   /// What the library holds regardless of the filter, so the count line can
   /// say "12/2242" rather than leaving you wondering whether the other 2230
@@ -81,7 +81,7 @@ export function useLibraryItems(
       if (swap) replacing = 0
       total.value = answer.total
       if (!query.value) libraryTotal.value = answer.total
-      const next = swap ? new Map<number, ItemRowI64>() : new Map(loaded.value)
+      const next = swap ? new Map<number, ItemSummary>() : new Map(loaded.value)
       answer.items.forEach((item, at) => next.set(answer.offset + at, item))
       loaded.value = next
       // Cleared only when nothing is still missing. Clearing on ANY arrival

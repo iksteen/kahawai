@@ -951,8 +951,10 @@ not describe this branch's current runtime.
       The hub's user/watch-state database remains separate.
 - [x] Hub startup, complete mediahost offers/deltas, durable ACKs, generation-safe
       reconnect/deletion, scoped catalogue APIs and independent library grants.
-      Legacy history is preserved without conversion; old catalogue consumers
-      are explicitly unavailable. API companion and isolated real-process check.
+      API companion and isolated real-process check.
+- [x] Removed retired catalogue endpoints and runtime implementation. Hub migration
+      0089 drops obsolete catalogue/history tables, views and triggers; current
+      user/watch state and operational data remain. Populated upgrade and reopen checks.
 - [x] Admin library composition and grants use mediadb: typed collection selection,
       ordered membership drafts, save/cancel, deletion and real-browser acceptance.
 - [x] Provider execution/matching on mediadb: independent durable provider work,

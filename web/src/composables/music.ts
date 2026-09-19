@@ -2,7 +2,7 @@ import { onScopeDispose, type Ref, ref, shallowRef, watch } from 'vue'
 
 import { artistAlbums, listArtists } from '../api/catalogue.ts'
 import type { ArtistSummary } from '../api/generated/model/artistSummary.ts'
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import { CHUNK } from '../domain/virtual.ts'
 import { sentence } from '../domain/refusal.ts'
 
@@ -125,7 +125,7 @@ export function useArtistAlbums(
   sort: Ref<string>,
 ) {
   const artist = ref<ArtistSummary | null>(null)
-  const pages = sparsePages<ItemRowI64>(
+  const pages = sparsePages<ItemSummary>(
     async (offset) => {
       const answer = await artistAlbums(key.value, {
         library: library.value,
@@ -139,7 +139,7 @@ export function useArtistAlbums(
     [library, key, query, sort],
     undefined,
     (answer) => {
-      artist.value = (answer as Page<ItemRowI64> & { artist: ArtistSummary }).artist
+      artist.value = (answer as Page<ItemSummary> & { artist: ArtistSummary }).artist
     },
   )
   // A sort or filter may leave the still-relevant old page visible until its

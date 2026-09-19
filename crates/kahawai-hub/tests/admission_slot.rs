@@ -15,48 +15,20 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use kahawai_hub::registry::{FileUpsertRecord, Registry};
+use kahawai_hub::registry::Registry;
 use kahawai_hub::sessions::Sessions;
 
 const CAP: usize = 4;
-const TEST_ROOT: &str = "/kahawai-test-root";
 
 async fn fixture() -> (Arc<Registry>, Arc<Sessions>, String, tempfile::TempDir) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db.clone(),
         Default::default(),
         kahawai_mediadb::Store::in_memory().await.unwrap(),
     ));
-    registry
-        .announce_collection("01HOST", "movies", "movies", &[TEST_ROOT.into()])
-        .await
-        .unwrap();
-    registry
-        .upsert_files(
-            "01HOST",
-            "movies",
-            vec![FileUpsertRecord {
-                root_token: kahawai_core::media::root_token(std::path::Path::new(TEST_ROOT)),
-                path_rel: "Heat (1995).mkv".into(),
-                size: 1_000_000,
-                mtime_unix: 1,
-                head_xxh3: 1,
-                tail_xxh3: 2,
-                oshash: 3,
-                streams_json: r#"{"container":"matroska","duration_ms":600000}"#.into(),
-            }],
-        )
-        .await
-        .unwrap();
-    registry.connected("01HOST", "mediahost", "nas", "fp", "test");
-    let item: String = sqlx::query_scalar("SELECT id FROM collection_items LIMIT 1")
-        .fetch_one(&db)
-        .await
-        .unwrap();
+    let item = "absent-catalogue-item".to_string();
     let sessions = Arc::new(Sessions::with_limits(
         dir.path().join("scratch"),
         CAP,

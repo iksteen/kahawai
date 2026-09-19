@@ -1,4 +1,12 @@
-vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The search panel, mounted. Two rules run through all of it: a library that
 /// could not be asked is not a library with no matches, and the rows that are
 /// on screen stay actionable while their replacements load.
@@ -8,24 +16,22 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { defineComponent, h, ref } from 'vue'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  listItems: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 
-const { listItems } = await import('../src/api/generated/kahawai.ts')
+const { listItems } = await import('./api-fixture.ts')
 const { useSearchPanel } = await import('../src/composables/search-panel.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 
 const films = { id: 'films', name: 'Films', media_type: 'movies' }
 const music = { id: 'music', name: 'Music', media_type: 'music' }
-const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemRowI64
-const page = (items: ItemRowI64[], total = items.length) => ({ items, total, limit: 5, offset: 0 })
+const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemSummary
+const page = (items: ItemSummary[], total = items.length) => ({ items, total, limit: 5, offset: 0 })
 
 /// The composable in a component, because it uses queries and a scope.
 function panel(query = ref('heat'), libraries = ref([films, music])) {
@@ -44,7 +50,7 @@ function panel(query = ref('heat'), libraries = ref([films, music])) {
 }
 
 /// Each library answers with what it is given, or refuses.
-function answers(by: Record<string, ItemRowI64[] | 'fails'>) {
+function answers(by: Record<string, ItemSummary[] | 'fails'>) {
   vi.mocked(listItems).mockImplementation(async (params) => {
     const answer = by[params?.library ?? '']
     if (answer === 'fails' || answer === undefined) throw new ApiError(503, 'the hub is restarting')

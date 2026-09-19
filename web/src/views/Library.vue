@@ -27,7 +27,7 @@ import {
   shapeOf,
   visibleRows,
 } from '../domain/virtual.ts'
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import { listLibraries } from '../api/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
@@ -83,9 +83,9 @@ const artists = useArtists(library, query, artistSort, music)
 /// Only for a work — an episode inherits its show's identity — and only for an
 /// admin, who is the only one the endpoint answers.
 const me = whoAmI()
-const matchable = (_item: ItemRowI64) => me.admin
+const matchable = (_item: ItemSummary) => me.admin
 
-const matching = ref<ItemRowI64 | null>(null)
+const matching = ref<ItemSummary | null>(null)
 
 /// Pressing the library's name drops the filter, which is the other half of
 /// the ✕ in the box — the heading is where somebody looks when the page is

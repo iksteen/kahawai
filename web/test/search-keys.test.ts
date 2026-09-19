@@ -1,4 +1,12 @@
-vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The search panel as the keyboard reaches it: through the box it belongs
 /// to, and nowhere else. Scoping these to the search area rather than the
 /// window is what keeps them from arguing with the menus, the dialogs and the
@@ -9,16 +17,14 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  listItems: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 
-const { listItems } = await import('../src/api/generated/kahawai.ts')
+const { listItems } = await import('./api-fixture.ts')
 const AppShell = (await import('../src/components/AppShell.vue')).default
 const { DEBOUNCE_MS } = await import('../src/composables/search.ts')
 
@@ -26,9 +32,9 @@ const LIBS = [
   { id: 'films', name: 'Films', media_type: 'movies' },
   { id: 'music', name: 'Music', media_type: 'music' },
 ]
-const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemRowI64
+const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemSummary
 
-function answers(by: Record<string, ItemRowI64[]>) {
+function answers(by: Record<string, ItemSummary[]>) {
   vi.mocked(listItems).mockImplementation(async (params) => ({
     items: by[params?.library ?? ''] ?? [],
     total: (by[params?.library ?? ''] ?? []).length,

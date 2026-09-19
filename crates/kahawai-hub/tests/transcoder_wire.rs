@@ -375,9 +375,7 @@ async fn mediahost_cert_is_refused_on_transcoder_link() {
 #[tokio::test]
 async fn capacity_holds_when_placements_arrive_together() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(Registry::new(
         db,
         AllowedCerts::default(),

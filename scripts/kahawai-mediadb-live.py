@@ -337,9 +337,9 @@ roots = {json.dumps([str(r) for r in roots])}
     assert len(page["items"]) == 1 and len(page["items"][0]["copy_ids"]) == 2, page
     item = page["items"][0]["id"]
     copies = page["items"][0]["copy_ids"]
-    assert query("hub.db", "SELECT COUNT(*) FROM files") == [(0,)]
+    assert query("hub.db", "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'") == [(0,)]
     assert query("mediadb.db", "SELECT COUNT(*) FROM files") == [(8,)]
-    assert query("mediadb.db", "SELECT MAX(version) FROM _sqlx_migrations")[0][0] == 3
+    assert query("mediadb.db", "SELECT MAX(version) FROM _sqlx_migrations")[0][0] == 4
     until(lambda: all(api("GET", f"/admin/v1/enrich/items/{copy}")["input"]["selected"] for copy in copies), "local NFO enrichment despite unavailable remote providers")
     until(lambda: query("mediadb.db", f"SELECT count(*) FROM enrichment_jobs j JOIN collection_items i ON i.id=j.item_id WHERE i.collection_id='{col['id']}' AND j.provider='local' AND j.state='done'")[0][0] == len(copies),
           "local enrichment settled after library membership changes")
@@ -420,7 +420,7 @@ roots = {json.dumps([str(r) for r in roots])}
     local_items = api("GET", f"/api/v1/catalogue/libraries/{local_library['id']}/items")["items"]
     assert len(local_items) == 1 and local_items[0]["id"] == item, local_items
     assert local_items[0]["played"] is True, "watch state must survive replacement of the entire mediahost"
-    assert query("hub.db", "SELECT COUNT(*) FROM files") == [(0,)]
+    assert query("hub.db", "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'") == [(0,)]
     session=api("POST","/api/v1/playback/sessions",{"library_id":local_library["id"],"item_id":item,"mode":"direct"})
     request=urllib.request.Request(url+session["stream_url"],headers={"Authorization":"Bearer "+token,"Range":"bytes=0-31"})
     with urllib.request.urlopen(request,timeout=10) as response:

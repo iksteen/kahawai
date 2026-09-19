@@ -58,8 +58,11 @@ async fn query_and_a_real_session_agree_on_the_ass_rung() {
         .clone()
         .oneshot(
             Request::builder()
-                .method("QUERY")
-                .uri(format!("/api/v1/items/{}", h.item_id))
+                .method("POST")
+                .uri(format!(
+                    "/api/v1/catalogue/libraries/{}/items/{}",
+                    h.library_id, h.item_id
+                ))
                 .header("authorization", &h.bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!("{{\"profile\":{PROFILE}}}")))
@@ -95,8 +98,8 @@ async fn query_and_a_real_session_agree_on_the_ass_rung() {
                 .header("authorization", &h.bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    "{{\"item_id\":\"{}\",\"profile\":{PROFILE}}}",
-                    h.item_id
+                    "{{\"library_id\":\"{}\",\"item_id\":\"{}\",\"profile\":{PROFILE}}}",
+                    h.library_id, h.item_id
                 )))
                 .unwrap(),
         )
@@ -148,6 +151,7 @@ async fn the_session_listing_reflects_the_session_profile() {
         let api = h.api.clone();
         let bearer = h.bearer.clone();
         let item_id = h.item_id.clone();
+        let library_id = h.library_id.clone();
         async move {
             let profile = format!(
                 r#"{{"containers":["mp4"],"video":[{{"codec":"h264"}}],
@@ -161,7 +165,7 @@ async fn the_session_listing_reflects_the_session_profile() {
                         .header("authorization", &bearer)
                         .header("content-type", "application/json")
                         .body(Body::from(format!(
-                            "{{\"item_id\":\"{item_id}\",\"profile\":{profile}}}"
+                            "{{\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"profile\":{profile}}}"
                         )))
                         .unwrap(),
                 )

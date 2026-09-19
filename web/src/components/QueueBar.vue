@@ -167,7 +167,6 @@ async function prepare(which: 0 | 1, want: number) {
       {
         item_id: track.id,
         library_id: track.library_id,
-        ...(track.album_track_id == null ? {} : { album_track_id: track.album_track_id }),
         mode: 'direct',
       },
       { signal: AbortSignal.timeout(START_TIMEOUT_MS) },

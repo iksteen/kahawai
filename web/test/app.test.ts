@@ -33,10 +33,8 @@ vi.mock('../src/composables/boot.ts', () => ({
 }))
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   libraries: vi.fn(async () => []),
-  listItems: vi.fn(async () => ({ items: [], total: 0, limit: 20, offset: 0 })),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 vi.mock('../src/api/session.ts', () => ({
   signOut: vi.fn(),
@@ -165,7 +163,7 @@ describe('what is asked for before there is a session', () => {
     // libraries, so an ungated query fires on the boot and sign-in screens —
     // a guaranteed 401, and two of them on first-run setup where no refresh
     // cookie can exist to recover with.
-    const { libraries } = await import('../src/api/generated/kahawai.ts')
+    const { libraries } = await import('./api-fixture.ts')
     const router = app()
     await router.isReady()
     for (const at of ['boot', 'login', 'setup'] as const) {

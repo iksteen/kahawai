@@ -2089,7 +2089,6 @@ dependencies = [
  "leptess",
  "libc",
  "md-5",
- "parking_lot",
  "prost",
  "rand_core 0.6.4",
  "rcgen",

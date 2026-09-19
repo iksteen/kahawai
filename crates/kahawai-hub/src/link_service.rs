@@ -57,16 +57,15 @@ async fn end_sessions_on(sessions: &Sessions, module_id: &str) {
 pub(crate) async fn forget_link(
     registry: &Registry,
     sessions: &Sessions,
-    segments: &crate::segments::Detector,
     module_id: &str,
-    generation: u64,
+    _generation: u64,
     tx: &tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
 ) {
     // Remove routing first, then retire this generation's work. A dispatcher
     // that raced before removal is cancelled below; one that races after sees
     // the generation is no longer current and cancels its own waiter.
     let current = registry.unregister_link_if_current(module_id, tx);
-    segments.segment_link_disconnected(module_id, generation);
+
     if !current {
         tracing::info!(%module_id, "link already replaced; leaving the new one alone");
         return;
@@ -79,7 +78,6 @@ pub struct MediahostLinkService {
     sessions: Arc<Sessions>,
     subtitles: Arc<crate::subtitles::Subtitles>,
     _enricher: Arc<crate::enrich::Enricher>,
-    segments: Arc<crate::segments::Detector>,
 }
 
 impl MediahostLinkService {
@@ -89,28 +87,11 @@ impl MediahostLinkService {
         subtitles: Arc<crate::subtitles::Subtitles>,
         _enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
-        Self::new_with_segments(
-            registry,
-            sessions,
-            subtitles,
-            _enricher,
-            Arc::new(crate::segments::Detector::new()),
-        )
-    }
-
-    pub fn new_with_segments(
-        registry: Arc<Registry>,
-        sessions: Arc<Sessions>,
-        subtitles: Arc<crate::subtitles::Subtitles>,
-        _enricher: Arc<crate::enrich::Enricher>,
-        segments: Arc<crate::segments::Detector>,
-    ) -> Self {
         Self {
             registry,
             sessions,
             subtitles,
             _enricher,
-            segments,
         }
     }
 
@@ -123,17 +104,13 @@ impl MediahostLinkService {
 
 fn register_host_link(
     registry: &Registry,
-    segments: &crate::segments::Detector,
     module_id: &str,
     tx: tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
     protocol_minor: u32,
     segment_detector_generation: i64,
 ) -> u64 {
-    let (generation, replaced) =
+    let (generation, _) =
         registry.register_link(module_id, tx, protocol_minor, segment_detector_generation);
-    if let Some(replaced) = replaced {
-        segments.segment_link_disconnected(module_id, replaced);
-    }
     generation
 }
 
@@ -146,7 +123,6 @@ pub fn local_link(
     registry: Arc<Registry>,
     subtitles: Arc<crate::subtitles::Subtitles>,
     _enricher: Arc<crate::enrich::Enricher>,
-    segments: Arc<crate::segments::Detector>,
     module_id: &str,
     name: &str,
 ) -> (
@@ -170,7 +146,6 @@ pub fn local_link(
         );
         let generation = register_host_link(
             &registry,
-            &segments,
             &module_id,
             hub_tx,
             PROTOCOL_MINOR,
@@ -188,9 +163,6 @@ pub fn local_link(
                 let _ = registered_tx.try_send(Err(Status::failed_precondition(error.to_string())));
                 break;
             }
-            let Some(msg) = route_segment_reply(&segments, &module_id, generation, msg) else {
-                continue;
-            };
             let _guard = gate.lock().await;
             if !registry.host_link_is_current(&module_id, generation) {
                 break;
@@ -215,7 +187,6 @@ pub fn local_link(
         // byte plane. The all-in-one local-link supervisor recreates this
         // adapter after an error, replaying from the durable catalogue cursor.
         registry.unregister_link_if_current(&module_id, &registered_tx);
-        segments.segment_link_disconnected(&module_id, generation);
     });
     (host_tx, hub_rx)
 }
@@ -254,7 +225,7 @@ impl MediahostLink for MediahostLinkService {
         }
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let registry = self.registry.clone();
-        let outer_segments = self.segments.clone();
+
         let sessions = self.sessions.clone();
         let subtitles = self.subtitles.clone();
         let module_id = peer.module_id.clone();
@@ -271,7 +242,6 @@ impl MediahostLink for MediahostLinkService {
         }
         let generation = register_host_link(
             &registry,
-            &outer_segments,
             &module_id,
             tx.clone(),
             hello.protocol_minor,
@@ -297,15 +267,7 @@ impl MediahostLink for MediahostLinkService {
                 })),
             };
             if tx.send(Ok(ack)).await.is_err() {
-                forget_link(
-                    &registry,
-                    &sessions,
-                    &outer_segments,
-                    &module_id,
-                    generation,
-                    &tx,
-                )
-                .await;
+                forget_link(&registry, &sessions, &module_id, generation, &tx).await;
                 return;
             }
             // Heavy messages (upserts with resolution, reconciliation)
@@ -377,9 +339,7 @@ impl MediahostLink for MediahostLinkService {
                         if matches!(msg, host_to_hub::Msg::Heartbeat(_)) {
                             tracing::debug!(%module_id, "heartbeat read");
                             registry.seen(&module_id);
-                        } else if let Some(msg) =
-                            route_segment_reply(&outer_segments, &module_id, generation, msg)
-                        {
+                        } else {
                             let kind = kind_name(&msg);
                             tracing::debug!(%module_id, kind, "link msg read");
                             let queued = tokio::time::Instant::now();
@@ -421,15 +381,7 @@ impl MediahostLink for MediahostLinkService {
             // SQL future; already committed records replay idempotently.
             worker.abort();
             let _ = worker.await;
-            forget_link(
-                &registry,
-                &sessions,
-                &outer_segments,
-                &module_id,
-                generation,
-                &tx,
-            )
-            .await;
+            forget_link(&registry, &sessions, &module_id, generation, &tx).await;
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
@@ -526,25 +478,6 @@ fn validate_exact_host_msg(m: &host_to_hub::Msg) -> anyhow::Result<()> {
         _ => {}
     }
     Ok(())
-}
-
-fn route_segment_reply(
-    segments: &crate::segments::Detector,
-    module_id: &str,
-    generation: u64,
-    msg: host_to_hub::Msg,
-) -> Option<host_to_hub::Msg> {
-    match msg {
-        host_to_hub::Msg::SegmentDetectionAccepted(accepted) => {
-            segments.segment_accepted(module_id, generation, accepted);
-            None
-        }
-        host_to_hub::Msg::SegmentDetectionResult(result) => {
-            segments.segment_result(module_id, generation, result);
-            None
-        }
-        other => Some(other),
-    }
 }
 
 fn kind_name(m: &host_to_hub::Msg) -> &'static str {
@@ -774,7 +707,7 @@ async fn handle_host_msg(
 
 #[cfg(test)]
 mod forget_link_tests {
-    use super::{forget_link, register_host_link, route_segment_reply};
+    use super::forget_link;
     use crate::registry::Registry;
     use crate::sessions::Sessions;
     use std::sync::Arc;
@@ -787,7 +720,7 @@ mod forget_link_tests {
     #[tokio::test]
     async fn both_maps_are_forgotten_together() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Arc::new(Registry::new(
             db,
             Default::default(),
@@ -807,15 +740,7 @@ mod forget_link_tests {
             .0;
         assert!(registry.is_connected("01HOST"));
 
-        forget_link(
-            &registry,
-            &sessions,
-            &crate::segments::Detector::new(),
-            "01HOST",
-            generation,
-            &tx,
-        )
-        .await;
+        forget_link(&registry, &sessions, "01HOST", generation, &tx).await;
 
         assert!(
             !registry.is_connected("01HOST"),
@@ -840,7 +765,7 @@ mod forget_link_tests {
     #[tokio::test]
     async fn a_replaced_link_is_left_alone() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Arc::new(Registry::new(
             db,
             Default::default(),
@@ -868,15 +793,7 @@ mod forget_link_tests {
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
 
         // Now the old task times out and tears down.
-        forget_link(
-            &registry,
-            &sessions,
-            &crate::segments::Detector::new(),
-            "01HOST",
-            old_generation,
-            &old_tx,
-        )
-        .await;
+        forget_link(&registry, &sessions, "01HOST", old_generation, &old_tx).await;
 
         assert!(
             registry.is_connected("01HOST"),
@@ -894,7 +811,7 @@ mod forget_link_tests {
     #[tokio::test]
     async fn protocol_four_baseline_opens_discovery_but_detector_generation_still_matches() {
         let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
+        let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Registry::new(
             db,
             Default::default(),
@@ -929,109 +846,6 @@ mod forget_link_tests {
         );
         assert!(registry.host_supports_segment_detection("host"));
         assert!(registry.host_supports_loudness_analysis("host"));
-    }
-
-    #[tokio::test]
-    async fn replacing_a_link_cancels_its_segment_waiter() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
-        let registry = Registry::new(
-            db,
-            Default::default(),
-            kahawai_mediadb::Store::in_memory().await.unwrap(),
-        );
-        let detector = crate::segments::Detector::new();
-        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
-        let old_generation = register_host_link(
-            &registry,
-            &detector,
-            "host",
-            old_tx,
-            1,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-        let current = registry.host_link("host").unwrap().current_token();
-        let reply = detector.wait_for_segment_result("host", old_generation, current, "job");
-
-        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        register_host_link(
-            &registry,
-            &detector,
-            "host",
-            new_tx,
-            1,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-
-        assert!(
-            reply.await.unwrap().is_err(),
-            "replacement left waiter alive"
-        );
-    }
-
-    #[tokio::test]
-    async fn replacement_invalidates_results_before_waiters_are_drained() {
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open_legacy_fixture(dir.path()).await.unwrap();
-        let registry = Registry::new(
-            db,
-            Default::default(),
-            kahawai_mediadb::Store::in_memory().await.unwrap(),
-        );
-        let detector = crate::segments::Detector::new();
-        let (old_tx, _old_rx) = tokio::sync::mpsc::channel(1);
-        let (old_generation, _) = registry.register_link(
-            "host",
-            old_tx,
-            1,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-        let current = registry.host_link("host").unwrap().current_token();
-        let mut reply = detector.wait_for_segment_result("host", old_generation, current, "job");
-
-        let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        let (_, replaced) = registry.register_link(
-            "host",
-            new_tx,
-            1,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
-        assert_eq!(replaced, Some(old_generation));
-        detector.segment_result(
-            "host",
-            old_generation,
-            kahawai_proto::v1::SegmentDetectionResult {
-                request_id: "job".into(),
-                ..Default::default()
-            },
-        );
-        assert!(matches!(
-            reply.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
-
-        detector.segment_link_disconnected("host", old_generation);
-        assert!(matches!(
-            reply.await.unwrap(),
-            Err(crate::segments::SegmentJobFailure::Disconnected)
-        ));
-    }
-
-    #[tokio::test]
-    async fn a_segment_result_completes_before_the_ordered_queue_drains() {
-        let detector = crate::segments::Detector::new();
-        let generation = 7;
-        let current = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
-        let reply = detector.wait_for_segment_result("host", generation, current, "job");
-        let message = kahawai_proto::v1::host_to_hub::Msg::SegmentDetectionResult(
-            kahawai_proto::v1::SegmentDetectionResult {
-                request_id: "job".into(),
-                ..Default::default()
-            },
-        );
-
-        assert!(route_segment_reply(&detector, "host", generation, message).is_none());
-        assert!(reply.await.unwrap().is_ok());
     }
 }
 

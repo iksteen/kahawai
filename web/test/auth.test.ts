@@ -13,7 +13,7 @@ vi.mock('../src/api/session.ts', () => ({ browserLogin: vi.fn() }))
 vi.mock('../src/api/generated/kahawai.ts', () => ({ setup: vi.fn() }))
 
 const { browserLogin } = await import('../src/api/session.ts')
-const { setup } = await import('../src/api/generated/kahawai.ts')
+const { setup } = await import('./api-fixture.ts')
 
 beforeEach(() => vi.resetAllMocks())
 afterEach(() => vi.restoreAllMocks())

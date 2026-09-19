@@ -6,16 +6,15 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, test, vi } from 'vitest'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  getCatalogueArtworkUrl: (library: string, id: string) =>
-    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string, params?: { size?: string; v?: string }) =>
-    `/api/v1/items/${id}/artwork?size=${params?.size ?? ''}&v=${params?.v ?? ''}`,
+  getCatalogueArtworkUrl: (library: string, id: string, params?: { size?: string }) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork${params?.size ? `?size=${params.size}` : ''}`,
 }))
 
 const Art = (await import('../src/components/Art.vue')).default
 
 const item = (over: Record<string, unknown> = {}) => ({
   id: 'i1',
+  library_id: 'films',
   kind: 'movie',
   played: false,
   art_version: 7,
@@ -30,8 +29,8 @@ describe('which poster, and at what size', () => {
     // show, for every card on the page.
     const art = mount(Art, { props: { item: item(), size: 'card' } })
     const [one, two] = art.find('img').attributes('srcset')!.split(', ')
-    expect(one).toMatch(/size=card1x&v=7 1x$/)
-    expect(two).toMatch(/size=card&v=7 2x$/)
+    expect(one).toMatch(/size=card1x 1x$/)
+    expect(two).toMatch(/size=card 2x$/)
   })
 
   test('and the small one is the 1x, not the other way round', () => {
@@ -47,9 +46,9 @@ describe('which poster, and at what size', () => {
     expect(art.find('img').attributes('srcset')).toBeUndefined()
   })
 
-  test('the version pins the URL, so a re-matched poster is not cached for ever', () => {
+  test('artwork is scoped to the catalogue library', () => {
     const art = mount(Art, { props: { item: item({ art_version: 7 }), size: 'card' } })
-    expect(art.find('img').attributes('src')).toContain('v=7')
+    expect(art.find('img').attributes('src')).toContain('/catalogue/libraries/films/')
   })
 })
 
@@ -69,7 +68,7 @@ describe("showing somebody else's poster", () => {
     const art = mount(Art, {
       props: { item: item({ art_version: 7 }), size: 'card', posterOf: 'show1' },
     })
-    expect(art.find('img').attributes('src')).toContain('v=')
+    expect(art.find('img').attributes('src')).not.toContain('v=')
     expect(art.find('img').attributes('src')).not.toContain('v=7')
   })
 })

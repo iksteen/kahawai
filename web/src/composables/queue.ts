@@ -22,7 +22,7 @@ import {
   removeAt,
   upNext,
 } from '../domain/queue.ts'
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import { notify } from './notices.ts'
 
 const queue = ref<Queue>(EMPTY)
@@ -47,15 +47,15 @@ export function useQueue() {
 
     /// Playing a record replaces the queue; adding one leaves what is playing
     /// alone. Both are what somebody asked for.
-    playAlbum(tracks: ItemRowI64[], from = 0) {
+    playAlbum(tracks: ItemSummary[], from = 0) {
       generation.value += 1
       queue.value = play(tracks, from)
     },
-    appendAlbum(tracks: ItemRowI64[]) {
+    appendAlbum(tracks: ItemSummary[]) {
       queue.value = append(queue.value, tracks)
       notify(`Added ${tracks.length} ${tracks.length === 1 ? 'track' : 'tracks'} to the queue.`)
     },
-    appendTrack(track: ItemRowI64) {
+    appendTrack(track: ItemSummary) {
       queue.value = appendOne(queue.value, track)
       notify(`Added ${track.title} to the queue.`)
     },

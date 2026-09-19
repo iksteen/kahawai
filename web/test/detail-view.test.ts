@@ -1,52 +1,18 @@
+const detailForEnrichment = vi.hoisted(() =>
+  vi.fn<(id: string) => Promise<import('../src/api/catalogue-model.ts').ItemDetail>>(),
+)
 // Layout fixtures exercise the existing playback-capable presentation as well as
 // unavailable states. The real catalogue adapter is covered separately and live.
-vi.mock('../src/composables/item.ts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/composables/item.ts')>()
-  return {
-    ...actual,
-    useItem: (
-      id: Parameters<typeof actual.useItem>[0],
-      playback: Parameters<typeof actual.useItem>[1],
-      library: Parameters<typeof actual.useItem>[2],
-    ) => actual.useItem(id, playback, library),
-  }
-})
-vi.mock('../src/api/catalogue.ts', async () => {
-  const api = await import('../src/api/generated/kahawai.ts')
-  return {
-    ...api,
-    catalogueDetail: async (
-      _library: string,
-      id: string,
-      query: Parameters<typeof api.itemQuery>[1],
-    ) => {
-      const detail = await api.itemQuery(id, query)
-      const source =
-        query?.source_id ??
-        detail.negotiated?.source?.source_id ??
-        detail.sources?.[0]?.source_id ??
-        1
-      return {
-        ...detail,
-        library_id: _library,
-        subtitle_source: { media_entry_id: String(source), source_version: 'fixture' },
-      }
-    },
-    catalogueChildren: async (_library: string, id: string, params?: { season?: string }) => {
-      const page = await api.itemChildren(id)
-      return {
-        ...page,
-        children: params?.season
-          ? page.children.filter((e) =>
-              params.season === 'absolute'
-                ? (e.proj_season ?? e.season) == null
-                : (e.proj_season ?? e.season) === Number(params.season),
-            )
-          : page.children,
-      }
-    },
-  }
-})
+
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The item pages, mounted. UI-13 is the shape of this file: three failures
 /// live on an item page and they are three different things, and one `error`
 /// state doing two of those jobs is what put "Could not load this item" over
@@ -55,58 +21,26 @@ vi.mock('../src/api/catalogue.ts', async () => {
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
-import { defineComponent, h } from 'vue'
+import { defineComponent, h, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  itemQuery: vi.fn(),
-  itemDetail: vi.fn(),
   enrichmentDetail: vi.fn(),
   enrichmentIdentities: vi.fn().mockResolvedValue([]),
   getEnrichmentArtworkUrl: (id: string) => `/api/v1/catalogue/collection-items/${id}/artwork`,
-  listItems: vi.fn(),
   enrichmentSearch: vi.fn(),
   enrichmentCorrect: vi.fn(),
-  itemChildren: vi.fn(),
-  itemSetWatched: vi.fn(),
-  catalogueSetWatched: async (
-    _library: string,
-    id: string,
-    body: { played: boolean; items?: string[] },
-  ) => (await import('../src/api/generated/kahawai.ts')).itemSetWatched(id, body),
+  catalogueSetWatched: vi.fn(),
   adminItemLog: vi.fn(),
-  listLibraries: vi.fn(),
   getPrefs: vi.fn(),
   putPref: vi.fn(),
-  catalogueSubtitleSearch: async (
-    _library: string,
-    id: string,
-    body: { source: { media_entry_id: string }; languages: string[] },
-  ) =>
-    (await import('../src/api/generated/kahawai.ts')).subtitleSearch(id, {
-      languages: body.languages,
-      source_id: Number(body.source.media_entry_id),
-    }),
-  catalogueSubtitleDownload: async (
-    _library: string,
-    id: string,
-    body: { source: { media_entry_id: string }; file_id: string; language: string | null },
-  ) =>
-    (await import('../src/api/generated/kahawai.ts')).subtitleDownload(id, {
-      file_id: body.file_id,
-      language: body.language,
-      source_id: Number(body.source.media_entry_id),
-    }),
-  catalogueSubtitleDelete: async (_library: string, _id: string, track: number) =>
-    (await import('../src/api/generated/kahawai.ts')).subtitleDelete(track),
-  subtitleSearch: vi.fn(),
-  subtitleDownload: vi.fn(),
-  subtitleDelete: vi.fn(),
+  catalogueSubtitleSearch: vi.fn(),
+  catalogueSubtitleDownload: vi.fn(),
+  catalogueSubtitleDelete: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 const admin = { value: false }
 vi.mock('../src/api/session.ts', () => ({ whoAmI: () => ({ username: 'me', admin: admin.value }) }))
@@ -117,21 +51,20 @@ vi.mock('../src/api/capabilities.ts', () => ({
 
 const {
   adminItemLog,
-  itemDetail,
   enrichmentDetail,
   enrichmentIdentities,
   listItems,
   enrichmentSearch,
   enrichmentCorrect,
   getPrefs,
-  itemChildren,
-  itemQuery,
-  itemSetWatched,
+  catalogueChildren,
+  catalogueDetail,
+  catalogueSetWatched,
   listLibraries,
-  subtitleDelete,
-  subtitleDownload,
-  subtitleSearch,
-} = await import('../src/api/generated/kahawai.ts')
+  catalogueSubtitleDelete,
+  catalogueSubtitleDownload,
+  catalogueSubtitleSearch,
+} = await import('./api-fixture.ts')
 const { loadMask } = await import('../src/api/capabilities.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 const { clearQueue, useQueue } = await import('../src/composables/queue.ts')
@@ -139,55 +72,70 @@ const queue = useQueue()
 const Detail = (await import('../src/views/Detail.vue')).default
 const Season = (await import('../src/views/Season.vue')).default
 
-const film = (over: Record<string, unknown> = {}) => ({
-  id: 'heat',
-  kind: 'movie',
-  title: 'Heat',
-  year: 1995,
-  played: false,
+const film = (over: Record<string, unknown> = {}) => {
+  const detail = {
+    id: 'heat',
+    library_id: 'films',
+    kind: 'movie',
+    title: 'Heat',
+    year: 1995,
+    played: false,
 
-  art_version: null,
-  duration_ms: 170 * 60_000,
-  resume_position_ms: null,
-  resume_duration_ms: null,
-  parent_id: null,
-  show_title: null,
-  season: null,
-  episode: null,
-  episode_end: null,
-  metadata: null,
-  negotiated: null,
-  copies: [
-    {
-      id: 'heat-copy',
-      match_confidence: null as string | null,
-      title: 'Heat',
-      year: 1995,
-      collection_id: 'c',
-      paths: ['Heat.mkv'],
-      assignment: { revision: 1, library_item_ids: ['heat'] },
+    art_version: null,
+    duration_ms: 170 * 60_000,
+    resume_position_ms: null,
+    resume_duration_ms: null,
+    parent_id: null,
+    show_title: null,
+    season: null,
+    episode: null,
+    episode_end: null,
+    metadata: null,
+    negotiated: null,
+    copies: [
+      {
+        id: 'heat-copy',
+        match_confidence: null as string | null,
+        title: 'Heat',
+        year: 1995,
+        collection_id: 'c',
+        paths: ['Heat.mkv'],
+        assignment: { revision: 1, library_item_ids: ['heat'] },
+      },
+    ],
+    sources: [
+      {
+        collection_item_id: 'heat-copy',
+        available: true,
+        collection_id: 'c',
+        module_id: 'm',
+        part: 1,
+        parts: 1,
+        path_rel: 'Heat.mkv',
+        revision: 1,
+        size: 8 * 1024 ** 3,
+        source_id: 1,
+        streams: null,
+      },
+    ],
+    ...over,
+  }
+  return {
+    ...detail,
+    subtitle_source: {
+      media_entry_id: String(
+        (detail.negotiated as { source?: { source_id?: number } } | null)?.source?.source_id ??
+          detail.sources[0]?.source_id ??
+          1,
+      ),
+      source_version: 'fixture',
     },
-  ],
-  sources: [
-    {
-      collection_item_id: 'heat-copy',
-      available: true,
-      collection_id: 'c',
-      module_id: 'm',
-      part: 1,
-      parts: 1,
-      path_rel: 'Heat.mkv',
-      revision: 1,
-      size: 8 * 1024 ** 3,
-      source_id: 1,
-      streams: null,
-    },
-  ],
-  ...over,
-})
+  }
+}
 
 const episode = (n: number, over: Record<string, unknown> = {}) => ({
   id: `e${n}`,
+  library_id: 'films',
   kind: 'episode',
   title: `Episode ${n}`,
   season: 1,
@@ -252,9 +200,9 @@ async function open(view: typeof Detail | typeof Season, at: string) {
 beforeEach(() => {
   vi.mocked(enrichmentIdentities).mockResolvedValue([])
   admin.value = false
-  vi.mocked(itemDetail).mockResolvedValue(film() as never)
+  vi.mocked(detailForEnrichment).mockResolvedValue(film() as never)
   vi.mocked(enrichmentDetail).mockImplementation(async (id) => {
-    const current = await itemDetail('heat')
+    const current = await detailForEnrichment('heat')
     const copy = current.copies.find((c) => c.id === id)!
     return {
       input: {
@@ -278,45 +226,25 @@ beforeEach(() => {
   vi.mocked(listItems).mockResolvedValue({ items: [] } as never)
   vi.mocked(enrichmentSearch).mockResolvedValue({ candidates: [] } as never)
   vi.mocked(enrichmentCorrect).mockResolvedValue({ library_item_ids: ['heat'] } as never)
-  vi.mocked(itemQuery).mockResolvedValue(film() as never)
-  vi.mocked(itemChildren).mockResolvedValue({ children: [] } as never)
-  vi.mocked(itemSetWatched).mockResolvedValue({ updated: 1 } as never)
+  vi.mocked(catalogueDetail).mockResolvedValue(film() as never)
+  vi.mocked(catalogueChildren).mockResolvedValue({ children: [] } as never)
+  vi.mocked(catalogueSetWatched).mockResolvedValue({ updated: 1 } as never)
   vi.mocked(loadMask).mockReturnValue({})
   vi.mocked(listLibraries).mockResolvedValue({
     libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
   } as never)
   vi.mocked(getPrefs).mockResolvedValue({ prefs: [] } as never)
-  vi.mocked(subtitleSearch).mockResolvedValue({
+  vi.mocked(catalogueSubtitleSearch).mockResolvedValue({
     candidates: [],
     quota: { remaining: null, total: null, resets_in_secs: null, per_account: false },
   } as never)
-  vi.mocked(subtitleDelete).mockResolvedValue({ removed: true } as never)
+  vi.mocked(catalogueSubtitleDelete).mockResolvedValue({ removed: true } as never)
   clearNotices()
   clearQueue()
 })
 afterEach(() => vi.resetAllMocks())
 
 describe('a film', () => {
-  test('catalogue sources remain visible while playback integration is unavailable', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
-      film({
-        negotiated: null,
-        unavailable: {
-          code: 'feature_unavailable',
-          message: 'Playback is not connected yet.',
-          request_id: '',
-        },
-      }) as never,
-    )
-    const { wrapper } = await open(Detail, '/library/films/item/heat')
-    expect(wrapper.text()).toContain('Heat.mkv')
-    expect(wrapper.findAll('h2').some((h) => h.text() === 'Source')).toBe(true)
-    const play = wrapper.findAll('button').find((button) => button.text().includes('Play'))!
-    expect(play.attributes('disabled')).toBeDefined()
-    expect(wrapper.text()).not.toContain('offline')
-    wrapper.unmount()
-  })
-
   test('says what it is and offers to play it', async () => {
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.find('h1').text()).toContain('Heat')
@@ -325,7 +253,7 @@ describe('a film', () => {
   })
 
   test('resumes where it was left, and offers the start as well', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ resume_position_ms: 300, resume_duration_ms: 1200 }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -335,7 +263,7 @@ describe('a film', () => {
 
   test('and once it is nearly over, Play starts it again', async () => {
     // Resuming into the credits is not resuming.
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ resume_position_ms: 1180, resume_duration_ms: 1200 }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -346,7 +274,7 @@ describe('a film', () => {
   test('an offline file cannot be played', async () => {
     const offline = film()
     offline.sources[0]!.available = false
-    vi.mocked(itemQuery).mockResolvedValue(offline as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(offline as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     const play = wrapper.findAll('button').find((b) => b.text().includes('Play'))!
     expect(play.attributes('disabled')).toBeDefined()
@@ -364,7 +292,7 @@ describe('a film', () => {
   })
 
   test('pressing a chapter starts there', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({
         chapters: [
           { start_ms: 0, title: 'Opening' },
@@ -396,7 +324,7 @@ describe('a film', () => {
 
 describe('what the hub says it would do with the file', () => {
   test('names the work, and every stream’s verdict', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({
         negotiated: {
           cost: 'audio_encode',
@@ -427,7 +355,7 @@ describe('choosing a playback source', () => {
     vi.mocked(getPrefs).mockResolvedValue({
       prefs: [{ scope: '', key: 'audio.movies', value: 'jpn' }],
     } as never)
-    vi.mocked(itemQuery).mockImplementation(async (_id, body) => {
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, _id, body) => {
       const selected = body?.source_id ?? (body?.source_audio_tracks?.['1'] === 1 ? 2 : 1)
       return film({
         sources: [
@@ -464,13 +392,13 @@ describe('choosing a playback source', () => {
         },
       }) as never
     })
-    vi.mocked(subtitleSearch).mockResolvedValue({
+    vi.mocked(catalogueSubtitleSearch).mockResolvedValue({
       candidates: [
         { file_id: 'preferred-sub', language: 'eng', release_name: 'Preferred release' },
       ],
       quota: null,
     } as never)
-    vi.mocked(subtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
+    vi.mocked(catalogueSubtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.find('#playback-source option').text()).toContain('Preferred.mkv')
     expect(wrapper.find('#subtitle-source option').text()).toContain('Preferred.mkv')
@@ -479,16 +407,19 @@ describe('choosing a playback source', () => {
       .find((button) => button.text() === 'Find subtitles online')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 2 })
+    expect(catalogueSubtitleSearch).toHaveBeenLastCalledWith(expect.any(String), 'heat', {
+      languages: [],
+      source: { media_entry_id: '2', source_version: 'fixture' },
+    })
     await wrapper
       .findAll('button')
       .find((button) => button.text() === 'Download')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleDownload).toHaveBeenLastCalledWith('heat', {
+    expect(catalogueSubtitleDownload).toHaveBeenLastCalledWith(expect.any(String), 'heat', {
       file_id: 'preferred-sub',
       language: 'eng',
-      source_id: 2,
+      source: { media_entry_id: '2', source_version: 'fixture' },
     })
     wrapper.unmount()
   })
@@ -538,8 +469,8 @@ describe('choosing a playback source', () => {
     wrapper.findAll('button').find((button) => button.text() === '▶ Resume')!
 
   beforeEach(() => {
-    vi.mocked(itemQuery).mockImplementation(
-      async (_id, body) => rendition(body?.source_id ?? 2) as never,
+    vi.mocked(catalogueDetail).mockImplementation(
+      async (_library, _id, body) => rendition(body?.source_id ?? 2) as never,
     )
   })
 
@@ -561,12 +492,12 @@ describe('choosing a playback source', () => {
     const offline = rendition()
     offline.sources = offline.sources.slice(0, 3).map((source) => ({ ...source, available: false }))
     offline.negotiated = null
-    vi.mocked(itemQuery).mockResolvedValue(offline as never)
-    vi.mocked(subtitleSearch).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(offline as never)
+    vi.mocked(catalogueSubtitleSearch).mockResolvedValue({
       candidates: [{ file_id: 'offline-sub', language: 'eng', release_name: 'Heat 1080p' }],
       quota: null,
     } as never)
-    vi.mocked(subtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
+    vi.mocked(catalogueSubtitleDownload).mockResolvedValue({ track_id: 9, quota: null } as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(playButton(wrapper).attributes('disabled')).toBeDefined()
     expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
@@ -584,16 +515,19 @@ describe('choosing a playback source', () => {
       .find((b) => b.text() === 'Find subtitles online')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 2 })
+    expect(catalogueSubtitleSearch).toHaveBeenLastCalledWith(expect.any(String), 'heat', {
+      languages: [],
+      source: { media_entry_id: '2', source_version: 'fixture' },
+    })
     await wrapper
       .findAll('button')
       .find((b) => b.text() === 'Download')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleDownload).toHaveBeenLastCalledWith('heat', {
+    expect(catalogueSubtitleDownload).toHaveBeenLastCalledWith(expect.any(String), 'heat', {
       file_id: 'offline-sub',
       language: 'eng',
-      source_id: 2,
+      source: { media_entry_id: '2', source_version: 'fixture' },
     })
     expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
       true,
@@ -607,7 +541,11 @@ describe('choosing a playback source', () => {
     const { wrapper, router } = await open(Detail, '/library/films/item/heat')
     await wrapper.find('#subtitle-source').setValue('1')
     await flushPromises()
-    expect(itemQuery).toHaveBeenLastCalledWith('heat', expect.objectContaining({ source_id: 1 }))
+    expect(catalogueDetail).toHaveBeenLastCalledWith(
+      expect.any(String),
+      'heat',
+      expect.objectContaining({ source_id: 1 }),
+    )
     expect(wrapper.text()).toContain('REMUX')
     expect(wrapper.text()).not.toContain('TRANSCODE')
     await playButton(wrapper).trigger('click')
@@ -622,7 +560,11 @@ describe('choosing a playback source', () => {
       const { wrapper, router } = await open(Detail, '/library/films/item/heat')
       await wrapper.find('#playback-source').setValue('1')
       await flushPromises()
-      expect(itemQuery).toHaveBeenLastCalledWith('heat', expect.objectContaining({ source_id: 1 }))
+      expect(catalogueDetail).toHaveBeenLastCalledWith(
+        expect.any(String),
+        'heat',
+        expect.objectContaining({ source_id: 1 }),
+      )
       expect(wrapper.text()).toContain('TRANSCODE')
       expect(wrapper.text()).not.toContain('REMUX')
       const button =
@@ -648,7 +590,7 @@ describe('choosing a playback source', () => {
   test('a pending or failed source check keeps the page and allows returning to automatic', async () => {
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     let fail!: (error: Error) => void
-    vi.mocked(itemQuery).mockImplementationOnce(
+    vi.mocked(catalogueDetail).mockImplementationOnce(
       () =>
         new Promise((_resolve, reject) => {
           fail = reject
@@ -676,14 +618,15 @@ describe('choosing a playback source', () => {
     await flushPromises()
     await router.push('/library/films/item/another')
     await flushPromises()
-    expect(itemQuery).toHaveBeenLastCalledWith(
+    expect(catalogueDetail).toHaveBeenLastCalledWith(
+      expect.any(String),
       'another',
       expect.not.objectContaining({ source_id: 1 }),
     )
     expect((wrapper.find('#playback-source option').element as HTMLOptionElement).selected).toBe(
       true,
     )
-    expect((await import('../src/api/generated/kahawai.ts')).putPref).not.toHaveBeenCalled()
+    expect((await import('./api-fixture.ts')).putPref).not.toHaveBeenCalled()
   })
 
   test('returning to automatic during subtitle search cannot reuse the override’s results', async () => {
@@ -691,7 +634,7 @@ describe('choosing a playback source', () => {
     await wrapper.find('#playback-source').setValue('1')
     await flushPromises()
     let finish!: (value: unknown) => void
-    vi.mocked(subtitleSearch).mockReturnValueOnce(
+    vi.mocked(catalogueSubtitleSearch).mockReturnValueOnce(
       new Promise((resolve) => {
         finish = resolve
       }) as never,
@@ -701,7 +644,10 @@ describe('choosing a playback source', () => {
       .find((b) => b.text() === 'Find subtitles online')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleSearch).toHaveBeenLastCalledWith('heat', { languages: [], source_id: 1 })
+    expect(catalogueSubtitleSearch).toHaveBeenLastCalledWith(expect.any(String), 'heat', {
+      languages: [],
+      source: { media_entry_id: '1', source_version: 'fixture' },
+    })
     await wrapper.find('#playback-source').setValue('Automatic · m · c · Heat 1080p.mkv · 8.0 GB')
     await flushPromises()
     finish({
@@ -742,8 +688,8 @@ describe('the files it is made of', () => {
         subtitles: [],
       },
     })
-    vi.mocked(itemQuery).mockResolvedValue(detail as never)
-    vi.mocked(itemDetail).mockResolvedValue(detail as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(detail as never)
+    vi.mocked(detailForEnrichment).mockResolvedValue(detail as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     for (const selector of ['#playback-source', '#subtitle-source']) {
       const choices = wrapper.findAll(`${selector} option`)
@@ -793,8 +739,8 @@ describe('the files it is made of', () => {
         assignment: { revision: 7, library_item_ids: ['heat'] },
       },
     ]
-    vi.mocked(itemQuery).mockResolvedValue(detail as never)
-    vi.mocked(itemDetail).mockResolvedValue(detail as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(detail as never)
+    vi.mocked(detailForEnrichment).mockResolvedValue(detail as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     const buttons = wrapper.findAll('button[title="Search metadata for this source"]')
     expect(buttons).toHaveLength(2)
@@ -830,7 +776,7 @@ describe('the files it is made of', () => {
 
   test('series copies have their own source actions too', async () => {
     admin.value = true
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', sources: [] }) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'series', sources: [] }) as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.findAll('button[title="Search metadata for this source"]')).toHaveLength(1)
   })
@@ -845,7 +791,7 @@ describe('the files it is made of', () => {
       path_rel: `Heat.part${part}.mkv`,
       source_id: 1,
     }))
-    vi.mocked(itemQuery).mockResolvedValue(multi as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(multi as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('Source')
     expect(wrapper.text()).toContain('3 parts')
@@ -864,7 +810,7 @@ describe('the files it is made of', () => {
       path_rel: `Heat.part${part}.mkv`,
       source_id: 1,
     }))
-    vi.mocked(itemQuery).mockResolvedValue(missing as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(missing as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('incomplete')
   })
@@ -874,7 +820,7 @@ describe('when something goes wrong', () => {
   test('the item failing takes the screen, with a way out', async () => {
     // There is no page without it, and a page you can only leave by editing
     // the URL is a dead end.
-    vi.mocked(itemQuery).mockRejectedValue(new ApiError(503, 'the hub is restarting'))
+    vi.mocked(catalogueDetail).mockRejectedValue(new ApiError(503, 'the hub is restarting'))
     const { router, wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('Could not load this item.')
     expect(wrapper.text()).toContain('restarting')
@@ -890,8 +836,8 @@ describe('when something goes wrong', () => {
   test('the episodes failing is a line, not the screen', async () => {
     // The head is real and already on screen: the title, the poster and the
     // way back are all in hand.
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
-    vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'no'))
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
+    vi.mocked(catalogueChildren).mockRejectedValue(new ApiError(500, 'no'))
     const { wrapper } = await open(Detail, '/library/films/item/show')
     expect(wrapper.find('h1').text()).toContain('Heat')
     expect(wrapper.text()).toContain('Could not load the episodes')
@@ -901,7 +847,7 @@ describe('when something goes wrong', () => {
   test('and a mark that would not stick is a notice, not either of those', async () => {
     // The page is intact and you are still looking at it — and the control
     // that caused it is right there, so pressing it again IS the retry.
-    vi.mocked(itemSetWatched).mockRejectedValue(new ApiError(500, 'nope'))
+    vi.mocked(catalogueSetWatched).mockRejectedValue(new ApiError(500, 'nope'))
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     await wrapper
       .findAll('button')
@@ -919,11 +865,11 @@ describe('a series', () => {
   test('a same-ID match refreshes the reconciled episode grouping', async () => {
     admin.value = true
     const detail = { ...show(), sources: [] }
-    vi.mocked(itemQuery).mockResolvedValue(detail as never)
-    vi.mocked(itemDetail).mockResolvedValue(detail as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(detail as never)
+    vi.mocked(detailForEnrichment).mockResolvedValue(detail as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     vi.mocked(enrichmentCorrect).mockImplementation(async () => {
-      vi.mocked(itemChildren).mockResolvedValue({
+      vi.mocked(catalogueChildren).mockResolvedValue({
         children: [episode(1, { season: 2, title: 'Corrected episode' })],
       } as never)
       return { library_item_ids: ['show'] } as never
@@ -938,15 +884,15 @@ describe('a series', () => {
       .trigger('click')
     await flushPromises()
     expect(router.currentRoute.value.params.id).toBe('show')
-    expect(itemChildren).toHaveBeenCalledTimes(2)
+    expect(catalogueChildren).toHaveBeenCalledTimes(2)
     expect(wrapper.text()).toContain('Season 2')
     expect(wrapper.text()).not.toContain('Season 1')
     wrapper.unmount()
   })
 
   test('counts its episodes, and says where to carry on', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(1, { played: true }), episode(2), episode(3)],
     } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
@@ -957,8 +903,8 @@ describe('a series', () => {
   test('and says nothing about where to carry on until the list answers', async () => {
     // "Start from the beginning" is the wrong answer to "we have not asked
     // yet", and it flashed in as the list arrived.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockReturnValue(new Promise(() => {}) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockReturnValue(new Promise(() => {}) as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
     expect(wrapper.find('h1').text()).toContain('Fringe')
     expect(wrapper.text()).not.toContain('Continue')
@@ -969,8 +915,8 @@ describe('a series', () => {
     // Reading the native fields here put "Continue · E10" above a row reading
     // "S01E10", and on a show whose projection spans seasons the two numbers
     // are not even close.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [
         episode(1, { season: null, proj_season: 1, proj_episode: 1, played: true }),
         episode(26, { season: null, proj_season: 2, proj_episode: 1 }),
@@ -982,8 +928,8 @@ describe('a series', () => {
   })
 
   test('a season heading opens the season', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { router, wrapper } = await open(Detail, '/library/shows/item/show')
     await wrapper
       .findAll('button')
@@ -996,9 +942,9 @@ describe('a series', () => {
   test('one press marks a whole season, naming its episodes', async () => {
     // WHICH episodes are in it is decided here, because the season a viewer
     // sees can be a projection of absolute numbering — the hub would guess.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
-      children: [episode(1), episode(2), episode(3, { season: 2 })],
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
+      children: [episode(1), episode(2)],
     } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
     await wrapper
@@ -1006,21 +952,24 @@ describe('a series', () => {
       .find((b) => b.text() === 'Mark season watched')!
       .trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('show', { played: true, items: ['e1', 'e2'] })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'show', {
+      played: true,
+      items: ['e1', 'e2'],
+    })
   })
 
   test('and ticking one episode is its own control, not the row', async () => {
     // A button within a button is invalid, and a click that both ticked the
     // episode and opened it would be neither.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { router, wrapper } = await open(Detail, '/library/shows/item/show')
     const tick = wrapper.find('[aria-label^="Mark as watched: Episode 1"]')
     expect(tick.exists()).toBe(true)
 
     await tick.trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('e1', { played: true })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'e1', { played: true })
     // And it did not navigate.
     expect(router.currentRoute.value.path).toBe('/library/shows/item/show')
   })
@@ -1043,10 +992,10 @@ describe('a season', () => {
           { ...base, source_id: 2, collection_item_id: 'online-copy' },
         ],
       })
-      vi.mocked(itemQuery).mockImplementation(
+      vi.mocked(catalogueDetail).mockImplementation(
         async (id) => (id === 'show' ? show() : detail) as never,
       )
-      vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+      vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
       const { router, wrapper } = await open(Season, '/library/shows/item/show/season/1')
       const play = wrapper
         .findAll('button')
@@ -1068,10 +1017,10 @@ describe('a season', () => {
       negotiated: { source: { source_id: 2 } },
       sources: [base, { ...base, source_id: 2, available: false }],
     })
-    vi.mocked(itemQuery).mockImplementation(
+    vi.mocked(catalogueDetail).mockImplementation(
       async (id) => (id === 'show' ? show() : detail) as never,
     )
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     for (const text of ['▶ Resume', 'Play from start']) {
       expect(
@@ -1085,9 +1034,9 @@ describe('a season', () => {
   })
 
   test('shows its episodes as stills', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
-      children: [episode(1), episode(2), episode(3, { season: 2 })],
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
+      children: [episode(1), episode(2)],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.find('h1').text()).toBe('Season 1')
@@ -1100,15 +1049,15 @@ describe('a season', () => {
   test('a season with nothing in it says so rather than looking broken', async () => {
     // A hand-typed or stale season number renders a heading, an empty strip
     // and two dead arrows.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/9')
     expect(wrapper.text()).toContain('No episodes in season 9')
   })
 
   test('and absolute numbering is a season of its own, not a missing one', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(11, { season: null })],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/all')
@@ -1120,23 +1069,23 @@ describe('a season', () => {
 describe('a mark, and what it costs', () => {
   test('asks for the item and its children again, so no tick can lie', async () => {
     const show = film({ kind: 'series', id: 'show' })
-    vi.mocked(itemQuery).mockResolvedValue(show as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
-    vi.mocked(itemChildren).mockClear()
-    vi.mocked(itemQuery).mockClear()
+    vi.mocked(catalogueChildren).mockClear()
+    vi.mocked(catalogueDetail).mockClear()
 
     await wrapper.find('[aria-label^="Mark as watched"]').trigger('click')
     await flushPromises()
-    expect(itemChildren).toHaveBeenCalled()
-    expect(itemQuery).toHaveBeenCalled()
+    expect(catalogueChildren).toHaveBeenCalled()
+    expect(catalogueDetail).toHaveBeenCalled()
   })
 
   test('and a re-ask that fails is a notice, not the screen', async () => {
     // The write LANDED. Replacing the page with "Could not load this item"
     // over a successful mark is the incident this whole split exists for.
     const { wrapper } = await open(Detail, '/library/films/item/heat')
-    vi.mocked(itemQuery).mockRejectedValue(new ApiError(503, 'blip'))
+    vi.mocked(catalogueDetail).mockRejectedValue(new ApiError(503, 'blip'))
 
     await wrapper
       .findAll('button')
@@ -1150,19 +1099,19 @@ describe('a mark, and what it costs', () => {
   })
 
   test('a tick can be taken back as well as put on', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(film({ played: true }) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ played: true }) as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     await wrapper
       .findAll('button')
       .find((b) => b.text().includes('Watched'))!
       .trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('heat', { played: false })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'heat', { played: false })
   })
 
   test('and pressing it twice while it is out sends one write', async () => {
     let settle = () => {}
-    vi.mocked(itemSetWatched).mockReturnValue(
+    vi.mocked(catalogueSetWatched).mockReturnValue(
       new Promise((resolve) => (settle = () => resolve({ updated: 1 } as never))) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -1170,7 +1119,7 @@ describe('a mark, and what it costs', () => {
     await tick.trigger('click')
     await tick.trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledTimes(1)
+    expect(catalogueSetWatched).toHaveBeenCalledTimes(1)
     settle()
     await flushPromises()
   })
@@ -1180,8 +1129,8 @@ describe('what a series page says about an episode', () => {
   const show = () => film({ kind: 'series', id: 'show', duration_ms: null })
 
   test('how far into it you are', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(1, { resume_position_ms: 300, resume_duration_ms: 1200 })],
     } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
@@ -1189,8 +1138,8 @@ describe('what a series page says about an episode', () => {
   })
 
   test('which one is next up', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(1, { played: true }), episode(2)],
     } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
@@ -1200,8 +1149,8 @@ describe('what a series page says about an episode', () => {
   test('and the file’s own number, under a projection', async () => {
     // HUB-31: the projected number is what the viewer navigates by, and the
     // native one is what the filename says.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(26, { season: null, proj_season: 2, proj_episode: 1 })],
     } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
@@ -1209,8 +1158,8 @@ describe('what a series page says about an episode', () => {
   })
 
   test('its seasons are headings, so they can be walked as headings', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
     expect(wrapper.findAll('h2').some((h) => h.text().includes('Season 1'))).toBe(true)
   })
@@ -1218,7 +1167,7 @@ describe('what a series page says about an episode', () => {
 
 describe('going back up', () => {
   test('an episode goes to its series', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ kind: 'episode', id: 'e1', parent_id: 'show', show_title: 'Fringe' }) as never,
     )
     const { router, wrapper } = await open(Detail, '/library/shows/item/e1')
@@ -1237,7 +1186,7 @@ describe('going back up', () => {
   })
 
   test('an album opened under an Album Artist returns to that artist', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ kind: 'album', id: 'album', title: 'Hot Space', artist: 'Queen' }) as never,
     )
     const { router, wrapper } = await open(Detail, '/library/music/artist/queen/item/album')
@@ -1259,7 +1208,7 @@ describe('the files, in detail', () => {
       path_rel: `Heat.part${part}.mkv`,
       source_id: 1,
     }))
-    vi.mocked(itemQuery).mockResolvedValue(multi as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(multi as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('4.0 GB')
   })
@@ -1274,7 +1223,7 @@ describe('the files, in detail', () => {
       path_rel: `Heat.part${part}.mkv`,
       source_id: 1,
     }))
-    vi.mocked(itemQuery).mockResolvedValue(multi as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(multi as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('offline')
   })
@@ -1283,7 +1232,7 @@ describe('the files, in detail', () => {
     // Two files of the same work otherwise look like the same file twice.
     const fixed = film()
     fixed.sources[0]!.revision = 2
-    vi.mocked(itemQuery).mockResolvedValue(fixed as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(fixed as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     expect(wrapper.text()).toContain('v2')
   })
@@ -1291,7 +1240,7 @@ describe('the files, in detail', () => {
 
 describe('who the metadata came from', () => {
   test('is said, because for TMDB that is a term of use', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ metadata: { provider: 'tmdb', overview: null } }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -1300,7 +1249,7 @@ describe('who the metadata came from', () => {
   })
 
   test('and each provider is credited in its own words', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ metadata: { provider: 'tvdb', overview: null } }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -1318,7 +1267,7 @@ describe('a capability mask', () => {
     // `buildProfile` already applies the mask, so a silent one is the exact
     // trap the badge exists to prevent.
     vi.mocked(loadMask).mockReturnValue({ video: ['hevc'] })
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({
         negotiated: {
           cost: 'direct',
@@ -1336,7 +1285,7 @@ describe('a capability mask', () => {
 
   test('and nothing is said when there is none', async () => {
     vi.mocked(loadMask).mockReturnValue({})
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({
         negotiated: {
           cost: 'direct',
@@ -1355,7 +1304,7 @@ describe('a capability mask', () => {
 
 describe('what this item is connected to', () => {
   test('is listed, and a row in the library is a way there', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({
         related: [
           { kind: 'sequel', title: 'Heat 2', item_id: 'heat2' },
@@ -1380,10 +1329,10 @@ describe('what this item is connected to', () => {
 
 describe('a record', () => {
   const record = async (tracks = [episode(1, { kind: 'song', title: 'Staying Power' })]) => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ kind: 'album', id: 'album', title: 'Hot Space', artist: 'Queen' }) as never,
     )
-    vi.mocked(itemChildren).mockResolvedValue({ children: tracks } as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: tracks } as never)
     return open(Detail, '/library/music/item/album')
   }
 
@@ -1488,7 +1437,7 @@ describe('a record', () => {
     const { wrapper } = await record([])
     expect(wrapper.text()).toContain('This record has no tracks')
 
-    vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'nope'))
+    vi.mocked(catalogueChildren).mockRejectedValue(new ApiError(500, 'nope'))
     const failed = await open(Detail, '/library/music/item/album')
     expect(failed.wrapper.text()).toContain('The track list could not be read')
     expect(
@@ -1556,8 +1505,8 @@ describe('a record', () => {
   })
 
   test('and a track list that failed can be asked for again', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'album', id: 'album' }) as never)
-    vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'no'))
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'album', id: 'album' }) as never)
+    vi.mocked(catalogueChildren).mockRejectedValue(new ApiError(500, 'no'))
     const { wrapper } = await open(Detail, '/library/music/item/album')
     expect(wrapper.text()).toContain('Could not load the track list')
     expect(wrapper.findAll('button').some((b) => b.text() === 'Try again')).toBe(true)
@@ -1569,12 +1518,12 @@ describe('the season page, in more detail', () => {
 
   test('opens on the first thing you have not finished', async () => {
     // The reason you came. Landing on nothing means finding your place twice.
-    vi.mocked(itemQuery).mockImplementation(async (id) =>
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, id) =>
       id === 'show'
         ? (show() as never)
         : (film({ id, kind: 'episode', title: `Open ${id}` }) as never),
     )
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(1, { played: true }), episode(2), episode(3)],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
@@ -1582,14 +1531,17 @@ describe('the season page, in more detail', () => {
   })
 
   test('and the panel is not left showing another season’s episode', async () => {
-    vi.mocked(itemQuery).mockImplementation(async (id) =>
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, id) =>
       id === 'show'
         ? (show() as never)
         : (film({ id, kind: 'episode', title: `Open ${id}` }) as never),
     )
-    vi.mocked(itemChildren).mockResolvedValue({
-      children: [episode(1), episode(2, { season: 2 })],
-    } as never)
+    vi.mocked(catalogueChildren).mockImplementation(
+      async (_library, _id, params) =>
+        ({
+          children: params?.season === '2' ? [episode(2, { season: 2 })] : [episode(1)],
+        }) as never,
+    )
     const { router, wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).toContain('Open e1')
 
@@ -1602,8 +1554,8 @@ describe('the season page, in more detail', () => {
   test('the episodes are what the page is: their failure takes the screen', async () => {
     // Which of the two failures the viewer saw used to depend on which
     // request settled last.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockRejectedValue(new ApiError(500, 'no episodes'))
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockRejectedValue(new ApiError(500, 'no episodes'))
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).toContain('Could not load this season.')
     expect(wrapper.findAll('button').some((b) => b.text() === 'Try again')).toBe(true)
@@ -1611,8 +1563,8 @@ describe('the season page, in more detail', () => {
 
   test('and the show’s own details failing is only a notice', async () => {
     // All it supplies is the title on the back button; the episodes are fine.
-    vi.mocked(itemQuery).mockRejectedValue(new ApiError(500, 'no title'))
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueDetail).mockRejectedValue(new ApiError(500, 'no title'))
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).not.toContain('Could not load this season.')
     expect(wrapper.text()).toContain('Episode 1')
@@ -1622,20 +1574,20 @@ describe('the season page, in more detail', () => {
   test('nothing is asked for an episode nobody has picked', async () => {
     // An empty id is a QUERY for `/items//query`, on every visit and after
     // every mark.
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [] } as never)
     await open(Season, '/library/shows/item/show/season/1')
-    expect(vi.mocked(itemQuery).mock.calls.map((c) => c[0])).not.toContain('')
+    expect(vi.mocked(catalogueDetail).mock.calls.map((c) => c[0])).not.toContain('')
   })
 
   test('the episodes are asked for straight away, not behind the show', async () => {
     // The show id is in the URL, and the episodes ARE the page: waiting for
     // the item puts a round trip in front of every still.
     let answerShow = () => {}
-    vi.mocked(itemQuery).mockReturnValue(
+    vi.mocked(catalogueDetail).mockReturnValue(
       new Promise((resolve) => (answerShow = () => resolve(show() as never))) as never,
     )
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).toContain('Episode 1')
     answerShow()
@@ -1643,9 +1595,9 @@ describe('the season page, in more detail', () => {
   })
 
   test('marking the season sends this season’s episodes, not the whole series', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
-      children: [episode(1), episode(2), episode(3, { season: 2 })],
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
+      children: [episode(1), episode(2)],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     await wrapper
@@ -1653,12 +1605,15 @@ describe('the season page, in more detail', () => {
       .find((b) => b.text().includes('Mark all watched'))!
       .trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('show', { played: true, items: ['e1', 'e2'] })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'show', {
+      played: true,
+      items: ['e1', 'e2'],
+    })
   })
 
   test('and a season already watched offers to unmark it', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(1, { played: true })],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
@@ -1667,19 +1622,22 @@ describe('the season page, in more detail', () => {
       .find((b) => b.text().includes('Mark none watched'))!
       .trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('show', { played: false, items: ['e1'] })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'show', {
+      played: false,
+      items: ['e1'],
+    })
   })
 
   test('a still says which episode it is, using the numbering on screen', async () => {
     // Only browse carries the projection: asking the item for itself gets a
     // null projected season, and the panel printed E10 under a card badged
     // S01E10 — the same episode, numbered two ways, a centimetre apart.
-    vi.mocked(itemQuery).mockImplementation(async (id) =>
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, id) =>
       id === 'show'
         ? (show() as never)
         : (film({ id, kind: 'episode', season: null, episode: 26, title: 'Late' }) as never),
     )
-    vi.mocked(itemChildren).mockResolvedValue({
+    vi.mocked(catalogueChildren).mockResolvedValue({
       children: [episode(26, { season: null, proj_season: 2, proj_episode: 1 })],
     } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/2')
@@ -1688,8 +1646,8 @@ describe('the season page, in more detail', () => {
   })
 
   test('and the picked card says it is the picked one', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(show() as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1), episode(2)] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(show() as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1), episode(2)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     const pressed = wrapper.findAll('[aria-pressed="true"]')
     expect(pressed).toHaveLength(1)
@@ -1699,24 +1657,26 @@ describe('the season page, in more detail', () => {
 describe('what an item page does not ask for', () => {
   test('a film has no children, so none are asked for', async () => {
     await open(Detail, '/library/films/item/heat')
-    expect(itemChildren).not.toHaveBeenCalled()
+    expect(catalogueChildren).not.toHaveBeenCalled()
   })
 
   test('and an episode does not either', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'episode', id: 'e1' }) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'episode', id: 'e1' }) as never)
     await open(Detail, '/library/shows/item/e1')
-    expect(itemChildren).not.toHaveBeenCalled()
+    expect(catalogueChildren).not.toHaveBeenCalled()
   })
 })
 
 describe('un-ticking', () => {
   test('an episode that has been watched offers to unmark it', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1, { played: true })] } as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({
+      children: [episode(1, { played: true })],
+    } as never)
     const { wrapper } = await open(Detail, '/library/shows/item/show')
     await wrapper.find('[aria-label^="Mark as unwatched"]').trigger('click')
     await flushPromises()
-    expect(itemSetWatched).toHaveBeenCalledWith('e1', { played: false })
+    expect(catalogueSetWatched).toHaveBeenCalledWith(expect.any(String), 'e1', { played: false })
   })
 })
 
@@ -1724,8 +1684,8 @@ describe('a season still loading', () => {
   test('does not say it is empty', async () => {
     // An empty array meant either "loading" or "this show has no episodes",
     // so the explanation was suppressed for the case it was written for.
-    vi.mocked(itemQuery).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
-    vi.mocked(itemChildren).mockReturnValue(new Promise(() => {}) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(film({ kind: 'series', id: 'show' }) as never)
+    vi.mocked(catalogueChildren).mockReturnValue(new Promise(() => {}) as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     expect(wrapper.text()).not.toContain('No episodes in')
   })
@@ -1735,12 +1695,12 @@ describe('a still whose episode will not open', () => {
   test('lets go, so pressing it again is not a dead click', async () => {
     // The card took the highlight, nothing opened, and clicking it again was
     // a no-op because the selection had not changed.
-    vi.mocked(itemQuery).mockImplementation(async (id) =>
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, id) =>
       id === 'show'
         ? (film({ kind: 'series', id: 'show' }) as never)
         : Promise.reject(new ApiError(500, 'no')),
     )
-    vi.mocked(itemChildren).mockResolvedValue({ children: [episode(1)] } as never)
+    vi.mocked(catalogueChildren).mockResolvedValue({ children: [episode(1)] } as never)
     const { wrapper } = await open(Season, '/library/shows/item/show/season/1')
     await flushPromises()
     expect(wrapper.findAll('[aria-pressed="true"]')).toHaveLength(0)
@@ -1753,7 +1713,7 @@ describe('the mark itself', () => {
     // that is not a button has nothing to grey out.
     const { useWatched } = await import('../src/composables/item.ts')
     let settle = () => {}
-    vi.mocked(itemSetWatched).mockReturnValue(
+    vi.mocked(catalogueSetWatched).mockReturnValue(
       new Promise((resolve) => (settle = () => resolve({ updated: 1 } as never))) as never,
     )
 
@@ -1762,7 +1722,7 @@ describe('the mark itself', () => {
     mount(
       defineComponent({
         setup() {
-          api = useWatched()
+          api = useWatched(ref('films'))
           return () => h('div')
         },
       }),
@@ -1780,7 +1740,7 @@ describe('the mark itself', () => {
 
     const first = api.mark('x', true)
     const second = api.mark('x', true)
-    expect(itemSetWatched).toHaveBeenCalledTimes(1)
+    expect(catalogueSetWatched).toHaveBeenCalledTimes(1)
     await expect(second).resolves.toBe(false)
     settle()
     await first
@@ -1802,7 +1762,7 @@ describe('the last session for this item (OPS-10)', () => {
 
   beforeEach(() => {
     admin.value = true
-    vi.mocked(itemQuery).mockResolvedValue(withPlan() as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(withPlan() as never)
     vi.mocked(adminItemLog).mockResolvedValue('the log' as never)
   })
   afterEach(() => (admin.value = false))
@@ -1858,7 +1818,7 @@ describe('the subtitles section (HUB-24)', () => {
     })
 
   test('says what is in the file, and lists what the hub is storing', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       withSubs([
         {
           id: 1,
@@ -1891,16 +1851,16 @@ describe('the subtitles section (HUB-24)', () => {
     vi.mocked(getPrefs).mockResolvedValue({
       prefs: [{ scope: '', key: 'subs.movies', value: 'eng, fra' }],
     } as never)
-    vi.mocked(itemQuery).mockResolvedValue(withSubs([]) as never)
+    vi.mocked(catalogueDetail).mockResolvedValue(withSubs([]) as never)
     const { wrapper } = await open(Detail, '/library/films/item/heat')
     await wrapper
       .findAll('button')
       .find((b) => b.text().startsWith('Find subtitles'))!
       .trigger('click')
     await flushPromises()
-    expect(subtitleSearch).toHaveBeenCalledWith('heat', {
+    expect(catalogueSubtitleSearch).toHaveBeenCalledWith(expect.any(String), 'heat', {
       languages: ['eng', 'fra'],
-      source_id: 1,
+      source: { media_entry_id: '1', source_version: 'fixture' },
     })
   })
 
@@ -1908,7 +1868,7 @@ describe('the subtitles section (HUB-24)', () => {
     vi.mocked(getPrefs).mockResolvedValue({
       prefs: [{ scope: 'show', key: 'subs', value: 'fra' }],
     } as never)
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       film({ kind: 'episode', parent_id: 'show', negotiated: null }) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
@@ -1916,7 +1876,7 @@ describe('the subtitles section (HUB-24)', () => {
   })
 
   test('and removing a track re-reads the item', async () => {
-    vi.mocked(itemQuery).mockResolvedValue(
+    vi.mocked(catalogueDetail).mockResolvedValue(
       withSubs([
         {
           id: 2,
@@ -1930,13 +1890,16 @@ describe('the subtitles section (HUB-24)', () => {
       ]) as never,
     )
     const { wrapper } = await open(Detail, '/library/films/item/heat')
-    const reads = vi.mocked(itemQuery).mock.calls.length
+    const reads = vi.mocked(catalogueDetail).mock.calls.length
     await wrapper
       .findAll('button')
       .find((b) => b.text() === 'Remove')!
       .trigger('click')
     await flushPromises()
-    expect(subtitleDelete).toHaveBeenCalledWith(2)
-    expect(vi.mocked(itemQuery).mock.calls.length).toBeGreaterThan(reads)
+    expect(catalogueSubtitleDelete).toHaveBeenCalledWith('films', 'heat', 2, {
+      media_entry_id: '1',
+      source_version: 'fixture',
+    })
+    expect(vi.mocked(catalogueDetail).mock.calls.length).toBeGreaterThan(reads)
   })
 })

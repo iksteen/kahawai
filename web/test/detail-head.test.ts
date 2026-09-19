@@ -6,15 +6,15 @@ import { mount } from '@vue/test-utils'
 import { describe, expect, test, vi } from 'vitest'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  getCatalogueArtworkUrl: (library: string, id: string) =>
-    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string, p?: { size?: string }) => `/art/${id}?size=${p?.size ?? ''}`,
+  getCatalogueArtworkUrl: (library: string, id: string, params?: { size?: string }) =>
+    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork${params?.size ? `?size=${params.size}` : ''}`,
 }))
 
 const DetailHead = (await import('../src/components/DetailHead.vue')).default
 
 const item = (over: Record<string, unknown> = {}) => ({
   id: 'heat',
+  library_id: 'films',
   kind: 'movie',
   title: 'Heat',
   year: 1995,
@@ -86,7 +86,7 @@ describe('the artwork', () => {
     expect(head().find('img').attributes('style')).toContain('2 / 3')
   })
 
-  test('asks for both densities, and is pinned to its version', () => {
+  test('asks for both densities from the catalogue library', () => {
     const img = head().find('img')
     expect(img.attributes('srcset')).toContain('card1x')
     expect(img.attributes('src')).toContain('size=card')

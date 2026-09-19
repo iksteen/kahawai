@@ -171,7 +171,7 @@ async fn direct_play_ranges_end_to_end() {
                 head_xxh3: 10,
                 tail_xxh3: 20,
                 oshash: 30,
-                streams_json: r#"{"container":"matroska"}"#.into(),
+                streams_json: r#"{"container":"matroska","subtitles":[{"format":"ass"}]}"#.into(),
             },
             pb::FileRecord {
                 source: Some(pb::SourcePath::new(
@@ -183,7 +183,7 @@ async fn direct_play_ranges_end_to_end() {
                 head_xxh3: 1,
                 tail_xxh3: 2,
                 oshash: 3,
-                streams_json: r#"{"container":"matroska"}"#.into(),
+                streams_json: r#"{"container":"matroska","subtitles":[{"format":"ass"}]}"#.into(),
             },
         ],
     )
@@ -224,6 +224,7 @@ async fn direct_play_ranges_end_to_end() {
             .unwrap()
             .access_token
     );
+    let library_id = catalog_fixture::compose_library(&registry).await;
     let api = test_router(registry.clone(), auth, sessions.clone());
 
     // Wait for the item to resolve.
@@ -232,7 +233,7 @@ async fn direct_play_ranges_end_to_end() {
             let resp = api
                 .clone()
                 .oneshot(
-                    Request::get("/api/v1/items")
+                    Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
                         .header("authorization", bearer.clone())
                         .body(Body::empty())
                         .unwrap(),
@@ -249,6 +250,18 @@ async fn direct_play_ranges_end_to_end() {
     .await
     .expect("item never resolved");
 
+    let media_entry_id = registry
+        .catalogue()
+        .playback_item(&library_id, &item_id)
+        .await
+        .unwrap()
+        .renditions
+        .into_iter()
+        .find(|r| r.files.iter().any(|f| f.size == Some(FILE_LEN as u64)))
+        .unwrap()
+        .entry
+        .id;
+
     // Start a session.
     let resp = api
         .clone()
@@ -257,7 +270,7 @@ async fn direct_play_ranges_end_to_end() {
                 .header("authorization", bearer.clone())
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                    "{{\"media_entry_id\":\"{media_entry_id}\",\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
                 )))
                 .unwrap(),
         )
@@ -268,28 +281,25 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(v["mode"], "direct");
     assert_eq!(v["content_type"], "video/x-matroska");
     assert_eq!(v["size"], FILE_LEN as u64);
-    let exact_sources: Vec<(String, String)> = sqlx::query_as(
-        "SELECT r.root_token,f.path_rel FROM files f JOIN collection_roots r ON r.id=f.root_id
-         ORDER BY r.root_token",
-    )
-    .fetch_all(&db)
-    .await
-    .unwrap();
+    let collection = &registry.catalogue().libraries().await.unwrap()[0].collection_ids[0];
+    let exact_sources: Vec<(String, String)> = registry
+        .catalogue()
+        .files(collection)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|f| (f.root_token, f.path))
+        .collect();
     assert_eq!(exact_sources.len(), 2);
     assert!(
         exact_sources
             .iter()
             .all(|(_, path)| path == "Heat (1995).mkv")
     );
-    assert_eq!(
-        sqlx::query_scalar::<_, String>(
-            "SELECT r.root_token FROM files f JOIN collection_roots r ON r.id=f.root_id
-             ORDER BY f.size DESC LIMIT 1",
-        )
-        .fetch_one(&db)
-        .await
-        .unwrap(),
-        preferred_token,
+    assert!(
+        exact_sources
+            .iter()
+            .any(|(root, _)| root == &preferred_token)
     );
     let stream_url = v["stream_url"].as_str().unwrap().to_string();
     let session_id = v["session_id"].as_str().unwrap().to_string();
@@ -396,7 +406,7 @@ async fn direct_play_ranges_end_to_end() {
                 .header("authorization", &bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                    "{{\"media_entry_id\":\"{media_entry_id}\",\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
                 )))
                 .unwrap(),
         )
@@ -452,7 +462,7 @@ async fn direct_play_ranges_end_to_end() {
                 .header("authorization", &bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    "{{\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
+                    "{{\"media_entry_id\":\"{media_entry_id}\",\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"mode\":\"direct\"}}"
                 )))
                 .unwrap(),
         )
@@ -467,17 +477,8 @@ async fn direct_play_ranges_end_to_end() {
     // host is not that. The two used to be checked in the wrong order, so an
     // offline host reached the burn arm first and the one condition stand-by
     // exists for was told to give up.
-    let track_id: i64 = sqlx::query_scalar(
-        "INSERT INTO subtitle_tracks(source_id,origin,stream_index,format)
-         SELECT f.id,'embedded',3,'ass' FROM files f
-          JOIN file_bindings fb ON fb.file_id=f.id
-          WHERE fb.item_id=? ORDER BY f.size DESC LIMIT 1
-         RETURNING id",
-    )
-    .bind(&item_id)
-    .fetch_one(&db)
-    .await
-    .unwrap();
+    // The source declares an embedded ASS track; its source-local ID is 1.
+    let track_id = 1;
     let resp = api
         .clone()
         .oneshot(
@@ -485,7 +486,7 @@ async fn direct_play_ranges_end_to_end() {
                 .header("authorization", &bearer)
                 .header("content-type", "application/json")
                 .body(Body::from(format!(
-                    "{{\"item_id\":\"{item_id}\",\"subtitle_track\":{track_id}}}"
+                    "{{\"media_entry_id\":\"{media_entry_id}\",\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"subtitle_track\":{track_id}}}"
                 )))
                 .unwrap(),
         )
@@ -494,7 +495,7 @@ async fn direct_play_ranges_end_to_end() {
     assert_eq!(
         resp.status(),
         StatusCode::SERVICE_UNAVAILABLE,
-        "a burn pick must not turn an absent host into a permanent refusal"
+        "an absent host remains unavailable"
     );
 }
 
@@ -514,7 +515,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::legacy_router_fixture(
+    kahawai_hub::api::router(
         registry,
         auth,
         sessions,
@@ -531,7 +532,6 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     )
 }

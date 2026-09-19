@@ -73,5 +73,5 @@ scripts/kahawai-library.sh audit DATA_COPY    # open/migrate DATA_COPY/mediadb.d
 ```
 
 The audit reads active items through Store; archived identities are not browse
-rows. It does not open `hub.db`. The one-shot `kahawai-collection-replay.py` is
-historical recovery tooling for old hub databases, not a mediadb importer.
+rows. It does not open `hub.db`. Retired hub catalogue recovery tooling has
+been removed along with its tables.

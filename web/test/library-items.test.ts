@@ -1,4 +1,12 @@
-vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// A library's items, a chunk at a time. Most of these are about a chunk that
 /// failed beside chunks that did not: the grid is a reserved height full of
 /// placeholders, so a hole in it looks exactly like something still loading.
@@ -7,16 +15,16 @@ import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { defineComponent, h, ref } from 'vue'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 import { CHUNK } from '../src/domain/virtual.ts'
 
-vi.mock('../src/api/generated/kahawai.ts', () => ({ listItems: vi.fn() }))
+vi.mock('../src/api/generated/kahawai.ts', () => ({}))
 
-const { listItems } = await import('../src/api/generated/kahawai.ts')
+const { listItems } = await import('./api-fixture.ts')
 const { useLibraryItems } = await import('../src/composables/library.ts')
 
-const item = (id: string) => ({ id, title: id }) as ItemRowI64
+const item = (id: string) => ({ id, title: id }) as ItemSummary
 
 /// A library of `total` items, answering every chunk — except the ones named.
 function hub(total: number, { failing = [] as number[] } = {}) {

@@ -10,7 +10,7 @@ import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({ adminSetUserLibraries: vi.fn() }))
 
-const { adminSetUserLibraries } = await import('../src/api/generated/kahawai.ts')
+const { adminSetUserLibraries } = await import('./api-fixture.ts')
 const { useGrants } = await import('../src/composables/grants.ts')
 
 const user = (over: Record<string, unknown> = {}) => ({

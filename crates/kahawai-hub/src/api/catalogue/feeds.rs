@@ -271,3 +271,15 @@ pub(in crate::api) async fn catalogue_up_next(
 ) -> Result<Json<FeedItems>, ApiError> {
     feed(s, claims, q, true).await
 }
+
+/// The one authority for the partition between Continue Watching and Up Next.
+///
+/// `duration_ms` can be absent on imported or legacy state. In that case the
+/// absolute minute remains the honest criterion we can evaluate.
+fn meaningful_unfinished(alias: &str) -> String {
+    format!(
+        "{alias}.position_ms >= MAX({CONTINUE_MIN_POSITION_MS}, \
+         COALESCE({alias}.duration_ms, 0) / {CONTINUE_MIN_RUNTIME_FRACTION}) \
+         AND {alias}.played = 0"
+    )
+}

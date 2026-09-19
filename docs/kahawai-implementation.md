@@ -129,177 +129,40 @@ Fast-path change detection uses `(path, size, mtime)`; `ContentId` resolves rena
 
 ## 4. Hub internals
 
-### 4.1 Data model (SQLite)
+### 4.1 Data model
 
-A **library item** is what the user browses and keeps history for. A
-**collection item** is a copy with detected metadata, provider answers and
-physical sources. `collection_item_library_items` links the two. Usually there
-is one link per copy; a combined episode file has one ordered link per episode.
-CD1/CD2 remain parts of one physical source and one movie assignment. Two files
-with different episode coverage have different collection items.
+`kahawai-mediadb` exclusively owns collections, physical media, provider answers,
+assignments and stable library items. See [mediadb-model.md](mediadb-model.md)
+and the crate's module documentation for the enforced schema and identity rules.
+The hub DB owns accounts, external library grants, credentials, settings,
+satellites, pacing and `catalogue_watch_state`, keyed by mediadb item IDs.
 
-`library_items` holds movies, series, episodes, albums and songs with stable,
-globally searchable IDs. Anime is a classification. Matching compares ordinary
-columns: movie/series title and year; episode series, numbering, season and
-number; album artist, title, year and edition; song album position or recording
-ID. Assigned title/year takes precedence over detected title/year, so assigning
-`X-Men.mp4` to X-Men (2000) joins `X-Men (2000).mkv`, across collections and
-providers. Missing fields and multiple matching items require identification or
-an explicit choice. Provider IDs do not define movie or series identity.
+Hub migration 0089 removes the retired catalogue, its derived views/triggers,
+old subtitle-track rows and historical watch archives. It does not convert that
+history. Current watch progress and user state remain; on-disk artwork and
+subtitle artifacts are retained. The `ed2k_aid` provider cache remains an input
+to enrichment so already-paid AniDB answers are available to mediadb.
 
-`episode_details` stores the series and native episode numbering. Provider season
-projections change presentation without changing the episode ID or watch history.
-`album_tracks` stores
-stable album positions. `collection_items.album_track_id` selects the current
-position of each copy; a shared recording can occur on several albums. Access to one album cannot reveal another album's copies.
+### 4.2 Ingestion and identity
 
-An assignment edits the existing links and sets
-`collection_items.assignment_manual`. Automatic matching then leaves those links
-alone. `assignment_revision` rejects stale edits; a queued source change advances
-it without storing a second snapshot of the metadata. Parent corrections update
-automatic children; manually assigned children retain their choice and report a
-parent conflict. `rejected_library_matches` records rejected choices. Permanent
-item aliases preserve those refusals: identifying a rejected work does not make
-it acceptable again. An explicit assignment clears only equivalent refusals.
-Resetting an episode or song also clears its independent provider choice,
-so it inherits from its parent again.
-Album Artist regrouping carries compatible album and song choices and rejections
-to the surviving copies. Conflicting choices keep the physical copies
-separate until resolved; their existing decisions determine the visible conflict.
-Provider-priority changes also refresh dependent episode descriptions and search
-text, preserving native numbering and history.
-
-Provider answers and provider choices stay on the collection item.
-`metadata_eligible` prevents a manually selected different item, and its automatic
-children, from inheriting an answer describing the old item. A combined file's first-episode answer cannot
-describe all covered episodes. `library_overrides` contains shared descriptive
-overrides; clearing them restores available provider descriptions.
-
-Source changes and matching commit together through the existing database
-writer. The hub installs a before-commit function; triggers enqueue affected
-collection items, and Rust matches parents before children. Reads do no repair.
-The cost is indexed comparisons and local writes for affected copies, without
-provider calls or media reads. Browse paginates library items before loading
-source context. Schema meaning lives beside the implementation in
-`hub/library/mod.rs`; matching, history and playback have separate modules.
-
-Public browse/search/detail/artwork/playback IDs are library item IDs. Details
-expose collection copies and their assignment revisions. Admin matching uses
-`/admin/v1/collection-items/{id}/match`; descriptive overrides use
-`/admin/v1/library-items/{id}/metadata`. Both require the current revision.
-Item QUERY and playback start accept a physical source ID so stream indexes
-and chapter offsets retain their meaning. Subtitle search/download and font
-requests name that source too. Music sessions return its actual ReplayGain.
-Public subtitle listings name the library item; extraction keeps the physical owner.
-Grants apply to the supporting copies, including child lists and album search.
-Copy selectors include the mediahost identity. The review queue includes unresolved
-library assignments and conflicts regardless of provider confidence.
-Matching can merge or reorder grid rows. The web grid invalidates its paginated
-results together and reloads the visible range while retaining the scroll position.
-
-`user_item_state` belongs to the library item. Correcting an identified copy
-leaves history with the previous item. An unidentified item retains its ID on
-first identification when possible; if it joins an existing item, its history
-transfers once and `merged_into` lets already playing sessions finish correctly.
-Reordering combined coverage retains each surviving item's identity and history;
-only removed unidentified items promote into newly added targets. Diagnostic log
-downloads search the permanent alias family for the newest session bundle.
-Sessions capture the copy, ordered library item IDs and physical fingerprint.
-Subtitle and font requests from an active session retain that source after a
-copy is reassigned, subject to the session owner's current collection access.
-Recovery carries that fingerprint; a removed version returns a conflict, while
-a matching version on a disconnected host remains retryable. An offset from another version starts at the
-beginning. Successful recovery refreshes source details before the player adopts
-its new session. Optional known episode boundaries make progress episode-relative;
-missing boundaries keep combined playback. Autoplay advances past the episodes
-covered by the current source. Legacy offsets without provenance remain stored
-but cannot resume an arbitrary physical version.
-Automatic playback ranks sources using the final capability profile and each
-source's preferred audio track before fixing the selected source for session start.
-
-Portable preferences follow the initially identified library item, with an
-existing library preference winning conflicts. Exact track preferences use a
-`source:{collection_item_id}:{source_id}` scope, so reused numeric source IDs
-cannot apply another copy's choice. Shared audio preferences select languages,
-not numeric stream indexes. A legacy exact choice is copied only when its collection
-item has one physical source; ambiguous original preferences remain stored.
-
-Migration 77 is the immutable introduction of shared items. Migration 78 removes
-the key, pin, assignment-snapshot and duplicate-numbering storage, retaining item
-IDs, source metadata, links, decisions and history. A version-76 database runs
-both migrations and derives library items directly from its existing metadata.
-Migrations 79–82 repair episode descriptions, source-qualified preferences,
-native episode identities and public collection-item aliases. Migration 83 also
-repairs unresolved songs whose recording identity is already known; migration 84
-repairs alias-qualified rejections. The existing content archive for manual provider matches and watch state remains unchanged.
-Startup repairs legacy episode coverages using stored paths, preserving source
-IDs and downloaded subtitle payloads, then finishes matching before accepting requests.
-These are the legacy hub upgrade steps. The current library audit opens
-`DATA_DIRECTORY/mediadb.db` through Store and reads the active libraries;
-`scripts/kahawai-library.sh` runs mediadb and hub integration checks.
-Current command usage is in [kahawai-cli.md](kahawai-cli.md).
-
-### 4.2 Item resolution pipeline
-
-Runs per file-upsert batch, incrementally:
-
-1. **Parse** filename/dirs → `NameGuess` (title, year, S/E including `S01E01E02`, specials `S00`, absolute numbering, `Artist/Album/NN - Track` for music). Anime collections use a dedicated tokenizer variant for fansub conventions: `[Group] Title - 01v2 [1080p][A1B2C3D4].mkv` → group, title, absolute episode, version, CRC32, quality tags; batch/OVA/ONA/movie markers. Table-driven tokenizer, not regex soup; per-library overrides.
-2. **Bind within the source's collection**: prior content binding → collection-local normalized identity/provider evidence → else create an unmatched collection item for review (HUB-8). No title/year/provider query may cross the collection boundary.
-3. **Dedup within that collection only**: another physical copy may bind to the same item and is ranked by resolution/bitrate/codec modernity. The same work in another collection is a different item with independent provider and watch state (HUB-3).
-4. **Enrich** the collection item via its media-type provider chain (below).
-
-For music, the album identity uses the embedded Album Artist, then the parsed
-path artist, then the recording Artist. Tracks keep the recording Artist. That
-distinction is what makes compilations one “Various Artists” album instead of
-one album per guest performer. A mapper-only correction reparents the existing
-track identity when its target slot is free; only a real slot collision merges
-watch state onto the surviving track. Reusing an album after its automatic
-Album Artist changes clears the obsolete MusicBrainz answer and question so
-the new credit is looked up, while a human pin remains authoritative. A file
-with different content at the same path gets a new identity and cannot inherit
-the displaced item’s state; that state is archived by the old content hashes.
-The mediahost records a monotonic music-tag mapper generation beside
-each local file, so pre-existing rows are refreshed once and resume after a
-restart; if re-probing unchanged bytes fails, their old playable catalogue row
-stays live and its old generation makes the next scan retry it. Advancing the
-generation publishes one file update even when the discovered JSON is
-byte-for-byte unchanged: a hub-side mapper change such as the path-artist
-fallback still needs to re-evaluate that evidence.
-
-**Which record an item IS** (`item_match`) is derived, never assigned. The pick orders every candidate answer by: the owner's pin first, then match strength (a strong match beats a weak one whatever the ranking says), then `local` (HUB-9), then the media type's chain order, then provider name for determinism. Refused records are not candidates, and no candidate means NO ROW — absence is the only representation of "unmatched", covering "never asked", "only misses" and "everything refused" alike.
-
-Because it is recomputed from scratch on every input write, a more preferred provider that later gains information replaces an automatic match by itself, a chain reorder re-decides ownership of a whole media type without contacting anyone, and a pin whose backing answer is withdrawn stops winning rather than stranding a match nothing supports. Top-level items only: episodes and tracks carry no assignment and render through their parent's.
+Mediahosts own scanning and journal source changes. The hub applies their
+collection offers and deltas through Store, and acknowledges only committed
+versions. Libraries compose collections. Provider assignments choose metadata
+for a collection item; matching identities coalesce into stable library items.
+Albums remain separate. Corrections move collection items between identities;
+a library item without collection items is archived by definition.
+Episodes and tracks use stable child identities under their parent. Playback
+captures its chosen physical rendition, coverage and source-bound artifacts;
+watch progress follows the captured library/child identities.
 
 ### 4.3 Enrichment providers
 
-```rust
-#[async_trait]
-trait MetadataProvider {
-    fn id(&self) -> &'static str;
-    fn supports(&self, kind: MediaKind) -> bool;
-    async fn search(&self, q: &NameGuess) -> Result<Vec<Candidate>>;
-    async fn fetch(&self, ext_id: &ExtId, lang: &Lang) -> Result<ItemMetadata>;
-    async fn images(&self, ext_id: &ExtId) -> Result<Vec<ImageRef>>;
-}
-```
-
-Implementations: `thetvdb` (v4 API, JWT login flow), `tmdb`, `musicbrainz` (+ Cover Art Archive), `local` (NFO + sidecar art + embedded tags). Providers compose into per-media-type chains with **first-claim-wins** field merging (HUB-5) — the earliest provider to supply a field owns it. Fanart.tv and TheAudioDB are deliberately outside that chain: they answer the separate Album Artist artwork projection described in §4.4.
-
-**How that is stored.** Each provider's answer is a row in `provider_metadata (item_id, provider, …)`, and one row per top-level item — `item_match` — says which of those records the item IS, plus whether a human chose it. Nothing descriptive is stored merged: the row the API serves is resolved per read by the `resolved_metadata` view, assigned provider first and then `provider_ranks`, first non-null per field. Episodes and tracks carry no assignment and render through their parent's, so an episode of a TMDB-assigned show shows TMDB's episode data and side-fills from TVDB where TMDB has none.
-
-That shape is deliberate, and it replaced a stored merge that produced a day of bugs: identity flipping to a weak match, a decline erasing a human's correction, a weak stranger donating fields, two manual rows tying on insertion order. Each fix added a rule to the merge. With one assignment and a read-time resolve there is no merge to get wrong, and re-deciding costs nothing — which is what makes the order editable at runtime (`provider_ranks`, per media type) and a reorder free: it re-decides from answers already on disk and contacts nobody. Assignment is strongest-match-first, then order, so a strong match beats a weak one whatever the ranking says; it is re-picked whenever an answer lands, which is how a more preferred provider that gains info replaces an automatic match without a special case. A human pin is an input like any other (`manual_match`) and wins as the pick's *first sort key* rather than by being exempt from recomputation — see §4.2. Refusing a match records the refused *records* and keeps every answer, so the item stays unmatched until a provider offers something that was not refused — "there is currently no correct record, try again when something new pops up".
-
-**Descriptive fields (HUB-6).** Genres and cast ride the same TMDB details request that already fetches `original_language`: `append_to_response=credits` folds the credits sub-request into one call, so the pair costs no extra provider traffic — which is the only thing that made cast affordable under the pacing above. Cast is stored as JSON in billing order and capped at 15; TMDB returns 68 for a 1995 film and nothing renders that.
-
-**Caching (HUB-7) is the answer store, not a response cache.** Every answer is kept permanently in `provider_metadata`, *including recorded misses* — an empty `provider_id` paired with `confidence = "miss"` says the provider was consulted and had nothing. Never-ask-twice, however, is keyed on the **question**, not the outcome: `provider_queries` records what was actually sent (a title-search anchor, a bridge fetch by mapped id; ED2K hashes keep their own content-keyed ledger in `ed2k_aid`), and a provider is due again exactly when its *current* question has no recorded row. A repaired title, a hash that lands after the first walk, or a bumped `QUERY_REV` (a derivation fix) each re-ask automatically — one paced request per changed question, ever — while an unchanged question is never re-sent, whatever its outcome was. (Adopted 2026-07-28 after a name-based miss permanently sealed the hash path for Doomed Megalopolis; misses had been the gate.) Provider-mandated TTLs are honoured where they exist (AniDB 24 h per anime, the daily titles dump, the weekly anime-lists mapping). A separate TTL cache would be a second copy of what the answer store already is, with its own way of disagreeing.
-
-The view is installed on open rather than by a migration (it derives rather than stores, so its definition is free to change), and it has one non-obvious rule with a runnable check: a `JOIN` in its FROM makes it unflattenable inside a `LEFT JOIN`, which every read site is, and per-item reads then go from sub-millisecond to ~45 ms while still returning correct rows.
-
-**Provider pacing (HUB-7), one chokepoint.** Every outbound provider request — TMDB, TheTVDB, MusicBrainz, Cover Art Archive, Fanart.tv, TheAudioDB, AniList, the AniDB HTTP API, OpenSubtitles, artwork CDNs — goes through `hub/gate.rs`, which keeps **one queue per provider host**: a single request in flight, spaced by that provider's published limit, and a `429`/`503` treated as silence for that provider alone (honouring `Retry-After`, capped at an hour) rather than a retry that walks into a ban. The queues are process-wide, because that is the unit providers count: per IP, not per struct. There is deliberately no unpaced path — `Http::send` is the only way out, so the next provider added inherits pacing instead of needing someone to remember it.
-
-Credentialed TMDB, TheTVDB and AniDB work also carries a runtime lease over the plaintext snapshot and its provider revision. Replacing or deleting that provider's fields wakes requests parked on the host/token/UDP mutex or pacing delay before they transmit; an operation already on the wire may finish. Revision is neutral cancellation rather than provider failure: its existing `enrichment_queue` row is left untouched, no retry debt is created, later providers still run, and the zero-delay scheduler coalesces save requests into one pass using the new snapshot. Debt for a disconnected network provider stays dormant until that provider is configured again; local-provider debt remains runnable.
-
-The numbers are each provider's own, and are the thing to re-check when behaviour changes (they move): MusicBrainz and CAA 1 req/s per IP (they answer 503 above it, and require an identifying User-Agent with contact); AniList 2.1 s — its documented 90/min has been *degraded to 30/min* for years; AniDB 2.2 s ("one page every two seconds", ban decaying only after ~24 h of silence); OpenSubtitles 1.1 s (1 req/s standard tier); TheAudioDB 2.1 s with the public free key (30/min) or 650 ms with a premium key (100/min); TMDB 60 ms (~40/s, unpublished); TheTVDB 200 ms (no published limit); CDNs unpaced. An unknown host gets 500 ms — the forgotten provider is the dangerous one. Corrected against the published rules on 2026-07-26, with TheAudioDB checked against its official API page on 2026-09-03.
+`hub/enrich/catalogue.rs` runs independent provider workers against mediadb's
+durable job queue. Each provider owns its evidence, and Store resolves metadata
+according to configured precedence. Provider failures release their claims and
+schedule retries without blocking other providers. Credentials and the provider
+gate belong to the hub. Matching corrections use the catalogue enrichment API;
+there is no second hub catalogue or compatibility router.
 
 ### 4.3a Subtitle acquisition (HUB-21..24)
 
@@ -389,57 +252,25 @@ The OCR sweep's “failures stick for the hub run” rule applies to corrupt tra
 
 **Dual audio.** Per-user, per-library preference `audio: original_subbed | dubbed(lang)` feeds default stream selection at negotiation time (HUB-33); the chosen default is overridable per session in the player as usual.
 
-### 4.4 Client API (v1 sketch)
+### 4.4 Client API
 
-```
-POST /api/v1/auth/token                     # login → access+refresh
-POST /api/v1/auth/refresh                   # rotate one refresh family
-POST /api/v1/auth/logout                    # bearer + refresh → revoke that family
-GET  /api/v1/libraries
-GET  /api/v1/items?library=&q=&sort=&limit=&offset=   # browse AND search; returns total
-GET  /api/v1/up-next?library=&limit=&offset=          # next episode per series (same rows)
-GET  /api/v1/items/{id}                     # as DISCOVERED: sources[] without StreamInfo
-QUERY /api/v1/items/{id}                    # as NEGOTIATED: the above + streams + verdict
-                                            # body: { profile?, audio_track?, video_track?,
-                                            #         subtitle_track?, mode? }
-GET  /api/v1/items/{id}/children            # seasons/episodes, album/tracks
-GET  /api/v1/items/{id}/artwork?size=       # named size, resized + cached
-GET  /api/v1/items/{id}/subtitles/search?lang=   # provider candidates (quota state included)
-POST /api/v1/items/{id}/subtitles           # body: { provider, provider_file_id }
-DELETE /api/v1/items/{id}/subtitles/{sub_id}
-POST /api/v1/playback/decisions             # body: item_id + CapabilityProfile
-POST /api/v1/playback/sessions              # start; returns manifest or direct URL
-GET  /api/v1/playback/sessions/{id}/stream  # direct-play byte-range endpoint
-GET  /api/v1/playback/sessions/{id}/master.m3u8
-POST /api/v1/playback/sessions/{id}/progress
-DELETE /api/v1/playback/sessions/{id}
-WS   /api/v1/events                         # library changes, session events
-GET  /admin/v1/...                          # registry, libraries, matching queue
-POST /admin/v1/libraries/{id}/refresh       # fan out RequestScan to each member collection
-POST /admin/v1/collections/{id}/refresh     # single collection (for UIs that enumerate them)
-GET  /admin/v1/enrollments                  # pending CSRs (fingerprint, type, name, age)
-POST /admin/v1/enrollments/approve          # body: { code }
-GET  /admin/v1/satellites                   # enrolled modules + cert fingerprints + status
-DELETE /admin/v1/satellites/{id}            # delete = allowlist removal + cascade (see §7.4)
-```
+The complete contract is [web/openapi.json](../web/openapi.json). Catalogue
+browsing uses `/api/v1/catalogue/libraries/{id}/items`, with item detail,
+children, artwork and watched state under that library. POST on an item detail
+URL previews negotiation without creating a session. Continue watching and
+Up next use `/api/v1/catalogue/continue-watching` and `/api/v1/catalogue/up-next`.
 
-`/playback/decisions` is side-effect-free and returns the full negotiation verdict (per-stream direct/remux/transcode + reasons) so clients can display "why is this transcoding".
-
-**A session resource is owner-scoped, and absence answers 404.** Every user-facing route below `/api/v1/playback/sessions/{id}` — direct stream, playlist, segment, subtitle tap, seek, progress and end — crosses one ownership middleware after authentication. An absent id and another user's live id return the same `404` body, so the id is not a bearer capability or a session-enumeration oracle. Administrative session routes remain separately administrator-gated.
-
-Sessions end for reasons a client cannot predict — idle reaping (HUB-18), a hub restart, `end_for_user`, a module going away, an admin ending them. A `404` from a session resource therefore tells its owner to start a new session at the current position. This deliberately spends the old distinction between a dead session and a missing subordinate artifact: tenant isolation takes precedence, and generated artifact URLs should exist for the life of a healthy session. The web player detects the response on whichever comes first: the 10-second progress ping, an hls.js fragment/playlist error carrying `response.code`, or a probe after a media-element error, since the element exposes no status of its own. Recovery is automatic and bounded: a restart at a position the previous restart already tried is refused and surfaced as an error, because two attempts at the same position mean the first never played, and retrying forever would spend a user's whole concurrent-session budget on a fault that is not going to clear.
-
-**The method carries the question** (RFC 10008). `GET /items/{id}` answers *what did we find* — the item, its sources, its metadata. `QUERY /items/{id}` answers *what would you get*, taking a whole `CapabilityProfile` in the request body and returning the same body plus per-source `StreamInfo` and a `negotiated` block: the source it judged, the mode, the cost, the per-stream verdicts, and the subtitle track list with each track's delivery. The library browser uses GET; the item viewer uses QUERY. The split exists because the old shape asked the same question two ways and got two answers: a separate `GET /items/{id}/subtitles` computed each track's delivery from two booleans in a query string, resolved *its own* source by size while negotiation resolved one by cost, and so could promise `burn` to a client that would refuse the video encode carrying it. One negotiation now answers both halves, over the source it actually chose, so they cannot disagree. That endpoint is deleted, and `sources[].streams` is gone from GET — "what is in the file" is only ever an answer to a question about playing it.
-
-QUERY is **safe and idempotent, and returns only what is knowable now**: it starts no extraction, generates no raster, opens no lease and claims no transcoder, so no session is ever slower because someone asked a question about it. Tiers gated on an artefact report the artefact that already exists — the overlay rung only where a raster row is already there — which under-promises on first play rather than over-promising the expensive tier. `Accept-Query: application/json` advertises it, a missing or inconsistent `Content-Type` is refused per the RFC, and an unsupported method answers 405 with `Allow: GET, QUERY`.
+Admin composition uses `/admin/v1/catalogue/collections` and
+`/admin/v1/catalogue/libraries`. Matching uses `/admin/v1/enrichment/items`.
+Playback starts at `/api/v1/playback/sessions` with a library ID, item/child ID
+and optional media-entry selection. Fonts and subtitle streams belong to the
+captured session; downloaded subtitle operations name the catalogue rendition.
+Retired item, library, artist and review endpoints are absent and return 404.
 
 **Generated contract.** The public listener serves the code-first OpenAPI 3.2
 document at `/api-docs/openapi.json` and a vendored Swagger UI at
-`/swagger-ui`. The document has 62 distinct method/path operations for all 63
-application bindings: the public and trusted-local listeners share
-`GET /api/v1/bootstrap`. The SPA catch-all and the Swagger/document-serving
-routes remain mounted infrastructure, not self-described application
-operations.
+`/swagger-ui`. The SPA catch-all and Swagger/document-serving routes are infrastructure,
+not self-described application operations.
 
 Every handler request and JSON response is a concrete Rust model. Producer-owned
 wire values stay owned by their domain modules — registry overviews and events,
@@ -451,19 +282,9 @@ null-versus-absent distinction. The operations also declare path/query/header
 parameters, response statuses and content types, binary/streaming headers, and
 their JWT bearer, media query-token or static metrics-token boundary.
 
-`utoipa` and `utoipa-swagger-ui` are pinned together at commit
-`e092565a9724b07a5ebf122e80ffa3d70addbe5d`, after its OpenAPI 3.2 model and
-`version = "3.2.0"` derive support landed but before the 6.0 release. The model
-has `PathItem.query`; the path macro still has no QUERY verb. Until it does,
-the real handler is described through the macro's POST arm and
-`openapi_document` moves that generated operation from `post` to `query`.
-`api::tests::openapi_covers_exact_application_surface_with_typed_bodies` fails
-closed on the exact 62-operation set, 3.2/QUERY placement, typed JSON bodies,
-security schemes and nullable/omitted schema boundaries.
-`admin_api::admin_flow_enrollments_satellites_archive_restore` then fetches the
-served document and proves every documented protected method/path reaches a
-mounted authentication boundary rather than the SPA fallback. The vendored
-Swagger assets keep builds and rendering independent of a CDN.
+`api::tests::openapi_covers_exact_application_surface_with_typed_bodies`
+checks the exact operation set, typed bodies, security schemes and nullable
+fields. The vendored Swagger assets keep rendering independent of a CDN.
 
 `web/openapi.json` is the one checked-in generated contract. `npm run
 api:export` runs the `kahawai-hub` `export_openapi` example with web building
@@ -1134,13 +955,8 @@ The web UI is built in vertical slices alongside its backend features rather tha
 It is an independent component for the hub to consume. Satellite connections,
 provider execution, HTTP and playback orchestration belong to the hub. Its model,
 interfaces and runnable checks are described in [Media database](mediadb-model.md).
-The preceding sections describe the original hub. On the `mediadb` development
-branch, ingestion and catalogue APIs now use the independent Store. Mediadb
-uses physical collection occurrences and provider assignments as inputs;
-each occurrence references a stable library item selected by its current identity,
-with albums always separate. Library items survive their last copy's removal;
-archival is derived from absent references, without a stored flag or restoration
-procedure. Ordered libraries select accessible copies and their descriptions.
+All runtime catalogue consumers now use Store. Library items survive their
+last copy's removal; archival is derived from absent references.
 
 Mediadb's numbered SQLx migrations are embedded in its own crate and applied on
 create/open before the Store is exposed. They use the media database's own history;
@@ -1150,18 +966,12 @@ any writer opens. Pre-migration development media databases must be recreated on
 subsequent schema changes append migrations rather than changing the baseline.
 
 
-The ingestion milestone opens both databases before accepting connections and
-routes remote and in-process offers/deltas through mediadb. The hub owns link
-liveness, enrollment and user grants; mediadb owns committed catalogue cursors,
-source facts, library composition and scoped item queries. Old hub catalogue rows
-and history remain untouched, with no conversion requirement. Original consumer
-implementations are retained for regression testing but are unavailable in the
-runtime until ported; background enrichment is not scheduled. See the media-db
-model document for API/script usage and the temporary runtime limitations. The
-admin Libraries panel now composes ordered collection memberships through these
-APIs; Users & grants uses the same library IDs. Viewer UI integration remains
-separate. `scripts/kahawai-mediadb-ui.sh` exercises this admin flow in a browser
-against the real ingestion fixture.
+The hub opens both databases before accepting connections. Browse, matching,
+playback, source-bound subtitles and segments, and current watch state use the
+mediadb model. Migration 0089 removes the old hub catalogue and history; there
+are no retained compatibility endpoints or old catalogue regression fixtures.
+`scripts/kahawai-mediadb.sh check-live` exercises ingestion, administration,
+playback and restart against disposable real processes.
 
 Subtitle extraction caches use the captured physical revision as well as the
 source path and stream index. Sidecar keys also include the companion revision.

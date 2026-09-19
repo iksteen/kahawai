@@ -123,9 +123,7 @@ async fn refusal(router: axum::Router, request: Request<Body>) -> (StatusCode, S
 
 async fn setup_router() -> (tempfile::TempDir, axum::Router, Arc<Auth>) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db, dir.path()).await.unwrap());
     let router = kahawai_hub::api::setup_router(auth.clone(), None);
     (dir, router, auth)
@@ -135,9 +133,7 @@ async fn setup_router() -> (tempfile::TempDir, axum::Router, Arc<Auth>) {
 /// `setup_router` — the public one is the only place the CORS layer exists.
 async fn api_harness() -> (tempfile::TempDir, axum::Router) {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let registry = Arc::new(kahawai_hub::registry::Registry::new(
         db.clone(),
         Default::default(),
@@ -164,7 +160,7 @@ async fn api_harness() -> (tempfile::TempDir, axum::Router) {
         90,
     ));
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(dir.path().to_path_buf()));
-    let router = kahawai_hub::api::legacy_router_fixture(
+    let router = kahawai_hub::api::router(
         registry,
         auth,
         sessions,
@@ -177,7 +173,6 @@ async fn api_harness() -> (tempfile::TempDir, axum::Router) {
             enricher.clone(),
         )),
         enricher,
-        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions {
             cors_origins: vec!["https://app.example.com".into()],
             ..Default::default()
@@ -343,9 +338,7 @@ async fn the_same_route_distinguishes_its_refusals_by_code() {
 #[tokio::test]
 async fn an_internal_failure_says_nothing_about_the_hub() {
     let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
     let auth = Arc::new(Auth::new(db.clone(), dir.path()).await.unwrap());
     let router = kahawai_hub::api::setup_router(auth, None);
     // Storage failure rather than validation failure: the arm that used to
@@ -682,7 +675,7 @@ async fn a_query_parameter_that_will_not_parse_refuses_in_the_same_shape() {
 async fn a_path_that_is_not_utf8_refuses_in_the_same_shape() {
     let (_dir, router) = api_harness().await;
     let token = bearer(&router).await;
-    let request = Request::get("/api/v1/items/%FF")
+    let request = Request::get("/api/v1/catalogue/libraries/%FF/items")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();
@@ -706,48 +699,6 @@ async fn a_wrong_content_type_is_415_and_not_400() {
     let (status, code, _) = refusal(router, request).await;
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE);
     assert_eq!(code, "unsupported_media_type");
-}
-
-/// A UNIQUE constraint firing is the request's data, not the hub's health.
-///
-/// `refusal_or_internal` treats a `sqlx::Error` anywhere in the chain as proof
-/// the hub is unwell, which is right for the producers that refuse with
-/// `Option::context` and `ensure!` — and inverted for `create_library`, whose
-/// one user-caused refusal IS the `libraries.name UNIQUE` constraint. Its
-/// first cut answered 500 "the hub could not complete this request" to an
-/// admin who typed a name that was already taken.
-#[tokio::test]
-async fn a_name_that_is_taken_is_a_conflict_and_not_a_hub_fault() {
-    let dir = tempfile::tempdir().unwrap();
-    let db = kahawai_hub::db::open_legacy_fixture(dir.path())
-        .await
-        .unwrap();
-    let registry = std::sync::Arc::new(kahawai_hub::registry::Registry::new(
-        db,
-        kahawai_transport::mtls::AllowedCerts::default(),
-        kahawai_mediadb::Store::in_memory().await.unwrap(),
-    ));
-    registry.create_library("Films", "movies").await.unwrap();
-
-    let again = registry
-        .create_library("Films", "movies")
-        .await
-        .unwrap_err();
-    assert!(
-        kahawai_hub::api::is_unique_violation(&again),
-        "a duplicate name must be recognisable as the caller's, not the hub's: {again:#}"
-    );
-
-    // And the other refusal on that route is not one, so it does not fall into
-    // the same arm.
-    let bad_type = registry
-        .create_library("Shows", "nonsense")
-        .await
-        .unwrap_err();
-    assert!(
-        !kahawai_hub::api::is_unique_violation(&bad_type),
-        "{bad_type:#}"
-    );
 }
 
 /// The Origin guard, which is a 403 that must not read as "sign in again".

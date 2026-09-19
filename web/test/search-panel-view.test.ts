@@ -6,20 +6,19 @@
 import { mount } from '@vue/test-utils'
 import { describe, expect, test, vi } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import type { SearchRow } from '../src/domain/search-nav.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 
 const SearchPanel = (await import('../src/components/SearchPanel.vue')).default
 
 const films = { id: 'films', name: 'Films', media_type: 'movies' }
 const music = { id: 'music', name: 'Music', media_type: 'music' }
-const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemRowI64
+const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemSummary
 
 const rows: SearchRow[] = [
   { kind: 'library', library: films, total: 9, shown: 2 },

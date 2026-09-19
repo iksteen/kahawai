@@ -19,9 +19,7 @@ use kahawai_hub::registry::Registry;
 async fn probe_anidb_once() {
     let data_dir =
         std::path::PathBuf::from(std::env::var("HOME").unwrap()).join(".local/share/kahawai");
-    let db = kahawai_hub::db::open_legacy_fixture(&data_dir)
-        .await
-        .expect("open hub db");
+    let db = kahawai_hub::db::open(&data_dir).await.expect("open hub db");
     // The live hub's own key, so the probe reads the credentials it stored.
     let credentials = std::sync::Arc::new(
         kahawai_hub::secrets::Credentials::open(&data_dir, db.clone())

@@ -10,7 +10,7 @@
 import { computed, type Ref, ref } from 'vue'
 import { useQueries, useQuery, useQueryClient } from '@tanstack/vue-query'
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 import { listItems, listLibraries, upNext } from '../api/catalogue.ts'
 import {
   appendPage,
@@ -77,7 +77,7 @@ export function useShelves(libraries: Ref<LibrarySummary[]>) {
   /// hub handed over for them. Held outside the query cache because it is the
   /// viewer's scrolling rather than the server's answer: a refetch of page one
   /// must not throw it away, and a query that re-runs must not double it.
-  const extra = ref<Record<string, { rows: ItemRowI64[]; served: number }>>({})
+  const extra = ref<Record<string, { rows: ItemSummary[]; served: number }>>({})
 
   /// Bumped when a shelf is asked again. A page already in flight belongs to
   /// the list that failed, and appending it to the fresh one splices somebody

@@ -9,7 +9,7 @@
 import { enableAutoUnmount, flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { CAP_TRIES, HUB_ERROR_TRIES } from '../src/domain/recovery.ts'
 import { ApiError } from '../src/api/errors.ts'
 import { IDLE_LIMIT_MS, PING_MS } from '../src/domain/keepalive.ts'
@@ -20,7 +20,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   postProgress: vi.fn(),
 }))
 
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const { useQueue, clearQueue } = await import('../src/composables/queue.ts')
 const { forgetRecoveries } = await import('../src/domain/recovery.ts')
 const QueueBar = (await import('../src/components/QueueBar.vue')).default
@@ -53,7 +53,7 @@ class FakeContext {
 }
 
 const track = (id: string, over: Record<string, unknown> = {}) =>
-  ({ id, title: id.toUpperCase(), artist: 'Someone', kind: 'song', ...over }) as ItemRowI64
+  ({ id, title: id.toUpperCase(), artist: 'Someone', kind: 'song', ...over }) as ItemSummary
 
 const session = (id: string) => ({
   session_id: `s-${id}`,

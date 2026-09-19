@@ -16,15 +16,15 @@ import type { LibraryChild } from './generated/model/libraryChild.ts'
 import type { CatalogueChildrenParams } from './generated/model/catalogueChildrenParams.ts'
 import type { CatalogueItem } from './generated/model/catalogueItem.ts'
 import type { Description } from './generated/model/description.ts'
-import type { ItemRowI64 } from './generated/model/itemRowI64.ts'
-import type { ItemQueryResponse } from './generated/model/itemQueryResponse.ts'
-import type { ListItemsParams } from './generated/model/listItemsParams.ts'
+import type { ItemSummary } from './catalogue-model.ts'
+import type { ItemDetail } from './catalogue-model.ts'
+import type { BrowseParams } from './catalogue-model.ts'
 
 export async function listLibraries() {
   return { libraries: await libraries() }
 }
 
-export function catalogueRow(entry: CatalogueItem, library: string): ItemRowI64 {
+export function catalogueRow(entry: CatalogueItem, library: string): ItemSummary {
   return {
     id: entry.id,
     title: entry.title,
@@ -54,7 +54,7 @@ export function catalogueRow(entry: CatalogueItem, library: string): ItemRowI64 
   }
 }
 
-export async function listItems(params: ListItemsParams = {}) {
+export async function listItems(params: BrowseParams = {}) {
   if (params.in_progress) {
     const result = await catalogueContinue({
       ...(params.library !== undefined ? { library: params.library } : {}),
@@ -85,10 +85,10 @@ export async function artistAlbums(
   params: { library: string; q?: string; sort?: string; offset?: number; limit?: number },
 ) {
   const { library, ...page } = params
-  const result = await items(library, { ...page, artist: key })
+  const { items: albums, ...result } = await items(library, { ...page, artist: key })
   return {
     ...result,
-    albums: result.items.map((entry) => catalogueRow(entry, library)),
+    albums: albums.map((entry) => catalogueRow(entry, library)),
     artist: { key, name: key, album_count: result.total },
   }
 }
@@ -101,7 +101,7 @@ export async function catalogueDetail(
   library: string,
   id: string,
   query?: ItemQuery,
-): Promise<ItemQueryResponse> {
+): Promise<ItemDetail> {
   const entry = query ? await cataloguePlayback(library, id, query) : await item(library, id)
   const description = descriptionOf(entry)
   const row = entry.child
@@ -116,7 +116,6 @@ export async function catalogueDetail(
     chapters: entry.chapters,
     sources: entry.sources,
     copies: entry.copies,
-    library_revision: 0,
     show_title: entry.child?.position.kind === 'episode' ? (entry.parent_title ?? null) : null,
     subtitle_source: entry.subtitle_source ?? null,
     negotiated: entry.negotiated ?? null,
@@ -144,7 +143,7 @@ export async function catalogueDetail(
   }
 }
 
-function childRow(entry: LibraryChild, library: string, parentTitle?: string | null): ItemRowI64 {
+function childRow(entry: LibraryChild, library: string, parentTitle?: string | null): ItemSummary {
   const position = entry.position
   return {
     ...catalogueRow(
@@ -192,7 +191,7 @@ export async function catalogueChildren(
   }
 }
 
-function feedRow(entry: FeedItem): ItemRowI64 {
+function feedRow(entry: FeedItem): ItemSummary {
   return {
     ...(entry.child
       ? childRow(entry.child, entry.library_id, entry.parent_title)

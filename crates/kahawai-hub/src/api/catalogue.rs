@@ -347,12 +347,12 @@ pub(super) async fn set_collections(
     Ok(StatusCode::NO_CONTENT)
 }
 async fn retire_removed_sources(s: &AppState, library: &str) -> Result<(), ApiError> {
-    for session in s.sessions.list().into_iter().filter(|session| {
-        session
-            .catalogue
-            .as_ref()
-            .is_some_and(|c| c.library_id == library)
-    }) {
+    for session in s
+        .sessions
+        .list()
+        .into_iter()
+        .filter(|session| session.catalogue.library_id == library)
+    {
         if let Some(part) = session.parts.first()
             && !s
                 .registry
@@ -698,7 +698,7 @@ pub struct CatalogueDetail {
     /// IDs from the representative copy's selected identity and verified links.
     tmdb_id: Option<i64>,
     tvdb_id: Option<i64>,
-    copies: Vec<library_api::CollectionCopy>,
+    copies: Vec<copies::CollectionCopy>,
     #[serde(flatten)]
     query: ItemQueryResult,
 }
@@ -752,7 +752,7 @@ pub(super) async fn item(
         }
         let host = hosts.iter().find(|h| h.module_id == input.mediahost_id);
         let host_name = host.map(|h| h.name.clone());
-        copies.push(library_api::CollectionCopy {
+        copies.push(copies::CollectionCopy {
             id: copy.clone(),
             title: input.title.clone(),
             year: input.year.map(i64::from),
@@ -790,7 +790,7 @@ pub(super) async fn item(
                 .as_ref()
                 .and_then(|(_, r)| r.year)
                 .map(i64::from),
-            assignment: crate::library::Assignment {
+            assignment: copies::CopyAssignment {
                 collection_item_id: copy.clone(),
                 revision: input.revision,
                 mode: if input.manual { "manual" } else { "auto" }.into(),
@@ -940,6 +940,25 @@ fn video_provider_id(
         })
 }
 
+#[utoipa::path(
+    operation_id = "admin_set_user_libraries",
+    put, path = "/admin/v1/users/{id}/libraries", tag = "Admin users",
+    security(("bearer_auth" = [])),
+    params(("id" = String, Path)),
+    request_body = SetAccess,
+    responses(
+        (status = 200, body = UserAccessResponse),
+        (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
+        (status = 401, body = ApiErrorBody),
+        (status = 403, body = ApiErrorBody),
+        (status = 404, body = ApiErrorBody),
+        (status = 500, body = ApiErrorBody),
+        (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
+        (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
+        (status = 503, description = "The hub has no administrator yet: `setup_required`", body = ApiErrorBody),
+        (status = 409, description = "Somebody else changed these grants since they were read: `stale_write`", body = ApiErrorBody)
+    )
+)]
 pub(super) async fn set_user_libraries(
     State(s): State<AppState>,
     ApiPath(id): ApiPath<String>,

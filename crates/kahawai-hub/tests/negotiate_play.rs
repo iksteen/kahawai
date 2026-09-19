@@ -35,7 +35,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::legacy_router_fixture(
+    kahawai_hub::api::router(
         registry,
         auth,
         sessions,
@@ -52,7 +52,6 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     )
 }
@@ -295,6 +294,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     auth.complete_setup("admin", "password-123").await.unwrap();
     let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
+    let library_id = catalog_fixture::compose_library(&registry).await;
     let api = test_router(registry.clone(), auth, sessions.clone());
 
     // Wait for the ONE item with BOTH sources.
@@ -303,7 +303,7 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
             let resp = api
                 .clone()
                 .oneshot(
-                    Request::get("/api/v1/items")
+                    Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
                         .header("authorization", bearer.clone())
                         .body(Body::empty())
                         .unwrap(),
@@ -312,7 +312,9 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
                 .unwrap();
             let v: serde_json::Value = json(body_bytes(resp).await);
             if let Some(item) = v["items"].get(0)
-                && item["sources"] == 2
+                && item["copy_ids"]
+                    .as_array()
+                    .is_some_and(|ids| ids.len() == 2)
             {
                 return item["id"].as_str().unwrap().to_string();
             }
@@ -322,7 +324,8 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
     .await
     .expect("two-source item never resolved");
 
-    let start = |body: serde_json::Value| {
+    let start = |mut body: serde_json::Value| {
+        body["library_id"] = library_id.clone().into();
         let api = api.clone();
         let bearer = bearer.clone();
         async move {

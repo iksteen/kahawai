@@ -7,13 +7,13 @@
 /// The season-projection helpers arrived with the item pages that need them
 /// (phase 9). The player's own timing helpers are still to come.
 
-import type { ItemRowI64 } from '../api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../api/catalogue-model.ts'
 
 /// What every list needs from a row, and no more. Typed structurally rather
 /// than as the whole generated row, so a card component can be tested with the
 /// four fields it reads instead of a thirty-field fixture.
 export type Labelled = Pick<
-  ItemRowI64,
+  ItemSummary,
   | 'kind'
   | 'title'
   | 'artist'

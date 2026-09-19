@@ -252,7 +252,6 @@ const subtitleListingKnown = computed(
 const subtitleWork = computed(() => works.value.find((work) => work.id === subtitleSource.value))
 const canPlay = computed(
   () =>
-    item.value?.unavailable?.code !== 'feature_unavailable' &&
     sourceReady.value &&
     selectedWork.value?.whole &&
     selectedWork.value.parts.every((part) => part.available),
@@ -344,7 +343,6 @@ const nowPlaying = computed(() =>
 /// as well as in a title: a disabled button is out of the tab order, so its
 /// tooltip is unreachable by exactly the people who need the sentence.
 const whyNoTracks = computed(() => {
-  if (item.value?.unavailable?.code === 'feature_unavailable') return item.value.unavailable.message
   if (tracks.value.length) return ''
   if (children.isError.value) return 'The track list could not be read.'
   if (children.isPending.value) return 'Still reading the track list…'
@@ -505,7 +503,6 @@ function markSeason(season: number | null, played: boolean) {
           <label for="playback-source" class="mb-1 block text-[13px] text-dim">Source</label>
           <select
             id="playback-source"
-            :disabled="item.unavailable?.code === 'feature_unavailable'"
             v-model="sourceOverride"
             class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
           >
@@ -997,7 +994,6 @@ function markSeason(season: number | null, played: boolean) {
         <label for="subtitle-source" class="mb-1 block text-[13px] text-dim">Subtitle source</label>
         <select
           id="subtitle-source"
-          :disabled="item.unavailable?.code === 'feature_unavailable'"
           v-model="subtitleSourceOverride"
           class="w-full max-w-[42rem] truncate rounded-md border border-line bg-surface px-2 py-2 text-[13px]"
         >

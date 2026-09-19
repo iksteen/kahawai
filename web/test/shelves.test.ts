@@ -4,7 +4,7 @@
 
 import { describe, expect, test } from 'vitest'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import {
   appendPage,
   cardRatio,
@@ -15,7 +15,7 @@ import {
   shown,
 } from '../src/domain/shelves.ts'
 
-const item = (id: string) => ({ id }) as ItemRowI64
+const item = (id: string) => ({ id }) as ItemSummary
 const shelf = (over: Partial<Shelf>): Shelf => ({
   library: { id: 'films', name: 'Films', media_type: 'movies' },
   items: [],

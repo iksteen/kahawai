@@ -1,36 +1,15 @@
 // Layout fixtures exercise the existing playback-capable presentation as well as
 // unavailable states. The real catalogue adapter is covered separately and live.
-vi.mock('../src/composables/item.ts', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('../src/composables/item.ts')>()
-  return {
-    ...actual,
-    useItem: (
-      id: Parameters<typeof actual.useItem>[0],
-      playback: Parameters<typeof actual.useItem>[1],
-    ) => actual.useItem(id, playback),
-  }
-})
-vi.mock('../src/api/catalogue.ts', async () => {
-  const api = await import('../src/api/generated/kahawai.ts')
-  return {
-    ...api,
-    catalogueDetail: (_library: string, id: string, query: Parameters<typeof api.itemQuery>[1]) =>
-      api.itemQuery(id, query),
-    catalogueChildren: async (_library: string, id: string, params?: { season?: string }) => {
-      const page = await api.itemChildren(id)
-      return {
-        ...page,
-        children: params?.season
-          ? page.children.filter((e) =>
-              params.season === 'absolute'
-                ? (e.proj_season ?? e.season) == null
-                : (e.proj_season ?? e.season) === Number(params.season),
-            )
-          : page.children,
-      }
-    },
-  }
-})
+
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// UI-17, as a standing check rather than a one-off audit.
 ///
 /// A keyboard-only run and a screen reader are the pass; this is what stops the
@@ -48,26 +27,15 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import { defineComponent, h, nextTick, ref } from 'vue'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  upNext: vi.fn(async () => ({ items: [], total: 0, limit: 12, offset: 0 })),
-  listLibraries: vi.fn(async () => ({ libraries: [] })),
-  listItems: vi.fn(async () => ({ items: [], total: 0, limit: 100, offset: 0 })),
-  itemQuery: vi.fn(),
-  itemChildren: vi.fn(async () => ({ children: [] })),
-  itemSetWatched: vi.fn(),
-  catalogueSetWatched: async (
-    _library: string,
-    id: string,
-    body: { played: boolean; items?: string[] },
-  ) => (await import('../src/api/generated/kahawai.ts')).itemSetWatched(id, body),
+  catalogueSetWatched: vi.fn(),
   getPrefs: vi.fn(async () => ({ prefs: [] })),
   putPref: vi.fn(),
   adminItemLog: vi.fn(),
-  subtitleSearch: vi.fn(),
-  subtitleDownload: vi.fn(),
-  subtitleDelete: vi.fn(),
+  catalogueSubtitleSearch: vi.fn(),
+  catalogueSubtitleDownload: vi.fn(),
+  catalogueSubtitleDelete: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/art/${id}`,
 }))
 vi.mock('../src/api/session.ts', () => ({
   whoAmI: () => ({ username: 'me', admin: false }),
@@ -96,7 +64,7 @@ vi.mock('../src/api/capabilities.ts', () => ({
   }),
 }))
 
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const { screenShowing, useScreenName } = await import('../src/composables/title.ts')
 type Showing = NonNullable<(typeof screenShowing)['value']>
 const Home = (await import('../src/views/Home.vue')).default
@@ -195,6 +163,7 @@ function named(el: HTMLElement): boolean {
 
 const film = (over: Record<string, unknown> = {}) => ({
   id: 'heat',
+  library_id: 'films',
   kind: 'movie',
   title: 'Heat',
   year: 1995,
@@ -217,7 +186,13 @@ const film = (over: Record<string, unknown> = {}) => ({
 
 beforeEach(() => {
   live = []
-  vi.mocked(api.itemQuery).mockResolvedValue(film() as never)
+  vi.mocked(api.catalogueChildren).mockResolvedValue({
+    children: [],
+    groups: [],
+    offset: 0,
+    total: 0,
+  } as never)
+  vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
   vi.mocked(api.listLibraries).mockResolvedValue({
     libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
   } as never)
@@ -274,7 +249,9 @@ describe('every screen says what it is showing', () => {
   for (const [what, view, at, expected] of screens) {
     test(what, async () => {
       if (what === 'a season') {
-        vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'series' }) as never)
+        vi.mocked(api.catalogueDetail).mockResolvedValue(
+          film({ id: 'show', kind: 'series' }) as never,
+        )
       }
       forgetScreenName()
       expect(screenShowing.value).toBe(null)
@@ -290,7 +267,7 @@ describe('every screen says what it is showing', () => {
   test('and an episode carries its show', async () => {
     // The name is `itemName`, not `item.title`: every one of these is called
     // "Episode 1". A film fixture cannot tell the two apart.
-    vi.mocked(api.itemQuery).mockResolvedValue(
+    vi.mocked(api.catalogueDetail).mockResolvedValue(
       film({ id: 'ep', title: 'Episode 1', kind: 'episode', show_title: 'Blue Exorcist' }) as never,
     )
     forgetScreenName()
@@ -305,7 +282,7 @@ describe('every screen says what it is showing', () => {
   test('and a player still waiting publishes nothing', async () => {
     // "Starting playback" is a state, not a name. Published, it would spend the
     // screen's one announcement before there is anything to announce.
-    vi.mocked(api.itemQuery).mockImplementation((() => new Promise(() => {})) as never)
+    vi.mocked(api.catalogueDetail).mockImplementation((() => new Promise(() => {})) as never)
     forgetScreenName()
     await screen(Player, '/library/films/item/heat/play')
     await flushPromises()
@@ -326,8 +303,8 @@ describe('and a screen that could not load says so', () => {
 
   for (const [what, view, at, expected] of screens) {
     test(what, async () => {
-      vi.mocked(api.itemQuery).mockRejectedValue(new Error('nope'))
-      vi.mocked(api.itemChildren).mockRejectedValue(new Error('nope'))
+      vi.mocked(api.catalogueDetail).mockRejectedValue(new Error('nope'))
+      vi.mocked(api.catalogueChildren).mockRejectedValue(new Error('nope'))
       forgetScreenName()
       expect(screenShowing.value).toBe(null)
       await screen(view, at)
@@ -340,8 +317,8 @@ describe('and a screen that could not load says so', () => {
     // Two different failures. The show's details going missing is a notice
     // over a page full of working episodes — announcing "could not load this
     // season" there tells the screen reader something the screen contradicts.
-    vi.mocked(api.itemQuery).mockRejectedValue(new Error('nope'))
-    vi.mocked(api.itemChildren).mockResolvedValue({
+    vi.mocked(api.catalogueDetail).mockRejectedValue(new Error('nope'))
+    vi.mocked(api.catalogueChildren).mockResolvedValue({
       children: [film({ id: 'ep1', title: 'Episode 1', kind: 'episode', season: 1, episode: 1 })],
     } as never)
     forgetScreenName()
@@ -378,10 +355,10 @@ describe('nothing announces itself by appearing', () => {
     (wrapper.element as Element).querySelectorAll('[role="status"], [role="alert"]').length
 
   test('an item page has the same regions whether or not its list failed', async () => {
-    vi.mocked(api.itemQuery).mockResolvedValue(film({ id: 'show', kind: 'series' }) as never)
+    vi.mocked(api.catalogueDetail).mockResolvedValue(film({ id: 'show', kind: 'series' }) as never)
     const quiet = regions(await screen(Detail, '/library/films/item/show'))
 
-    vi.mocked(api.itemChildren).mockRejectedValue(new Error('nope'))
+    vi.mocked(api.catalogueChildren).mockRejectedValue(new Error('nope'))
     const failing = await screen(Detail, '/library/films/item/show')
     expect(failing.text()).toContain('Could not load the episodes')
     expect(regions(failing)).toBe(quiet)
@@ -512,7 +489,7 @@ describe('a heading names the screen', () => {
     // MOST to explain — a refusal, an unreachable source — was the one with no
     // answer to "where am I". `Failed` opens at `h2`, so the screen started at
     // level two as well.
-    vi.mocked(api.itemQuery).mockRejectedValue(new Error('nope'))
+    vi.mocked(api.catalogueDetail).mockRejectedValue(new Error('nope'))
     const wrapper = await screen(Player, '/library/films/item/heat/play')
     expect(wrapper.text()).toContain('Could not start playback.')
     const h1 = (wrapper.element as Element).querySelectorAll('h1')

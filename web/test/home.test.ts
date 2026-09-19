@@ -1,4 +1,12 @@
-vi.mock('../src/api/catalogue.ts', async () => await import('../src/api/generated/kahawai.ts'))
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  listItems: vi.fn(),
+  listArtists: vi.fn(),
+  artistAlbums: vi.fn(),
+  upNext: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The home screen, mounted. The rule most of this is about: a library that
 /// would not load must not look like a library with nothing in it — the second
 /// is dropped, and conflating them deleted whole libraries from this screen
@@ -10,20 +18,16 @@ import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
 import { defineComponent, h, ref } from 'vue'
 import { createMemoryHistory, createRouter } from 'vue-router'
 
-import type { ItemRowI64 } from '../src/api/generated/model/itemRowI64.ts'
+import type { ItemSummary } from '../src/api/catalogue-model.ts'
 import { ApiError } from '../src/api/errors.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  listLibraries: vi.fn(),
-  listItems: vi.fn(),
-  upNext: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/api/v1/items/${id}/artwork`,
 }))
 vi.mock('../src/api/session.ts', () => ({ whoAmI: vi.fn(() => ({ username: 'x', admin: false })) }))
 
-const { listItems, listLibraries, upNext } = await import('../src/api/generated/kahawai.ts')
+const { listItems, listLibraries, upNext } = await import('./api-fixture.ts')
 const { whoAmI } = await import('../src/api/session.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
 const Home = (await import('../src/views/Home.vue')).default
@@ -34,7 +38,7 @@ const LIBS = [
   { id: 'music', name: 'Music', media_type: 'music' },
 ]
 
-const item = (id: string, over: Partial<ItemRowI64> = {}) =>
+const item = (id: string, over: Partial<ItemSummary> = {}) =>
   ({
     id,
     title: id,
@@ -52,7 +56,7 @@ const item = (id: string, over: Partial<ItemRowI64> = {}) =>
     resume_position_ms: null,
     resume_duration_ms: null,
     ...over,
-  }) as ItemRowI64
+  }) as ItemSummary
 
 /// No retries and no cache between tests: a retrying client turns one refused
 /// request into three and a shared cache carries an answer into the next test.
@@ -79,7 +83,7 @@ function home() {
 }
 
 /// A page of items, with the paging echo the hub sends back.
-const page = (items: ItemRowI64[], total = items.length, offset = 0) => ({
+const page = (items: ItemSummary[], total = items.length, offset = 0) => ({
   items,
   total,
   limit: 20,
@@ -93,7 +97,7 @@ const page = (items: ItemRowI64[], total = items.length, offset = 0) => ({
 /// second page straight away. That is correct behaviour — a lane whose cards
 /// fit should fill itself — but it means a 25-item fixture is 25 on screen by
 /// the time a test looks, not 20.
-function shelvesThat(answers: Record<string, ItemRowI64[] | 'fails'>, { pagesFail = false } = {}) {
+function shelvesThat(answers: Record<string, ItemSummary[] | 'fails'>, { pagesFail = false } = {}) {
   vi.mocked(listItems).mockImplementation(async (params) => {
     if (params?.in_progress) return page([])
     const answer = answers[params?.library ?? '']
@@ -105,7 +109,9 @@ function shelvesThat(answers: Record<string, ItemRowI64[] | 'fails'>, { pagesFai
 }
 
 beforeEach(() => {
-  vi.mocked(listLibraries).mockResolvedValue({ libraries: LIBS })
+  vi.mocked(listLibraries).mockResolvedValue({
+    libraries: LIBS.map((library) => ({ ...library, collection_ids: [] })),
+  })
   vi.mocked(upNext).mockResolvedValue(page([]))
   vi.mocked(whoAmI).mockReturnValue({ username: 'x', admin: false })
   clearNotices()

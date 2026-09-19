@@ -12,9 +12,8 @@ import type JASSUB from 'jassub'
 import type { StartSessionResponse } from '../api/generated/model/startSessionResponse.ts'
 import type { SubtitleRoute } from '../domain/subtitle-route.ts'
 import type { TrackListing } from '../api/generated/model/trackListing.ts'
-import { fontUrl, overlayUrl, sessionFileUrl, subtitleFileUrl } from '../api/playback.ts'
+import { overlayUrl, sessionFileUrl, subtitleFileUrl } from '../api/playback.ts'
 import { isRasterSub } from '../domain/subtitles.ts'
-import { itemFonts } from '../api/generated/kahawai.ts'
 import { loadChunk } from '../api/chunk.ts'
 import { playerNote } from './player-note.ts'
 
@@ -298,14 +297,8 @@ export function useSubtitleRenderers(p: {
       let fonts: string[] = []
       try {
         const session = p.session.value
-        const answer = session.media_entry_id
-          ? await sessionFonts(session.session_id)
-          : await itemFonts(p.itemId.value, { source_id: session.source_id })
-        fonts = answer.fonts.map((_, at) =>
-          session.media_entry_id
-            ? getSessionFontUrl(session.session_id, at)
-            : fontUrl(p.itemId.value, at, session.source_id),
-        )
+        const answer = await sessionFonts(session.session_id)
+        fonts = answer.fonts.map((_, at) => getSessionFontUrl(session.session_id, at))
       } catch {
         // No fonts: libass falls back.
       }

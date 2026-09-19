@@ -35,10 +35,11 @@ pub struct Harness {
     pub api: axum::Router,
     pub bearer: String,
     pub item_id: String,
+    pub library_id: String,
     pub registry: Arc<Registry>,
     pub sessions: Arc<kahawai_hub::sessions::Sessions>,
     pub subtitles: Arc<kahawai_hub::subtitles::Subtitles>,
-    pub db: kahawai_hub::library::Database,
+    pub db: kahawai_sqlite::Database,
     /// Held so the collection root and PKI outlive the test.
     _root: tempfile::TempDir,
     _pki: tempfile::TempDir,
@@ -247,7 +248,8 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
         Duration::from_secs(900),
         90,
     ));
-    let api = kahawai_hub::api::legacy_router_fixture(
+    let library_id = catalog::compose_library(&registry).await;
+    let api = kahawai_hub::api::router(
         registry.clone(),
         auth,
         sessions.clone(),
@@ -258,22 +260,20 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
             enricher.clone(),
         )),
         enricher,
-        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     );
-
-    catalog::seed_legacy_fixture(&registry).await;
 
     // The upsert crosses the link asynchronously; wait for the item.
     let item_id = tokio::time::timeout(Duration::from_secs(10), {
         let api = api.clone();
         let bearer = bearer.clone();
+        let library_id = library_id.clone();
         async move {
             loop {
                 let resp = api
                     .clone()
                     .oneshot(
-                        Request::get("/api/v1/items")
+                        Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
                             .header("authorization", &bearer)
                             .body(Body::empty())
                             .unwrap(),
@@ -292,6 +292,7 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
     .expect("item never resolved");
 
     Harness {
+        library_id,
         api,
         bearer,
         item_id,

@@ -176,8 +176,7 @@ matching is performed. Provider records remain reusable evidence.
 exposes its membership. `library_item(library, item_id)` returns an item with copies
 accessible in that library; `library_item_record(item_id)` returns its durable ID,
 media type, original readable identity label/year and computed `archived` state,
-even without copies. It stores no resolved-description snapshot. Watch history is
-not implemented by this increment.
+even without copies. It stores no resolved-description snapshot. Watch history lives separately in the hub database.
 
 Browse uses an indexed existence check for copies in the requested library, then
 loads that page's copies by foreign key, without query-time grouping. The first
@@ -291,14 +290,13 @@ are available through the API companion. Authenticated catalogue endpoints are:
   physical sources, stream summaries, representative runtime and chapters.
 
 Library IDs from this API can be granted through the existing user administration
-endpoint. The old browse, playback, legacy matching, subtitle, viewer artwork and
-watch-state APIs return `501 feature_unavailable` after authentication. Their
-legacy background consumers are not scheduled. The admin Libraries and Users & grants
-panels use mediadb. Viewer home, jump-menu, library pages and item metadata
-details use the catalogue endpoints; playback UI has not been adapted.
-Backup/restore includes independent snapshots of hub.db and mediadb.db in a
-format-4 manifest and validates both before replacing either. Historical consumer tests explicitly arrange legacy
-fixtures and use a separate fixture router; production has no fallback catalogue.
+endpoint. All catalogue, playback, watch-state and source-artifact consumers
+use mediadb. Retired browse/matching/artwork/subtitle routes are absent and return
+404. Hub migration 0089 drops their unused catalogue and historical watch tables,
+views and triggers. Current accounts, grants, credentials and watch state remain;
+paid on-disk artifacts and the still-consumed AniDB hash-answer cache are retained.
+There is no separate compatibility router or legacy ingestion implementation.
+Backup/restore snapshots both databases and validates both before replacing either.
 
 ```sh
 scripts/kahawai-mediadb.sh api login USERNAME
@@ -329,9 +327,8 @@ libraries are valid. Host names, roots, file counts and scan/offline status iden
 the inputs, including the in-process host.
 
 Deleting a library requires confirmation, revokes its grants and retains imported
-collections. The Users & grants panel reads the same media library IDs. Sessions
-are read only while their tab is open, so that unavailable consumer does not report
-an error over a working composer. The API has no membership revision token: Save
+collections. The Users & grants panel reads the same media library IDs. The API
+has no membership revision token: Save
 replaces the ordered set, and simultaneous administrators use last successful write.
 
 Run `scripts/kahawai-mediadb-ui.sh` for browser acceptance against an isolated hub
@@ -397,8 +394,8 @@ consume catalogue data through a presentation adapter. Item and artist pages are
 filtered, sorted and counted in mediadb; only the requested page is described.
 Artwork is served through a library-scoped viewer endpoint with the same access
 checks as item details. Album identities remain separate. Composition changes
-invalidate the shell and view queries. Watch-state shelves and playback remain
-pending their separate integration; legacy watch records are not attached to new IDs.
+invalidate the shell and view queries. Watch-state shelves and playback use stable library/child identities; old history
+is not remapped and is removed by migration 0089.
 
 ## User watch state
 

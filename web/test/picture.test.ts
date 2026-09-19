@@ -1,3 +1,8 @@
+vi.mock('../src/api/catalogue.ts', () => ({
+  listLibraries: vi.fn(),
+  catalogueDetail: vi.fn(),
+  catalogueChildren: vi.fn(),
+}))
 /// The picture: one session, its pipeline, and the four overlays that can own
 /// the screen.
 ///
@@ -14,22 +19,18 @@ import { ApiError } from '../src/api/errors.ts'
 import { IDLE_LIMIT_MS, PING_MS } from '../src/domain/keepalive.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  itemQuery: vi.fn(),
-  itemChildren: vi.fn(),
+  catalogueNext: vi.fn(),
+  sessionFonts: vi.fn(async () => ({ fonts: [] })),
+  getSessionFontUrl: vi.fn(),
   getPrefs: vi.fn(),
-  listLibraries: vi.fn(),
   startSession: vi.fn(),
   endSession: vi.fn(),
   postProgress: vi.fn(),
   seekSession: vi.fn(),
   putPref: vi.fn(),
   adminSessionLog: vi.fn(),
-  itemFonts: vi.fn(async () => ({ fonts: [] })),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
-  getItemArtworkUrl: (id: string) => `/art/${id}`,
-  getItemFontUrl: (id: string, n: number) => `/font/${id}/${n}`,
-  getItemSubtitleFileUrl: (id: string, file: string) => `/subs/${id}/${file}`,
   getSessionFileUrl: (id: string, file: string) => `/session/${id}/${file}`,
 }))
 vi.mock('../src/api/session.ts', () => ({
@@ -90,7 +91,7 @@ class FakeHls {
 }
 vi.mock('hls.js', () => ({ default: FakeHls }))
 
-const api = await import('../src/api/generated/kahawai.ts')
+const api = await import('./api-fixture.ts')
 const { forgetRecoveries } = await import('../src/domain/recovery.ts')
 const { forgetIntrodb } = await import('../src/domain/introdb-cache.ts')
 const { resetIntrodb } = await import('../src/api/introdb.ts')
@@ -99,6 +100,7 @@ const Picture = (await import('../src/components/Picture.vue')).default
 const film = (over: Record<string, unknown> = {}) => {
   const item = {
     id: 'heat',
+    library_id: 'films',
     kind: 'movie',
     title: 'Heat',
     parent_id: null,
@@ -208,8 +210,8 @@ beforeEach(() => {
     'fetch',
     vi.fn(async () => new Response('', { status: 404 })),
   )
-  vi.mocked(api.itemQuery).mockResolvedValue(film() as never)
-  vi.mocked(api.itemChildren).mockResolvedValue({ children: [] } as never)
+  vi.mocked(api.catalogueDetail).mockResolvedValue(film() as never)
+  vi.mocked(api.catalogueChildren).mockResolvedValue({ children: [] } as never)
   vi.mocked(api.getPrefs).mockResolvedValue({ prefs: [] } as never)
   vi.mocked(api.listLibraries).mockResolvedValue({
     libraries: [{ id: 'films', name: 'Films', media_type: 'movies' }],
@@ -1416,6 +1418,7 @@ describe('choosing subtitles', () => {
 describe('the next episode', () => {
   const episode = (id: string, n: number) => ({
     id,
+    library_id: 'films',
     kind: 'episode',
     title: `Episode ${n}`,
     parent_id: 'show',
@@ -1431,11 +1434,9 @@ describe('the next episode', () => {
   })
 
   async function nearTheEnd() {
-    vi.mocked(api.itemChildren).mockResolvedValue({
-      children: [episode('e1', 1), episode('e2', 2)],
-    } as never)
-    vi.mocked(api.itemQuery).mockImplementation(
-      async (id) => (id === 'e2' ? episode('e2', 2) : episode('e1', 1)) as never,
+    vi.mocked(api.catalogueNext).mockResolvedValue(episode('e2', 2) as never)
+    vi.mocked(api.catalogueDetail).mockImplementation(
+      async (_library, id) => (id === 'e2' ? episode('e2', 2) : episode('e1', 1)) as never,
     )
     const it = await watching({ item: episode('e1', 1) as never })
     starts(it.element)
@@ -1454,11 +1455,9 @@ describe('the next episode', () => {
     // Credits segments and the up-next card fire in the same corner at the
     // same moment; both at once is two buttons stacked on one spot, and
     // the countdown is the one that acts on its own.
-    vi.mocked(api.itemChildren).mockResolvedValue({
-      children: [episode('e1', 1), episode('e2', 2)],
-    } as never)
-    vi.mocked(api.itemQuery).mockImplementation(
-      async (id) => (id === 'e2' ? episode('e2', 2) : episode('e1', 1)) as never,
+    vi.mocked(api.catalogueNext).mockResolvedValue(episode('e2', 2) as never)
+    vi.mocked(api.catalogueDetail).mockImplementation(
+      async (_library, id) => (id === 'e2' ? episode('e2', 2) : episode('e1', 1)) as never,
     )
     const { wrapper, element } = await watching({
       item: {
@@ -1716,6 +1715,7 @@ describe('chapter marks on the bar', () => {
     const { wrapper, element } = await watching({
       item: film({
         id: 'ep1',
+        library_id: 'films',
         kind: 'episode',
         season: 1,
         episode: 1,

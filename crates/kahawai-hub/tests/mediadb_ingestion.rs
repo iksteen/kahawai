@@ -20,7 +20,6 @@ struct Fixture {
     token: String,
     subtitles: Arc<kahawai_hub::subtitles::Subtitles>,
     enricher: Arc<kahawai_hub::enrich::Enricher>,
-    segments: Arc<kahawai_hub::segments::Detector>,
 }
 impl Fixture {
     async fn new() -> Self {
@@ -41,8 +40,6 @@ impl Fixture {
             .await
             .unwrap()
             .access_token;
-        sqlx::query("INSERT INTO library_items(id,kind,title,norm_title,sort_title,added_id) VALUES('old','movie','Old','old','old','old')").execute(&db).await.unwrap();
-        sqlx::query("INSERT INTO user_item_state(user_id,item_id,position_ms,played,play_count) SELECT id,'old',123456,1,7 FROM users WHERE username='admin'").execute(&db).await.unwrap();
         let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
             dir.path().join("sessions"),
         ));
@@ -64,7 +61,6 @@ impl Fixture {
             dir.path().join("artwork"),
             enricher.clone(),
         ));
-        let segments = Arc::new(kahawai_hub::segments::Detector::new());
         let api = kahawai_hub::api::router(
             registry.clone(),
             auth,
@@ -73,7 +69,6 @@ impl Fixture {
             subtitles.clone(),
             artwork,
             enricher.clone(),
-            segments.clone(),
             Default::default(),
         );
         Self {
@@ -84,7 +79,6 @@ impl Fixture {
             token,
             subtitles,
             enricher,
-            segments,
         }
     }
     fn link(
@@ -97,7 +91,6 @@ impl Fixture {
             self.registry.clone(),
             self.subtitles.clone(),
             self.enricher.clone(),
-            self.segments.clone(),
             "host",
             "Fixture",
         )
@@ -293,11 +286,11 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
         f.request("GET", "/api/v1/items", Value::Null, Some(&f.token))
             .await
             .0,
-        StatusCode::NOT_IMPLEMENTED
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         f.request("GET", "/api/v1/items", Value::Null, None).await.0,
-        StatusCode::UNAUTHORIZED
+        StatusCode::NOT_FOUND
     );
     assert_eq!(
         f.request(
@@ -360,30 +353,11 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
     .await
     .unwrap();
     assert!(disk.library_item_record(&id).await.unwrap().archived);
-    let old_count: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
-        .fetch_one(f.registry.db())
-        .await
-        .unwrap();
-    assert_eq!(old_count, 0);
-    let history: (i64, i64, i64) = sqlx::query_as(
-        "SELECT position_ms,played,play_count FROM user_item_state WHERE item_id='old'",
-    )
-    .fetch_one(f.registry.db())
-    .await
-    .unwrap();
-    assert_eq!(history, (123456, 1, 7));
     let backup = kahawai_hub::backup::backup(f.dir.path(), None, &f.dir.path().join("backup"))
         .await
         .unwrap();
     assert!(backup.mediadb_bytes.is_some());
     f.registry.delete_satellite("host").await.unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM user_item_state WHERE item_id='old'")
-            .fetch_one(f.registry.db())
-            .await
-            .unwrap(),
-        1
-    );
     disk.close().await;
 }
 
@@ -612,7 +586,7 @@ async fn revocation_serializes_with_queued_ingestion() {
 }
 
 #[tokio::test]
-async fn grants_upgrade_preserves_legacy_rows_and_keeps_the_user_foreign_key() {
+async fn grants_upgrade_preserves_grants_and_user_foreign_key_after_catalogue_removal() {
     use sqlx::Connection;
     let dir = tempfile::tempdir().unwrap();
     let options = sqlx::sqlite::SqliteConnectOptions::new()
@@ -646,12 +620,12 @@ async fn grants_upgrade_preserves_legacy_rows_and_keeps_the_user_foreign_key() {
             .await
             .unwrap();
     assert_eq!(grants, vec![("old-user".into(), "old-library".into())]);
-    let history: (i64, i64, i64) =
-        sqlx::query_as("SELECT position_ms,played,play_count FROM user_item_state")
-            .fetch_one(&db)
+    assert!(
+        sqlx::query("SELECT * FROM user_item_state")
+            .fetch_all(&db)
             .await
-            .unwrap();
-    assert_eq!(history, (123456, 1, 7));
+            .is_err()
+    );
     sqlx::query("INSERT INTO user_libraries VALUES('old-user','external-mediadb-id')")
         .execute(&db)
         .await
@@ -1700,17 +1674,6 @@ async fn movie_playback_case(kind: MediaType) {
         .0,
         StatusCode::NO_CONTENT
     );
-    let legacy: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM files")
-        .fetch_one(f.registry.db())
-        .await
-        .unwrap();
-    assert_eq!(legacy, 0);
-    let history: i64 =
-        sqlx::query_scalar("SELECT position_ms FROM user_item_state WHERE item_id='old'")
-            .fetch_one(f.registry.db())
-            .await
-            .unwrap();
-    assert_eq!(history, 123456);
     let (status, new_session) = f
         .request(
             "POST",
@@ -1793,10 +1756,9 @@ async fn combined_episode_playback_finishes_captured_coverage_and_next_skips_the
         session["library_item_ids"],
         json!([children[0].id, children[1].id])
     );
-    assert_eq!(
-        session["coverage"],
-        json!([]),
-        "never invent episode boundaries"
+    assert!(
+        session.get("coverage").is_none(),
+        "no invented episode boundaries"
     );
     let next = f
         .request(
@@ -1992,10 +1954,7 @@ async fn skip_segments_follow_the_selected_medium_and_multipart_timeline() {
         .await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     assert_eq!(preview["segments"], json!([]));
-    assert_eq!(
-        captured.unwrap().catalogue.as_ref().unwrap().segments[0].start_ms,
-        5000
-    );
+    assert_eq!(captured.unwrap().catalogue.segments[0].start_ms, 5000);
     // Facts from obsolete detector generations and failed analyses never become
     // skip buttons, even when they describe the current physical file version.
     for (index, failed) in [false, true].into_iter().enumerate() {

@@ -38,9 +38,6 @@ pub(super) fn now() -> i64 {
 struct Unconfigured;
 
 impl Enricher {
-    pub(crate) fn catalogue_active(&self) -> bool {
-        self.catalogue_started.load(Ordering::SeqCst)
-    }
     pub fn start_catalogue(self: &Arc<Self>, registry: Arc<Registry>) {
         if self.catalogue_started.swap(true, Ordering::SeqCst) {
             self.catalogue_wake.notify_waiters();

@@ -14,7 +14,7 @@ vi.mock('../src/api/session.ts', () => ({
   onTokensCleared: vi.fn(() => vi.fn()),
 }))
 
-const { bootstrap } = await import('../src/api/generated/kahawai.ts')
+const { bootstrap } = await import('./api-fixture.ts')
 const { onTokensCleared, restoreSession } = await import('../src/api/session.ts')
 const { useBoot } = await import('../src/composables/boot.ts')
 const { QueryClient } = await import('@tanstack/vue-query')

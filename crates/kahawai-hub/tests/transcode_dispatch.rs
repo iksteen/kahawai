@@ -310,6 +310,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
     auth.complete_setup("admin", "password-123").await.unwrap();
     let pair = auth.login("admin", "password-123").await.unwrap();
     let bearer = format!("Bearer {}", pair.access_token);
+    let library_id = catalog_fixture::compose_library(&registry).await;
     let api = test_router(registry.clone(), auth, sessions.clone());
     let get = |uri: String| {
         Request::get(uri)
@@ -323,7 +324,9 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
         loop {
             let resp = api
                 .clone()
-                .oneshot(get("/api/v1/items".into()))
+                .oneshot(get(format!(
+                    "/api/v1/catalogue/libraries/{library_id}/items"
+                )))
                 .await
                 .unwrap();
             let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
@@ -355,7 +358,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
             .header("authorization", bearer.clone())
             .header("content-type", "application/json")
             .body(Body::from(format!(
-                "{{\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}"
+                "{{\"library_id\":\"{library_id}\",\"item_id\":\"{item_id}\",\"mode\":\"remux\"}}"
             )))
             .unwrap()
     };
@@ -619,7 +622,7 @@ fn test_router(
         std::time::Duration::from_secs(900),
         90,
     ));
-    kahawai_hub::api::legacy_router_fixture(
+    kahawai_hub::api::router(
         registry,
         auth,
         sessions,
@@ -636,7 +639,6 @@ fn test_router(
         Arc::new(kahawai_hub::enrich::Enricher::new(
             tempfile::tempdir().unwrap().keep(),
         )),
-        Arc::new(kahawai_hub::segments::Detector::new()),
         kahawai_hub::api::NetOptions::default(),
     )
 }

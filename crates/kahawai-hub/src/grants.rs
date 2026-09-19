@@ -1,8 +1,7 @@
 //! Runtime grants reference external mediadb library IDs. Only the user FK is
 //! stored here; library existence, composition and item visibility come from Store.
 //! Removing a library makes dangling grants inert because IDs are never reused.
-//! Runtime writes use `set_catalogue_access`; the legacy SQL predicates and
-//! `set_access` remain regression fixtures for consumers awaiting their port.
+//! Runtime writes validate library IDs through `set_catalogue_access`.
 //!
 //! Per-library access grants (HUB-10): which libraries an account may
 //! see, and so which items it may browse, search, open, fetch artwork
@@ -24,7 +23,7 @@
 //! (UI-25). A reader is told the version it read at; a writer sends it back
 //! and the `UPDATE` matches only while it still holds, so of two admins who
 //! read the same state and both submit, the second is refused rather than
-//! silently replacing the first. See [`set_access`].
+//! silently replacing the first. See [`set_catalogue_access`].
 //!
 //! The flag is there so that "nothing" is expressible. A list on its own
 //! cannot say it: with no rows meaning "everything" you can never revoke
@@ -71,8 +70,8 @@
 //! row on the two scan-shaped browses: the cost class of the in-library
 //! search predicate that has always been there.
 
-use crate::library::Database as SqlitePool;
 use anyhow::Result;
+use kahawai_sqlite::Database as SqlitePool;
 use serde::Serialize;
 use sqlx::Row;
 use utoipa::ToSchema;
@@ -96,30 +95,6 @@ pub async fn restricted(db: &SqlitePool, claims: &Claims) -> Result<bool> {
     Ok(all.unwrap_or(0) == 0)
 }
 
-/// May this account see this item — or the show/album it belongs to?
-///
-/// One statement: the flag and the membership probe share a round trip,
-/// because the caller that asks this is usually about to do one thing
-/// with the answer and two queries would be two waits.
-pub async fn can_see(db: &SqlitePool, claims: &Claims, item_id: &str) -> Result<bool> {
-    if claims.admin {
-        return Ok(true);
-    }
-    let item_id = crate::library::resolve_id(db, item_id).await?;
-    let ok: i64 = sqlx::query_scalar(
-        "SELECT EXISTS(SELECT 1 FROM users WHERE id=?1 AND all_libraries=1)
-             OR EXISTS(SELECT 1 FROM collection_item_library_items a JOIN collection_items i ON i.id=a.collection_item_id JOIN library_collections lc
-                  ON (lc.module_id,lc.collection_id)=(i.module_id,i.collection_id)
-                  JOIN user_libraries ul ON ul.library_id=lc.library_id AND ul.user_id=?1
-                 WHERE a.library_item_id=?2)",
-    )
-    .bind(&claims.sub)
-    .bind(item_id)
-    .fetch_one(db)
-    .await?;
-    Ok(ok != 0)
-}
-
 /// May this account see this library? True for a library that does not
 /// exist when the account is unrestricted — "no such library" is the
 /// caller's own 404 to give, not a grant decision.
@@ -138,34 +113,6 @@ pub async fn can_see_library(db: &SqlitePool, claims: &Claims, library_id: &str)
     Ok(ok != 0)
 }
 
-/// The membership predicate for a browse scan, correlated on the
-/// candidate alias `c` — the same shape and the same alias as the
-/// in-library search fragment it sits beside.
-///
-/// `?1` is the user id in every browse query already (it is what
-/// `watch_state` joins on), so this binds nothing new. Only ever
-/// interpolated when [`restricted`] said so: it carries no
-/// `all_libraries` check of its own, which is what keeps it a single
-/// indexed probe instead of a per-row lookup in `users`.
-pub const VISIBLE_C: &str = "AND EXISTS(SELECT 1 FROM library_membership lc JOIN user_libraries ul ON ul.library_id=lc.library_id AND ul.user_id=?1 WHERE lc.item_id=c.id)";
-
-/// The same restriction, for the navigation library a browse row carries.
-///
-/// `VISIBLE_C` decides which items a restricted account may SEE; this decides
-/// which library such a row is allowed to NAME. Without it the row reports
-/// `MIN(library_id)` over every library the item belongs to, which for an item
-/// in a withheld and a granted library is the withheld one — a denial that
-/// answers, in the module whose whole point is that denials do not. The client
-/// then navigates there and gets a 404.
-///
-/// Correlated on `il`, so it belongs inside that subquery rather than beside
-/// it, and interpolated only when [`restricted`] said so: an unrestricted
-/// account has no `user_libraries` rows at all, so applying this to everyone
-/// would answer NULL for everyone.
-pub const VISIBLE_LIB: &str = "\
-AND EXISTS (SELECT 1 FROM user_libraries ul
-             WHERE ul.library_id=lc.library_id AND ul.user_id=?1)";
-
 #[derive(Debug, Serialize, ToSchema)]
 pub struct UserAccess {
     pub id: String,
@@ -175,7 +122,7 @@ pub struct UserAccess {
     pub created_at: i64,
     pub libraries: Vec<String>,
     /// What this account's grants were when they were read, for the write
-    /// that follows. See [`set_access`].
+    /// that follows. See [`set_catalogue_access`].
     pub grants_version: i64,
 }
 
@@ -207,7 +154,7 @@ pub async fn users_with_access(db: &SqlitePool) -> Result<Vec<UserAccess>> {
 
 /// What a write to an account's grants did. Each is something a caller can
 /// act on, so they are return values rather than errors to read prose out of;
-/// an `Err` from [`set_access`] is the database being unavailable.
+/// an `Err` from [`set_catalogue_access`] is the database being unavailable.
 #[derive(Debug, PartialEq, Eq)]
 pub enum SetAccess {
     Applied {
@@ -228,41 +175,6 @@ pub enum SetAccess {
     /// nothing said. A version turns that into a refusal they can see.
     Stale,
     NoSuchUser,
-}
-
-/// Replace an account's access wholesale, in one transaction, if nobody else
-/// has written since it was read.
-///
-/// Wholesale rather than add/remove because that is what a panel of
-/// checkboxes has in hand, and because two clients toggling different boxes
-/// should not be able to interleave into a set neither asked for. That is also
-/// why it needs a version: a wholesale write does not merge, so without one
-/// the second writer silently replaces the first (UI-25).
-///
-/// `expected` is the `grants_version` the caller was shown. The check and the
-/// write are one statement, so two admins racing cannot both pass it: the
-/// loser's `UPDATE` matches no row and is told so.
-///
-/// Library ids that do not exist are dropped rather than refused — the insert
-/// selects from `libraries`, so a stale id from a client holding an old list
-/// cannot fail the whole call. The caller reads the stored set back and can
-/// see what landed.
-pub async fn set_access(
-    db: &SqlitePool,
-    user_id: &str,
-    expected: i64,
-    all_libraries: bool,
-    libraries: &[String],
-) -> Result<SetAccess> {
-    let existing: Vec<String> = sqlx::query_scalar("SELECT id FROM libraries")
-        .fetch_all(db)
-        .await?;
-    let valid: Vec<String> = libraries
-        .iter()
-        .filter(|id| existing.contains(id))
-        .cloned()
-        .collect();
-    write_access(db, user_id, expected, all_libraries, &valid).await
 }
 
 async fn write_access(
