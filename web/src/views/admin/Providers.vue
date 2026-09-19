@@ -547,7 +547,7 @@ async function run() {
           </li>
         </ul>
         <p v-if="segments.data.value.collections.length" class="mt-2 text-[12px] text-dim">
-          Last reported counts; sources may be waiting for more episodes to compare.
+          Last reported counts; only sources with enough episodes to compare are included.
         </p>
       </template>
     </section>

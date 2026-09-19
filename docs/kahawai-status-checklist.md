@@ -699,6 +699,10 @@ How something works and why it was built that way belong in
       authority; the owning mediahost performs the decode work locally, yielding
       to scans and viewer leases, so analysis sends no media bytes over a lease.
       The admin API reports what is left and can run the next season now.
+      Pending segment counts use the mediahost scheduler's eligibility rules:
+      only missing results in groups with two distinct usable episodes count.
+      Lone episodes and unparseable files do not appear as stuck work; alternate
+      copies still count and completed usable sources remain comparison material.
       Successful scan rows retain the historical rendition-mtime membership
       rule. Unreadable exact module/collection/root/path/size/mtime revisions
       land in a separate failure table, so another rendition may be tried and
@@ -1036,6 +1040,11 @@ not describe this branch's current runtime.
       of the retired hub season queue. The Providers panel distinguishes offline,
       disabled and unknown reports; manual discovery wakes each eligible mediahost
       once without claiming analysis completion. Reports reset on reconnect.
+
+- [x] Segment discovery analyzes every eligible physical source in a pending
+      season, including alternate releases, and advances once all have results.
+      Comparison excludes copies of the same episode; each source retains its
+      own timestamps. Regression covers alternate sources and season progress.
 
 - [x] CLI tooling uses mediadb libraries, stable item/child IDs and optional media
       entry selection. Browse reads every page and supports artists, albums,

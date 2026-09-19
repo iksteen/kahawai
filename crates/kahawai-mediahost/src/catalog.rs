@@ -12,6 +12,10 @@
 //! A restored hub below that floor resets its projection and takes a live
 //! snapshot, so compaction can never turn a deletion into a resurrected file.
 //!
+//! Segment progress counts missing facts only in schedulable comparison groups,
+//! using the scheduler's grouping. Lone episodes and non-episode files do not
+//! count as pending; catalogue changes make them eligible for reconsideration.
+//!
 //! Discovery queue membership is materialized from missing current records,
 //! which makes a crash retry work without a hub or a queue-repair pass.
 //! `catalog_jobs` is the lease/error journal for work that later needs partial
@@ -71,6 +75,18 @@ pub(crate) type VersionState = HashMap<String, (String, u64, bool)>;
 pub struct Catalog {
     db: Database,
     versions: tokio::sync::watch::Sender<VersionState>,
+}
+
+struct SegmentCandidate {
+    root: String,
+    path: String,
+    size: u64,
+    mtime: i64,
+    duration: u64,
+    group: String,
+    episode: u32,
+    pending: bool,
+    source_version: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -462,7 +478,13 @@ impl Catalog {
             0
         };
         let segments = if matches!(media_type.as_str(), "series" | "anime") {
-            pending("file_segments").await?
+            let mut connection = self.db.acquire().await?;
+            Self::segment_groups(&mut connection, collection, &media_type)
+                .await?
+                .iter()
+                .flatten()
+                .filter(|source| source.pending)
+                .count() as i64
         } else {
             0
         };
@@ -1385,27 +1407,14 @@ impl Catalog {
         Ok(())
     }
 
-    /// Choose one locally derived season containing pending source facts. The
-    /// path parser is source truth; hubs may map the returned exact sources to
-    /// different provider-enriched item identities afterwards.
-    pub async fn next_segment_job(
-        &self,
+    /// Pending comparison groups, shared by scheduling and progress reporting.
+    /// Missing facts alone are not work: unparseable paths and groups without
+    /// two distinct usable episodes cannot be compared.
+    async fn segment_groups(
+        connection: &mut sqlx::SqliteConnection,
         collection: &str,
         media_type: &str,
-    ) -> Result<Option<kahawai_proto::v1::DetectSegments>> {
-        #[derive(Clone)]
-        struct Candidate {
-            root: String,
-            path: String,
-            size: u64,
-            mtime: i64,
-            duration: u64,
-            group: String,
-            episode: u32,
-            pending: bool,
-            source_version: i64,
-        }
-        let mut tx = self.db.begin().await?;
+    ) -> Result<Vec<Vec<SegmentCandidate>>> {
         let rows = sqlx::query(
             "SELECT f.root_token,f.path_rel,f.size,f.mtime_unix,f.streams_json,f.version,
                     s.payload AS segment_payload, s.payload IS NULL AS pending
@@ -1418,7 +1427,7 @@ impl Catalog {
                ORDER BY f.mtime_unix DESC,f.path_rel",
         )
         .bind(collection)
-        .fetch_all(&mut *tx)
+        .fetch_all(connection)
         .await?;
         let mut candidates = Vec::new();
         for row in rows {
@@ -1459,7 +1468,7 @@ impl Catalog {
             };
             let info: kahawai_core::media::MediaInfo =
                 serde_json::from_str(row.get::<&str, _>("streams_json"))?;
-            candidates.push(Candidate {
+            candidates.push(SegmentCandidate {
                 root: row.get("root_token"),
                 path,
                 size: row.get::<i64, _>("size") as u64,
@@ -1471,34 +1480,57 @@ impl Catalog {
                 source_version: row.get("version"),
             });
         }
-        // One exact, newest source per episode. A pending singleton is not a
-        // season job, but it also must not starve every older viable season.
-        // Candidate order is newest-first, preserving the scheduler's prior
-        // preference while considering every pending group.
+        // Analyze every physical source in a pending season, including alternate
+        // releases. A season needs two distinct episodes for comparison.
+        // Candidate order is newest-first, preserving season priority.
         let mut pending_groups = Vec::new();
         let mut pending_seen = std::collections::HashSet::new();
-        let mut groups =
-            std::collections::HashMap::<String, std::collections::BTreeMap<u32, Candidate>>::new();
+        let mut groups = std::collections::HashMap::<String, Vec<SegmentCandidate>>::new();
         for candidate in candidates {
             if candidate.pending && pending_seen.insert(candidate.group.clone()) {
                 pending_groups.push(candidate.group.clone());
             }
-            let episodes = groups.entry(candidate.group.clone()).or_default();
-            let replace = episodes
-                .get(&candidate.episode)
-                .is_none_or(|old| candidate.mtime > old.mtime);
-            if replace {
-                episodes.insert(candidate.episode, candidate);
-            }
+            groups
+                .entry(candidate.group.clone())
+                .or_default()
+                .push(candidate);
         }
-        let selected = pending_groups
+        Ok(pending_groups
             .into_iter()
-            .find_map(|group| groups.remove(&group).filter(|episodes| episodes.len() >= 2));
+            .filter_map(|group| {
+                groups
+                    .remove(&group)
+                    .filter(|episodes| {
+                        episodes
+                            .iter()
+                            .any(|episode| episode.episode != episodes[0].episode)
+                    })
+                    .map(|mut episodes| {
+                        episodes.sort_by_key(|episode| episode.episode);
+                        episodes
+                    })
+            })
+            .collect())
+    }
+
+    /// Choose one locally derived season containing pending source facts. The
+    /// path parser is source truth; hubs may map the returned exact sources to
+    /// different provider-enriched item identities afterwards.
+    pub async fn next_segment_job(
+        &self,
+        collection: &str,
+        media_type: &str,
+    ) -> Result<Option<kahawai_proto::v1::DetectSegments>> {
+        let mut tx = self.db.begin().await?;
+        let selected = Self::segment_groups(&mut tx, collection, media_type)
+            .await?
+            .into_iter()
+            .next();
         let Some(episodes) = selected else {
             tx.commit().await?;
             return Ok(None);
         };
-        for candidate in episodes.values() {
+        for candidate in &episodes {
             sqlx::query(
                 "INSERT INTO catalog_jobs
                    (collection_id,kind,job_key,root_token,path_rel,size,mtime_unix,
@@ -1527,7 +1559,7 @@ impl Catalog {
             collection_id: collection.to_string(),
             anime: media_type == "anime",
             episodes: episodes
-                .into_values()
+                .into_iter()
                 .map(|candidate| kahawai_proto::v1::SegmentEpisode {
                     item_id: format!("{}\0{}", candidate.root, candidate.path),
                     source: Some(SourcePath {
@@ -2930,31 +2962,98 @@ mod tests {
 
     #[tokio::test]
     async fn a_newest_single_episode_does_not_starve_an_analyzable_season() {
+        for media_type in ["series", "anime"] {
+            let state = tempfile::tempdir().unwrap();
+            let root = tempfile::tempdir().unwrap();
+            let config = CollectionConfig {
+                name: "series".into(),
+                media_type: media_type.into(),
+                roots: vec![root.path().to_path_buf()],
+            };
+            let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+                .await
+                .unwrap();
+            let root_token = kahawai_core::media::root_token(root.path());
+            let generation = catalog.begin_scan("series").await.unwrap();
+            for (path_rel, mtime) in [
+                ("Standalone Film (2004).mkv", 110),
+                ("Unknown/part1.mp4", 109),
+                ("Newest Show/Season 01/Newest Show - S01E01.mkv", 100),
+                (
+                    "Newest Show/Season 01/Newest Show - S01E01 alternate.mkv",
+                    99,
+                ),
+                ("Older Show/Season 01/Older Show - S01E01.mkv", 90),
+                ("Older Show/Season 01/Older Show - S01E02.mkv", 80),
+            ] {
+                catalog
+                    .upsert_file(
+                        "series",
+                        &FileRecord {
+                            source: Some(SourcePath {
+                                root_token: root_token.clone(),
+                                path_rel: path_rel.into(),
+                            }),
+                            size: 200,
+                            mtime_unix: mtime,
+                            streams_json: serde_json::to_string(&media_info(true)).unwrap(),
+                            ..Default::default()
+                        },
+                        generation,
+                    )
+                    .await
+                    .unwrap();
+            }
+
+            assert_eq!(
+                catalog
+                    .discovery_status("series")
+                    .await
+                    .unwrap()
+                    .pending_segments,
+                2
+            );
+
+            let job = catalog
+                .next_segment_job("series", media_type)
+                .await
+                .unwrap()
+                .expect("the older complete season should be selected");
+            assert_eq!(job.episodes.len(), 2);
+            assert!(job.episodes.iter().all(|episode| {
+                episode
+                    .source
+                    .as_ref()
+                    .is_some_and(|source| source.path_rel.contains("Older Show"))
+            }));
+        }
+    }
+
+    #[tokio::test]
+    async fn season_batch_includes_all_alternate_sources_and_then_advances() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
         let config = CollectionConfig {
             name: "series".into(),
             media_type: "series".into(),
-            roots: vec![root.path().to_path_buf()],
+            roots: vec![root.path().into()],
         };
-        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
-            .await
-            .unwrap();
+        let catalog = Catalog::open(state.path(), &[config]).await.unwrap();
         let root_token = kahawai_core::media::root_token(root.path());
         let generation = catalog.begin_scan("series").await.unwrap();
-        for (path_rel, mtime) in [
-            ("Newest Show/Season 01/Newest Show - S01E01.mkv", 100),
-            ("Older Show/Season 01/Older Show - S01E01.mkv", 90),
-            ("Older Show/Season 01/Older Show - S01E02.mkv", 80),
+        for (path, mtime) in [
+            ("From/Season 3/From - S03E09.mkv", 100),
+            ("From/Season 3/From - S03E10.mkv", 100),
+            ("From/Season 3/from.s03e10.older.mkv", 90),
+            ("From/Season 3/from.s03e10.oldest.mkv", 80),
+            ("Other/Other S01E01.mkv", 10),
+            ("Other/Other S01E02.mkv", 10),
         ] {
             catalog
                 .upsert_file(
                     "series",
                     &FileRecord {
-                        source: Some(SourcePath {
-                            root_token: root_token.clone(),
-                            path_rel: path_rel.into(),
-                        }),
+                        source: Some(SourcePath::new(&root_token, path)),
                         size: 200,
                         mtime_unix: mtime,
                         streams_json: serde_json::to_string(&media_info(true)).unwrap(),
@@ -2965,19 +3064,81 @@ mod tests {
                 .await
                 .unwrap();
         }
-
-        let job = catalog
+        // Reproduce a catalogue where the newer canonical copies already
+        // completed, but older alternate releases still need results.
+        for finish_all in [false, true] {
+            assert_eq!(
+                catalog
+                    .discovery_status("series")
+                    .await
+                    .unwrap()
+                    .pending_segments,
+                if finish_all { 4 } else { 6 }
+            );
+            let job = catalog
+                .next_segment_job("series", "series")
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(job.episodes.len(), 4);
+            assert!(
+                job.episodes.iter().all(|e| e
+                    .source
+                    .as_ref()
+                    .unwrap()
+                    .path_rel
+                    .starts_with("From/"))
+            );
+            catalog
+                .store_fact(HostToHub {
+                    msg: Some(host_to_hub::Msg::SegmentDetectionResult(
+                        kahawai_proto::v1::SegmentDetectionResult {
+                            request_id: job.request_id,
+                            collection_id: "series".into(),
+                            detector: job.detector,
+                            episodes: job
+                                .episodes
+                                .into_iter()
+                                .filter(|e| finish_all || e.expected_mtime_unix == 100)
+                                .map(|e| kahawai_proto::v1::SegmentEpisodeResult {
+                                    item_id: e.item_id,
+                                    source: e.source,
+                                    observed_size: e.expected_size,
+                                    observed_mtime_unix: e.expected_mtime_unix,
+                                    ..Default::default()
+                                })
+                                .collect(),
+                            ..Default::default()
+                        },
+                    )),
+                })
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            catalog
+                .discovery_status("series")
+                .await
+                .unwrap()
+                .pending_segments,
+            2
+        );
+        let known = catalog
+            .pending_sources("series", "file_segments", 100)
+            .await
+            .unwrap();
+        assert_eq!(known.len(), 2);
+        assert!(known.iter().all(|s| s.path_rel.starts_with("Other/")));
+        let next = catalog
             .next_segment_job("series", "series")
             .await
             .unwrap()
-            .expect("the older complete season should be selected");
-        assert_eq!(job.episodes.len(), 2);
-        assert!(job.episodes.iter().all(|episode| {
-            episode
-                .source
-                .as_ref()
-                .is_some_and(|source| source.path_rel.contains("Older Show"))
-        }));
+            .unwrap();
+        assert!(
+            next.episodes
+                .iter()
+                .all(|e| e.source.as_ref().unwrap().path_rel.starts_with("Other/"))
+        );
     }
 
     #[tokio::test]
@@ -3048,6 +3209,14 @@ mod tests {
             .await
             .unwrap();
 
+        assert_eq!(
+            catalog
+                .discovery_status(collection_id)
+                .await
+                .unwrap()
+                .pending_segments,
+            0
+        );
         assert!(
             catalog
                 .next_segment_job(collection_id, "series")

@@ -101,6 +101,8 @@ pub struct Episode {
     /// Whatever the caller needs to key the result back to: an item id in the
     /// hub, empty from the command line.
     pub id: String,
+    /// Logical episode within this season; alternate sources must not match each other.
+    pub episode_number: Option<u32>,
 }
 
 impl Episode {
@@ -129,12 +131,18 @@ impl Episode {
             name,
             duration,
             id: String::new(),
+            episode_number: None,
         }
     }
 
     pub fn with_id(mut self, id: impl Into<String>) -> Self {
         self.id = id.into();
         self
+    }
+
+    /// Whether these sources can establish shared content across episodes.
+    pub fn can_compare(&self, other: &Self) -> bool {
+        self.episode_number.is_none() || self.episode_number != other.episode_number
     }
 
     /// `[0, min(duration × percent, limit)]`, the percentage only applying to
@@ -267,7 +275,10 @@ pub fn analyze(episodes: &[Episode], cfg: &Config, between: Between<'_>) -> Resu
     // search that could not run. The empty print map makes every pairwise
     // search below answer "nothing", which is the truthful result; the
     // black-frame credits pass still runs, because it compares nothing.
-    let single = episodes.len() < 2;
+    let single = !episodes
+        .iter()
+        .skip(1)
+        .any(|episode| episodes[0].can_compare(episode));
     let intro_windows = windows_for(episodes, cfg, Mode::Intro);
     let intro_prints = if single {
         HashMap::new()
@@ -577,20 +588,26 @@ fn fingerprints(
 }
 
 /// The queue the pairwise search walks: the episodes asked for, plus a
-/// neighbour when only one was asked for and it would have nothing to compare
-/// against.
+/// different episode when the requested sources are all copies of one episode.
 fn search_queue(episodes: &[Episode], wanted: &[usize]) -> Vec<usize> {
     let mut queue: Vec<usize> = wanted.to_vec();
-    if queue.len() == 1 {
-        let only = queue[0];
-        queue.extend((0..episodes.len()).filter(|i| *i != only && i.abs_diff(only) <= 1));
+    if let Some(&first) = queue.first()
+        && !queue
+            .iter()
+            .any(|&i| i != first && episodes[first].can_compare(&episodes[i]))
+        && let Some(neighbour) = (0..episodes.len())
+            .filter(|i| !queue.contains(i) && episodes[first].can_compare(&episodes[*i]))
+            .min_by_key(|i| i.abs_diff(first))
+    {
+        queue.push(neighbour);
     }
     queue
 }
 
 /// The pairwise season search, popping episodes off the front of a queue and
 /// comparing each against everything still behind it — theirs, including the
-/// `break` after the first pair that yields a region.
+/// `break` after the first pair that yields a region. Unanswered trailing
+/// copies may borrow an earlier episode after later candidates are exhausted.
 #[allow(clippy::too_many_arguments)]
 fn search_regions(
     episodes: &[Episode],
@@ -605,9 +622,20 @@ fn search_regions(
     unreadable: &mut HashSet<usize>,
 ) -> Result<HashMap<usize, Range>> {
     let mut found: HashMap<usize, Range> = HashMap::new();
+    let all = queue.clone();
     while !queue.is_empty() {
         let current = queue.remove(0);
-        for &remaining in &queue {
+        // A trailing alternate may not have been reached before an earlier
+        // episode found its first match. Give it comparison material too.
+        let unanswered = !found.contains_key(&current);
+        let comparisons = queue.iter().chain(
+            all.iter()
+                .filter(|i| unanswered && **i != current && !queue.contains(i)),
+        );
+        for &remaining in comparisons {
+            if !episodes[current].can_compare(&episodes[remaining]) {
+                continue;
+            }
             let (mut lhs, mut rhs) =
                 chroma::compare_with(&prints[&current], &prints[&remaining], params, select);
 
@@ -631,6 +659,10 @@ fn search_regions(
             }
 
             for (index, range) in [(current, lhs), (remaining, rhs)] {
+                // A borrowed earlier source has already been refined.
+                if index != current && !queue.contains(&index) {
+                    continue;
+                }
                 // Credits live in the BACK of an episode. For anything longer
                 // than ~15 minutes the 450s window says so by construction,
                 // but a short's window covers the whole file and the shared
@@ -818,6 +850,46 @@ mod tests {
                 .iter()
                 .all(|e| e.intro.is_none() && e.credits.is_none())
         );
+    }
+
+    #[test]
+    fn alternate_sources_compare_with_other_episodes_only() {
+        let mut episodes = vec![episode(600.0); 3];
+        for (e, number) in episodes.iter_mut().zip([9, 10, 10]) {
+            e.episode_number = Some(number);
+        }
+        assert_eq!(search_queue(&episodes, &[1, 2]), vec![1, 2, 0]);
+        assert_eq!(search_queue(&episodes, &[2]), vec![2, 0]);
+        assert_eq!(search_queue(&[], &[]), Vec::<usize>::new());
+        assert_eq!(
+            search_queue(&[episode(600.0), episode(600.0)], &[1]),
+            vec![1, 0]
+        );
+        // Identical fingerprints for the two releases cannot establish an
+        // intro on their own. With another episode, both get their own range,
+        // including the last copy after the first successful pair breaks.
+        let points: Vec<u32> = (0..300u32).map(|i| i.wrapping_mul(2654435761)).collect();
+        let cfg = Config::default();
+        for (queue, expected) in [(vec![1, 2], 0), (vec![0, 1, 2], 3)] {
+            let found = search_regions(
+                &episodes,
+                &cfg,
+                Mode::Intro,
+                &windows_for(&episodes, &cfg, Mode::Intro),
+                &HashMap::from([
+                    (0, points.clone()),
+                    (1, points.clone()),
+                    (2, points.clone()),
+                ]),
+                queue,
+                &cfg.search,
+                chroma::Select::Longest,
+                false,
+                &mut HashSet::new(),
+            )
+            .unwrap();
+            assert_eq!(found.len(), expected);
+        }
     }
 
     /// A season's last unanswered episode borrows a neighbour to compare

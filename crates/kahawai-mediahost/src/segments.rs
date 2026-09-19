@@ -257,7 +257,34 @@ fn analyze(
             path,
         });
     }
-    if prepared.len() < 2 {
+    let episodes = prepared
+        .iter()
+        .map(|prepared| {
+            let mut episode = kahawai_intro::season::Episode::new(
+                prepared.path.as_path().into(),
+                prepared
+                    .request
+                    .source
+                    .as_ref()
+                    .map(|source| source.path_rel.clone())
+                    .unwrap_or_default(),
+                Milliseconds(prepared.request.duration_ms).as_seconds(),
+            )
+            .with_id(prepared.request.item_id.clone());
+            episode.episode_number = if job.anime {
+                kahawai_core::names::parse_anime(&episode.name)
+            } else {
+                kahawai_core::names::parse_episode(&episode.name)
+            }
+            .map(|guess| guess.episode);
+            episode
+        })
+        .collect::<Vec<_>>();
+    if !episodes
+        .iter()
+        .skip(1)
+        .any(|episode| episodes[0].can_compare(episode))
+    {
         preflight_failures.extend(prepared.into_iter().map(|prepared| {
             let mut result = preflight_failure(
                 &prepared.request,
@@ -281,22 +308,6 @@ fn analyze(
         });
     }
 
-    let episodes = prepared
-        .iter()
-        .map(|prepared| {
-            kahawai_intro::season::Episode::new(
-                prepared.path.as_path().into(),
-                prepared
-                    .request
-                    .source
-                    .as_ref()
-                    .map(|source| source.path_rel.clone())
-                    .unwrap_or_default(),
-                Milliseconds(prepared.request.duration_ms).as_seconds(),
-            )
-            .with_id(prepared.request.item_id.clone())
-        })
-        .collect::<Vec<_>>();
     let config = kahawai_intro::season::Config {
         anime: job.anime,
         ..Default::default()
@@ -520,7 +531,8 @@ mod tests {
     #[tokio::test]
     async fn comparison_insufficiency_does_not_condemn_the_readable_source() {
         let dir = tempfile::tempdir().unwrap();
-        std::fs::write(dir.path().join("healthy.mkv"), b"healthy").unwrap();
+        std::fs::write(dir.path().join("Show S01E01.mkv"), b"healthy").unwrap();
+        std::fs::write(dir.path().join("Show S01E01 alternate.mkv"), b"healthy").unwrap();
         std::fs::write(dir.path().join("changed.mkv"), b"changed").unwrap();
         let collection = CollectionConfig {
             name: "series".into(),
@@ -547,7 +559,8 @@ mod tests {
             collection_id: "series".into(),
             anime: false,
             episodes: vec![
-                episode("healthy", "healthy.mkv", false),
+                episode("healthy", "Show S01E01.mkv", false),
+                episode("alternate", "Show S01E01 alternate.mkv", false),
                 episode("changed", "changed.mkv", true),
             ],
         };
@@ -576,6 +589,12 @@ mod tests {
             .find(|episode| episode.item_id == "healthy")
             .unwrap();
         assert!(healthy.unreadable && healthy.retryable);
+        let alternate = result
+            .episodes
+            .iter()
+            .find(|episode| episode.item_id == "alternate")
+            .unwrap();
+        assert!(alternate.unreadable && alternate.retryable);
         let changed = result
             .episodes
             .iter()
