@@ -603,6 +603,13 @@ How something works and why it was built that way belong in
 - [x] Catalogue playback uses GET for source facts, then QUERY for negotiation
       with source-specific capabilities and audio preferences. Item POST is rejected;
       session creation remains POST. CLI and generated clients use the same contract.
+- [x] Background work reporting: `GET /admin/v1/work` lists every queue
+      (enrichment per provider, subtitle text and display sets and the OCR
+      worker's counters, mediahost discovery per collection and kind) in one shape — counts per state, next due time,
+      last error, whether a rerun applies — and `POST /admin/v1/work/rerun`
+      releases a parked hub queue. Its own admin section, "Background work";
+      the media-analysis counts moved there from Providers.
+      `scripts/kahawai-work.sh`.
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
 - [x] Descriptive metadata shares mediadb's `Description` across enrichment, NFO
@@ -684,12 +691,21 @@ How something works and why it was built that way belong in
       guessing a base from the first of them put every subtitle a
       resume offset out — a 1 h resume looked up 2 h and burned nothing
 - [x] HUB-32c OCR text tier: Tesseract via leptess (MIT — subtile-ocr
-      dropped, no copyleft), default-on `ocr` feature, idle sweep over
-      the whole library (playback outranks it) + per-track button as the
-      urgent path, `tier: ocr` spares the burn encode, doctor row.
-      Covers embedded image tracks AND VobSub sidecar tracks. OCR attempts
-      interrupted by a mediahost disconnect retry when that host reconnects;
-      corrupt/local failures remain suppressed for the hub run.
+      dropped, no copyleft), default-on `ocr` feature, one worker fed by
+      display-set landings (playback outranks it: the worker waits on the
+      sessions' idle signal) + per-track button as the urgent path,
+      `tier: ocr` spares the burn encode, doctor row. Covers embedded image
+      tracks AND VobSub sidecar tracks — the landing gate resolves a
+      sidecar's `.idx` to its media file, so sidecar sets are no longer
+      dropped. A failed track leaves a marker and is skipped until an
+      administrator rerun. Prewarm is a durable `subtitle_jobs` row per
+      probed file and kind (`text`, `sets`): created by the catalogue
+      commit, ranked at claim time from live watch state, leased to the
+      mediahost holding the bytes as one worklist message per batch
+      (`SubsWorklist`, `ImageSubsWorklist` — protocol 4.4) and settled by
+      its reply. No catalogue walk remains on the hub;
+      enrichment shares the queue driver (`hub/queue.rs`) and is woken by
+      catalogue commits instead of polling.
       Deferred: the bandwidth-threshold selection (needs measurement)
 - [x] Subtitle unification (HUB-32c mechanics amendment, 2026-07-31):
       one `subtitle_tracks` keyspace for every origin

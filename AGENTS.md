@@ -128,6 +128,16 @@ Deployment topology, cross-compilation and the NAS/macOS satellites:
   reference for `provider_metadata`, `merged_metadata`, `provider_ranks`
   and `enrichment_queue`. Providers write their own answers; nothing
   writes the merged row.
+- **Background work** — every durable hub queue (`enrichment_jobs`,
+  `subtitle_jobs`) runs on `hub/queue.rs`: claim and work, otherwise sleep
+  until the earliest due time or a wake; the tick is lost-event insurance.
+  Rows are created by the catalogue commit, never by a walk; wakes come
+  from commits, landings and reconnects; a batch goes to a mediahost as ONE
+  worklist message, never one message per item (its inbound channel holds
+  32). OCR is deliberately NOT a queue: it runs when display sets land.
+  Don't add a sweep — add a row kind and a wake, or react to the landing. `GET /admin/v1/work` and `scripts/kahawai-work.sh` show
+  every queue; schema meaning is in `mediadb/subtitles_work.rs` and
+  `mediadb/enrichment.rs`.
 - **Caches are not evicted**, by decision (OPS-6): every one is either
   expensive to rebuild (subtitle extractions re-demux a whole file) or
   latency-critical at point of use (artwork during a grid scroll). Don't

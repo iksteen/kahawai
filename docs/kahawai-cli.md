@@ -51,6 +51,8 @@ scripts/kahawai-enrich.sh pick COPY REVISION RECORD_ID
 scripts/kahawai-library.sh match COPY correction.json
 scripts/kahawai-mediadb.sh api item-log ITEM
 scripts/kahawai-mediadb.sh api segments
+scripts/kahawai-work.sh status
+scripts/kahawai-work.sh rerun subtitles ocr
 ```
 
 Correction JSON uses `revision`, `action`, and (where needed) `record_id` or

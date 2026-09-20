@@ -282,6 +282,21 @@ impl Store {
         tx.commit().await?;
         Ok(())
     }
+    /// When the next row of this provider becomes claimable by the clock:
+    /// the earliest due time or lease expiry, or the provider's own pause.
+    pub async fn enrichment_next_due(&self, provider: &str) -> Result<Option<i64>> {
+        Ok(sqlx::query_scalar(
+            "SELECT max(COALESCE((SELECT due_at FROM enrichment_providers WHERE provider=?1 AND blocked=0),0),
+                        min(CASE j.state WHEN 'running' THEN j.lease_until ELSE j.due_at END))
+             FROM enrichment_jobs j JOIN collection_items i ON i.id=j.item_id
+             WHERE j.provider=?1 AND j.revision=i.enrichment_revision
+               AND (j.state IN ('pending','retry','running') OR (j.state='done' AND j.due_at>0))
+               AND EXISTS(SELECT 1 FROM library_collections lc WHERE lc.collection_id=i.collection_id)",
+        )
+        .bind(provider)
+        .fetch_one(self.db.read_pool())
+        .await?)
+    }
     pub async fn finish_enrichment(
         &self,
         job: &EnrichmentJob,

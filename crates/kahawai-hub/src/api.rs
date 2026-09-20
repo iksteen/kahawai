@@ -11,6 +11,7 @@
 mod catalogue;
 mod copies;
 mod enrichment;
+mod work;
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -161,6 +162,8 @@ pub struct NetOptions {
         enrichment::enrichment_artwork,
         enrichment::enrichment_identities,
         enrichment::enrichment_artist_artwork,
+        work::work_status,
+        work::work_rerun,
         admin_sessions,
         admin_end_session,
         admin_session_log,
@@ -347,6 +350,7 @@ pub fn router(
         );
     admin = admin
         .merge(enrichment::routes())
+        .merge(work::routes())
         .route("/admin/v1/segments", get(admin_segments_status))
         .route("/admin/v1/providers", get(admin_providers))
         .route(
@@ -4792,6 +4796,8 @@ mod tests {
             ("get", "/admin/v1/sessions/{id}/log"),
             ("get", "/admin/v1/items/{id}/log"),
             ("get", "/admin/v1/segments"),
+            ("get", "/admin/v1/work"),
+            ("post", "/admin/v1/work/rerun"),
         ]
         .into_iter()
         .collect::<BTreeSet<_>>();

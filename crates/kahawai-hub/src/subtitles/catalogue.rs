@@ -6,7 +6,6 @@
 //! without repeating extraction/rendering. Atomic publication also records empty
 //! OCR answers. Sessions capture immutable raster paths and OCR text.
 use super::*;
-use crate::sessions::FileId;
 use crate::{sessions::PartSource, tracks::Track};
 use std::path::Path;
 
@@ -37,7 +36,7 @@ pub(crate) fn key(
 }
 // v1 artifacts may have been built from path-only extraction caches. They
 // cannot be promoted safely, even when their outer source revision matches.
-fn path(dir: &Path, parent: &Track, kind: &str) -> Result<PathBuf> {
+pub(super) fn path(dir: &Path, parent: &Track, kind: &str) -> Result<PathBuf> {
     Ok(dir.join(format!(
         "derived-v2-{}-{kind}",
         parent
@@ -162,15 +161,16 @@ impl Subtitles {
                 &file,
                 index,
                 parent.source_revision()?,
-                SETS_WAIT_IDLE,
+                // Never waits: the sets are on disk or they are not, and if
+                // not, this asks for them and the landing brings the file
+                // back to the worker.
+                std::time::Duration::ZERO,
                 true,
             )
             .await
         {
             ImageSetsState::Ready(path) => path,
-            ImageSetsState::RetryOnReconnect => {
-                return Ok(OcrGeneration::RetryOnReconnect { module_id: host });
-            }
+            ImageSetsState::RetryOnReconnect => return Ok(OcrGeneration::RetryOnReconnect),
             ImageSetsState::NotYet => return Ok(OcrGeneration::RetryLater),
             ImageSetsState::Unavailable => bail!("display sets unavailable"),
         };
@@ -187,145 +187,6 @@ impl Subtitles {
         })
         .await?
     }
-    /// Everything the extraction sweep could do, from one pass over the
-    /// catalogue.
-    ///
-    /// Text extraction and OCR ask the same rows the same questions — which
-    /// collection, which file, which tracks — so they walk together rather
-    /// than twice. Both come back in [crate::workorder] order, so the sweep
-    /// works through one backlog in one sequence however the individual
-    /// pieces are carried out.
-    pub(super) async fn catalogue_sweep_work(&self, registry: &Registry) -> Result<SweepWork> {
-        let in_flight = crate::workorder::in_flight(registry.db()).await;
-        let mut text: Vec<(
-            crate::workorder::Ordered,
-            String,
-            String,
-            kahawai_proto::v1::SubsWorkItem,
-        )> = vec![];
-        #[cfg(feature = "ocr")]
-        let mut ocr: Vec<(crate::workorder::Ordered, Track)> = vec![];
-        let mut seen = std::collections::HashSet::new();
-        for summary in registry.catalogue().collection_summaries().await? {
-            let c = summary.collection;
-            if !registry.is_connected(&c.mediahost_id) {
-                continue;
-            }
-            let movie = c.media_type == kahawai_mediadb::MediaType::Movies;
-            for f in registry.catalogue().files(&c.id).await? {
-                let (Some(info), Some(size)) = (&f.media, f.size) else {
-                    continue;
-                };
-                let mtime = f.mtime.unwrap_or(0);
-                // A part-way-through episode and the series it belongs to
-                // both count: every file of that series carries the series
-                // id, so the rest of the season comes forward with it.
-                let watching = f
-                    .item_id
-                    .as_deref()
-                    .is_some_and(|id| in_flight.contains(id));
-                let part = PartSource {
-                    file_id: FileId::Catalogue(f.id),
-                    module_id: c.mediahost_id.clone(),
-                    collection_id: c.remote_id.clone(),
-                    root_token: f.root_token,
-                    path_rel: f.path,
-                    size,
-                    mtime_unix: mtime,
-                    head_xxh3: f.head_hash.unwrap_or(0) as i64,
-                    tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
-                    base_ms: 0,
-                    duration_ms: info.duration_ms.unwrap_or(0),
-                };
-                let rank = || crate::workorder::Ordered {
-                    in_flight: watching,
-                    movie,
-                    mtime_unix: mtime,
-                    path_rel: part.path_rel.clone(),
-                };
-                for track in crate::sessions::catalogue::tracks(
-                    f.item_id.as_deref().unwrap_or(""),
-                    &part,
-                    info,
-                ) {
-                    if crate::tracks::is_image_format(&track.format) {
-                        #[cfg(feature = "ocr")]
-                        if !path(&self.dir, &track, "ocr.json")?.try_exists()? {
-                            ocr.push((rank(), track));
-                        }
-                        continue;
-                    }
-                    // Sidecars are one small read on demand, with no
-                    // container to walk; only embedded tracks are worth
-                    // warming.
-                    if track.origin != "embedded" {
-                        continue;
-                    }
-                    let (Some(source), Ok(revision)) = (&track.physical, track.source_revision())
-                    else {
-                        continue;
-                    };
-                    let cached = self
-                        .dir
-                        .join(format!(
-                            "{}.json",
-                            super::cache_key(
-                                &source.module_id,
-                                &source.collection_id,
-                                &source.root_token,
-                                &source.path_rel,
-                                &track.internal_key(),
-                                revision,
-                            )
-                        ))
-                        .try_exists()?;
-                    if cached {
-                        continue;
-                    }
-                    // One entry per file: the mediahost extracts every track
-                    // of a container in one pass, so naming a file twice
-                    // would buy the same twenty seconds twice.
-                    let file = (
-                        source.module_id.clone(),
-                        source.collection_id.clone(),
-                        source.root_token.clone(),
-                        source.path_rel.clone(),
-                    );
-                    if seen.insert(file) {
-                        text.push((
-                            rank(),
-                            source.module_id.clone(),
-                            source.collection_id.clone(),
-                            kahawai_proto::v1::SubsWorkItem {
-                                source: Some(kahawai_proto::v1::SourcePath {
-                                    root_token: source.root_token.clone(),
-                                    path_rel: source.path_rel.clone(),
-                                }),
-                                // Every embedded track of one file shares the
-                                // file's revision, so the first one to name
-                                // this file settles it.
-                                source_revision: revision.to_string(),
-                                // Stamped by the sweep once the whole round
-                                // is in order; the walk cannot know it yet.
-                                rank: 0,
-                            },
-                        ));
-                    }
-                }
-            }
-        }
-        text.sort_by(|left, right| left.0.first(&right.0));
-        #[cfg(feature = "ocr")]
-        ocr.sort_by(|left, right| left.0.first(&right.0));
-        Ok(SweepWork {
-            text: text
-                .into_iter()
-                .map(|(_, module, collection, item)| (module, collection, item))
-                .collect(),
-            #[cfg(feature = "ocr")]
-            ocr: ocr.into_iter().map(|(_, track)| track).collect(),
-        })
-    }
 }
 
 #[cfg(test)]
@@ -334,7 +195,7 @@ mod tests {
     const SCRIPT: &str = "[Script Info]\nScriptType: v4.00+\nPlayResX: 320\nPlayResY: 180\n[V4+ Styles]\nFormat: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\nStyle: Default,DejaVu Sans,24,&H00FFFFFF,&H000000FF,&H00000000,&H80000000,0,0,0,0,100,100,0,0,1,2,0,2,10,10,10,1\n[Events]\nFormat: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\nDialogue: 0,0:00:00.00,0:00:00.50,Default,,0,0,0,,Source subtitle\n";
     fn parent(format: &str) -> Track {
         let part = PartSource {
-            file_id: FileId::Catalogue("file-a".into()),
+            file_id: crate::sessions::FileId::Catalogue("file-a".into()),
             module_id: "host".into(),
             collection_id: "movies".into(),
             root_token: "root".into(),
@@ -469,7 +330,7 @@ mod tests {
     #[test]
     fn sidecar_revision_only_changes_external_artifact_keys() {
         let part = PartSource {
-            file_id: FileId::Catalogue("file-a".into()),
+            file_id: crate::sessions::FileId::Catalogue("file-a".into()),
             module_id: "host".into(),
             collection_id: "movies".into(),
             root_token: "root".into(),
@@ -589,224 +450,6 @@ mod tests {
         );
         parent.artifact_key = Some("replaced-file".into());
         assert!(cached(subs.cache_dir(), &[parent]).unwrap().is_empty());
-    }
-    /// A file is named once however many text tracks it carries: the
-    /// mediahost extracts the whole container in one pass, so a second
-    /// entry would buy the same twenty seconds twice. Image tracks belong
-    /// to the OCR sweep and sidecars are read on demand, so neither counts.
-    #[tokio::test]
-    async fn text_prewarm_names_each_cold_file_once_and_ignores_image_tracks() {
-        use kahawai_proto::v1 as p;
-        use prost::Message;
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let store = crate::db::open_catalogue(dir.path()).await.unwrap();
-        store.put_mediahost("host", "Fixture").await.unwrap();
-        store
-            .offer_collection(
-                "host",
-                &p::CatalogCollection {
-                    id: "series".into(),
-                    media_type: "series".into(),
-                    epoch: "epoch".into(),
-                    current_version: 2,
-                    roots: vec![p::CollectionRoot::new("root", "/fixture")],
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        // Three embedded text tracks on one file, and a second file whose
-        // only subtitle is an image track.
-        let many = p::FileRecord {
-            source: Some(p::SourcePath::new("root", "Many.mkv")),
-            size: 10,
-            mtime_unix: 1,
-            streams_json: serde_json::json!({"container":"mkv","subtitles":[
-                {"format":"subrip","language":"eng"},
-                {"format":"ass","language":"nld"},
-                {"format":"subrip","language":"fra"}
-            ]})
-            .to_string(),
-            ..Default::default()
-        };
-        let image_only = p::FileRecord {
-            source: Some(p::SourcePath::new("root", "Image.mkv")),
-            size: 10,
-            mtime_unix: 1,
-            streams_json: serde_json::json!({"container":"mkv","subtitles":[
-                {"format":"pgs","language":"eng"}
-            ]})
-            .to_string(),
-            ..Default::default()
-        };
-        store
-            .apply_catalogue(
-                "host",
-                &p::CatalogDelta {
-                    collection_id: "series".into(),
-                    epoch: "epoch".into(),
-                    snapshot: true,
-                    done: true,
-                    through_version: 2,
-                    records: vec![
-                        p::CatalogRecord {
-                            version: 1,
-                            kind: "file".into(),
-                            key: b"root\0Many.mkv".to_vec(),
-                            payload: p::FileUpsert {
-                                collection_id: "series".into(),
-                                files: vec![many],
-                            }
-                            .encode_to_vec(),
-                            deleted: false,
-                        },
-                        p::CatalogRecord {
-                            version: 2,
-                            kind: "file".into(),
-                            key: b"root\0Image.mkv".to_vec(),
-                            payload: p::FileUpsert {
-                                collection_id: "series".into(),
-                                files: vec![image_only],
-                            }
-                            .encode_to_vec(),
-                            deleted: false,
-                        },
-                    ],
-                },
-            )
-            .await
-            .unwrap();
-        let registry = Registry::new(db, Default::default(), store);
-        registry.connected("host", "mediahost", "Fixture", "fp", "test");
-        let subs = Subtitles::new(dir.path().join("subtitles"));
-
-        let cold = subs.catalogue_sweep_work(&registry).await.unwrap().text;
-        assert_eq!(
-            cold.iter()
-                .map(|(_, _, item)| item.source.as_ref().unwrap().path_rel.as_str())
-                .collect::<Vec<_>>(),
-            vec!["Many.mkv"],
-            "one entry for the three-track file, none for the image-only one"
-        );
-
-        // Once every text track of that file is cached, it drops out --
-        // keyed by the revision the worklist CARRIES, not one the test
-        // derives for itself. A worklist that names a file without saying
-        // which bytes it means cannot be answered: the reply keys nothing,
-        // the file stays cold, and the sweep offers it again forever.
-        let (module, collection, item) = cold[0].clone();
-        let source = item.source.clone().expect("worklist item names a source");
-        assert!(
-            !item.source_revision.is_empty(),
-            "the worklist must carry the revision its reply has to echo"
-        );
-        for key in ["e0", "e1", "e2"] {
-            subs.store_extracted(
-                &module,
-                &collection,
-                &source.root_token,
-                &source.path_rel,
-                key,
-                &item.source_revision,
-                &kahawai_media::subtitles::Extracted {
-                    cues: vec![],
-                    ass: None,
-                },
-            )
-            .unwrap();
-        }
-        assert!(
-            subs.catalogue_sweep_work(&registry)
-                .await
-                .unwrap()
-                .text
-                .is_empty(),
-            "a fully cached file is not swept again"
-        );
-    }
-
-    #[cfg(feature = "ocr")]
-    #[tokio::test]
-    async fn empty_ocr_answer_removes_mediadb_source_from_idle_work_after_reopen() {
-        use kahawai_proto::v1 as p;
-        use prost::Message;
-        let dir = tempfile::tempdir().unwrap();
-        let db = crate::db::open(dir.path()).await.unwrap();
-        let store = crate::db::open_catalogue(dir.path()).await.unwrap();
-        store.put_mediahost("host", "Fixture").await.unwrap();
-        store
-            .offer_collection(
-                "host",
-                &p::CatalogCollection {
-                    id: "movies".into(),
-                    media_type: "movies".into(),
-                    epoch: "epoch".into(),
-                    current_version: 1,
-                    roots: vec![p::CollectionRoot::new("root", "/fixture")],
-                    ..Default::default()
-                },
-            )
-            .await
-            .unwrap();
-        let file = p::FileRecord {
-            source:Some(p::SourcePath::new("root","Film.2000.mkv")),size:10,mtime_unix:1,
-            streams_json:serde_json::json!({"container":"mkv","subtitles":[{"format":"pgs","language":"eng"}]}).to_string(), ..Default::default()
-        };
-        store
-            .apply_catalogue(
-                "host",
-                &p::CatalogDelta {
-                    collection_id: "movies".into(),
-                    epoch: "epoch".into(),
-                    snapshot: true,
-                    done: true,
-                    through_version: 1,
-                    records: vec![p::CatalogRecord {
-                        version: 1,
-                        kind: "file".into(),
-                        key: b"root\0Film.2000.mkv".to_vec(),
-                        payload: p::FileUpsert {
-                            collection_id: "movies".into(),
-                            files: vec![file],
-                        }
-                        .encode_to_vec(),
-                        deleted: false,
-                    }],
-                },
-            )
-            .await
-            .unwrap();
-        let registry = Registry::new(db, Default::default(), store);
-        registry.connected("host", "mediahost", "Fixture", "fp", "test");
-        let subs = Subtitles::new(dir.path().join("subtitles"));
-        let candidates = subs.catalogue_sweep_work(&registry).await.unwrap().ocr;
-        assert_eq!(candidates.len(), 1);
-        subs.store_image_sets(
-            "host",
-            &p::ImageSubtitles {
-                collection_id: "movies".into(),
-                source: Some(p::SourcePath::new("root", "Film.2000.mkv")),
-                source_revision: candidates[0].source_revision().unwrap().into(),
-                codec: "S_HDMV/PGS".into(),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap();
-        assert!(matches!(
-            subs.catalogue_ocr(&registry, &candidates[0]).await.unwrap(),
-            OcrGeneration::NoText
-        ));
-        let reopened = Subtitles::new(subs.cache_dir().into());
-        assert!(
-            reopened
-                .catalogue_sweep_work(&registry)
-                .await
-                .unwrap()
-                .ocr
-                .is_empty()
-        );
     }
     #[cfg(feature = "ocr")]
     #[tokio::test]

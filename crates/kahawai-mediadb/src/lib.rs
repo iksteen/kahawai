@@ -65,8 +65,10 @@ mod metadata;
 pub use enrichment::*;
 mod occurrence;
 mod subtitles;
+mod subtitles_work;
 mod types;
 pub use subtitles::DownloadedSubtitle;
+pub use subtitles_work::*;
 
 pub use catalogue::SourceFact;
 pub use types::*;

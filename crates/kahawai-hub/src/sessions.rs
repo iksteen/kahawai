@@ -1459,6 +1459,10 @@ pub struct Sessions {
     /// None → pipelines run in-process (tests only).
     worker_exe: Option<PathBuf>,
     active: Mutex<HashMap<String, Arc<Session>>>,
+    /// True while `active` is empty. Background work that must not
+    /// compete with a viewer (idle OCR) waits on this instead of polling
+    /// the session list.
+    idle: tokio::sync::watch::Sender<bool>,
     /// Session ids admitted but not yet in `active`, keyed to their
     /// user. The per-user cap counts the UNION of this and `active`.
     ///
@@ -1819,6 +1823,7 @@ impl Sessions {
             idle_timeout,
             worker_exe: None,
             active: Mutex::new(HashMap::new()),
+            idle: tokio::sync::watch::channel(true).0,
             reserved: Mutex::new(HashMap::new()),
             tc_leases: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
@@ -2602,6 +2607,7 @@ impl Sessions {
             .lock()
             .unwrap()
             .insert(session.id.clone(), session.clone());
+        self.idle.send_replace(false);
         tracing::info!(session = %session.id, item = item_id, path = %path_rel, mode, "session started");
         registry.emit(crate::registry::RegistryEvent::Sessions { kind: "sessions" });
         Ok(session)
@@ -3947,6 +3953,12 @@ impl Sessions {
     }
 
     /// Active sessions for the admin dashboard (HUB-18).
+    /// Flips to true when the last session ends and to false when one
+    /// starts. Idle work that must yield to playback waits on it.
+    pub fn idle_watch(&self) -> tokio::sync::watch::Receiver<bool> {
+        self.idle.subscribe()
+    }
+
     pub fn list(&self) -> Vec<Arc<Session>> {
         let mut v: Vec<_> = self.active.lock().unwrap().values().cloned().collect();
         v.sort_by(|a, b| a.id.cmp(&b.id));
@@ -4021,9 +4033,16 @@ impl Sessions {
         // OPS-10: while the session still exists. Everything below this
         // line has already forgotten it.
         let header = self.log_header(id);
-        let Some(session) = self.active.lock().unwrap().remove(id) else {
-            return false;
+        let (session, idle) = {
+            let mut active = self.active.lock().unwrap();
+            let Some(session) = active.remove(id) else {
+                return false;
+            };
+            (session, active.is_empty())
         };
+        if idle {
+            self.idle.send_replace(true);
+        }
         // A progress handler that already found this session finishes its DB
         // write before teardown reads the result. One that arrives after the
         // removal either fails its lookup or sees `ending` and writes nothing.

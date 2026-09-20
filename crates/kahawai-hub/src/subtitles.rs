@@ -4,6 +4,7 @@
 //! remain in the durable on-disk cache because rebuilding demuxes the source.
 
 pub(crate) mod catalogue;
+pub(crate) mod work;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -62,37 +63,6 @@ pub enum AssBody {
     Stream(tokio::sync::mpsc::Receiver<String>),
 }
 
-/// How long OCR generation waits for the mediahost's display-set walk.
-/// Only the sweep generates now — nobody is waiting, and giving up
-/// early only wastes the walk: the sets still arrive and get cached,
-/// but the track sits in the failed set until the next hub run.
-#[cfg(feature = "ocr")]
-const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
-
-/// One round's worth of extraction work, in [crate::workorder] order.
-///
-/// Both kinds come from a single catalogue pass: they ask the same rows the
-/// same questions, and they are worked through as one backlog even though
-/// text is published to the mediahost while OCR runs here.
-#[derive(Default)]
-pub(crate) struct SweepWork {
-    /// (mediahost, collection, work item) per cold file — one entry per
-    /// file, since extraction walks the whole container at once. The item
-    /// carries the source revision: a reply that cannot echo it back is
-    /// unkeyable, and the hub discards it.
-    pub text: Vec<(String, String, kahawai_proto::v1::SubsWorkItem)>,
-    #[cfg(feature = "ocr")]
-    pub ocr: Vec<crate::tracks::Track>,
-}
-
-/// How long between extraction-sweep rounds. A round only re-reads mediadb
-/// and re-publishes what is still cold, so it is cheap; this paces the retry
-/// of work a mediahost is still chewing through rather than the work itself.
-const EXTRACTION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
-
-#[cfg(feature = "ocr")]
-const OCR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
-
 enum ImageSetsState {
     Ready(std::path::PathBuf),
     RetryOnReconnect,
@@ -110,57 +80,11 @@ enum ImageSetsState {
 enum OcrGeneration {
     Generated,
     NoText,
-    RetryOnReconnect {
-        module_id: String,
-    },
+    RetryOnReconnect,
     /// The display sets are queued on the mediahost and had not arrived when
     /// the wait ran out. Nothing is wrong, so nothing is remembered: the next
     /// round asks again.
     RetryLater,
-}
-
-/// Failures in hub-owned OCR work are remembered for this process run so a
-/// corrupt track cannot consume ~15 seconds of Tesseract CPU every sweep.
-/// Failures whose input depends on one mediahost are different: reconnecting
-/// that host is a state change, so only those entries become eligible again.
-#[cfg(feature = "ocr")]
-#[derive(Default)]
-struct OcrSweepFailures(std::collections::HashMap<String, Option<String>>);
-
-#[cfg(feature = "ocr")]
-impl OcrSweepFailures {
-    fn contains(&self, track_id: impl ToString) -> bool {
-        self.0.contains_key(&track_id.to_string())
-    }
-
-    fn remember_permanent(&mut self, track_id: impl ToString) {
-        self.0.insert(track_id.to_string(), None);
-    }
-
-    fn remember_until_reconnect(&mut self, track_id: impl ToString, module_id: String) {
-        self.0.insert(track_id.to_string(), Some(module_id));
-    }
-
-    fn host_reconnected(&mut self, module_id: &str) {
-        self.0
-            .retain(|_, retry_host| retry_host.as_deref() != Some(module_id));
-    }
-
-    fn reconsider_connected(&mut self, registry: &Registry) {
-        self.0.retain(|_, retry_host| {
-            retry_host
-                .as_deref()
-                .is_none_or(|module_id| !registry.is_connected(module_id))
-        });
-    }
-}
-
-#[cfg(feature = "ocr")]
-#[derive(Debug, PartialEq, Eq)]
-enum OcrSweepWake {
-    Periodic,
-    MediahostReconnected(String),
-    EventsLagged,
 }
 
 /// HUB-32d: how long a starting session waits for a rasterisation it
@@ -236,6 +160,11 @@ pub struct Subtitles {
     /// Shared with every other provider caller — the rate limits are
     /// per-IP, so the queues have to be process-wide (gate.rs).
     http: Arc<crate::gate::Http>,
+    /// Wakes the subtitle work drivers (`work.rs`): a catalogue commit, a
+    /// landing, a reconnect.
+    wake: Arc<tokio::sync::Notify>,
+    /// The OCR worker's inbox and counters (`work.rs`).
+    ocr: work::OcrState,
 }
 
 impl Subtitles {
@@ -249,6 +178,8 @@ impl Subtitles {
             provider_cfg: Default::default(),
             inflight: Default::default(),
             http: Arc::new(crate::gate::Http::new().expect("http client")),
+            wake: Default::default(),
+            ocr: Default::default(),
         }
     }
 
@@ -737,297 +668,6 @@ impl Subtitles {
         }
     }
 
-    #[cfg(feature = "ocr")]
-    async fn wait_for_next_ocr_round(
-        registry: &Registry,
-        events: &mut tokio::sync::broadcast::Receiver<crate::registry::RegistryEvent>,
-        interval: std::time::Duration,
-    ) -> OcrSweepWake {
-        let deadline = tokio::time::sleep(interval);
-        tokio::pin!(deadline);
-        loop {
-            tokio::select! {
-                _ = &mut deadline => return OcrSweepWake::Periodic,
-                event = events.recv() => match event {
-                    Ok(event) => {
-                        if let Some(module_id) = Self::reconnected_mediahost(registry, event) {
-                            return OcrSweepWake::MediahostReconnected(module_id);
-                        }
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                        return OcrSweepWake::EventsLagged;
-                    }
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                        return OcrSweepWake::Periodic;
-                    }
-                }
-            }
-        }
-    }
-
-    #[cfg(feature = "ocr")]
-    fn reconnected_mediahost(
-        registry: &Registry,
-        event: crate::registry::RegistryEvent,
-    ) -> Option<String> {
-        let crate::registry::RegistryEvent::Satellite {
-            module_id,
-            connected: true,
-            ..
-        } = event
-        else {
-            return None;
-        };
-        registry
-            .snapshot()
-            .into_iter()
-            .any(|(id, state)| {
-                id == module_id && state.connected && state.module_type == "mediahost"
-            })
-            .then_some(module_id)
-    }
-
-    /// Reconnects can arrive during a long library pass. Drain them between
-    /// tracks so a track skipped earlier in the same pass is revisited without
-    /// waiting for every remaining OCR job to finish first.
-    #[cfg(feature = "ocr")]
-    fn drain_ocr_reconnects(
-        registry: &Registry,
-        events: &mut tokio::sync::broadcast::Receiver<crate::registry::RegistryEvent>,
-        failed: &mut OcrSweepFailures,
-    ) -> bool {
-        let mut retry_earlier_candidates = false;
-        loop {
-            match events.try_recv() {
-                Ok(event) => {
-                    if let Some(module_id) = Self::reconnected_mediahost(registry, event) {
-                        failed.host_reconnected(&module_id);
-                        retry_earlier_candidates = true;
-                    }
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => {
-                    failed.reconsider_connected(registry);
-                    retry_earlier_candidates = true;
-                }
-                Err(tokio::sync::broadcast::error::TryRecvError::Empty)
-                | Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
-            }
-        }
-        retry_earlier_candidates
-    }
-
-    /// Warm the caches the mediahost fills: text subtitles and image display
-    /// sets.
-    ///
-    /// Both are the same job on the other end — a walk of the container
-    /// index, bound by reading it — so they share a catalogue pass, an order
-    /// ([crate::workorder]) and a round, and both are published as work the
-    /// mediahost schedules for itself rather than waited on here. Neither
-    /// needs an idle gate on this side: the mediahost ranks them below demand
-    /// and yields storage around a viewer's reads.
-    ///
-    /// Decoding what comes back is a different resource entirely, and lives
-    /// in `spawn_ocr_sweep`.
-    pub fn spawn_extraction_sweep(self: &Arc<Self>, registry: Arc<Registry>) {
-        let subs = self.clone();
-        tokio::spawn(async move {
-            // Let links and reconnect scans settle first.
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            loop {
-                let work = match subs.catalogue_sweep_work(&registry).await {
-                    Ok(work) => work,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not read extraction work from mediadb");
-                        SweepWork::default()
-                    }
-                };
-                let mut by_collection: std::collections::BTreeMap<
-                    (String, String),
-                    Vec<kahawai_proto::v1::SubsWorkItem>,
-                > = Default::default();
-                // Grouping is a wire requirement -- a worklist names one
-                // collection -- so the round's global order is carried as a
-                // rank on each item rather than implied by position, which
-                // grouping would otherwise destroy.
-                for (rank, (module_id, collection_id, mut item)) in
-                    work.text.into_iter().enumerate()
-                {
-                    item.rank = rank.try_into().unwrap_or(u32::MAX);
-                    by_collection
-                        .entry((module_id, collection_id))
-                        .or_default()
-                        .push(item);
-                }
-                let (mut sent, mut skipped) = (0usize, 0usize);
-                for ((module_id, collection_id), items) in by_collection {
-                    if !registry.is_connected(&module_id) {
-                        skipped += items.len();
-                        continue; // not a failure — the next round retries
-                    }
-                    sent += items.len();
-                    tracing::info!(%module_id, collection = %collection_id, files = items.len(),
-                        "sending subtitle prewarm worklist");
-                    // Chunked: one message naming every cold file in a large
-                    // collection is a needlessly large frame.
-                    for chunk in items.chunks(5000) {
-                        let msg = kahawai_proto::v1::HubToHost {
-                            msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
-                                kahawai_proto::v1::SubsWorklist {
-                                    collection_id: collection_id.clone(),
-                                    items: chunk.to_vec(),
-                                },
-                            )),
-                        };
-                        if let Err(error) = registry.send_to_host(&module_id, msg).await {
-                            tracing::warn!(%module_id, error = format!("{error:#}"),
-                                "subtitle prewarm worklist send failed");
-                            break;
-                        }
-                    }
-                }
-                // Logged even when there is nothing to do: a warm cache and a
-                // sweep that never ran read the same way in a log otherwise.
-                tracing::info!(sent, skipped, "subtitle prewarm round complete");
-                tokio::time::sleep(EXTRACTION_SWEEP_INTERVAL).await;
-            }
-        });
-    }
-
-    /// HUB-32c idle sweep: OCR each image subtitle with no cached answer.
-    ///
-    /// Its own loop, because it is the one piece of this that runs HERE and
-    /// on CPU — Tesseract over display sets the mediahost already walked out
-    /// of the container. So unlike [Self::spawn_extraction_sweep] it waits
-    /// for playback to stop: nothing else on this hub can hand delivery CPU
-    /// back to a viewer on its behalf.
-    ///
-    /// Retaining the answer avoids repeating extraction and OCR or making
-    /// playback wait for them. Reconnects retry only work blocked on that
-    /// mediahost.
-    #[cfg(feature = "ocr")]
-    pub fn spawn_ocr_sweep(
-        self: &Arc<Self>,
-        registry: Arc<Registry>,
-        sessions: Arc<crate::sessions::Sessions>,
-    ) {
-        let subs = self.clone();
-        // Subscribe before spawning so a reconnect racing task startup remains
-        // queued for the first post-settle retry decision.
-        let mut events = registry.subscribe_events();
-        tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-            // Tracks that failed stay failed for this hub run — a
-            // corrupt track must not become a 15-second crash loop.
-            let mut failed = OcrSweepFailures::default();
-            loop {
-                Self::drain_ocr_reconnects(&registry, &mut events, &mut failed);
-                let work = match subs.catalogue_sweep_work(&registry).await {
-                    Ok(work) => work,
-                    Err(error) => {
-                        tracing::warn!(%error, "could not read OCR work from mediadb");
-                        SweepWork::default()
-                    }
-                };
-                let mut generated = 0usize;
-                let mut retry_earlier_candidates = false;
-                for track in work.ocr {
-                    let id = track.artifact_key.clone().expect("catalogue OCR identity");
-                    if Self::drain_ocr_reconnects(&registry, &mut events, &mut failed) {
-                        retry_earlier_candidates = true;
-                        break;
-                    }
-                    if failed.contains(&id) {
-                        continue;
-                    }
-                    // Idle means idle: playback outranks the sweep.
-                    while !sessions.list().is_empty() {
-                        tokio::time::sleep(std::time::Duration::from_secs(60)).await;
-                    }
-                    let Ok((
-                        module_id,
-                        collection_id,
-                        root_token,
-                        extract_rel,
-                        extract_idx,
-                        language,
-                    )) = subs.extract_ref(&registry, &track).await
-                    else {
-                        failed.remember_permanent(&id);
-                        continue;
-                    };
-                    if !registry.is_connected(&module_id) {
-                        continue; // not a failure — retry when it returns
-                    }
-                    // No Tesseract model for this track's language: OCR
-                    // is off the table, but the display sets are still
-                    // warmed into the cache — a later burn-in session
-                    // start then reads a file instead of waiting out
-                    // the mediahost walk.
-                    if crate::ocr::model_for(language.as_deref()).is_none() {
-                        let _ = subs
-                            .image_sets(
-                                &registry,
-                                &module_id,
-                                &collection_id,
-                                &root_token,
-                                &extract_rel,
-                                extract_idx,
-                                track.source_revision().expect("captured source"),
-                                SETS_WAIT_IDLE,
-                                true,
-                            )
-                            .await;
-                        failed.remember_permanent(&id);
-                        continue;
-                    }
-                    match subs.catalogue_ocr(&registry, &track).await {
-                        Ok(OcrGeneration::Generated) => generated += 1,
-                        // No text is an answer and it is now recorded;
-                        // the next candidates query no longer offers it.
-                        Ok(OcrGeneration::NoText) => {}
-                        Ok(OcrGeneration::RetryOnReconnect { module_id }) => {
-                            tracing::info!(track = id, item = %track.item_id, %module_id,
-                                "idle OCR paused until mediahost reconnects");
-                            failed.remember_until_reconnect(&id, module_id);
-                        }
-                        // Nothing remembered: a queue delay is not a verdict
-                        // on this track, and the sets may well land before
-                        // the next round asks again.
-                        Ok(OcrGeneration::RetryLater) => {
-                            tracing::info!(track = id, item = %track.item_id,
-                                "idle OCR waiting on queued display sets");
-                        }
-                        Err(e) => {
-                            tracing::warn!(track = id, item = %track.item_id,
-                                error = format!("{e:#}"), "idle OCR failed; skipping this run");
-                            failed.remember_permanent(&id);
-                        }
-                    }
-                    tokio::time::sleep(std::time::Duration::from_secs(10)).await;
-                }
-                if generated > 0 {
-                    tracing::info!(generated, "idle OCR sweep round complete");
-                }
-                if retry_earlier_candidates {
-                    continue;
-                }
-                match Self::wait_for_next_ocr_round(&registry, &mut events, OCR_SWEEP_INTERVAL)
-                    .await
-                {
-                    OcrSweepWake::MediahostReconnected(module_id) => {
-                        failed.host_reconnected(&module_id);
-                        tracing::info!(%module_id, "mediahost reconnect woke idle OCR sweep");
-                    }
-                    // A periodic pass is also the lost-event fallback. Lagging
-                    // means at least one state hint was dropped, so reconcile
-                    // against authoritative connection state immediately.
-                    OcrSweepWake::Periodic | OcrSweepWake::EventsLagged => {
-                        failed.reconsider_connected(&registry);
-                    }
-                }
-            }
-        });
-    }
     /// Ingest a mediahost-extracted track into the cache (ladder step 2).
     #[allow(clippy::too_many_arguments)] // exact source, stream and revision plus payload
     pub fn store_extracted(
@@ -1097,6 +737,32 @@ impl Subtitles {
     }
 
     #[allow(clippy::too_many_arguments)] // exact source/track identity plus wait policy
+    /// Whether one image track's display sets are already on disk.
+    pub(crate) fn image_sets_cached(
+        &self,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+        sub_index: usize,
+        revision: &str,
+    ) -> bool {
+        self.dir
+            .join(format!(
+                "{}.sets",
+                cache_key(
+                    module_id,
+                    collection_id,
+                    root_token,
+                    path_rel,
+                    &format!("i{sub_index}"),
+                    revision
+                )
+            ))
+            .exists()
+    }
+
+    #[allow(clippy::too_many_arguments)] // one source address, one track, one policy
     async fn image_sets_state(
         &self,
         registry: &Registry,
@@ -1165,8 +831,12 @@ impl Subtitles {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tracing::info!(collection = %collection_id, path = %path_rel, track = sub_index,
-            "image display sets still queued on the mediahost");
+        // A zero wait is a request, not a wait: the request line above
+        // already said so.
+        if !wait.is_zero() {
+            tracing::info!(collection = %collection_id, path = %path_rel, track = sub_index,
+                "image display sets still queued on the mediahost");
+        }
         ImageSetsState::NotYet
     }
 
@@ -1519,49 +1189,6 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 
 #[cfg(all(test, feature = "ocr"))]
 mod ocr_memory_tests {
-
-    #[test]
-    fn reconnect_releases_only_failures_owned_by_that_mediahost() {
-        let mut failed = super::OcrSweepFailures::default();
-        failed.remember_permanent(1);
-        failed.remember_until_reconnect(2, "host-a".into());
-        failed.remember_until_reconnect(3, "host-b".into());
-
-        failed.host_reconnected("host-a");
-
-        assert!(failed.contains(1), "a corrupt track remains suppressed");
-        assert!(!failed.contains(2), "the returning host's track is retried");
-        assert!(
-            failed.contains(3),
-            "another offline host remains suppressed"
-        );
-    }
-
-    #[tokio::test]
-    async fn mediahost_reconnect_wakes_the_ocr_sweep() {
-        let db = crate::db::open_in_memory().await.unwrap();
-        let registry = crate::registry::Registry::new(
-            db,
-            Default::default(),
-            kahawai_mediadb::Store::in_memory().await.unwrap(),
-        );
-        let mut events = registry.subscribe_events();
-        registry.connected("tc", "transcoder", "encoder", "fp-tc", "test");
-        registry.connected("mh", "mediahost", "storage", "fp-mh", "test");
-
-        let wake = super::Subtitles::wait_for_next_ocr_round(
-            &registry,
-            &mut events,
-            std::time::Duration::from_secs(1),
-        )
-        .await;
-
-        assert_eq!(
-            wake,
-            super::OcrSweepWake::MediahostReconnected("mh".into()),
-            "transcoder events must not wake mediahost-dependent OCR work"
-        );
-    }
 
     #[tokio::test]
     async fn stale_connected_state_with_no_link_is_retryable() {

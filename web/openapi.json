@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "a10687247e85737984053efaefc980d47b4d38e7c134e46a9f797e775bfe4dd3",
+  "x-kahawai-source-sha256": "5160f0504a1374751dbe178fe4bcfd92feba81d5df37e0ac6085af5f9b1705dc",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -4417,6 +4417,169 @@
           },
           "503": {
             "description": "The hub has no administrator yet: `setup_required`",
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/work": {
+      "get": {
+        "tags": [
+          "Admin work"
+        ],
+        "summary": "Every background queue and how far it is",
+        "description": "Admin only. Enrichment and subtitle queues come from the hub's durable\njob tables; discovery queues are each mediahost's last report for a\ncollection, so they have no retry or done counts.",
+        "operationId": "work_status",
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/WorkResponse"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/admin/v1/work/rerun": {
+      "post": {
+        "tags": [
+          "Admin work"
+        ],
+        "summary": "Run a queue's parked and waiting rows again",
+        "description": "Admin only. Enrichment: releases the provider's configuration block and\nits blocked jobs. Subtitle text and sets: blocked, waiting and done rows\ngo again, which also repairs a cache deleted by hand. Subtitle OCR: failure markers\nare forgotten and the worker is seeded again from the sets on disk.\nDiscovery queues select their own work and cannot be rerun from here.",
+        "operationId": "work_rerun",
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/WorkRerun"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/OkResponse"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "401": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "403": {
             "headers": {
               "X-Request-Id": {
                 "schema": {
@@ -12953,6 +13116,112 @@
             "type": "integer",
             "format": "int64",
             "minimum": 0
+          }
+        }
+      },
+      "WorkQueue": {
+        "type": "object",
+        "required": [
+          "area",
+          "queue",
+          "host",
+          "collection",
+          "pending",
+          "running",
+          "retry",
+          "blocked",
+          "done",
+          "next_due",
+          "error",
+          "rerun"
+        ],
+        "properties": {
+          "area": {
+            "type": "string",
+            "description": "`enrichment`, `subtitles` or `discovery`."
+          },
+          "blocked": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "collection": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "done": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "error": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "host": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "next_due": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Unix time the clock next makes a row claimable, when known."
+          },
+          "pending": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "queue": {
+            "type": "string",
+            "description": "The provider, the subtitle kind, or the discovery kind."
+          },
+          "rerun": {
+            "type": "boolean",
+            "description": "Whether `POST /admin/v1/work/rerun` applies to this queue."
+          },
+          "retry": {
+            "type": "integer",
+            "format": "int64"
+          },
+          "running": {
+            "type": "integer",
+            "format": "int64"
+          }
+        }
+      },
+      "WorkRerun": {
+        "type": "object",
+        "required": [
+          "area",
+          "queue"
+        ],
+        "properties": {
+          "area": {
+            "type": "string"
+          },
+          "queue": {
+            "type": "string"
+          }
+        }
+      },
+      "WorkResponse": {
+        "type": "object",
+        "required": [
+          "queues"
+        ],
+        "properties": {
+          "queues": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/WorkQueue"
+            }
           }
         }
       }
