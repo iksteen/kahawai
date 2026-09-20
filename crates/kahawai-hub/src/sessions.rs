@@ -2187,6 +2187,7 @@ impl Sessions {
                         catalogue::physical(part, &info).revision
                     },
                     BURN_SETS_WAIT,
+                    false,
                 )
                 .await;
             if burn_sets.is_none() {
@@ -3382,6 +3383,7 @@ impl Sessions {
                                 walk_idx,
                                 track.source_revision()?,
                                 BURN_SETS_WAIT,
+                                false,
                             )
                             .await;
                         anyhow::ensure!(

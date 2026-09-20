@@ -76,6 +76,14 @@ impl Tier {
 struct Queues {
     urgent: VecDeque<(String, String, String, String)>,
     urgent_image: VecDeque<kahawai_proto::v1::ExtractImageSubs>,
+    /// The same walk, requested by a sweep rather than a viewer: admitted
+    /// through the scheduler at prewarm priority instead of entering as
+    /// interactive.
+    background_image: VecDeque<kahawai_proto::v1::ExtractImageSubs>,
+    /// What [Self::background_image] already holds. A sweep re-asks for work
+    /// it has not seen land yet, so without this a track queued behind a
+    /// large backlog is enqueued again every round it fails to surface.
+    background_image_seen: HashSet<(String, String, String, u32, String)>,
     ed2k: Tier,
     subs: Tier,
     atts: Tier,
@@ -83,14 +91,37 @@ struct Queues {
     geometry: Tier,
 }
 
+/// Identity of one queued background image walk: which track of which
+/// revision of which file. A request naming all four is the same work as one
+/// already waiting.
+fn background_image_key(
+    e: &kahawai_proto::v1::ExtractImageSubs,
+) -> Option<(String, String, String, u32, String)> {
+    let source = e.source.as_ref()?;
+    Some((
+        e.collection_id.clone(),
+        source.root_token.clone(),
+        source.path_rel.clone(),
+        e.sub_index,
+        e.source_revision.clone(),
+    ))
+}
+
 /// Route one message into its tier; returns true for urgent work.
 fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
     match msg {
-        // Same urgency as a text extraction: a viewer is waiting on it
-        // to start a burn-in session.
+        // A viewer waiting to start a burn-in session is urgent; the hub's
+        // idle sweep warming the same cache is not, and says so.
         JobMsg::UrgentImage(e) => {
-            queues.urgent_image.push_back(e);
-            true
+            let urgent = !e.background;
+            if urgent {
+                queues.urgent_image.push_back(e);
+            } else if background_image_key(&e)
+                .is_some_and(|key| queues.background_image_seen.insert(key))
+            {
+                queues.background_image.push_back(e);
+            }
+            urgent
         }
         JobMsg::Urgent(e) => {
             if let Some(source) = e.source {
@@ -228,6 +259,48 @@ pub async fn run(
                         e.sub_index,
                         &e.source_revision,
                         urgent,
+                        None,
+                        &tx,
+                    )
+                    .await;
+                });
+            }
+        }
+
+        while let Some(e) = queues.background_image.pop_front() {
+            if let Some(key) = background_image_key(&e) {
+                queues.background_image_seen.remove(&key);
+            }
+            if let Some(source) = e.source {
+                let scheduler = scheduler.clone();
+                let collections = collections.clone();
+                let tx = tx.clone();
+                let owner = owner.clone();
+                jobs.spawn(async move {
+                    // I/O only, like the text extraction it sits beside:
+                    // walking the container index reads, it does not decode.
+                    // Decoding stays hub-owned OCR work.
+                    let resources = scheduler.resources([source.root_token.as_str()], false);
+                    let label = format!(
+                        "image subtitle prewarm {}/{}",
+                        e.collection_id, source.path_rel
+                    );
+                    let Ok(permit) = scheduler
+                        .acquire(Priority::SubtitlePrewarm, resources, owner, label)
+                        .await
+                    else {
+                        return;
+                    };
+                    let guard: BlockingGuard = Arc::new(permit.clone());
+                    extract_image_and_send(
+                        &collections,
+                        &e.collection_id,
+                        &source.root_token,
+                        &source.path_rel,
+                        e.sub_index,
+                        &e.source_revision,
+                        guard,
+                        Some(permit),
                         &tx,
                     )
                     .await;
@@ -631,6 +704,10 @@ async fn extract_image_and_send(
     sub_index: u32,
     source_revision: &str,
     blocking_guard: BlockingGuard,
+    // Present for a background walk: the permit playback pauses and
+    // cancels. A walk without one reads to completion whatever else the
+    // mediahost is being asked to do.
+    permit: Option<JobPermit>,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
 ) {
     let started = std::time::Instant::now();
@@ -664,11 +741,19 @@ async fn extract_image_and_send(
         let mut src = kahawai_media::remux::FileSource::open(&path)?;
         // Local disk: no budget needed, and a header walk is still
         // only a few percent of the file.
-        kahawai_media::subindex::extract_image_track(
-            &mut src,
-            sub_index as usize,
-            std::time::Duration::from_secs(120),
-        )
+        match permit {
+            Some(permit) => kahawai_media::subindex::extract_image_track_interruptible(
+                &mut src,
+                sub_index as usize,
+                std::time::Duration::from_secs(120),
+                move || permit.checkpoint_blocking(),
+            ),
+            None => kahawai_media::subindex::extract_image_track(
+                &mut src,
+                sub_index as usize,
+                std::time::Duration::from_secs(120),
+            ),
+        }
     })
     .await;
 

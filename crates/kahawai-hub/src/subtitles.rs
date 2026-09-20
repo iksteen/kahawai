@@ -69,10 +69,24 @@ pub enum AssBody {
 #[cfg(feature = "ocr")]
 const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
 
-/// How long between text-prewarm rounds. A round only re-reads mediadb and
-/// re-sends what is still cold, so it is cheap; this paces the retry of work
-/// a mediahost is still chewing through rather than the work itself.
-const TEXT_PREWARM_ROUND: std::time::Duration = std::time::Duration::from_secs(900);
+/// One round's worth of extraction work, in [crate::workorder] order.
+///
+/// Both kinds come from a single catalogue pass: they ask the same rows the
+/// same questions, and they are worked through as one backlog even though
+/// text is published to the mediahost while OCR runs here.
+#[derive(Default)]
+pub(crate) struct SweepWork {
+    /// (mediahost, collection, source) per cold file — one entry per file,
+    /// since extraction walks the whole container at once.
+    pub text: Vec<(String, String, kahawai_proto::v1::SourcePath)>,
+    #[cfg(feature = "ocr")]
+    pub ocr: Vec<crate::tracks::Track>,
+}
+
+/// How long between extraction-sweep rounds. A round only re-reads mediadb
+/// and re-publishes what is still cold, so it is cheap; this paces the retry
+/// of work a mediahost is still chewing through rather than the work itself.
+const EXTRACTION_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(900);
 
 #[cfg(feature = "ocr")]
 const OCR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(600);
@@ -80,6 +94,13 @@ const OCR_SWEEP_INTERVAL: std::time::Duration = std::time::Duration::from_secs(6
 enum ImageSetsState {
     Ready(std::path::PathBuf),
     RetryOnReconnect,
+    /// Nothing arrived inside the wait, but nothing said it never will:
+    /// background walks queue behind whatever else that mediahost is doing,
+    /// and a large prewarm backlog can outlast any wait a caller is willing
+    /// to sit through. Distinct from [Self::Unavailable] because the work is
+    /// still coming — recording it as a failure would disable this track's
+    /// OCR for the rest of the hub run over a queue delay.
+    NotYet,
     Unavailable,
 }
 
@@ -87,7 +108,13 @@ enum ImageSetsState {
 enum OcrGeneration {
     Generated,
     NoText,
-    RetryOnReconnect { module_id: String },
+    RetryOnReconnect {
+        module_id: String,
+    },
+    /// The display sets are queued on the mediahost and had not arrived when
+    /// the wait ran out. Nothing is wrong, so nothing is remembered: the next
+    /// round asks again.
+    RetryLater,
 }
 
 /// Failures in hub-owned OCR work are remembered for this process run so a
@@ -787,46 +814,36 @@ impl Subtitles {
         retry_earlier_candidates
     }
 
-    /// Keep the text-subtitle cache warm, so a first play does not pay for
-    /// extraction with the viewer watching a spinner.
+    /// Warm the caches the mediahost fills: text subtitles and image display
+    /// sets.
     ///
-    /// Extraction is a whole-container walk: a live host logs
-    /// `tracks=38 elapsed=21.3s` for one episode, and every second of that
-    /// used to land on the first person to press Play. Nothing refilled the
-    /// cache in the background after the mediadb rewrite removed
-    /// `push_subs_worklist` along with the protocol-3 scan handler its two
-    /// call sites lived in — the mediahost end survived intact and simply
-    /// stopped being asked.
+    /// Both are the same job on the other end — a walk of the container
+    /// index, bound by reading it — so they share a catalogue pass, an order
+    /// ([crate::workorder]) and a round, and both are published as work the
+    /// mediahost schedules for itself rather than waited on here. Neither
+    /// needs an idle gate on this side: the mediahost ranks them below demand
+    /// and yields storage around a viewer's reads.
     ///
-    /// A `SubsWorklist`, not the `ExtractSubs` the urgent path sends: the
-    /// mediahost queues those at `Priority::SubtitlePrewarm`, below every
-    /// other background job and interruptible by demand. Sending
-    /// `ExtractSubs` here would file idle work as urgent and let a sweep
-    /// outrank a viewer.
-    ///
-    /// That also means no idle gate on this side, unlike the OCR sweep
-    /// below: OCR burns hub CPU, so it waits for playback to stop, while
-    /// this only publishes work that a scheduler elsewhere already ranks.
-    pub fn spawn_text_prewarm(self: &Arc<Self>, registry: Arc<Registry>) {
+    /// Decoding what comes back is a different resource entirely, and lives
+    /// in `spawn_ocr_sweep`.
+    pub fn spawn_extraction_sweep(self: &Arc<Self>, registry: Arc<Registry>) {
         let subs = self.clone();
         tokio::spawn(async move {
-            // Let links and reconnect scans settle first, as the OCR sweep does.
+            // Let links and reconnect scans settle first.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             loop {
-                let pending = match subs.catalogue_text_prewarm(&registry).await {
-                    Ok(p) => p,
+                let work = match subs.catalogue_sweep_work(&registry).await {
+                    Ok(work) => work,
                     Err(error) => {
-                        tracing::warn!(%error, "could not read subtitle prewarm work from mediadb");
-                        vec![]
+                        tracing::warn!(%error, "could not read extraction work from mediadb");
+                        SweepWork::default()
                     }
                 };
-                // Group per (mediahost, collection): a worklist names one
-                // collection, and the mediahost dedupes what it already holds.
                 let mut by_collection: std::collections::BTreeMap<
                     (String, String),
                     Vec<kahawai_proto::v1::SourcePath>,
                 > = Default::default();
-                for (module_id, collection_id, source) in pending {
+                for (module_id, collection_id, source) in work.text {
                     by_collection
                         .entry((module_id, collection_id))
                         .or_default()
@@ -841,9 +858,8 @@ impl Subtitles {
                     sent += sources.len();
                     tracing::info!(%module_id, collection = %collection_id, files = sources.len(),
                         "sending subtitle prewarm worklist");
-                    // Chunked like the worklist this replaces: one message
-                    // naming every cold file in a large collection is a
-                    // needlessly large frame.
+                    // Chunked: one message naming every cold file in a large
+                    // collection is a needlessly large frame.
                     for chunk in sources.chunks(5000) {
                         let msg = kahawai_proto::v1::HubToHost {
                             msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
@@ -860,20 +876,25 @@ impl Subtitles {
                         }
                     }
                 }
-                // Logged even when there is nothing to do, mirroring the OCR
-                // sweep: a quiet cache and a sweep that never ran read the
-                // same way in a log otherwise.
+                // Logged even when there is nothing to do: a warm cache and a
+                // sweep that never ran read the same way in a log otherwise.
                 tracing::info!(sent, skipped, "subtitle prewarm round complete");
-                tokio::time::sleep(TEXT_PREWARM_ROUND).await;
+                tokio::time::sleep(EXTRACTION_SWEEP_INTERVAL).await;
             }
         });
     }
 
-    /// HUB-32c idle sweep: OCR each physical image subtitle in mediadb
-    /// that lacks a cached answer, one at a time, only while nothing is
-    /// playing. Retaining the answer avoids repeating extraction and OCR
-    /// or making playback wait for them. Reconnects retry only work
-    /// blocked on that mediahost.
+    /// HUB-32c idle sweep: OCR each image subtitle with no cached answer.
+    ///
+    /// Its own loop, because it is the one piece of this that runs HERE and
+    /// on CPU — Tesseract over display sets the mediahost already walked out
+    /// of the container. So unlike [Self::spawn_extraction_sweep] it waits
+    /// for playback to stop: nothing else on this hub can hand delivery CPU
+    /// back to a viewer on its behalf.
+    ///
+    /// Retaining the answer avoids repeating extraction and OCR or making
+    /// playback wait for them. Reconnects retry only work blocked on that
+    /// mediahost.
     #[cfg(feature = "ocr")]
     pub fn spawn_ocr_sweep(
         self: &Arc<Self>,
@@ -885,23 +906,22 @@ impl Subtitles {
         // queued for the first post-settle retry decision.
         let mut events = registry.subscribe_events();
         tokio::spawn(async move {
-            // Let links and reconnect scans settle first.
             tokio::time::sleep(std::time::Duration::from_secs(60)).await;
             // Tracks that failed stay failed for this hub run — a
             // corrupt track must not become a 15-second crash loop.
             let mut failed = OcrSweepFailures::default();
             loop {
                 Self::drain_ocr_reconnects(&registry, &mut events, &mut failed);
-                let candidates = match subs.catalogue_ocr_candidates(&registry).await {
-                    Ok(tracks) => tracks,
+                let work = match subs.catalogue_sweep_work(&registry).await {
+                    Ok(work) => work,
                     Err(error) => {
                         tracing::warn!(%error, "could not read OCR work from mediadb");
-                        vec![]
+                        SweepWork::default()
                     }
                 };
                 let mut generated = 0usize;
                 let mut retry_earlier_candidates = false;
-                for track in candidates {
+                for track in work.ocr {
                     let id = track.artifact_key.clone().expect("catalogue OCR identity");
                     if Self::drain_ocr_reconnects(&registry, &mut events, &mut failed) {
                         retry_earlier_candidates = true;
@@ -945,6 +965,7 @@ impl Subtitles {
                                 extract_idx,
                                 track.source_revision().expect("captured source"),
                                 SETS_WAIT_IDLE,
+                                true,
                             )
                             .await;
                         failed.remember_permanent(&id);
@@ -959,6 +980,13 @@ impl Subtitles {
                             tracing::info!(track = id, item = %track.item_id, %module_id,
                                 "idle OCR paused until mediahost reconnects");
                             failed.remember_until_reconnect(&id, module_id);
+                        }
+                        // Nothing remembered: a queue delay is not a verdict
+                        // on this track, and the sets may well land before
+                        // the next round asks again.
+                        Ok(OcrGeneration::RetryLater) => {
+                            tracing::info!(track = id, item = %track.item_id,
+                                "idle OCR waiting on queued display sets");
                         }
                         Err(e) => {
                             tracing::warn!(track = id, item = %track.item_id,
@@ -991,7 +1019,6 @@ impl Subtitles {
             }
         });
     }
-
     /// Ingest a mediahost-extracted track into the cache (ladder step 2).
     #[allow(clippy::too_many_arguments)] // exact source, stream and revision plus payload
     pub fn store_extracted(
@@ -1033,7 +1060,11 @@ impl Subtitles {
         path_rel: &str,
         sub_index: usize,
         revision: &str,
+        // `background`: a sweep warming the cache with nobody waiting, so the
+        // mediahost queues the walk behind demand instead of entering it as
+        // interactive.
         wait: std::time::Duration,
+        background: bool,
     ) -> Option<std::path::PathBuf> {
         match self
             .image_sets_state(
@@ -1045,11 +1076,14 @@ impl Subtitles {
                 sub_index,
                 revision,
                 wait,
+                background,
             )
             .await
         {
             ImageSetsState::Ready(path) => Some(path),
-            ImageSetsState::RetryOnReconnect | ImageSetsState::Unavailable => None,
+            ImageSetsState::RetryOnReconnect
+            | ImageSetsState::NotYet
+            | ImageSetsState::Unavailable => None,
         }
     }
 
@@ -1064,6 +1098,7 @@ impl Subtitles {
         sub_index: usize,
         revision: &str,
         wait: std::time::Duration,
+        background: bool,
     ) -> ImageSetsState {
         let key = format!("i{sub_index}");
         let cache_path = self.dir.join(format!(
@@ -1093,6 +1128,7 @@ impl Subtitles {
                     }),
                     sub_index: sub_index as u32,
                     source_revision: revision.into(),
+                    background,
                 },
             )),
         };
@@ -1120,9 +1156,9 @@ impl Subtitles {
             }
             tokio::time::sleep(std::time::Duration::from_millis(200)).await;
         }
-        tracing::warn!(collection = %collection_id, path = %path_rel, track = sub_index,
-            "image display sets did not arrive in time");
-        ImageSetsState::Unavailable
+        tracing::info!(collection = %collection_id, path = %path_rel, track = sub_index,
+            "image display sets still queued on the mediahost");
+        ImageSetsState::NotYet
     }
 
     /// Store what the mediahost walked, in the worker's own format.
@@ -1539,6 +1575,7 @@ mod ocr_memory_tests {
                 0,
                 "revision",
                 std::time::Duration::from_secs(1),
+                false,
             )
             .await;
 
@@ -1566,6 +1603,7 @@ mod ocr_memory_tests {
             0,
             "revision",
             std::time::Duration::from_secs(2),
+            false,
         );
         tokio::pin!(wait);
 

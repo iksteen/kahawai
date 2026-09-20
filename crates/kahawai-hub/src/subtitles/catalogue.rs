@@ -163,6 +163,7 @@ impl Subtitles {
                 index,
                 parent.source_revision()?,
                 SETS_WAIT_IDLE,
+                true,
             )
             .await
         {
@@ -170,6 +171,7 @@ impl Subtitles {
             ImageSetsState::RetryOnReconnect => {
                 return Ok(OcrGeneration::RetryOnReconnect { module_id: host });
             }
+            ImageSetsState::NotYet => return Ok(OcrGeneration::RetryLater),
             ImageSetsState::Unavailable => bail!("display sets unavailable"),
         };
         tokio::task::spawn_blocking(move || -> Result<OcrGeneration> {
@@ -185,30 +187,24 @@ impl Subtitles {
         })
         .await?
     }
-    /// Files whose TEXT subtitles are not extracted yet, one entry per
-    /// file: the mediahost extracts every track of a file in one pass
-    /// (`tracks=38 elapsed=21.3s` is a real line from a live host), so
-    /// naming a file twice would just buy the same 20 seconds twice.
+    /// Everything the extraction sweep could do, from one pass over the
+    /// catalogue.
     ///
-    /// Sidecars are skipped — those are one small read on demand, with no
-    /// container to walk. Only embedded tracks are worth warming.
-    ///
-    /// Ordered the way the mediahost already orders its own extraction work
-    /// (`loudness::priority`): movies ahead of episodes, newest first. A
-    /// backlog this size is otherwise drained alphabetically by path, which
-    /// is the one order nobody is ever waiting on — a title beginning with A
-    /// is warmed hours before the episode that just landed.
-    pub(super) async fn catalogue_text_prewarm(
-        &self,
-        registry: &Registry,
-    ) -> Result<Vec<(String, String, kahawai_proto::v1::SourcePath)>> {
+    /// Text extraction and OCR ask the same rows the same questions — which
+    /// collection, which file, which tracks — so they walk together rather
+    /// than twice. Both come back in [crate::workorder] order, so the sweep
+    /// works through one backlog in one sequence however the individual
+    /// pieces are carried out.
+    pub(super) async fn catalogue_sweep_work(&self, registry: &Registry) -> Result<SweepWork> {
         let in_flight = crate::workorder::in_flight(registry.db()).await;
-        let mut out: Vec<(
+        let mut text: Vec<(
             crate::workorder::Ordered,
             String,
             String,
             kahawai_proto::v1::SourcePath,
         )> = vec![];
+        #[cfg(feature = "ocr")]
+        let mut ocr: Vec<(crate::workorder::Ordered, Track)> = vec![];
         let mut seen = std::collections::HashSet::new();
         for summary in registry.catalogue().collection_summaries().await? {
             let c = summary.collection;
@@ -221,6 +217,13 @@ impl Subtitles {
                     continue;
                 };
                 let mtime = f.mtime.unwrap_or(0);
+                // A part-way-through episode and the series it belongs to
+                // both count: every file of that series carries the series
+                // id, so the rest of the season comes forward with it.
+                let watching = f
+                    .item_id
+                    .as_deref()
+                    .is_some_and(|id| in_flight.contains(id));
                 let part = PartSource {
                     file_id: FileId::Catalogue(f.id),
                     module_id: c.mediahost_id.clone(),
@@ -234,12 +237,28 @@ impl Subtitles {
                     base_ms: 0,
                     duration_ms: info.duration_ms.unwrap_or(0),
                 };
+                let rank = || crate::workorder::Ordered {
+                    in_flight: watching,
+                    movie,
+                    mtime_unix: mtime,
+                    path_rel: part.path_rel.clone(),
+                };
                 for track in crate::sessions::catalogue::tracks(
                     f.item_id.as_deref().unwrap_or(""),
                     &part,
                     info,
                 ) {
-                    if crate::tracks::is_image_format(&track.format) || track.origin != "embedded" {
+                    if crate::tracks::is_image_format(&track.format) {
+                        #[cfg(feature = "ocr")]
+                        if !path(&self.dir, &track, "ocr.json")?.try_exists()? {
+                            ocr.push((rank(), track));
+                        }
+                        continue;
+                    }
+                    // Sidecars are one small read on demand, with no
+                    // container to walk; only embedded tracks are worth
+                    // warming.
+                    if track.origin != "embedded" {
                         continue;
                     }
                     let (Some(source), Ok(revision)) = (&track.physical, track.source_revision())
@@ -263,6 +282,9 @@ impl Subtitles {
                     if cached {
                         continue;
                     }
+                    // One entry per file: the mediahost extracts every track
+                    // of a container in one pass, so naming a file twice
+                    // would buy the same twenty seconds twice.
                     let file = (
                         source.module_id.clone(),
                         source.collection_id.clone(),
@@ -270,20 +292,8 @@ impl Subtitles {
                         source.path_rel.clone(),
                     );
                     if seen.insert(file) {
-                        // A part-way-through episode and the series it
-                        // belongs to both count: the rest of that season is
-                        // what gets played next.
-                        let watching = f
-                            .item_id
-                            .as_deref()
-                            .is_some_and(|id| in_flight.contains(id));
-                        out.push((
-                            crate::workorder::Ordered {
-                                in_flight: watching,
-                                movie,
-                                mtime_unix: mtime,
-                                path_rel: source.path_rel.clone(),
-                            },
+                        text.push((
+                            rank(),
                             source.module_id.clone(),
                             source.collection_id.clone(),
                             kahawai_proto::v1::SourcePath {
@@ -292,74 +302,20 @@ impl Subtitles {
                             },
                         ));
                     }
-                    break;
                 }
             }
         }
-        out.sort_by(|left, right| left.0.first(&right.0));
-        Ok(out
-            .into_iter()
-            .map(|(_, module, collection, source)| (module, collection, source))
-            .collect())
-    }
-
-    /// Image tracks lacking a cached OCR answer, in the same order the text
-    /// prewarm uses (see crate::workorder): what somebody is watching, then
-    /// newest. Both sweeps face one backlog and one viewer.
-    #[cfg(feature = "ocr")]
-    pub(super) async fn catalogue_ocr_candidates(&self, registry: &Registry) -> Result<Vec<Track>> {
-        let in_flight = crate::workorder::in_flight(registry.db()).await;
-        let mut tracks: Vec<(crate::workorder::Ordered, Track)> = vec![];
-        for summary in registry.catalogue().collection_summaries().await? {
-            let c = summary.collection;
-            if !registry.is_connected(&c.mediahost_id) {
-                continue;
-            }
-            let movie = c.media_type == kahawai_mediadb::MediaType::Movies;
-            for f in registry.catalogue().files(&c.id).await? {
-                let (Some(info), Some(size)) = (&f.media, f.size) else {
-                    continue;
-                };
-                let part = PartSource {
-                    file_id: FileId::Catalogue(f.id),
-                    module_id: c.mediahost_id.clone(),
-                    collection_id: c.remote_id.clone(),
-                    root_token: f.root_token,
-                    path_rel: f.path,
-                    size,
-                    mtime_unix: f.mtime.unwrap_or(0),
-                    head_xxh3: f.head_hash.unwrap_or(0) as i64,
-                    tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
-                    base_ms: 0,
-                    duration_ms: info.duration_ms.unwrap_or(0),
-                };
-                for track in crate::sessions::catalogue::tracks(
-                    f.item_id.as_deref().unwrap_or(""),
-                    &part,
-                    info,
-                ) {
-                    if crate::tracks::is_image_format(&track.format)
-                        && !path(&self.dir, &track, "ocr.json")?.try_exists()?
-                    {
-                        let watching = f
-                            .item_id
-                            .as_deref()
-                            .is_some_and(|id| in_flight.contains(id));
-                        tracks.push((
-                            crate::workorder::Ordered {
-                                in_flight: watching,
-                                movie,
-                                mtime_unix: part.mtime_unix,
-                                path_rel: part.path_rel.clone(),
-                            },
-                            track,
-                        ));
-                    }
-                }
-            }
-        }
-        tracks.sort_by(|left, right| left.0.first(&right.0));
-        Ok(tracks.into_iter().map(|(_, track)| track).collect())
+        text.sort_by(|left, right| left.0.first(&right.0));
+        #[cfg(feature = "ocr")]
+        ocr.sort_by(|left, right| left.0.first(&right.0));
+        Ok(SweepWork {
+            text: text
+                .into_iter()
+                .map(|(_, module, collection, source)| (module, collection, source))
+                .collect(),
+            #[cfg(feature = "ocr")]
+            ocr: ocr.into_iter().map(|(_, track)| track).collect(),
+        })
     }
 }
 
@@ -478,7 +434,8 @@ mod tests {
                 "film.mkv",
                 0,
                 "old",
-                std::time::Duration::ZERO
+                std::time::Duration::ZERO,
+                false
             )
             .await,
             ImageSetsState::Ready(_)
@@ -492,7 +449,8 @@ mod tests {
                 "film.mkv",
                 0,
                 "new",
-                std::time::Duration::ZERO
+                std::time::Duration::ZERO,
+                false
             )
             .await,
             ImageSetsState::RetryOnReconnect
@@ -714,7 +672,7 @@ mod tests {
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
         let subs = Subtitles::new(dir.path().join("subtitles"));
 
-        let cold = subs.catalogue_text_prewarm(&registry).await.unwrap();
+        let cold = subs.catalogue_sweep_work(&registry).await.unwrap().text;
         assert_eq!(
             cold.iter()
                 .map(|(_, _, s)| s.path_rel.as_str())
@@ -741,9 +699,10 @@ mod tests {
             .unwrap();
         }
         assert!(
-            subs.catalogue_text_prewarm(&registry)
+            subs.catalogue_sweep_work(&registry)
                 .await
                 .unwrap()
+                .text
                 .is_empty(),
             "a fully cached file is not swept again"
         );
@@ -858,7 +817,7 @@ mod tests {
         let registry = Registry::new(db, Default::default(), store);
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
         let subs = Subtitles::new(dir.path().join("subtitles"));
-        let candidates = subs.catalogue_ocr_candidates(&registry).await.unwrap();
+        let candidates = subs.catalogue_sweep_work(&registry).await.unwrap().ocr;
         assert_eq!(candidates.len(), 1);
         subs.store_image_sets(
             "host",
@@ -879,9 +838,10 @@ mod tests {
         let reopened = Subtitles::new(subs.cache_dir().into());
         assert!(
             reopened
-                .catalogue_ocr_candidates(&registry)
+                .catalogue_sweep_work(&registry)
                 .await
                 .unwrap()
+                .ocr
                 .is_empty()
         );
     }

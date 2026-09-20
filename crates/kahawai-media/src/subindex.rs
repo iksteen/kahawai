@@ -75,6 +75,10 @@ struct Reader<'a> {
     /// over network filesystems each would be a round trip.
     win_start: u64,
     win: Vec<u8>,
+    /// Asked before every read whether this walk should still be running.
+    /// A background walk holds a scheduler permit that playback can pause or
+    /// cancel, and a walk that never asks keeps reading regardless.
+    checkpoint: Option<Box<dyn FnMut() -> Result<()> + 'a>>,
 }
 
 const READAHEAD: usize = 256 * 1024;
@@ -88,6 +92,7 @@ impl<'a> Reader<'a> {
             win_start: 0,
             win: Vec::new(),
             deadline: None,
+            checkpoint: None,
         }
     }
 
@@ -98,6 +103,9 @@ impl<'a> Reader<'a> {
     }
 
     fn read_at(&mut self, off: u64, n: usize) -> Result<Vec<u8>> {
+        if let Some(checkpoint) = self.checkpoint.as_mut() {
+            checkpoint()?;
+        }
         if let Some(d) = self.deadline
             && std::time::Instant::now() > d
         {
@@ -1205,7 +1213,33 @@ pub fn extract_image_track(
     sub_index: usize,
     budget: std::time::Duration,
 ) -> Result<Option<ImageTrack>> {
+    extract_image_track_inner(src, sub_index, budget, None)
+}
+
+/// [extract_image_track], for a caller holding a scheduler permit.
+///
+/// `checkpoint` is consulted before each read, so a background walk pauses
+/// and cancels with the permit instead of reading on through playback. Its
+/// error surfaces like any other read failure, which is what the callers
+/// want: an interrupted walk has not established that a file has no image
+/// track, so it must not be recorded as an answer.
+pub fn extract_image_track_interruptible<'a>(
+    src: &'a mut dyn RemuxSource,
+    sub_index: usize,
+    budget: std::time::Duration,
+    checkpoint: impl FnMut() -> Result<()> + 'a,
+) -> Result<Option<ImageTrack>> {
+    extract_image_track_inner(src, sub_index, budget, Some(Box::new(checkpoint)))
+}
+
+fn extract_image_track_inner<'a>(
+    src: &'a mut dyn RemuxSource,
+    sub_index: usize,
+    budget: std::time::Duration,
+    checkpoint: Option<Box<dyn FnMut() -> Result<()> + 'a>>,
+) -> Result<Option<ImageTrack>> {
     let mut r = Reader::with_budget(src, budget);
+    r.checkpoint = checkpoint;
     let magic = r.read_at(0, 4)?;
     if magic != [0x1A, 0x45, 0xDF, 0xA3] {
         return Ok(None); // mp4 image subtitles do not occur in practice
