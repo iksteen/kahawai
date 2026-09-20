@@ -32,3 +32,4 @@ pub mod tracks;
 pub mod transcoder_link;
 pub mod watch;
 pub mod web;
+pub(crate) mod workorder;

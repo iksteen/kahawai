@@ -192,21 +192,35 @@ impl Subtitles {
     ///
     /// Sidecars are skipped — those are one small read on demand, with no
     /// container to walk. Only embedded tracks are worth warming.
+    ///
+    /// Ordered the way the mediahost already orders its own extraction work
+    /// (`loudness::priority`): movies ahead of episodes, newest first. A
+    /// backlog this size is otherwise drained alphabetically by path, which
+    /// is the one order nobody is ever waiting on — a title beginning with A
+    /// is warmed hours before the episode that just landed.
     pub(super) async fn catalogue_text_prewarm(
         &self,
         registry: &Registry,
     ) -> Result<Vec<(String, String, kahawai_proto::v1::SourcePath)>> {
-        let mut out = vec![];
+        let in_flight = crate::workorder::in_flight(registry.db()).await;
+        let mut out: Vec<(
+            crate::workorder::Ordered,
+            String,
+            String,
+            kahawai_proto::v1::SourcePath,
+        )> = vec![];
         let mut seen = std::collections::HashSet::new();
         for summary in registry.catalogue().collection_summaries().await? {
             let c = summary.collection;
             if !registry.is_connected(&c.mediahost_id) {
                 continue;
             }
+            let movie = c.media_type == kahawai_mediadb::MediaType::Movies;
             for f in registry.catalogue().files(&c.id).await? {
                 let (Some(info), Some(size)) = (&f.media, f.size) else {
                     continue;
                 };
+                let mtime = f.mtime.unwrap_or(0);
                 let part = PartSource {
                     file_id: FileId::Catalogue(f.id),
                     module_id: c.mediahost_id.clone(),
@@ -214,7 +228,7 @@ impl Subtitles {
                     root_token: f.root_token,
                     path_rel: f.path,
                     size,
-                    mtime_unix: f.mtime.unwrap_or(0),
+                    mtime_unix: mtime,
                     head_xxh3: f.head_hash.unwrap_or(0) as i64,
                     tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
                     base_ms: 0,
@@ -256,7 +270,20 @@ impl Subtitles {
                         source.path_rel.clone(),
                     );
                     if seen.insert(file) {
+                        // A part-way-through episode and the series it
+                        // belongs to both count: the rest of that season is
+                        // what gets played next.
+                        let watching = f
+                            .item_id
+                            .as_deref()
+                            .is_some_and(|id| in_flight.contains(id));
                         out.push((
+                            crate::workorder::Ordered {
+                                in_flight: watching,
+                                movie,
+                                mtime_unix: mtime,
+                                path_rel: source.path_rel.clone(),
+                            },
                             source.module_id.clone(),
                             source.collection_id.clone(),
                             kahawai_proto::v1::SourcePath {
@@ -269,17 +296,26 @@ impl Subtitles {
                 }
             }
         }
-        Ok(out)
+        out.sort_by(|left, right| left.0.first(&right.0));
+        Ok(out
+            .into_iter()
+            .map(|(_, module, collection, source)| (module, collection, source))
+            .collect())
     }
 
+    /// Image tracks lacking a cached OCR answer, in the same order the text
+    /// prewarm uses (see crate::workorder): what somebody is watching, then
+    /// newest. Both sweeps face one backlog and one viewer.
     #[cfg(feature = "ocr")]
     pub(super) async fn catalogue_ocr_candidates(&self, registry: &Registry) -> Result<Vec<Track>> {
-        let mut tracks = vec![];
+        let in_flight = crate::workorder::in_flight(registry.db()).await;
+        let mut tracks: Vec<(crate::workorder::Ordered, Track)> = vec![];
         for summary in registry.catalogue().collection_summaries().await? {
             let c = summary.collection;
             if !registry.is_connected(&c.mediahost_id) {
                 continue;
             }
+            let movie = c.media_type == kahawai_mediadb::MediaType::Movies;
             for f in registry.catalogue().files(&c.id).await? {
                 let (Some(info), Some(size)) = (&f.media, f.size) else {
                     continue;
@@ -305,12 +341,25 @@ impl Subtitles {
                     if crate::tracks::is_image_format(&track.format)
                         && !path(&self.dir, &track, "ocr.json")?.try_exists()?
                     {
-                        tracks.push(track);
+                        let watching = f
+                            .item_id
+                            .as_deref()
+                            .is_some_and(|id| in_flight.contains(id));
+                        tracks.push((
+                            crate::workorder::Ordered {
+                                in_flight: watching,
+                                movie,
+                                mtime_unix: part.mtime_unix,
+                                path_rel: part.path_rel.clone(),
+                            },
+                            track,
+                        ));
                     }
                 }
             }
         }
-        Ok(tracks)
+        tracks.sort_by(|left, right| left.0.first(&right.0));
+        Ok(tracks.into_iter().map(|(_, track)| track).collect())
     }
 }
 

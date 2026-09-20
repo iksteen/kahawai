@@ -832,10 +832,13 @@ impl Subtitles {
                         .or_default()
                         .push(source);
                 }
+                let (mut sent, mut skipped) = (0usize, 0usize);
                 for ((module_id, collection_id), sources) in by_collection {
                     if !registry.is_connected(&module_id) {
+                        skipped += sources.len();
                         continue; // not a failure — the next round retries
                     }
+                    sent += sources.len();
                     tracing::info!(%module_id, collection = %collection_id, files = sources.len(),
                         "sending subtitle prewarm worklist");
                     // Chunked like the worklist this replaces: one message
@@ -857,6 +860,10 @@ impl Subtitles {
                         }
                     }
                 }
+                // Logged even when there is nothing to do, mirroring the OCR
+                // sweep: a quiet cache and a sweep that never ran read the
+                // same way in a log otherwise.
+                tracing::info!(sent, skipped, "subtitle prewarm round complete");
                 tokio::time::sleep(TEXT_PREWARM_ROUND).await;
             }
         });
