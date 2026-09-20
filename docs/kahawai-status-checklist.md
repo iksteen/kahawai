@@ -135,7 +135,9 @@ How something works and why it was built that way belong in
       rows plus tombstones, hub-supplied durable cursors, incremental replay or
       full live snapshot. Committed versions push each connected hub to resume
       from its own cursor without polling; hub ACKs are independent and
-      reconnect never walks the filesystem. Protocol 4 intentionally rejects
+      reconnect never walks the filesystem. Snapshot pages hold a query-only
+      reader transaction, so a slow hub cannot pin the writer and block
+      acknowledgements, discovery commits or playback control. Protocol 4 intentionally rejects
       protocol-3 satellites
 - [x] MH-11 One source-owned scheduler admits scans, watcher installation,
       exact-source probes/hashes/extraction, segment/loudness analysis and
