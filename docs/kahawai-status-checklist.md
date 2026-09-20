@@ -834,7 +834,10 @@ How something works and why it was built that way belong in
       remux and audio-only transcode and never enters video placement
 - [x] TC-3 Sessions fully specified by the hub
 - [x] TC-4 Dynamic GStreamer pipelines, HLS segments, supervised worker
-      process. Progress reporting is PARTIAL, and the requirement was
+      process. Initial seeks use one parsed stream; GStreamer patch 0010
+      serializes Matroska index seeks against natural Cues parsing, with a
+      deterministic reproducer for the release-test race.
+      Progress reporting is PARTIAL, and the requirement was
       long recorded as if it were not: a per-run pace sample exists
       (HUB-36 — the un-throttled phase, once per run), but there is
       still no continuous progress percentage per session
