@@ -297,6 +297,8 @@ impl Store {
                     .bind(value.oshash.to_le_bytes().to_vec()).bind(serde_json::to_string(&media)?).bind(&file).execute(&mut *tx).await?;
                 crate::occurrence::resolve_file(&mut tx, &collection, &root, &file, path, &media)
                     .await?;
+                // Subtitle work is queue state next to the probe it asks about.
+                crate::subtitles_work::upsert_subtitle_jobs(&mut tx, &file, changed).await?;
             } else {
                 let fact = SourceFact::decode(&record.kind, &record.payload)?;
                 let (remote, source, size, mtime) = fact.identity()?;

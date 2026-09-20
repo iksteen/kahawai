@@ -16,7 +16,6 @@ import {
   adminEnrichRun,
   adminEnrichStatus,
   adminProviders,
-  adminSegmentsStatus,
   adminSetAnidb,
   adminSetChain,
   adminSetFanart,
@@ -49,16 +48,10 @@ const enrich = useQuery({
   queryFn: () => adminEnrichStatus(),
   refetchInterval: POLL_MS,
 })
-const segments = useQuery({
-  queryKey: ['admin', 'segments'],
-  queryFn: () => adminSegmentsStatus(),
-  refetchInterval: POLL_MS,
-})
 async function reload() {
   await Promise.all([
     client.invalidateQueries({ queryKey: ['admin', 'providers'] }),
     client.invalidateQueries({ queryKey: ['admin', 'enrich'] }),
-    client.invalidateQueries({ queryKey: ['admin', 'segments'] }),
   ])
 }
 
@@ -481,58 +474,5 @@ async function run() {
         {{ enrich.data.value.missed }} missed
       </span>
     </div>
-    <section aria-labelledby="skip-points" class="rounded border border-line bg-surface p-3">
-      <h2 id="skip-points" class="mb-3 text-[14px] font-[600]">Media analysis</h2>
-      <p class="text-dim">Mediahosts find skip points and measure loudness in the background.</p>
-      <p v-if="segments.isError.value" class="mt-2 text-warn">
-        Could not read media analysis status: {{ sentence(segments.error.value) }}
-        <Btn ghost small @click="segments.refetch()">Try again</Btn>
-      </p>
-      <p v-else-if="!segments.data.value" class="mt-2 text-dim">Loading media analysis status…</p>
-      <template v-else>
-        <p v-if="!segments.data.value.collections.length" class="mt-2 text-dim">
-          No video collections.
-        </p>
-        <ul v-else class="mt-2 flex flex-col gap-1">
-          <li
-            v-for="collection in segments.data.value.collections"
-            :key="collection.collection_id"
-            class="break-words text-[13px]"
-          >
-            {{ collection.mediahost_name }}/{{ collection.name }} ·
-            <span v-if="!collection.connected" class="text-warn">offline</span>
-            <template v-else>
-              <span v-if="['series', 'anime'].includes(collection.media_type)" class="text-dim">
-                Skip points:
-                <template v-if="collection.enabled === false">detection disabled</template>
-                <template v-else-if="collection.pending_sources == null"
-                  >waiting for mediahost status</template
-                >
-                <template v-else
-                  >{{ collection.pending_sources }} sources awaiting analysis</template
-                >
-                <template v-if="collection.enabled == null">
-                  · detection setting not reported</template
-                >
-                ·
-              </span>
-              <span class="text-dim">
-                Loudness:
-                <template v-if="collection.pending_loudness == null"
-                  >waiting for mediahost status</template
-                >
-                <template v-else
-                  >{{ collection.pending_loudness }} sources awaiting measurement</template
-                >
-              </span>
-            </template>
-          </li>
-        </ul>
-        <p v-if="segments.data.value.collections.length" class="mt-2 text-[12px] text-dim">
-          Last reported counts. Skip points require enough episodes to compare; loudness counts
-          sources with audio.
-        </p>
-      </template>
-    </section>
   </div>
 </template>

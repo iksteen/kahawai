@@ -1143,6 +1143,10 @@ async fn link_once_v4(
                     job_tx.try_send(hasher::JobMsg::SubsWorklist(request))
                         .context("hub overran the subtitle work queue")?;
                 }
+                Some(HubToHost { msg: Some(hub_to_host::Msg::ImageSubsWorklist(request)) }) => {
+                    job_tx.try_send(hasher::JobMsg::ImageSubsWorklist(request))
+                        .context("hub overran the subtitle work queue")?;
+                }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) }) => {
                     let channel = byte_channel.clone();
                     let scheduler = runtime.scheduler.clone();
@@ -1548,6 +1552,10 @@ async fn run_local_link(
                     }
                     Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::SubsWorklist(request)) })) => {
                         job_tx.try_send(hasher::JobMsg::SubsWorklist(request))
+                            .context("local hub overran the subtitle work queue")?;
+                    }
+                    Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::ImageSubsWorklist(request)) })) => {
+                        job_tx.try_send(hasher::JobMsg::ImageSubsWorklist(request))
                             .context("local hub overran the subtitle work queue")?;
                     }
                     Some(Ok(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) })) => {

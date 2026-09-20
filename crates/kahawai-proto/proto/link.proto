@@ -286,6 +286,7 @@ message HubToHost {
     // Short-lived viewer/up-next interest. This changes admission priority,
     // never ownership or result routing; the mediahost still chooses work.
     DiscoveryPriorityHint discovery_priority_hint = 18;
+    ImageSubsWorklist image_subs_worklist = 19;
   }
 }
 
@@ -504,6 +505,24 @@ message SubsWorkItem {
   // and works whole collections in whatever order they arrive -- putting
   // the series someone is watching behind thousands of unrelated files.
   uint32 rank = 3;
+}
+
+// One image track the hub wants walked into display sets, ahead of any
+// viewer: the same shape as a text item plus which track, since image
+// tracks are walked one at a time.
+message ImageSubsWorkItem {
+  SourcePath source = 1;
+  uint32 sub_index = 2;
+  string source_revision = 3;
+  uint32 rank = 4;
+}
+
+// The image counterpart of SubsWorklist: one message per batch, so a
+// library's worth of requests cannot overrun the link's inbound queue the
+// way one ExtractImageSubs per track did.
+message ImageSubsWorklist {
+  string collection_id = 1;
+  repeated ImageSubsWorkItem items = 2;
 }
 
 message SubsWorklist {

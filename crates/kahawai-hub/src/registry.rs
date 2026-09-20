@@ -174,6 +174,10 @@ impl HostLink {
         kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
             .supports(kahawai_proto::ProtocolFeature::RevisionedSubtitles)
     }
+    pub(crate) fn supports_image_subs_worklists(&self) -> bool {
+        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
+            .supports(kahawai_proto::ProtocolFeature::ImageSubsWorklists)
+    }
     pub(crate) fn supports_loudness_analysis(&self) -> bool {
         kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
             .supports(kahawai_proto::ProtocolFeature::AudioLoudnessAnalysis)
@@ -896,6 +900,10 @@ impl Registry {
     pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
         self.host_link(module_id)
             .is_some_and(|link| link.supports_segment_detection())
+    }
+    pub fn host_supports_image_subs_worklists(&self, module_id: &str) -> bool {
+        self.host_link(module_id)
+            .is_some_and(|link| link.supports_image_subs_worklists())
     }
     pub fn host_supports_loudness_analysis(&self, module_id: &str) -> bool {
         self.host_link(module_id)

@@ -27,6 +27,7 @@ const CHUNK_PACE: Duration = Duration::from_millis(100);
 pub enum JobMsg {
     Hashlist(Hashlist),
     SubsWorklist(SubsWorklist),
+    ImageSubsWorklist(kahawai_proto::v1::ImageSubsWorklist),
     AttachmentsWorklist(AttachmentsWorklist),
     KeyframeWorklist(kahawai_proto::v1::KeyframeWorklist),
     VideoGeometryWorklist(kahawai_proto::v1::VideoGeometryWorklist),
@@ -190,6 +191,27 @@ fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
         }
         JobMsg::Hashlist(h) => {
             queues.ed2k.push(&h.collection_id, h.sources);
+            false
+        }
+        // A batch of background image walks: each item takes the same
+        // deduped path a single background ExtractImageSubs does.
+        JobMsg::ImageSubsWorklist(w) => {
+            tracing::info!(collection = %w.collection_id, tracks = w.items.len(),
+                "image subtitle worklist received");
+            for item in w.items {
+                let e = kahawai_proto::v1::ExtractImageSubs {
+                    collection_id: w.collection_id.clone(),
+                    source: item.source,
+                    sub_index: item.sub_index,
+                    source_revision: item.source_revision,
+                    background: true,
+                };
+                if background_image_key(&e)
+                    .is_some_and(|key| queues.background_image_seen.insert(key))
+                {
+                    queues.background_image.push_back(e);
+                }
+            }
             false
         }
         JobMsg::SubsWorklist(w) => {

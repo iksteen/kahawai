@@ -1,7 +1,7 @@
 <script setup lang="ts">
 /// The operator's panel: the fleet, the libraries composed from it, the
-/// providers that describe them, the accounts that may see them, and who is
-/// watching what.
+/// providers that describe them, the accounts that may see them, who is
+/// watching what, and the work going on in the background.
 ///
 /// One flat scroll put five unrelated jobs in one column, and the two that
 /// change on their own — a satellite waiting to be admitted, somebody
@@ -19,6 +19,7 @@ import AdminProviders from './admin/Providers.vue'
 import AdminSatellites from './admin/Satellites.vue'
 import AdminSessions from './admin/Sessions.vue'
 import AdminUsers from './admin/Users.vue'
+import AdminWork from './admin/Work.vue'
 import Failed from '../components/Failed.vue'
 import { useAdmin } from '../composables/admin.ts'
 import { useHints } from '../composables/hints.ts'
@@ -51,6 +52,12 @@ const SECTIONS = [
     id: 'sessions',
     label: 'Sessions',
     intro: 'Who is playing what, how it is being delivered, and where.',
+  },
+  {
+    id: 'work',
+    label: 'Background work',
+    intro:
+      'Every queue the hub and its mediahosts work through on their own: metadata, subtitles and discovery. What is left, what is done, and what is stuck.',
   },
 ] as const
 
@@ -227,11 +234,13 @@ function key(event: KeyboardEvent, at: number) {
         />
 
         <AdminSessions
-          v-else
+          v-else-if="tab === 'sessions'"
           :sessions="admin.sessions.value"
           :broken="admin.broken.value"
           :act="admin.act"
         />
+
+        <AdminWork v-else :act="admin.act" />
       </div>
 
       <!-- Nothing has ever been read AND something is failing: the panel is

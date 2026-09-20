@@ -21,6 +21,7 @@ pub mod pace;
 pub mod pki;
 pub mod providers;
 pub mod proxy;
+pub(crate) mod queue;
 pub mod registry;
 pub mod renewal_service;
 pub mod secrets;

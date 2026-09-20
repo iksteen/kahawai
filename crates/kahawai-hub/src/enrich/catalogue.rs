@@ -27,6 +27,10 @@ const PROVIDERS: &[&str] = &[
 // allowing process-death recovery without two live owners of an ordinary job.
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(120);
 const CLAIM_SECONDS: i64 = 180;
+/// Lost-event insurance for the queue driver: a catalogue commit and an
+/// admin action both wake it, so this only has to catch a wake that was
+/// dropped. One indexed SELECT per provider per minute.
+const QUEUE_FALLBACK: Duration = Duration::from_secs(60);
 pub(super) fn now() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -74,26 +78,23 @@ impl Enricher {
         for &provider in PROVIDERS {
             let this = self.clone();
             let registry = registry.clone();
-            tokio::spawn(async move {
-                loop {
-                    let notified = this.catalogue_wake.notified();
-                    match this.catalogue_step(&registry, provider).await {
-                        Ok(true) => continue,
-                        Ok(false) => {}
-                        Err(error) => {
-                            tracing::error!(provider,error=%error,"enrichment queue operation failed")
-                        }
-                    }
-                    tokio::select! {_=notified=>{},_=tokio::time::sleep(Duration::from_secs(2))=>{}}
-                }
-            });
+            crate::queue::spawn(
+                provider,
+                this.catalogue_wake.clone(),
+                QUEUE_FALLBACK,
+                move || {
+                    let this = this.clone();
+                    let registry = registry.clone();
+                    async move { this.catalogue_step(&registry, provider).await }
+                },
+            );
         }
     }
     async fn catalogue_step(
         self: &Arc<Self>,
         registry: &Arc<Registry>,
         provider: &str,
-    ) -> Result<bool> {
+    ) -> Result<crate::queue::Step> {
         self.catalogue_import
             .get_or_try_init(|| seed_hash_cache(registry))
             .await?;
@@ -102,7 +103,9 @@ impl Enricher {
             .claim_enrichment(provider, now(), CLAIM_SECONDS)
             .await?
         else {
-            return Ok(false);
+            return Ok(crate::queue::Step::Idle {
+                next_due: store.enrichment_next_due(provider).await?,
+            });
         };
         let input = store.enrichment_input(&job.item_id).await?;
         let result = tokio::time::timeout(
@@ -167,7 +170,7 @@ impl Enricher {
                 );
             }
         }
-        Ok(true)
+        Ok(crate::queue::Step::Worked)
     }
     async fn catalogue_answer(
         self: &Arc<Self>,

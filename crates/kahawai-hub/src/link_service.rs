@@ -77,7 +77,7 @@ pub struct MediahostLinkService {
     registry: Arc<Registry>,
     sessions: Arc<Sessions>,
     subtitles: Arc<crate::subtitles::Subtitles>,
-    _enricher: Arc<crate::enrich::Enricher>,
+    enricher: Arc<crate::enrich::Enricher>,
 }
 
 impl MediahostLinkService {
@@ -85,13 +85,13 @@ impl MediahostLinkService {
         registry: Arc<Registry>,
         sessions: Arc<Sessions>,
         subtitles: Arc<crate::subtitles::Subtitles>,
-        _enricher: Arc<crate::enrich::Enricher>,
+        enricher: Arc<crate::enrich::Enricher>,
     ) -> Self {
         Self {
             registry,
             sessions,
             subtitles,
-            _enricher,
+            enricher,
         }
     }
 
@@ -122,7 +122,7 @@ fn register_host_link(
 pub fn local_link(
     registry: Arc<Registry>,
     subtitles: Arc<crate::subtitles::Subtitles>,
-    _enricher: Arc<crate::enrich::Enricher>,
+    enricher: Arc<crate::enrich::Enricher>,
     module_id: &str,
     name: &str,
 ) -> (
@@ -170,6 +170,7 @@ pub fn local_link(
             if let Err(e) = handle_host_msg(
                 &registry,
                 &subtitles,
+                &enricher,
                 &mut partial,
                 &module_id,
                 generation,
@@ -228,6 +229,7 @@ impl MediahostLink for MediahostLinkService {
 
         let sessions = self.sessions.clone();
         let subtitles = self.subtitles.clone();
+        let enricher = self.enricher.clone();
         let module_id = peer.module_id.clone();
         // Sender first, and only then "present". The reverse order left this
         // host offered as a playback source across the renewal settlement's DB
@@ -300,6 +302,7 @@ impl MediahostLink for MediahostLinkService {
                         if let Err(e) = handle_host_msg(
                             &registry,
                             &subtitles,
+                            &enricher,
                             &mut partial,
                             &module_id,
                             generation,
@@ -574,6 +577,7 @@ fn accept_chunk(
 async fn handle_host_msg(
     registry: &Arc<Registry>,
     subtitles: &crate::subtitles::Subtitles,
+    enricher: &crate::enrich::Enricher,
     partial: &mut std::collections::HashMap<(String, String, String, u32, String), PartialSets>,
     module_id: &str,
     generation: u64,
@@ -615,11 +619,15 @@ async fn handle_host_msg(
             }
         }
         host_to_hub::Msg::CatalogDelta(delta) => {
-            if let Some(ack) = registry
+            let ack = registry
                 .catalogue()
                 .apply_catalogue(module_id, &delta)
-                .await?
-            {
+                .await?;
+            // The commit created or reset queue rows; the queues look now
+            // rather than at their next tick.
+            enricher.wake();
+            subtitles.wake();
+            if let Some(ack) = ack {
                 registry
                     .send_to_host_generation(
                         module_id,
@@ -658,6 +666,22 @@ async fn handle_host_msg(
                     "extracted subtitles discarded"
                 );
             }
+            if !message.error.is_empty() && known {
+                // The mediahost's verdict on this file releases the queue
+                // row with a retry instead of leaving it leased.
+                registry
+                    .catalogue()
+                    .fail_subtitle_source(
+                        module_id,
+                        &message.collection_id,
+                        &source,
+                        "text",
+                        crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
+                        &message.error,
+                    )
+                    .await?;
+                subtitles.wake();
+            }
             if message.error.is_empty() && known {
                 let mut keys = vec![];
                 for track in message.tracks {
@@ -686,32 +710,75 @@ async fn handle_host_msg(
                     keys = %keys.join(","),
                     "extracted subtitles stored"
                 );
+                registry
+                    .catalogue()
+                    .finish_subtitle_source(module_id, &message.collection_id, &source, "text")
+                    .await?;
+                subtitles.wake();
             }
         }
         host_to_hub::Msg::ImageSubtitles(mut message) => {
             let source = message.source.as_ref().context("missing image source")?;
-            if !message.error.is_empty()
-                || !registry
-                    .catalogue()
-                    .source_exists(module_id, &message.collection_id, source, None)
-                    .await?
-            {
+            // Resolved through the catalogue, so a sidecar's `.idx` path
+            // lands on the media file that lists it instead of being
+            // dropped for not being a file row.
+            let file = registry
+                .catalogue()
+                .source_file(module_id, &message.collection_id, source)
+                .await?;
+            if !message.error.is_empty() || file.is_none() {
                 partial.remove(&(
-                    message.collection_id,
+                    message.collection_id.clone(),
                     source.root_token.clone(),
                     source.path_rel.clone(),
                     message.sub_index,
                     message.source_revision.clone(),
                 ));
+                if file.is_some() {
+                    // The host's verdict on this track releases the file's
+                    // `sets` row with a retry instead of leaving it leased.
+                    registry
+                        .catalogue()
+                        .fail_subtitle_source(
+                            module_id,
+                            &message.collection_id,
+                            source,
+                            "sets",
+                            crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
+                            &message.error,
+                        )
+                        .await?;
+                    subtitles.wake();
+                } else {
+                    tracing::warn!(module_id, collection = %message.collection_id,
+                        path = %source.path_rel, "image subtitle sets discarded: unknown source");
+                }
                 return Ok(());
             }
             match accept_chunk(partial, &mut message) {
                 Chunk::Complete(bytes) => {
                     subtitles.store_image_sets(module_id, &message).await?;
                     tracing::debug!(bytes, "image subtitle transfer complete");
+                    if let Some(file) = file {
+                        // Settles the `sets` row once every image track has
+                        // landed, and hands the file to OCR.
+                        subtitles.sets_landed(registry, file).await?;
+                    }
                 }
                 Chunk::TooBig(bytes) => {
-                    tracing::warn!(bytes, "image subtitle transfer exceeded existing limit")
+                    tracing::warn!(bytes, "image subtitle transfer exceeded existing limit");
+                    let source = message.source.as_ref().context("missing image source")?;
+                    registry
+                        .catalogue()
+                        .fail_subtitle_source(
+                            module_id,
+                            &message.collection_id,
+                            source,
+                            "sets",
+                            crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
+                            "display sets exceed the transfer limit",
+                        )
+                        .await?;
                 }
                 Chunk::More => {}
             }

@@ -270,7 +270,7 @@ pub(crate) struct TvdbCreds {
 pub struct Enricher {
     catalogue_started: AtomicBool,
     catalogue_import: tokio::sync::OnceCell<()>,
-    catalogue_wake: tokio::sync::Notify,
+    catalogue_wake: std::sync::Arc<tokio::sync::Notify>,
     /// Every provider call goes out through this: pacing and
     /// rate-limit backoff live in `gate.rs`, not at the call sites.
     http: std::sync::Arc<crate::gate::Http>,
@@ -1191,8 +1191,14 @@ impl Enricher {
         Ok(out)
     }
 
-    pub(crate) fn request_run(self: &Arc<Self>, registry: Arc<Registry>) {
+    /// Something changed the queue: a catalogue commit created rows, a
+    /// credential landed. Look now rather than at the next tick.
+    pub fn wake(&self) {
         self.catalogue_wake.notify_waiters();
+    }
+
+    pub(crate) fn request_run(self: &Arc<Self>, registry: Arc<Registry>) {
+        self.wake();
         tokio::spawn(async move {
             let _ = registry.catalogue().wake_enrichment(None).await;
         });

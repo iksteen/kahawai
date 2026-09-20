@@ -46,6 +46,8 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   adminSetTvdb: vi.fn(),
   adminSetUserAdmin: vi.fn(),
   adminSetUserLibraries: vi.fn(),
+  workRerun: vi.fn(),
+  workStatus: vi.fn(),
 }))
 vi.mock('../src/api/session.ts', () => ({
   whoAmI: () => ({ username: 'boss', admin: true }),
@@ -152,7 +154,7 @@ beforeEach(() => {
     weak: 0,
     missed: 0,
   } as never)
-  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({ collections: [] })
+  vi.mocked(api.workStatus).mockResolvedValue({ queues: [] })
   clearNotices()
 })
 afterEach(() => {
@@ -523,6 +525,7 @@ describe('the tabs', () => {
       'Providers',
       'Users & grants',
       'Sessions',
+      'Background work',
     ])
     expect(wrapper.get('[role="tablist"]').attributes('aria-orientation')).toBe('vertical')
     expect(tabs[0]!.attributes('aria-selected')).toBe('true')
@@ -1127,12 +1130,14 @@ describe('providers', () => {
     })
   })
 
-  test('polls segment work only while the provider controls are open', async () => {
+  test('reads background work only while its tab is open', async () => {
     const wrapper = await open()
-    expect(api.adminSegmentsStatus).not.toHaveBeenCalled()
+    expect(api.workStatus).not.toHaveBeenCalled()
     await tab(wrapper, 'Providers')
-    expect(wrapper.text()).toContain('Media analysis')
-    expect(api.adminSegmentsStatus).toHaveBeenCalled()
+    expect(wrapper.text()).not.toContain('Media analysis')
+    expect(api.workStatus).not.toHaveBeenCalled()
+    await tab(wrapper, 'Background work')
+    expect(api.workStatus).toHaveBeenCalled()
   })
 
   test('Enrich now is offered for ANY provider, not TMDB alone', async () => {
@@ -1295,99 +1300,76 @@ describe('providers', () => {
   })
 })
 
-test('analysis status distinguishes unknown, disabled and offline reports', async () => {
-  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({
-    collections: [
-      {
-        collection_id: 'a',
-        mediahost_id: 'host',
-        mediahost_name: 'NAS',
-        name: 'shows',
-        connected: true,
-        media_type: 'series',
-        pending_loudness: 12,
-        pending_sources: 7,
-        enabled: true,
-      },
-      {
-        collection_id: 'b',
-        mediahost_id: 'old',
-        mediahost_name: 'Older',
-        name: 'anime',
-        connected: true,
-        media_type: 'anime',
-        pending_loudness: null,
-        pending_sources: null,
-        enabled: null,
-      },
-      {
-        collection_id: 'c',
-        mediahost_id: 'disabled',
-        mediahost_name: 'Disabled',
-        name: 'shows',
-        connected: true,
-        media_type: 'series',
-        pending_loudness: 12,
-        pending_sources: 0,
-        enabled: false,
-      },
-      {
-        collection_id: 'd',
-        mediahost_id: 'offline',
-        mediahost_name: 'Offline',
-        name: 'shows',
-        connected: false,
-        media_type: 'series',
-        pending_loudness: null,
-        pending_sources: null,
-        enabled: null,
-      },
-      {
-        collection_id: 'e',
-        mediahost_id: 'host',
-        mediahost_name: 'NAS',
-        name: 'movies',
-        connected: true,
-        media_type: 'movies',
-        pending_sources: 0,
-        pending_loudness: 0,
-        enabled: true,
-      },
-    ],
+describe('background work', () => {
+  const row = (over: Record<string, unknown>) => ({
+    area: 'subtitles',
+    queue: 'text',
+    host: null,
+    collection: null,
+    pending: 0,
+    running: 0,
+    retry: 0,
+    blocked: 0,
+    done: 0,
+    next_due: null,
+    error: null,
+    rerun: true,
+    ...over,
   })
-  const wrapper = await open()
-  await tab(wrapper, 'Providers')
-  expect(wrapper.text()).toContain('7 sources awaiting analysis')
-  expect(wrapper.text()).toContain('12 sources awaiting measurement')
-  const movies = wrapper.findAll('li').find((row) => row.text().includes('NAS/movies'))!
-  expect(movies.text()).toContain('0 sources awaiting measurement')
-  expect(movies.text()).not.toContain('Skip points:')
-  const disabled = wrapper.findAll('li').find((row) => row.text().includes('Disabled/shows'))!
-  expect(disabled.text()).toContain('12 sources awaiting measurement')
-  expect(wrapper.text()).toContain('waiting for mediahost status')
-  expect(wrapper.text()).toContain('detection disabled')
-  expect(wrapper.text()).not.toContain('Find skip points now')
-  expect(wrapper.text()).not.toContain('episodes done since')
-})
 
-test('movie-only analysis reports loudness', async () => {
-  vi.mocked(api.adminSegmentsStatus).mockResolvedValue({
-    collections: [
-      {
-        collection_id: 'movies',
-        mediahost_id: 'host',
-        mediahost_name: 'NAS',
-        name: 'movies',
-        media_type: 'movies',
-        connected: true,
-        pending_sources: 0,
-        pending_loudness: 3,
-        enabled: true,
-      },
-    ],
+  test('shows every area in one shape, and Rerun only where it does something', async () => {
+    vi.mocked(api.workStatus).mockResolvedValue({
+      queues: [
+        row({ area: 'enrichment', queue: 'tmdb', pending: 3, done: 1 }),
+        row({ area: 'subtitles', queue: 'ocr', blocked: 1, done: 9, error: 'tesseract failed' }),
+        row({
+          area: 'discovery',
+          queue: 'loudness',
+          host: 'NAS',
+          collection: 'shows',
+          pending: 12,
+          rerun: false,
+        }),
+      ],
+    })
+    const wrapper = await open()
+    await tab(wrapper, 'Background work')
+    const text = wrapper.text()
+    expect(text).toContain('Metadata providers')
+    expect(text).toContain('TMDB')
+    expect(text).toContain('1 / 4')
+    expect(text).toContain('Image OCR')
+    expect(text).toContain('1 blocked')
+    expect(text).toContain('tesseract failed')
+    expect(text).toContain('NAS/shows')
+    expect(text).toContain('12 pending')
+    // Two hub queues can be rerun; the mediahost's own work cannot.
+    expect(wrapper.findAll('button').filter((b) => b.text() === 'Rerun')).toHaveLength(2)
   })
-  const wrapper = await open()
-  await tab(wrapper, 'Providers')
-  expect(wrapper.text()).toContain('3 sources awaiting measurement')
-  expect(wrapper.text()).not.toContain('Find skip points now')
+
+  test('a rerun names the queue and reads the counts again', async () => {
+    vi.mocked(api.workStatus).mockResolvedValue({
+      queues: [row({ area: 'subtitles', queue: 'ocr', blocked: 1 })],
+    })
+    vi.mocked(api.workRerun).mockResolvedValue({ ok: true })
+    const wrapper = await open()
+    await tab(wrapper, 'Background work')
+    const calls = vi.mocked(api.workStatus).mock.calls.length
+    await wrapper
+      .findAll('button')
+      .find((b) => b.text() === 'Rerun')!
+      .trigger('click')
+    await flushPromises()
+    expect(api.workRerun).toHaveBeenCalledWith({ area: 'subtitles', queue: 'ocr' })
+    expect(notice.value).toContain('Image OCR queued again')
+    expect(vi.mocked(api.workStatus).mock.calls.length).toBeGreaterThan(calls)
+  })
+
+  test('a failed read says so once, with a way back', async () => {
+    vi.mocked(api.workStatus).mockRejectedValue(new ApiError(503, 'hub restarting'))
+    const wrapper = await open()
+    await tab(wrapper, 'Background work')
+    expect(wrapper.text()).toContain('Could not read background work')
+    expect(wrapper.findAll('button').some((b) => b.text() === 'Try again')).toBe(true)
+  })
 })
