@@ -30,6 +30,10 @@
 //! the hub runs it when they land (migration 0007 dropped the rows that
 //! once tried to queue it).
 //!
+//! Claims atomically enforce a caller-supplied ceiling on unexpired leases
+//! per host and kind across collections. The hub's 16/refill-at-8 policy
+//! keeps the durable backlog here instead of filling the satellite's memory.
+//!
 //! Ranking happens at claim time, from a caller-supplied set of in-flight
 //! library items (watch state lives in the hub database), then movies
 //! before episodes, newest mtime first, then path — the order the hub's
@@ -110,8 +114,10 @@ fn source_file(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFile> {
 }
 
 impl Store {
-    /// Claim up to `limit` rows of one kind for one mediahost, most wanted
-    /// first. `in_flight` are library item ids somebody is part-way through.
+    /// Fill up to `limit` outstanding, unexpired leases of one kind for one
+    /// mediahost, most wanted first. Count and claim share the writer transaction
+    /// so repeated/concurrent claims cannot drain the backlog past this window.
+    /// `in_flight` are library item ids somebody is part-way through.
     pub async fn claim_subtitle_jobs(
         &self,
         kind: &str,
@@ -125,6 +131,19 @@ impl Store {
         ensure!(lease_seconds > 0, "lease must be positive");
         let in_flight = serde_json::to_string(in_flight)?;
         let mut tx = self.db.begin().await?;
+        let running: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM subtitle_jobs
+             WHERE kind=? AND host=? AND state='running' AND lease_until>?",
+        )
+        .bind(kind)
+        .bind(host)
+        .bind(now)
+        .fetch_one(&mut *tx)
+        .await?;
+        let available = limit.saturating_sub(running as usize);
+        if available == 0 {
+            return Ok(vec![]);
+        }
         let rows = sqlx::query(sqlx::AssertSqlSafe(format!(
             "SELECT j.attempts,{SOURCE_COLUMNS}
              FROM subtitle_jobs j
@@ -142,7 +161,7 @@ impl Store {
         .bind(host)
         .bind(now)
         .bind(&in_flight)
-        .bind(limit as i64)
+        .bind(available as i64)
         .bind(kind)
         .fetch_all(&mut *tx)
         .await?;
@@ -318,6 +337,46 @@ impl Store {
         .bind(kind)
         .fetch_one(self.db.read_pool())
         .await?)
+    }
+
+    /// Outstanding leases and the next useful dispatch time for this host.
+    /// Above the refill threshold, pending rows cannot trigger a dispatch;
+    /// only a landing/wake or a lease expiry can free room. Offline hosts,
+    /// incomplete snapshots and files without probes must not cause a hot loop.
+    pub async fn subtitle_dispatch_state(
+        &self,
+        kind: &str,
+        host: &str,
+        now: i64,
+        refill_at: usize,
+    ) -> Result<(usize, Option<i64>)> {
+        kind_ok(kind)?;
+        let (running, lease): (i64, Option<i64>) = sqlx::query_as(
+            "SELECT count(*),min(lease_until) FROM subtitle_jobs
+             WHERE kind=? AND host=? AND state='running' AND lease_until>?",
+        )
+        .bind(kind)
+        .bind(host)
+        .bind(now)
+        .fetch_one(self.db.read_pool())
+        .await?;
+        if running as usize > refill_at {
+            return Ok((running as usize, lease));
+        }
+        let due: Option<i64> = sqlx::query_scalar(
+            "SELECT min(CASE j.state WHEN 'running' THEN j.lease_until ELSE j.due_at END)
+             FROM subtitle_jobs j JOIN files f ON f.id=j.file_id
+             JOIN collection_roots r ON r.id=f.root_id
+             JOIN collections c ON c.id=f.collection_id
+             WHERE j.kind=? AND c.mediahost_id=? AND c.snapshot_active=0
+               AND f.media_json IS NOT NULL AND f.size IS NOT NULL
+               AND j.state IN ('pending','retry','running')",
+        )
+        .bind(kind)
+        .bind(host)
+        .fetch_one(self.db.read_pool())
+        .await?;
+        Ok((running as usize, due.into_iter().chain(lease).min()))
     }
 
     pub async fn subtitle_jobs_status(&self) -> Result<Vec<SubtitleWorkStatus>> {

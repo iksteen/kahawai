@@ -705,7 +705,10 @@ How something works and why it was built that way belong in
       commit, ranked at claim time from live watch state, leased to the
       mediahost holding the bytes as one worklist message per batch
       (`SubsWorklist`, `ImageSubsWorklist` — protocol 4.4) and settled by
-      its reply. No catalogue walk remains on the hub;
+      its reply. Each hub keeps at most 16 unexpired file leases per kind
+      per host, across collections, and refills to 16 at 8 or fewer. The
+      rest stays pending on the hub; image files may expand to several
+      track requests. No catalogue walk remains on the hub;
       enrichment shares the queue driver (`hub/queue.rs`) and is woken by
       catalogue commits instead of polling.
       Deferred: the bandwidth-threshold selection (needs measurement)
