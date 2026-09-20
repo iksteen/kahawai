@@ -4006,6 +4006,25 @@ pub fn start_full(
     start_paced(out_dir, plan, source, start_ms, sink, None)
 }
 
+fn seek_parsed_stream(parsebin: &gst::Element, seek: gst::Event) -> bool {
+    // GstBin broadcasts upstream events to its source pads. A Matroska
+    // push-mode seek returns after requesting Cues, before its streaming
+    // thread seeks back to the target cluster. A duplicate through another
+    // pad can collide with that flush (or be deferred as another seek).
+    // Send once, through video for keyframe alignment, or audio otherwise.
+    // https://github.com/GStreamer/gstreamer/blob/1.28.7/subprojects/gstreamer/gst/gstbin.c
+    let pads = parsebin.src_pads();
+    let pad = ["video/", "audio/"].into_iter().find_map(|kind| {
+        pads.iter().find(|pad| {
+            pad.current_caps().is_some_and(|caps| {
+                caps.structure(0)
+                    .is_some_and(|s| s.name().starts_with(kind))
+            })
+        })
+    });
+    pad.is_some_and(|pad| pad.send_event(seek))
+}
+
 /// A seekable appsrc fed from a `RemuxSource` through a PREFETCH RING:
 /// a reader thread streams ahead of the pipeline into a bounded buffer,
 /// and stalls when it is full — "stream until pushback", expressed
@@ -4620,8 +4639,9 @@ pub fn start_parts(
             );
             std::thread::sleep(std::time::Duration::from_millis(20));
         }
-        // Straight at the demuxer: a pipeline-level seek routes through
-        // the sinks, and the gated (unprerolled) HLS sink refuses it.
+        // Through one parsed stream: the gated HLS sink refuses a
+        // pipeline-level seek, and broadcasting through parsebin sends
+        // duplicate requests to the demuxer.
         let seek = gst::event::Seek::new(
             1.0,
             gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
@@ -4631,7 +4651,7 @@ pub fn start_parts(
             gst::ClockTime::NONE,
         );
         anyhow::ensure!(
-            parsebin.send_event(seek),
+            seek_parsed_stream(&parsebin, seek),
             "demuxer refused the start-offset seek"
         );
         gate.open_reporting(out_dir.join("start.pos"));
@@ -6511,6 +6531,75 @@ mod tests {
         );
     }
 
+    /// One requested seek must reach the demuxer once, even when parsebin
+    /// exposes both audio and video. Broadcasting through the bin races the
+    /// duplicate against the demuxer's asynchronous index/cluster seeks.
+    #[test]
+    fn offset_seek_is_delivered_once() {
+        crate::init().unwrap();
+        if !crate::testutil::require_h264_aac_fixture() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("in.mkv");
+        crate::testutil::render_h264_aac_mkv(&source);
+        let pipeline = gst::Pipeline::new();
+        let src = seekable_appsrc(Box::new(FileSource::open(&source).unwrap()));
+        let parsebin = gst::ElementFactory::make("parsebin").build().unwrap();
+        pipeline.add_many([src.upcast_ref(), &parsebin]).unwrap();
+        src.link(&parsebin).unwrap();
+        let deliveries = Arc::new(Mutex::new(Vec::new()));
+        let observed = deliveries.clone();
+        let weak = pipeline.downgrade();
+        let (ready, pads_ready) = std::sync::mpsc::channel();
+        parsebin.connect_pad_added(move |_, pad| {
+            let observed = observed.clone();
+            pad.add_probe(gst::PadProbeType::EVENT_UPSTREAM, move |pad, info| {
+                if let Some(gst::PadProbeData::Event(event)) = &info.data
+                    && event.type_() == gst::EventType::Seek
+                {
+                    observed.lock().unwrap().push(pad.name().to_string());
+                    // Consume at the routing boundary so the test observes
+                    // every delivery without depending on flush timing.
+                    return gst::PadProbeReturn::Handled;
+                }
+                gst::PadProbeReturn::Ok
+            });
+            let pipeline = weak.upgrade().unwrap();
+            let queue = gst::ElementFactory::make("queue").build().unwrap();
+            let sink = gst::ElementFactory::make("fakesink").build().unwrap();
+            pipeline.add_many([&queue, &sink]).unwrap();
+            queue.link(&sink).unwrap();
+            pad.link(&queue.static_pad("sink").unwrap()).unwrap();
+            sink.sync_state_with_parent().unwrap();
+            queue.sync_state_with_parent().unwrap();
+            ready.send(()).unwrap();
+        });
+        pipeline.set_state(gst::State::Paused).unwrap();
+        for _ in 0..2 {
+            pads_ready.recv_timeout(Duration::from_secs(10)).unwrap();
+        }
+        let (state, current, _) = pipeline.state(gst::ClockTime::from_seconds(10));
+        let pads = parsebin.src_pads().len();
+        let accepted = seek_parsed_stream(
+            &parsebin,
+            gst::event::Seek::new(
+                1.0,
+                gst::SeekFlags::FLUSH | gst::SeekFlags::KEY_UNIT,
+                gst::SeekType::Set,
+                gst::ClockTime::from_seconds(6),
+                gst::SeekType::None,
+                gst::ClockTime::NONE,
+            ),
+        );
+        pipeline.set_state(gst::State::Null).unwrap();
+        state.unwrap();
+        assert_eq!(current, gst::State::Paused);
+        assert_eq!(pads, 2, "fixture must expose both audio and video");
+        assert!(accepted);
+        assert_eq!(deliveries.lock().unwrap().len(), 1, "one initial seek");
+    }
+
     /// §6 seek story: starting at an offset produces only the tail.
     #[test]
     fn starts_at_offset() {
@@ -6518,41 +6607,58 @@ mod tests {
         if !crate::testutil::require_h264_aac_fixture() {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
-        let src_path = dir.path().join("in.mkv");
-        crate::testutil::render_h264_aac_mkv(&src_path); // 10 s fixture
+        for video in [true, false] {
+            let dir = tempfile::tempdir().unwrap();
+            let src_path = dir.path().join("in.mkv");
+            if video {
+                crate::testutil::render_h264_aac_mkv(&src_path); // 10 s fixture
+            } else {
+                crate::testutil::render(&format!(
+                    "audiotestsrc num-buffers=430 ! audioconvert ! {} ! matroskamux ! filesink location=\"{}\"",
+                    aac_encoder().unwrap(),
+                    src_path.display()
+                ));
+            }
 
-        let out = tempfile::tempdir().unwrap();
-        let job = start_at(
-            out.path(),
-            COPY_AV,
-            Box::new(FileSource::open(&src_path).unwrap()),
-            6_000,
-        )
-        .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while !job.finished() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+            let out = tempfile::tempdir().unwrap();
+            let job = start_at(
+                out.path(),
+                RemuxPlan {
+                    video: if video {
+                        StreamMode::Copy
+                    } else {
+                        StreamMode::Off
+                    },
+                    ..COPY_AV
+                },
+                Box::new(FileSource::open(&src_path).unwrap()),
+                6_000,
+            )
+            .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(30);
+            while !job.finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(job.finished(), "offset remux did not finish");
+            assert!(
+                job.failed().is_none(),
+                "offset remux failed: {:?}",
+                job.failed()
+            );
+            let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
+            assert!(playlist.contains("#EXT-X-ENDLIST"));
+            let total: f64 = playlist
+                .lines()
+                .filter_map(|l| l.strip_prefix("#EXTINF:"))
+                .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
+                .sum();
+            // 10 s source, started at 6 s (snapped to a keyframe at or
+            // before): expect roughly the tail, never the whole file.
+            assert!(
+                total > 2.0 && total < 6.5,
+                "expected ~4s tail, playlist covers {total}s:\n{playlist}"
+            );
         }
-        assert!(job.finished(), "offset remux did not finish");
-        assert!(
-            job.failed().is_none(),
-            "offset remux failed: {:?}",
-            job.failed()
-        );
-        let playlist = std::fs::read_to_string(out.path().join("master.m3u8")).unwrap();
-        assert!(playlist.contains("#EXT-X-ENDLIST"));
-        let total: f64 = playlist
-            .lines()
-            .filter_map(|l| l.strip_prefix("#EXTINF:"))
-            .filter_map(|l| l.trim_end_matches(',').parse::<f64>().ok())
-            .sum();
-        // 10 s source, started at 6 s (snapped to a keyframe at or
-        // before): expect roughly the tail, never the whole file.
-        assert!(
-            total > 2.0 && total < 6.5,
-            "expected ~4s tail, playlist covers {total}s:\n{playlist}"
-        );
     }
 
     /// The crashing combo from the field: offset start + encode branch.

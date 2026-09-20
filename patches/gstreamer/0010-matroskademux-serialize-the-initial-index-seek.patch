@@ -1,0 +1,106 @@
+Subject: [PATCH] matroskademux: stop streaming before publishing an index seek
+
+The push-mode initial seek publishes READ_STATE_SEEK before flushing the
+streaming thread. If that thread reaches Cues naturally in that window,
+it starts the deferred cluster seek while the application starts the
+index seek. One upstream seek is then rejected by the other's flush,
+and parse_id posts a fatal "Failed to seek" error.
+
+Flush upstream and downstream, acquire the stream lock, and recheck
+whether Cues arrived before publishing the pending seek. Reopen upstream
+event delivery under that lock so the byte seek can perform its normal
+flush/segment sequence. The lock replaces the building_index flag.
+
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.c
+@@ -362,7 +362,6 @@
+   demux->requested_seek_duration = GST_CLOCK_TIME_NONE;
+   demux->seek_offset = -1;
+   demux->audio_lead_in_ts = 0;
+-  demux->building_index = FALSE;
+   if (demux->seek_event) {
+     gst_event_unref (demux->seek_event);
+     demux->seek_event = NULL;
+@@ -3367,12 +3366,36 @@
+ 
+   /* check for having parsed index already */
+   if (!demux->common.index_parsed) {
+-    gboolean building_index;
++    gboolean result;
++    GstEvent *flush;
+     guint64 offset = 0;
+ 
+     if (!demux->index_offset) {
+       GST_DEBUG_OBJECT (demux, "no index (location); no seek in push mode");
+       return FALSE;
++    }
++
++    /* Stop the chain before publishing SEEK. Otherwise it can reach Cues
++     * naturally and run the deferred cluster seek while our index seek is
++     * still starting its flush. Flush first to release blocked downstream
++     * queues, then hold the stream lock through the upstream seek. */
++    flush = gst_event_new_flush_start ();
++    gst_event_set_seqnum (flush, gst_event_get_seqnum (event));
++    gst_pad_push_event (demux->common.sinkpad, gst_event_ref (flush));
++    gst_matroska_demux_send_event (demux, flush);
++    GST_PAD_STREAM_LOCK (demux->common.sinkpad);
++
++    /* Allow the upstream seek event through again. Its own flush-stop
++     * releases the downstream pads after the new position is installed. */
++    flush = gst_event_new_flush_stop (TRUE);
++    gst_event_set_seqnum (flush, gst_event_get_seqnum (event));
++    gst_pad_push_event (demux->common.sinkpad, flush);
++
++    /* Cues may have arrived before the chain stopped. */
++    if (demux->common.index_parsed) {
++      result = gst_matroska_demux_handle_seek_event (demux, pad, event);
++      GST_PAD_STREAM_UNLOCK (demux->common.sinkpad);
++      return result;
+     }
+ 
+     GST_OBJECT_LOCK (demux);
+@@ -3385,24 +3408,16 @@
+       gst_event_unref (demux->seek_event);
+     demux->seek_event = gst_event_ref (event);
+ 
+-    /* set the building_index flag so that only one thread can setup the
+-     * structures for index seeking. */
+-    building_index = demux->building_index;
+-    if (!building_index) {
+-      demux->building_index = TRUE;
+-      offset = demux->index_offset;
+-    }
++    offset = demux->index_offset;
+     GST_OBJECT_UNLOCK (demux);
+ 
+-    if (!building_index) {
+-      /* seek to the first subindex or legacy index */
+-      GST_INFO_OBJECT (demux, "Seeking to Cues at %" G_GUINT64_FORMAT, offset);
+-      return perform_seek_to_offset (demux, rate, offset,
+-          gst_event_get_seqnum (event), GST_SEEK_FLAG_NONE);
+-    }
+-
+-    /* well, we are handling it already */
+-    return TRUE;
++    /* The stream lock serializes index requests, including a newer seek
++     * that arrived while the previous request was waiting for Cues. */
++    GST_INFO_OBJECT (demux, "Seeking to Cues at %" G_GUINT64_FORMAT, offset);
++    result = perform_seek_to_offset (demux, rate, offset,
++        gst_event_get_seqnum (event), GST_SEEK_FLAG_NONE);
++    GST_PAD_STREAM_UNLOCK (demux->common.sinkpad);
++    return result;
+   }
+ 
+   /* delegate to tweaked regular seek */
+diff --git a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
+--- a/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
++++ b/subprojects/gst-plugins-good/gst/matroska/matroska-demux.h
+@@ -103,7 +103,6 @@
+ 
+   /* index stuff */
+   gboolean                 seekable;
+-  gboolean                 building_index;
+   guint64                  index_offset;
+ 
+   /* Tracks after the first Cluster: where the SeekHead says it is, and
