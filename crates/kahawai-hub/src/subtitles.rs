@@ -76,9 +76,11 @@ const SETS_WAIT_IDLE: std::time::Duration = std::time::Duration::from_secs(180);
 /// text is published to the mediahost while OCR runs here.
 #[derive(Default)]
 pub(crate) struct SweepWork {
-    /// (mediahost, collection, source) per cold file — one entry per file,
-    /// since extraction walks the whole container at once.
-    pub text: Vec<(String, String, kahawai_proto::v1::SourcePath)>,
+    /// (mediahost, collection, work item) per cold file — one entry per
+    /// file, since extraction walks the whole container at once. The item
+    /// carries the source revision: a reply that cannot echo it back is
+    /// unkeyable, and the hub discards it.
+    pub text: Vec<(String, String, kahawai_proto::v1::SubsWorkItem)>,
     #[cfg(feature = "ocr")]
     pub ocr: Vec<crate::tracks::Track>,
 }
@@ -841,31 +843,38 @@ impl Subtitles {
                 };
                 let mut by_collection: std::collections::BTreeMap<
                     (String, String),
-                    Vec<kahawai_proto::v1::SourcePath>,
+                    Vec<kahawai_proto::v1::SubsWorkItem>,
                 > = Default::default();
-                for (module_id, collection_id, source) in work.text {
+                // Grouping is a wire requirement -- a worklist names one
+                // collection -- so the round's global order is carried as a
+                // rank on each item rather than implied by position, which
+                // grouping would otherwise destroy.
+                for (rank, (module_id, collection_id, mut item)) in
+                    work.text.into_iter().enumerate()
+                {
+                    item.rank = rank.try_into().unwrap_or(u32::MAX);
                     by_collection
                         .entry((module_id, collection_id))
                         .or_default()
-                        .push(source);
+                        .push(item);
                 }
                 let (mut sent, mut skipped) = (0usize, 0usize);
-                for ((module_id, collection_id), sources) in by_collection {
+                for ((module_id, collection_id), items) in by_collection {
                     if !registry.is_connected(&module_id) {
-                        skipped += sources.len();
+                        skipped += items.len();
                         continue; // not a failure — the next round retries
                     }
-                    sent += sources.len();
-                    tracing::info!(%module_id, collection = %collection_id, files = sources.len(),
+                    sent += items.len();
+                    tracing::info!(%module_id, collection = %collection_id, files = items.len(),
                         "sending subtitle prewarm worklist");
                     // Chunked: one message naming every cold file in a large
                     // collection is a needlessly large frame.
-                    for chunk in sources.chunks(5000) {
+                    for chunk in items.chunks(5000) {
                         let msg = kahawai_proto::v1::HubToHost {
                             msg: Some(kahawai_proto::v1::hub_to_host::Msg::SubsWorklist(
                                 kahawai_proto::v1::SubsWorklist {
                                     collection_id: collection_id.clone(),
-                                    sources: chunk.to_vec(),
+                                    items: chunk.to_vec(),
                                 },
                             )),
                         };

@@ -2043,7 +2043,8 @@ impl Engine {
                 Ok(None)
             }
             hub_to_host::Msg::SubsWorklist(w) => {
-                validate_sources("SubsWorklist", &w.sources)?;
+                let sources: Vec<_> = w.items.iter().filter_map(|i| i.source.clone()).collect();
+                validate_sources("SubsWorklist", &sources)?;
                 let _ = self.hash_tx.try_send(hasher::JobMsg::SubsWorklist(w));
                 Ok(None)
             }

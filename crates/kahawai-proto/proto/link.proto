@@ -492,9 +492,26 @@ message ImageSubBlock {
   bytes payload = 3;
 }
 
+message SubsWorkItem {
+  SourcePath source = 1;
+  // Opaque source revision captured by the hub; echoed unchanged in replies.
+  // Without it the hub cannot key the extracted cues to the bytes it asked
+  // about, and drops the reply.
+  string source_revision = 2;
+  // Position in the hub's ranked backlog, lowest first, across every
+  // collection in the round. A worklist has to name one collection, so
+  // without this the mediahost can only see the order inside each message
+  // and works whole collections in whatever order they arrive -- putting
+  // the series someone is watching behind thousands of unrelated files.
+  uint32 rank = 3;
+}
+
 message SubsWorklist {
   string collection_id = 1;
-  repeated SourcePath sources = 2;
+  // Was `repeated SourcePath sources`, which carried no revision: every
+  // reply to it came back unkeyable and was discarded on arrival.
+  reserved 2;
+  repeated SubsWorkItem items = 3;
 }
 
 message AttachmentsWorklist {

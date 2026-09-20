@@ -48,6 +48,11 @@ pub struct RetryClaim {
 struct Tier {
     q: VecDeque<(String, String, String)>,
     seen: HashSet<(String, String, String)>,
+    /// Only the subtitle tier has these: the hub's opaque revision for each
+    /// queued file, which the reply must echo or the hub cannot key the cues
+    /// to the bytes it asked about and throws them away, and the rank it gave
+    /// that file in the round's backlog.
+    meta: HashMap<(String, String, String), SubsWork>,
 }
 
 fn source(root_token: &str, path_rel: &str) -> Option<kahawai_proto::v1::SourcePath> {
@@ -55,6 +60,13 @@ fn source(root_token: &str, path_rel: &str) -> Option<kahawai_proto::v1::SourceP
         root_token: root_token.to_string(),
         path_rel: path_rel.to_string(),
     })
+}
+
+/// What the hub said about one queued subtitle file, beyond its identity.
+#[derive(Clone, Default)]
+struct SubsWork {
+    revision: String,
+    rank: u32,
 }
 
 impl Tier {
@@ -69,6 +81,48 @@ impl Tier {
                 self.q.push_back(key);
             }
         }
+    }
+
+    fn push_revisioned(
+        &mut self,
+        collection_id: &str,
+        items: Vec<kahawai_proto::v1::SubsWorkItem>,
+    ) {
+        for item in items {
+            let Some(source) = item.source else { continue };
+            let key = (
+                collection_id.to_string(),
+                source.root_token,
+                source.path_rel,
+            );
+            // A re-offer of a file already queued still refreshes both:
+            // the newer worklist saw the newer bytes, and ranked the file
+            // against a backlog that has moved on since.
+            self.meta.insert(
+                key.clone(),
+                SubsWork {
+                    revision: item.source_revision.clone(),
+                    rank: item.rank,
+                },
+            );
+            if self.seen.insert(key.clone()) {
+                self.q.push_back(key);
+            }
+        }
+    }
+
+    /// Put the queue in the hub's ranked order.
+    ///
+    /// A worklist names one collection, so a round arrives as several
+    /// messages and arrival order says nothing about what is most wanted.
+    /// The rank does, across the whole round.
+    fn sort_by_rank(&mut self) {
+        let rank = |key: &(String, String, String)| {
+            self.meta.get(key).map(|work| work.rank).unwrap_or(u32::MAX)
+        };
+        let mut queued: Vec<_> = self.q.drain(..).collect();
+        queued.sort_by_key(rank);
+        self.q.extend(queued);
     }
 }
 
@@ -139,7 +193,11 @@ fn intake(msg: JobMsg, queues: &mut Queues) -> bool {
             false
         }
         JobMsg::SubsWorklist(w) => {
-            queues.subs.push(&w.collection_id, w.sources);
+            // Logged on receipt, mirroring the hub's "sending" line: a
+            // worklist that never arrives is one grep rather than a guess.
+            tracing::info!(collection = %w.collection_id, files = w.items.len(),
+                "subtitle worklist received");
+            queues.subs.push_revisioned(&w.collection_id, w.items);
             false
         }
         JobMsg::AttachmentsWorklist(w) => {
@@ -316,8 +374,18 @@ pub async fn run(
                 Bg::Keyframe => &mut queues.keys,
                 Bg::Geometry => &mut queues.geometry,
             };
+            if which == Bg::Subs {
+                tier.sort_by_rank();
+            }
             while let Some(key) = tier.q.pop_front() {
                 let (collection_id, root_token, path_rel) = key.clone();
+                // Empty for every tier but Subs, and harmless there: the
+                // other kinds of work carry no revision to echo.
+                let revision = tier
+                    .meta
+                    .get(&key)
+                    .map(|work| work.revision.clone())
+                    .unwrap_or_default();
                 let scheduler = scheduler.clone();
                 let collections = collections.clone();
                 let tx = tx.clone();
@@ -340,6 +408,7 @@ pub async fn run(
                             &collection_id,
                             &root_token,
                             &path_rel,
+                            &revision,
                             permit,
                             &tx,
                             retry_tx.as_ref(),
@@ -380,6 +449,7 @@ pub async fn run(
                         Bg::Geometry => &mut queues.geometry,
                     };
                     tier.seen.remove(&key);
+                    tier.meta.remove(&key);
                 }
             }
         }
@@ -393,6 +463,8 @@ async fn run_background_job(
     collection_id: &str,
     root_token: &str,
     path_rel: &str,
+    // Only `Bg::Subs` has one; empty everywhere else.
+    source_revision: &str,
     permit: JobPermit,
     tx: &tokio::sync::mpsc::Sender<HostToHub>,
     retry_tx: Option<&tokio::sync::mpsc::UnboundedSender<RetryClaim>>,
@@ -437,7 +509,7 @@ async fn run_background_job(
                 collection_id,
                 root_token,
                 path_rel,
-                "",
+                source_revision,
                 Some(background),
                 Some(permit),
                 tx,
@@ -1119,5 +1191,62 @@ mod subtitle_revision_tests {
         };
         assert_eq!(message.source_revision, "empty-revision");
         assert_eq!(message.done, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn item(path: &str, rank: u32) -> kahawai_proto::v1::SubsWorkItem {
+        kahawai_proto::v1::SubsWorkItem {
+            source: Some(kahawai_proto::v1::SourcePath {
+                root_token: "root".into(),
+                path_rel: path.into(),
+            }),
+            source_revision: format!("rev-{path}"),
+            rank,
+        }
+    }
+
+    #[test]
+    fn the_hubs_ranking_survives_being_split_across_collection_messages() {
+        let mut tier = Tier::default();
+        // One round, delivered as one message per collection. The series
+        // someone is watching is ranked first but arrives last.
+        tier.push_revisioned("anime", vec![item("Anime/a.mkv", 2)]);
+        tier.push_revisioned("movies", vec![item("Movies/m.mkv", 1)]);
+        tier.push_revisioned("series", vec![item("Series/watching.mkv", 0)]);
+        tier.sort_by_rank();
+        let order: Vec<_> = tier.q.iter().map(|(_, _, path)| path.as_str()).collect();
+        assert_eq!(
+            order,
+            vec!["Series/watching.mkv", "Movies/m.mkv", "Anime/a.mkv"],
+            "the round's own order, not the order its messages happened to arrive in"
+        );
+    }
+
+    #[test]
+    fn a_re_offer_updates_rank_and_revision_without_queueing_twice() {
+        let mut tier = Tier::default();
+        tier.push_revisioned("series", vec![item("Series/e01.mkv", 40)]);
+        tier.push_revisioned("series", vec![item("Series/e02.mkv", 5)]);
+        // The next round finds e01 in flight and ranks it first.
+        let mut promoted = item("Series/e01.mkv", 0);
+        promoted.source_revision = "rev-new".into();
+        tier.push_revisioned("series", vec![promoted]);
+        tier.sort_by_rank();
+        let order: Vec<_> = tier.q.iter().map(|(_, _, path)| path.as_str()).collect();
+        assert_eq!(order, vec!["Series/e01.mkv", "Series/e02.mkv"]);
+        let key = (
+            "series".to_string(),
+            "root".to_string(),
+            "Series/e01.mkv".to_string(),
+        );
+        assert_eq!(
+            tier.meta.get(&key).map(|work| work.revision.as_str()),
+            Some("rev-new"),
+            "the newer worklist saw the newer bytes"
+        );
     }
 }

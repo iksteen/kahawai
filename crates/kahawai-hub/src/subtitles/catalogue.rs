@@ -201,7 +201,7 @@ impl Subtitles {
             crate::workorder::Ordered,
             String,
             String,
-            kahawai_proto::v1::SourcePath,
+            kahawai_proto::v1::SubsWorkItem,
         )> = vec![];
         #[cfg(feature = "ocr")]
         let mut ocr: Vec<(crate::workorder::Ordered, Track)> = vec![];
@@ -296,9 +296,18 @@ impl Subtitles {
                             rank(),
                             source.module_id.clone(),
                             source.collection_id.clone(),
-                            kahawai_proto::v1::SourcePath {
-                                root_token: source.root_token.clone(),
-                                path_rel: source.path_rel.clone(),
+                            kahawai_proto::v1::SubsWorkItem {
+                                source: Some(kahawai_proto::v1::SourcePath {
+                                    root_token: source.root_token.clone(),
+                                    path_rel: source.path_rel.clone(),
+                                }),
+                                // Every embedded track of one file shares the
+                                // file's revision, so the first one to name
+                                // this file settles it.
+                                source_revision: revision.to_string(),
+                                // Stamped by the sweep once the whole round
+                                // is in order; the walk cannot know it yet.
+                                rank: 0,
                             },
                         ));
                     }
@@ -311,7 +320,7 @@ impl Subtitles {
         Ok(SweepWork {
             text: text
                 .into_iter()
-                .map(|(_, module, collection, source)| (module, collection, source))
+                .map(|(_, module, collection, item)| (module, collection, item))
                 .collect(),
             #[cfg(feature = "ocr")]
             ocr: ocr.into_iter().map(|(_, track)| track).collect(),
@@ -675,14 +684,23 @@ mod tests {
         let cold = subs.catalogue_sweep_work(&registry).await.unwrap().text;
         assert_eq!(
             cold.iter()
-                .map(|(_, _, s)| s.path_rel.as_str())
+                .map(|(_, _, item)| item.source.as_ref().unwrap().path_rel.as_str())
                 .collect::<Vec<_>>(),
             vec!["Many.mkv"],
             "one entry for the three-track file, none for the image-only one"
         );
 
-        // Once every text track of that file is cached, it drops out.
-        let (module, collection, source) = cold[0].clone();
+        // Once every text track of that file is cached, it drops out --
+        // keyed by the revision the worklist CARRIES, not one the test
+        // derives for itself. A worklist that names a file without saying
+        // which bytes it means cannot be answered: the reply keys nothing,
+        // the file stays cold, and the sweep offers it again forever.
+        let (module, collection, item) = cold[0].clone();
+        let source = item.source.clone().expect("worklist item names a source");
+        assert!(
+            !item.source_revision.is_empty(),
+            "the worklist must carry the revision its reply has to echo"
+        );
         for key in ["e0", "e1", "e2"] {
             subs.store_extracted(
                 &module,
@@ -690,7 +708,7 @@ mod tests {
                 &source.root_token,
                 &source.path_rel,
                 key,
-                revision_of(&subs, &registry, &source).await.as_str(),
+                &item.source_revision,
                 &kahawai_media::subtitles::Extracted {
                     cues: vec![],
                     ass: None,
@@ -706,61 +724,6 @@ mod tests {
                 .is_empty(),
             "a fully cached file is not swept again"
         );
-    }
-
-    /// The revision the prewarm keyed its cache path on, read back the same
-    /// way the candidate scan derives it.
-    #[cfg(test)]
-    async fn revision_of(
-        subs: &Subtitles,
-        registry: &Registry,
-        source: &kahawai_proto::v1::SourcePath,
-    ) -> String {
-        let _ = subs;
-        for summary in registry
-            .catalogue()
-            .collection_summaries()
-            .await
-            .unwrap()
-            .into_iter()
-        {
-            for f in registry
-                .catalogue()
-                .files(&summary.collection.id)
-                .await
-                .unwrap()
-            {
-                if f.path != source.path_rel {
-                    continue;
-                }
-                let (Some(info), Some(size)) = (&f.media, f.size) else {
-                    continue;
-                };
-                let part = PartSource {
-                    file_id: FileId::Catalogue(f.id),
-                    module_id: summary.collection.mediahost_id.clone(),
-                    collection_id: summary.collection.remote_id.clone(),
-                    root_token: f.root_token,
-                    path_rel: f.path,
-                    size,
-                    mtime_unix: f.mtime.unwrap_or(0),
-                    head_xxh3: f.head_hash.unwrap_or(0) as i64,
-                    tail_xxh3: f.tail_hash.unwrap_or(0) as i64,
-                    base_ms: 0,
-                    duration_ms: info.duration_ms.unwrap_or(0),
-                };
-                if let Some(t) = crate::sessions::catalogue::tracks(
-                    f.item_id.as_deref().unwrap_or(""),
-                    &part,
-                    info,
-                )
-                .first()
-                {
-                    return t.source_revision().unwrap().to_string();
-                }
-            }
-        }
-        panic!("no revision for {}", source.path_rel);
     }
 
     #[cfg(feature = "ocr")]
