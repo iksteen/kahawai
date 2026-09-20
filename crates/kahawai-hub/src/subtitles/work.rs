@@ -57,6 +57,7 @@ const LEASE_SECS: i64 = 3600;
 pub(crate) const HOST_ERROR_RETRY_SECS: i64 = 3600;
 /// Between OCR files, so a large backlog is a background hum rather
 /// than a CPU pin.
+#[cfg(feature = "ocr")]
 const OCR_PACE: Duration = Duration::from_secs(10);
 /// Lost-event insurance; every real change wakes the driver.
 const FALLBACK: Duration = Duration::from_secs(900);
@@ -99,6 +100,7 @@ fn tracks(file: &SourceFile) -> Vec<crate::tracks::Track> {
 }
 
 /// Cheap pre-check from the probe alone, before any track is built.
+#[cfg(feature = "ocr")]
 fn has_image_tracks(media: &kahawai_core::media::MediaInfo) -> bool {
     media
         .subtitles
