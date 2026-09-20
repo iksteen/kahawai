@@ -779,6 +779,7 @@ async fn handle_host_msg(
                             "display sets exceed the transfer limit",
                         )
                         .await?;
+                    subtitles.wake();
                 }
                 Chunk::More => {}
             }

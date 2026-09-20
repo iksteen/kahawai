@@ -7,8 +7,10 @@
 //! is the embedded text tracks, walked out of the container in one pass
 //! and settled by the host's `FileSubtitles`; `sets` is the image tracks'
 //! display sets, walked one track at a time and settled once every image
-//! track has landed (`ImageSubtitles`). One step claims a ranked batch of
-//! each kind per connected mediahost, settles the rows that need nothing
+//! track has landed (`ImageSubtitles`). Each hub keeps at most 16 unexpired
+//! file leases per kind per mediahost across collections, refilling to 16 at
+//! 8 or fewer. Image files may expand to multiple track requests. The backlog
+//! stays on the hub. One step claims the available capacity and settles rows that need nothing
 //! (no such track, or everything already cached — one `try_exists` per
 //! claimed track, never a walk), and offers the rest as one worklist
 //! message per batch carrying the batch rank. A row stays leased until
@@ -39,10 +41,13 @@ use crate::queue::{self, Step};
 use crate::registry::Registry;
 use crate::sessions::{FileId, PartSource, Sessions};
 
-/// Rows examined per claim and kind. A worklist names one collection, so
-/// a batch is split by collection on the way out, and the rank carries
-/// the batch's order across that split.
-const BATCH: usize = 256;
+/// Per hub/host/kind, across collections. Keep little work on the satellite:
+/// eight queued files cover a refill's message/query latency, while a sixteen
+/// file ceiling bounds intake and scheduler work. More frequent small refills
+/// buy responsiveness and freshly ranked priorities; the durable backlog stays
+/// here. Image files may expand to several track requests.
+const WINDOW: usize = 16;
+const REFILL_AT: usize = 8;
 /// A whole batch has to be walked before its lease matters: the host
 /// works the list at its lowest priority, so this is the fallback for a
 /// queue that vanished without a reconnect the hub saw.
@@ -264,7 +269,7 @@ impl Subtitles {
         }
     }
 
-    /// One claimed batch of each kind per connected mediahost.
+    /// Refill each eligible host/kind window, leaving the backlog on the hub.
     pub(crate) async fn step(&self, registry: &Registry) -> Result<Step> {
         let store = registry.catalogue();
         let in_flight: Vec<String> = crate::workorder::in_flight(registry.db())
@@ -273,6 +278,7 @@ impl Subtitles {
             .collect();
         let now = queue::now();
         let mut worked = false;
+        let mut next_due: Option<i64> = None;
         for host in connected_mediahosts(registry) {
             for kind in SUBTITLE_KINDS {
                 if kind == "sets" && !registry.host_supports_image_subs_worklists(&host) {
@@ -281,67 +287,77 @@ impl Subtitles {
                     // upgrade, visible as pending.
                     continue;
                 }
-                let jobs = store
-                    .claim_subtitle_jobs(kind, &host, &in_flight, now, LEASE_SECS, BATCH)
+                let (running, due) = store
+                    .subtitle_dispatch_state(kind, &host, now, REFILL_AT)
                     .await?;
-                if jobs.is_empty() {
+                next_due = next_due.into_iter().chain(due).min();
+                if running > REFILL_AT {
                     continue;
                 }
-                worked = true;
-                let mut by_collection: BTreeMap<String, Items> = Default::default();
-                let (mut settled, mut offered) = (0usize, 0usize);
-                for (rank, job) in jobs.iter().enumerate() {
-                    let rank = rank.try_into().unwrap_or(u32::MAX);
-                    let tracks = tracks(&job.file);
-                    let batch = by_collection
-                        .entry(job.file.remote_id.clone())
-                        .or_insert_with(|| match kind {
-                            "text" => Items::Text(vec![]),
-                            _ => Items::Sets(vec![]),
-                        });
-                    let before = batch.len();
-                    match batch {
-                        Items::Text(items) => {
-                            if let Some(mut item) = self.text_item(&tracks)? {
-                                item.rank = rank;
-                                items.push(item);
+                // Cached/irrelevant files settle here without consuming remote
+                // capacity. Continue this refill until the window is full or
+                // there is no eligible work, even if those local settlements
+                // leave it temporarily above the refill threshold.
+                loop {
+                    let jobs = store
+                        .claim_subtitle_jobs(kind, &host, &in_flight, now, LEASE_SECS, WINDOW)
+                        .await?;
+                    if jobs.is_empty() {
+                        break;
+                    }
+                    worked = true;
+                    let mut by_collection: BTreeMap<String, Items> = Default::default();
+                    let (mut settled, mut offered) = (0usize, 0usize);
+                    for (rank, job) in jobs.iter().enumerate() {
+                        let rank = rank.try_into().unwrap_or(u32::MAX);
+                        let tracks = tracks(&job.file);
+                        let batch = by_collection
+                            .entry(job.file.remote_id.clone())
+                            .or_insert_with(|| match kind {
+                                "text" => Items::Text(vec![]),
+                                _ => Items::Sets(vec![]),
+                            });
+                        let before = batch.len();
+                        match batch {
+                            Items::Text(items) => {
+                                if let Some(mut item) = self.text_item(&tracks)? {
+                                    item.rank = rank;
+                                    items.push(item);
+                                }
+                            }
+                            Items::Sets(items) => {
+                                for mut item in self.sets_items(registry, &tracks).await {
+                                    item.rank = rank;
+                                    items.push(item);
+                                }
                             }
                         }
-                        Items::Sets(items) => {
-                            for mut item in self.sets_items(registry, &tracks).await {
-                                item.rank = rank;
-                                items.push(item);
-                            }
+                        if batch.len() == before {
+                            settled += 1;
+                            store.finish_subtitle_job(&job.file.file_id, kind).await?;
+                        } else {
+                            offered += 1;
                         }
                     }
-                    if batch.len() == before {
-                        settled += 1;
-                        store.finish_subtitle_job(&job.file.file_id, kind).await?;
-                    } else {
-                        offered += 1;
-                    }
-                }
-                'send: for (collection_id, items) in by_collection {
-                    for msg in items.messages(&collection_id) {
-                        if let Err(error) = registry.send_to_host(&host, msg).await {
-                            tracing::warn!(module_id = %host, kind, error = format!("{error:#}"),
+                    for (collection_id, items) in by_collection {
+                        for msg in items.messages(&collection_id) {
+                            if let Err(error) = registry.send_to_host(&host, msg).await {
+                                tracing::warn!(module_id = %host, kind, error = format!("{error:#}"),
                                 "subtitle worklist send failed; releasing the batch");
-                            store.release_subtitle_host(&host).await?;
-                            break 'send;
+                                store.release_subtitle_host(&host).await?;
+                                return Err(error);
+                            }
                         }
                     }
+                    tracing::info!(module_id = %host, kind, offered, settled, "subtitle work claimed");
+                    if settled == 0 {
+                        break;
+                    }
                 }
-                tracing::info!(module_id = %host, kind, offered, settled, "subtitle work claimed");
             }
         }
         if worked {
             return Ok(Step::Worked);
-        }
-        let mut next_due: Option<i64> = None;
-        for kind in SUBTITLE_KINDS {
-            if let Some(due) = store.subtitle_jobs_next_due(kind).await? {
-                next_due = Some(next_due.map_or(due, |d| d.min(due)));
-            }
         }
         Ok(Step::Idle { next_due })
     }
@@ -450,6 +466,7 @@ impl Subtitles {
                 .catalogue()
                 .finish_subtitle_job(&file.file_id, "sets")
                 .await?;
+            self.wake();
         }
         self.ocr_enqueue(file);
         Ok(())
@@ -708,6 +725,130 @@ mod tests {
             .collect()
     }
 
+    #[tokio::test]
+    async fn work_windows_refill_at_eight_without_draining_the_backlog() {
+        let names: Vec<_> = (0..40).map(|n| format!("File {n:02}.mkv")).collect();
+        let media = serde_json::json!({"container":"mkv","subtitles":[
+            {"format":"subrip","language":"eng"},
+            {"format":"pgs","language":"eng"}
+        ]});
+        let (_dir, registry, subs) = fixture(
+            names
+                .iter()
+                .map(|name| (name.as_str(), media.clone()))
+                .collect(),
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.connected("host", "mediahost", "Fixture", "fp", "test");
+        assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
+        let sent = drain(&mut rx);
+        assert_eq!(sent.len(), 2);
+        let text = sent
+            .iter()
+            .find_map(|m| match m {
+                p::hub_to_host::Msg::SubsWorklist(w) => Some(w),
+                _ => None,
+            })
+            .unwrap();
+        assert_eq!(text.items.len(), WINDOW);
+        for kind in SUBTITLE_KINDS {
+            assert_eq!(
+                states(&registry, kind).await,
+                vec![("pending".into(), 24), ("running".into(), 16)]
+            );
+        }
+        for completed in 0..8 {
+            let Step::Idle { next_due } = subs.step(&registry).await.unwrap() else {
+                panic!("more than eight outstanding jobs must prevent a refill");
+            };
+            assert!(
+                next_due.unwrap() > queue::now(),
+                "pending backlog must not spin the driver"
+            );
+            assert!(drain(&mut rx).is_empty());
+            registry
+                .catalogue()
+                .finish_subtitle_source(
+                    "host",
+                    "series",
+                    text.items[completed].source.as_ref().unwrap(),
+                    "text",
+                )
+                .await
+                .unwrap();
+        }
+        assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
+        let refilled = drain(&mut rx);
+        assert!(
+            matches!(refilled.as_slice(), [p::hub_to_host::Msg::SubsWorklist(w)] if w.items.len() == 8)
+        );
+        assert_eq!(
+            states(&registry, "text").await,
+            vec![
+                ("done".into(), 8),
+                ("pending".into(), 16),
+                ("running".into(), 16)
+            ]
+        );
+        assert_eq!(
+            states(&registry, "sets").await,
+            vec![("pending".into(), 24), ("running".into(), 16)]
+        );
+
+        registry.disconnected("host");
+        assert!(
+            matches!(
+                subs.step(&registry).await.unwrap(),
+                Step::Idle { next_due: None }
+            ),
+            "an offline backlog must wait for reconnect rather than spin"
+        );
+    }
+
+    #[tokio::test]
+    async fn locally_settled_files_do_not_leave_a_refill_half_empty() {
+        let names: Vec<_> = (0..32).map(|n| format!("File {n:02}.mkv")).collect();
+        let (_dir, registry, subs) = fixture(
+            names
+                .iter()
+                .enumerate()
+                .map(|(n, name)| {
+                    let media = if n < 6 {
+                        serde_json::json!({"container":"mkv"})
+                    } else {
+                        serde_json::json!({"container":"mkv","subtitles":[{"format":"subrip"}]})
+                    };
+                    (name.as_str(), media)
+                })
+                .collect(),
+        )
+        .await;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(32);
+        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.connected("host", "mediahost", "Fixture", "fp", "test");
+        assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
+        let sent = drain(&mut rx);
+        let offered: usize = sent
+            .iter()
+            .map(|m| match m {
+                p::hub_to_host::Msg::SubsWorklist(w) => w.items.len(),
+                _ => 0,
+            })
+            .sum();
+        assert_eq!(offered, 16);
+        assert_eq!(
+            states(&registry, "text").await,
+            vec![
+                ("done".into(), 6),
+                ("pending".into(), 10),
+                ("running".into(), 16)
+            ]
+        );
+        assert_eq!(states(&registry, "sets").await, vec![("done".into(), 32)]);
+    }
+
     /// A file is named once however many text tracks it carries: the
     /// mediahost extracts the whole container in one pass. Image tracks go
     /// out as the `sets` kind's own worklist, and a file with nothing of a
@@ -827,7 +968,11 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
+        let refill = subs.wake.notified();
         subs.sets_landed(&registry, image).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(1), refill)
+            .await
+            .expect("image completion must wake the window refill");
         assert_eq!(states(&registry, "text").await, vec![("done".into(), 2)]);
         assert_eq!(states(&registry, "sets").await, vec![("done".into(), 2)]);
 
@@ -890,7 +1035,10 @@ mod tests {
         let (tx, rx) = tokio::sync::mpsc::channel(1);
         registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
         drop(rx);
-        assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
+        assert!(
+            subs.step(&registry).await.is_err(),
+            "send failures must use the driver's retry delay instead of spinning"
+        );
         assert_eq!(states(&registry, "text").await, vec![("pending".into(), 1)]);
     }
 

@@ -360,3 +360,110 @@ async fn a_source_resolves_by_media_path_or_by_sidecar_path() {
     );
     assert_eq!(states(&store).await, vec![("pending".to_string(), 1)]);
 }
+
+#[tokio::test]
+async fn dispatch_window_is_shared_across_collections_and_atomic_between_claims() {
+    let (_dir, store) = store().await;
+    for collection in ["films", "extras"] {
+        store
+            .offer_collection("host", &offer(collection, MediaType::Movies, 20))
+            .await
+            .unwrap();
+        let records = (1..=20)
+            .map(|n| file_at(n, &format!("Film {n}.mkv"), 10, n as i64))
+            .collect();
+        store
+            .apply_catalogue("host", &delta(collection, true, true, 20, records))
+            .await
+            .unwrap();
+    }
+    let (first, second) = tokio::join!(
+        store.claim_subtitle_jobs("text", "host", &[], 1000, 60, 16),
+        store.claim_subtitle_jobs("text", "host", &[], 1000, 60, 16),
+    );
+    let jobs: Vec<_> = first.unwrap().into_iter().chain(second.unwrap()).collect();
+    assert_eq!(jobs.len(), 16, "concurrent claims share a host-wide window");
+    assert_eq!(
+        store
+            .subtitle_dispatch_state("text", "host", 1000, 8)
+            .await
+            .unwrap(),
+        (16, Some(1060)),
+        "a full window sleeps until expiry despite pending rows"
+    );
+    assert_eq!(
+        store
+            .subtitle_dispatch_state("text", "other", 1000, 8)
+            .await
+            .unwrap(),
+        (0, None)
+    );
+    for job in jobs.iter().take(7) {
+        store
+            .finish_subtitle_job(&job.file.file_id, "text")
+            .await
+            .unwrap();
+    }
+    assert_eq!(
+        store
+            .subtitle_dispatch_state("text", "host", 1000, 8)
+            .await
+            .unwrap(),
+        (9, Some(1060))
+    );
+    store
+        .finish_subtitle_job(&jobs[7].file.file_id, "text")
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .subtitle_dispatch_state("text", "host", 1000, 8)
+            .await
+            .unwrap(),
+        (8, Some(0))
+    );
+    assert_eq!(
+        store
+            .claim_subtitle_jobs("text", "host", &[], 1000, 60, 16)
+            .await
+            .unwrap()
+            .len(),
+        8
+    );
+    assert_eq!(
+        store
+            .claim_subtitle_jobs("sets", "host", &[], 1000, 60, 16)
+            .await
+            .unwrap()
+            .len(),
+        16,
+        "each kind has its own window"
+    );
+    assert_eq!(
+        store
+            .subtitle_dispatch_state("text", "host", 1061, 8)
+            .await
+            .unwrap()
+            .0,
+        0
+    );
+    assert_eq!(
+        store
+            .claim_subtitle_jobs("text", "host", &[], 1061, 60, 16)
+            .await
+            .unwrap()
+            .len(),
+        16,
+        "expired leases permit a bounded retry"
+    );
+    store.release_subtitle_host("host").await.unwrap();
+    assert_eq!(
+        store
+            .claim_subtitle_jobs("text", "host", &[], 1062, 60, 16)
+            .await
+            .unwrap()
+            .len(),
+        16,
+        "reconnect does not dump the released backlog"
+    );
+}
