@@ -149,6 +149,10 @@ struct State {
     io_capacity: BTreeMap<String, usize>,
     pending: Vec<Pending>,
     active: HashMap<u64, Active>,
+    /// Jobs admitted per owner per priority, for [fair_order]. Kept across
+    /// dispatches; read relative to the lowest waiting owner, so it never
+    /// matters how large these grow.
+    served: BTreeMap<(Priority, Option<String>), u64>,
     interactive: HashMap<u64, Resources>,
     hints: HashMap<(String, String, String, String), std::time::Instant>,
 }
@@ -259,6 +263,7 @@ impl Scheduler {
                     cpu_capacity: config.cpu_slots,
                     io_capacity,
                     pending: Vec::new(),
+                    served: BTreeMap::new(),
                     active: HashMap::new(),
                     interactive: HashMap::new(),
                     hints: HashMap::new(),
@@ -341,6 +346,7 @@ impl Scheduler {
             state.next_id += 1;
             let sequence = state.next_sequence;
             state.next_sequence += 1;
+            join_service_level(&mut state, priority, owner.as_deref());
             state.pending.push(Pending {
                 id,
                 sequence,
@@ -573,14 +579,110 @@ fn request_preemption(state: &mut State) {
     }
 }
 
+/// Admission order within a priority: round-robin across owners, oldest
+/// first inside each one.
+///
+/// Sequence alone is a single global FIFO, which starves an owner that
+/// queues second. Two hubs sharing one mediahost do exactly that — each
+/// drains its whole prewarm backlog into the scheduler at once, so the link
+/// that got there first holds the lane for as long as its thousands of files
+/// take, and the other waits behind every one of them.
+///
+/// So a job's position is how many of its owner's jobs have already been
+/// admitted, plus its age within its owner's own queue. That count has to
+/// persist across dispatches: recomputing rank from the pending set alone
+/// just rebuilds the FIFO, because removing an owner's head makes its next
+/// job rank zero again.
+///
+/// Counts are read relative to the lowest among the owners actually waiting,
+/// which keeps the numbers small; what stops a newcomer from bursting past
+/// everyone on a lifetime count of zero is [join_service_level].
+fn fair_order(
+    pending: &[Pending],
+    served: &BTreeMap<(Priority, Option<String>), u64>,
+) -> Vec<usize> {
+    let served: BTreeMap<(Priority, Option<&str>), u64> = served
+        .iter()
+        .map(|((priority, owner), count)| ((*priority, owner.as_deref()), *count))
+        .collect();
+    let mut order: Vec<usize> = (0..pending.len()).collect();
+    order.sort_by_key(|index| {
+        let job = &pending[*index];
+        (job.priority, job.sequence)
+    });
+    let mut next_rank: BTreeMap<(Priority, Option<&str>), u64> = BTreeMap::new();
+    let mut rank = vec![0u64; pending.len()];
+    let mut floor: BTreeMap<Priority, u64> = BTreeMap::new();
+    for &index in &order {
+        let job = &pending[index];
+        let key = (job.priority, job.owner.as_deref());
+        let slot = next_rank.entry(key).or_insert(0);
+        rank[index] = *slot;
+        *slot += 1;
+        let count = served.get(&key).copied().unwrap_or(0);
+        floor
+            .entry(job.priority)
+            .and_modify(|low| *low = (*low).min(count))
+            .or_insert(count);
+    }
+    order.sort_by_key(|index| {
+        let job = &pending[*index];
+        let key = (job.priority, job.owner.as_deref());
+        let count = served.get(&key).copied().unwrap_or(0);
+        let low = floor.get(&job.priority).copied().unwrap_or(0);
+        (job.priority, count - low + rank[*index], job.sequence)
+    });
+    order
+}
+
+/// Bring an owner with nothing queued up to the service level of those that
+/// are, as it joins the queue.
+///
+/// [fair_order] compares admission counts, and a difference between them
+/// survives any common offset. So an owner arriving with a lifetime count of
+/// zero beside one that has been served ten thousand times does not merely
+/// get its fair share — it gets ten thousand admissions before the other is
+/// considered again, which is the same starvation in the other direction.
+/// Joining at the lowest count among the owners already waiting makes
+/// arrival worth exactly one turn, whatever happened before it.
+///
+/// Only an owner with no pending job at this priority is rebased: one that
+/// is already in the running keeps the position it has earned, including a
+/// deficit it is owed.
+fn join_service_level(state: &mut State, priority: Priority, owner: Option<&str>) {
+    if state
+        .pending
+        .iter()
+        .any(|job| job.priority == priority && job.owner.as_deref() == owner)
+    {
+        return;
+    }
+    let floor = state
+        .pending
+        .iter()
+        .filter(|job| job.priority == priority)
+        .map(|job| {
+            state
+                .served
+                .get(&(priority, job.owner.clone()))
+                .copied()
+                .unwrap_or(0)
+        })
+        .min();
+    // Nobody waiting: there is no level to join, and the floor subtraction in
+    // fair_order flattens a lone owner's count to zero anyway.
+    let Some(floor) = floor else { return };
+    let entry = state
+        .served
+        .entry((priority, owner.map(str::to_string)))
+        .or_insert(0);
+    *entry = (*entry).max(floor);
+}
+
 fn dispatch(state: &mut State) {
     refresh_demand_priorities(state);
     loop {
-        let mut order: Vec<usize> = (0..state.pending.len()).collect();
-        order.sort_by_key(|index| {
-            let job = &state.pending[*index];
-            (job.priority, job.sequence)
-        });
+        let order = fair_order(&state.pending, &state.served);
         let mut selected = None;
         for index in order {
             let job = &state.pending[index];
@@ -591,6 +693,10 @@ fn dispatch(state: &mut State) {
         }
         let Some(index) = selected else { break };
         let pending = state.pending.swap_remove(index);
+        *state
+            .served
+            .entry((pending.priority, pending.owner.clone()))
+            .or_insert(0) += 1;
         pending.control.pause.store(false, Ordering::Release);
         pending.control.granted.store(true, Ordering::Release);
         tracing::debug!(
@@ -1066,6 +1172,101 @@ mod tests {
         high.await.unwrap();
         assert_eq!(started_rx.recv().await, Some("loudness"));
         low.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn one_hubs_backlog_does_not_starve_another_hubs_work() {
+        let (_temp, scheduler, a, _) = scheduler();
+        let blocker = scheduler.enter_interactive(scheduler.resources([a.as_str()], false), "hold");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = vec![];
+        // One hub queues its whole prewarm backlog before the other gets a
+        // word in — which is what two sweeps landing minutes apart look like.
+        for (owner, count) in [("hub:one", 3), ("hub:two", 2)] {
+            for n in 0..count {
+                let scheduler = scheduler.clone();
+                let root = a.clone();
+                let tx = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    let permit = scheduler
+                        .acquire(
+                            Priority::SubtitlePrewarm,
+                            scheduler.resources([root.as_str()], false),
+                            Some(owner.to_string()),
+                            format!("{owner} #{n}"),
+                        )
+                        .await
+                        .unwrap();
+                    tx.send(owner).unwrap();
+                    drop(permit);
+                }));
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(tx);
+        drop(blocker);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut admitted = vec![];
+        while let Some(owner) = rx.recv().await {
+            admitted.push(owner);
+        }
+        assert_eq!(
+            admitted,
+            vec!["hub:one", "hub:two", "hub:one", "hub:two", "hub:one"],
+            "round-robin between hubs, oldest first within each"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hub_joining_late_gets_a_turn_not_a_thousand() {
+        let (_temp, scheduler, a, _) = scheduler();
+        // One hub has been served all day before the other ever connects.
+        scheduler.inner.state.lock().unwrap().served.insert(
+            (Priority::SubtitlePrewarm, Some("hub:old".to_string())),
+            1_000,
+        );
+        let blocker = scheduler.enter_interactive(scheduler.resources([a.as_str()], false), "hold");
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let mut tasks = vec![];
+        for (owner, count) in [("hub:old", 3), ("hub:new", 3)] {
+            for n in 0..count {
+                let scheduler = scheduler.clone();
+                let root = a.clone();
+                let tx = tx.clone();
+                tasks.push(tokio::spawn(async move {
+                    let permit = scheduler
+                        .acquire(
+                            Priority::SubtitlePrewarm,
+                            scheduler.resources([root.as_str()], false),
+                            Some(owner.to_string()),
+                            format!("{owner} #{n}"),
+                        )
+                        .await
+                        .unwrap();
+                    tx.send(owner).unwrap();
+                    drop(permit);
+                }));
+                tokio::task::yield_now().await;
+            }
+        }
+        drop(tx);
+        drop(blocker);
+        for task in tasks {
+            task.await.unwrap();
+        }
+        let mut admitted = vec![];
+        while let Some(owner) = rx.recv().await {
+            admitted.push(owner);
+        }
+        assert_eq!(
+            admitted,
+            vec![
+                "hub:old", "hub:new", "hub:old", "hub:new", "hub:old", "hub:new"
+            ],
+            "a newcomer joins the current service level instead of              collecting a thousand admissions of back pay"
+        );
     }
 
     #[tokio::test]
