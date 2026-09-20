@@ -11,6 +11,10 @@
 //! indefinitely; per-hub ACKs and the replay floor make later compaction safe.
 //! A restored hub below that floor resets its projection and takes a live
 //! snapshot, so compaction can never turn a deletion into a resurrected file.
+//! Snapshot/delta page producers hold a query-only reader transaction across
+//! network backpressure. They must never borrow the serialized writer: a link
+//! waiting to persist its hub's ACK would otherwise stop handling heartbeats and
+//! playback reads until that same hub drains the snapshot.
 //!
 //! Segment progress counts missing facts only in schedulable comparison groups,
 //! using the scheduler's grouping. Lone episodes and non-episode files do not
@@ -1071,7 +1075,7 @@ impl Catalog {
         snapshot: bool,
     ) -> Result<tokio::sync::mpsc::Receiver<Result<Delta>>> {
         const RECORDS_PER_PAGE: usize = 256;
-        let mut transaction = self.db.begin().await?;
+        let mut transaction = self.db.read_pool().begin().await?;
         let row = sqlx::query(
             "SELECT epoch,current_version,oldest_replayable_version
                FROM catalog_collections WHERE id=? AND retired=0",
@@ -2097,10 +2101,44 @@ mod tests {
         let first = pages.recv().await.unwrap().unwrap();
         assert_eq!(first.records.len(), 256);
         assert!(!first.done);
+        // Leave the remaining pages undrained, as a slow hub does. Neither
+        // its ACK nor discovery writes may wait for that network consumer.
+        let writer_catalog = catalog.clone();
+        let epoch = first.epoch.clone();
+        let writer = tokio::spawn(async move {
+            writer_catalog
+                .acknowledge("slow-hub", "movies", &epoch, 257)
+                .await
+                .unwrap();
+            writer_catalog
+                .upsert_file(
+                    "movies",
+                    &FileRecord {
+                        source: Some(SourcePath::new(root_token.clone(), "Film 256.mkv")),
+                        size: 1000,
+                        mtime_unix: 1000,
+                        streams_json: serde_json::to_string(&media_info(true)).unwrap(),
+                        ..Default::default()
+                    },
+                    generation,
+                )
+                .await
+                .unwrap();
+        });
+        tokio::time::timeout(Duration::from_secs(2), writer)
+            .await
+            .expect("a stalled snapshot held the catalogue writer and blocked the control link")
+            .unwrap();
         let second = pages.recv().await.unwrap().unwrap();
         assert_eq!(second.records.len(), 1);
         assert!(!second.done);
         assert_eq!(second.current_version, 257);
+        let upsert =
+            kahawai_proto::v1::FileUpsert::decode(second.records[0].payload.as_slice()).unwrap();
+        assert_eq!(
+            upsert.files[0].size, 257,
+            "the snapshot must retain its original revision"
+        );
         let final_page = pages.recv().await.unwrap().unwrap();
         assert!(final_page.records.is_empty());
         assert!(final_page.done);
