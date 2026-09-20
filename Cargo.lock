@@ -2025,7 +2025,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "axum",
@@ -2050,7 +2050,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-core"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "data-encoding",
  "libc",
@@ -2064,7 +2064,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-hub"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -2121,7 +2121,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-intro"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "gstreamer",
@@ -2137,7 +2137,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-media"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "base64 0.23.0",
@@ -2161,7 +2161,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-mediadb"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "kahawai-core",
@@ -2181,7 +2181,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-mediahost"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "crc32fast",
@@ -2211,7 +2211,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-mediahostd"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2223,7 +2223,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-proto"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "prost",
  "tonic",
@@ -2233,7 +2233,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-runtime"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2252,7 +2252,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-sqlite"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -2267,7 +2267,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-transcoder"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "kahawai-core",
@@ -2285,7 +2285,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-transcoderd"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "clap",
@@ -2296,7 +2296,7 @@ dependencies = [
 
 [[package]]
 name = "kahawai-transport"
-version = "0.0.0-dev"
+version = "0.0.15-rc.1"
 dependencies = [
  "anyhow",
  "hyper-util",
