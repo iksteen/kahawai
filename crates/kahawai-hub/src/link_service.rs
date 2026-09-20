@@ -633,17 +633,33 @@ async fn handle_host_msg(
         }
         host_to_hub::Msg::FileSubtitles(message) => {
             let source = message.source.context("missing subtitle source")?;
-            if message.error.is_empty()
-                && registry
-                    .catalogue()
-                    .source_exists(
-                        module_id,
-                        &message.collection_id,
-                        &source,
-                        Some(message.size),
-                    )
-                    .await?
-            {
+            // Both gates below drop the mediahost's work silently, and a drop
+            // is indistinguishable from never having extracted: the sweep
+            // re-offers the same file on its next round, forever. Say so.
+            let known = registry
+                .catalogue()
+                .source_exists(
+                    module_id,
+                    &message.collection_id,
+                    &source,
+                    Some(message.size),
+                )
+                .await?;
+            if !message.error.is_empty() || !known || message.source_revision.is_empty() {
+                tracing::warn!(
+                    module_id,
+                    collection = %message.collection_id,
+                    path = %source.path_rel,
+                    size = message.size,
+                    tracks = message.tracks.len(),
+                    error = %message.error,
+                    known,
+                    revisioned = !message.source_revision.is_empty(),
+                    "extracted subtitles discarded"
+                );
+            }
+            if message.error.is_empty() && known {
+                let mut keys = vec![];
                 for track in message.tracks {
                     let extracted = kahawai_media::subtitles::Extracted {
                         cues: serde_json::from_str(&track.cues_json)?,
@@ -658,7 +674,18 @@ async fn handle_host_msg(
                         &message.source_revision,
                         &extracted,
                     )?;
+                    keys.push(track.key);
                 }
+                // The keys are what makes a stored entry findable again: the
+                // sweep asks for `e<stream_index>`, and anything else caches
+                // under a name it will never look for.
+                tracing::info!(
+                    module_id,
+                    collection = %message.collection_id,
+                    path = %source.path_rel,
+                    keys = %keys.join(","),
+                    "extracted subtitles stored"
+                );
             }
         }
         host_to_hub::Msg::ImageSubtitles(mut message) => {
