@@ -1137,7 +1137,14 @@ entries track the extraction of the shared playback mechanics into
       is the PDEATHSIG guard, niceness and thread ceiling followed by
       `Job::from_args`. `crates/kahawai/tests/remux_worker.rs` pins the
       spawned binary end to end.
-- [ ] The transcoder runs dispatched sessions on the crate's executor.
+- [x] The transcoder runs dispatched sessions on the crate's executor: the
+      link byte source, the heartbeat pace report and the SessionReady/
+      SessionError/SessionLogs messages are all that remain in
+      `transcoder/src/sessions.rs`. Its readiness runway now follows the
+      hub's declared target duration when the hub sends one. A start that
+      is still prerolling when its EndSession or a replacement StartSession
+      arrives ends itself quietly instead of answering the hub with a
+      verdict meant for the newer start.
 - [ ] The hub's registry ranks placement over a fleet snapshot.
 - [ ] The hub runs local remux sessions on the crate's executor, with per-run
       directories, a death watch and local pace samples.

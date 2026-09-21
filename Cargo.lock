@@ -2289,6 +2289,7 @@ dependencies = [
  "anyhow",
  "kahawai-core",
  "kahawai-media",
+ "kahawai-playback",
  "kahawai-proto",
  "kahawai-transport",
  "rustls",
