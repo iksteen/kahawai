@@ -1,0 +1,24 @@
+[package]
+name = "kahawai-playback"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+# Sits between the media layer and the role crates: the hub, the transcoder
+# and the runtime's pipeline worker all depend on it, which is exactly why
+# it must never depend on a role crate or on anything only the hub links
+# (SQLite, axum, the OCR engine, HTTP clients). `tests/boundaries.rs` and
+# `scripts/kahawai-playback.sh lean` keep that promise visible.
+[dependencies]
+kahawai-core = { workspace = true }
+kahawai-media = { workspace = true }
+kahawai-proto = { workspace = true }
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tempfile = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]

@@ -10,7 +10,7 @@ pub mod v1 {
 /// durable local catalogue authoritative and deliberately rejects protocol 3
 /// peers, whose hub-owned manifest/worklist contract has the reverse meaning.
 pub const PROTOCOL_MAJOR: u32 = 4;
-pub const PROTOCOL_MINOR: u32 = 4;
+pub const PROTOCOL_MINOR: u32 = 5;
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
 /// Protocol features that may acquire minor-version gates after the 4.0
@@ -29,6 +29,10 @@ pub enum ProtocolFeature {
     /// Batched display-set requests (`ImageSubsWorklist`); older hosts take
     /// one `ExtractImageSubs` per track and are not offered prewarm at all.
     ImageSubsWorklists,
+    /// `StartSession.target_duration_secs`: the transcoder's readiness runway
+    /// follows the hub's playlist declaration. Informational, never a
+    /// placement filter — an older transcoder keeps the flat floor.
+    ReadinessRunway,
 }
 
 impl ProtocolFeature {
@@ -38,6 +42,7 @@ impl ProtocolFeature {
             Self::DeepRescan => 2,
             Self::RevisionedSubtitles => 3,
             Self::ImageSubsWorklists => 4,
+            Self::ReadinessRunway => 5,
             _ => 0,
         }
     }
@@ -87,8 +92,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_four_one_keeps_inherited_gates_open_and_adds_hints() {
-        assert_eq!(PROTOCOL_MINOR, 4);
+    fn protocol_four_five_keeps_inherited_gates_open_and_adds_runway() {
+        assert_eq!(PROTOCOL_MINOR, 5);
+        assert!(!ProtocolFeatures::new(4).supports(ProtocolFeature::ReadinessRunway));
+        assert!(ProtocolFeatures::current().supports(ProtocolFeature::ReadinessRunway));
         assert!(!ProtocolFeatures::new(3).supports(ProtocolFeature::ImageSubsWorklists));
         assert!(ProtocolFeatures::current().supports(ProtocolFeature::ImageSubsWorklists));
         assert!(!ProtocolFeatures::new(2).supports(ProtocolFeature::RevisionedSubtitles));

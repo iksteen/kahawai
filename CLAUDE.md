@@ -83,6 +83,11 @@ Crate dependency boundaries are deliberate and enforced by packaging:
   shared by networked satellites.
 - `kahawai-media`: GStreamer wrappers (discovery, pipeline builder, encoder
   probing). Blocking; call from `spawn_blocking`.
+- `kahawai-playback`: the pipeline job and its argv/`StartSession` codecs,
+  the supervised executor (run directory, worker sockets, readiness, log
+  bundle) and the pure placement ranker, shared by the hub, the transcoder
+  and the runtime's worker entry. Tokio, but never hub dependencies: the
+  lean transcoder daemon links it.
 - `kahawai-runtime`: config (figment: TOML + `KAHAWAI_<SECTION>__<KEY>` env
   overrides), logging, the doctor, worker plumbing. Knows nothing about roles.
 - `kahawai-sqlite`: one serialized writer + read-only WAL reader pool. Every

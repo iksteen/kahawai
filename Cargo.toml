@@ -18,6 +18,7 @@ kahawai-intro = { path = "crates/kahawai-intro" }
 kahawai-media = { path = "crates/kahawai-media" }
 kahawai-mediahost = { path = "crates/kahawai-mediahost" }
 kahawai-mediahostd = { path = "crates/kahawai-mediahostd" }
+kahawai-playback = { path = "crates/kahawai-playback" }
 kahawai-runtime = { path = "crates/kahawai-runtime" }
 kahawai-sqlite = { path = "crates/kahawai-sqlite" }
 kahawai-transcoderd = { path = "crates/kahawai-transcoderd" }

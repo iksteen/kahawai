@@ -958,6 +958,11 @@ message StartSession {
   // scalar fields for old-hub compatibility; current placement requires this
   // feature because only the worker knows its actual post-conversion layout.
   repeated AudioLayoutGain loudness_gains = 25;
+  // What the hub's playlist will declare as EXT-X-TARGETDURATION. The
+  // transcoder's readiness runway follows it the way the hub's own does
+  // (three target durations, floored at 6.5 s, capped at 30 s). 0 = unknown:
+  // a hub too old to say, and the flat 6.5 s floor those hubs always got.
+  uint32 target_duration_secs = 26;
 }
 
 message EndSession {
