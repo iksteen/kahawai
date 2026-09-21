@@ -106,7 +106,7 @@ impl Subtitles {
     pub(crate) async fn catalogue_raster(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         parent: &Track,
     ) -> Result<()> {
         let path = path(&self.dir, parent, "raster.jsonl")?;
@@ -116,7 +116,7 @@ impl Subtitles {
             return Ok(());
         }
         let script = self
-            .ass_for_burn(registry, sessions, parent)
+            .ass_for_burn(registry, bytes, parent)
             .await
             .context("no ASS script to render")?;
         let (width, height, fps) = self.raster_geometry(registry, parent).await?;
@@ -218,7 +218,7 @@ mod tests {
             Default::default(),
             kahawai_mediadb::Store::in_memory().await.unwrap(),
         );
-        let sessions = Sessions::new(dir.path().join("sessions"));
+        let sources = ByteSources::new();
         let subs = Subtitles::new(dir.path().join("subtitles"));
         for sidecar in [false, true] {
             let mut track = parent("ass");
@@ -249,7 +249,7 @@ mod tests {
             )
             .unwrap();
             assert_eq!(
-                subs.load(&registry, &sessions, &track)
+                subs.load(&registry, &sources, &track)
                     .await
                     .unwrap()
                     .ass
@@ -263,7 +263,7 @@ mod tests {
                 source.revision.push_str("-replaced");
             }
             // Offline source makes a cache miss observable without extracting media.
-            assert!(subs.load(&registry, &sessions, &track).await.is_err());
+            assert!(subs.load(&registry, &sources, &track).await.is_err());
             // A late result for the previous source must not fill the new cache.
             subs.store_extracted(
                 "host",
@@ -275,7 +275,7 @@ mod tests {
                 &body,
             )
             .unwrap();
-            assert!(subs.load(&registry, &sessions, &track).await.is_err());
+            assert!(subs.load(&registry, &sources, &track).await.is_err());
             subs.store_extracted(
                 "host",
                 "movies",
@@ -286,7 +286,7 @@ mod tests {
                 &body,
             )
             .unwrap();
-            assert!(subs.load(&registry, &sessions, &track).await.is_ok());
+            assert!(subs.load(&registry, &sources, &track).await.is_ok());
         }
         let message = kahawai_proto::v1::ImageSubtitles {
             collection_id: "movies".into(),
@@ -393,7 +393,7 @@ mod tests {
         let db = crate::db::open(dir.path()).await.unwrap();
         let catalogue = crate::db::open_catalogue(dir.path()).await.unwrap();
         let registry = Registry::new(db, Default::default(), catalogue);
-        let sessions = Sessions::new(dir.path().join("sessions"));
+        let sources = ByteSources::new();
         let subs = Subtitles::new(dir.path().join("subtitles"));
         let mut image = parent("vobsub");
         image.origin = "sidecar".into();
@@ -415,8 +415,8 @@ mod tests {
             ass: Some(SCRIPT.into()),
         }));
         let (a, b) = tokio::join!(
-            subs.catalogue_raster(&registry, &sessions, &parent),
-            subs.catalogue_raster(&registry, &sessions, &parent)
+            subs.catalogue_raster(&registry, &sources, &parent),
+            subs.catalogue_raster(&registry, &sources, &parent)
         );
         a.unwrap();
         b.unwrap();
@@ -441,7 +441,7 @@ mod tests {
             cues: vec![],
             ass: Some("invalid; cached asset must be used".into()),
         }));
-        subs.catalogue_raster(&registry, &sessions, &parent)
+        subs.catalogue_raster(&registry, &sources, &parent)
             .await
             .unwrap();
         assert_eq!(

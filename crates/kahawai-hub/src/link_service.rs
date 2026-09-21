@@ -408,6 +408,7 @@ impl MediahostLink for MediahostLinkService {
             .ok_or_else(|| Status::invalid_argument("empty byte channel"))?;
         let (req_stream, chunk_tx) = self
             .sessions
+            .bytes
             .leases
             .fulfill(&first.lease_token)
             .ok_or_else(|| Status::not_found("unknown or expired lease token"))?;

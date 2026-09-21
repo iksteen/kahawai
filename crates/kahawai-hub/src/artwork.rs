@@ -40,8 +40,8 @@ use anyhow::{Context, Result};
 use image::GenericImageView;
 use serde::{Deserialize, Serialize};
 
+use crate::bytes::ByteSources;
 use crate::registry::Registry;
-use crate::sessions::Sessions;
 
 pub struct Artwork {
     dir: PathBuf,
@@ -535,7 +535,7 @@ impl Artwork {
     pub(crate) async fn catalogue_at(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         input: &kahawai_mediadb::EnrichmentInput,
         poster: &str,
         size: Option<&str>,
@@ -566,14 +566,14 @@ impl Artwork {
             let bytes = match std::fs::read(&cache) {
                 Ok(bytes) => bytes,
                 Err(_) => {
-                    let lease = sessions
+                    let lease = bytes
                         .open_lease(
                             registry,
                             &input.mediahost_id,
                             &input.remote_id,
                             root,
                             path,
-                            crate::sessions::Reader::Sweep,
+                            crate::bytes::Reader::Sweep,
                         )
                         .await?;
                     let bytes = read_all(lease).await?;
@@ -610,7 +610,7 @@ impl Artwork {
     pub(crate) async fn prefetch_catalogue_collage(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         item: &str,
         library: &str,
     ) -> Result<()> {
@@ -625,7 +625,7 @@ impl Artwork {
             }
             let copy = registry.catalogue().enrichment_input(&donor.id).await?;
             let Some((bytes, _)) = self
-                .catalogue_at(registry, sessions, &copy, &donor.poster, Some("card"))
+                .catalogue_at(registry, bytes, &copy, &donor.poster, Some("card"))
                 .await?
             else {
                 continue;

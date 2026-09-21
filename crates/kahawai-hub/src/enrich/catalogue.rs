@@ -680,7 +680,7 @@ impl Enricher {
                     continue;
                 }
                 let lease = self
-                    .sessions
+                    .bytes
                     .get()
                     .context("metadata byte reader unavailable")?
                     .open_lease(
@@ -689,7 +689,7 @@ impl Enricher {
                         &input.remote_id,
                         &source.root_token,
                         nfo,
-                        crate::sessions::Reader::Sweep,
+                        crate::bytes::Reader::Sweep,
                     )
                     .await?;
                 let bytes = read_nfo(lease).await?;
@@ -1050,11 +1050,11 @@ impl Enricher {
             .get()
             .and_then(std::sync::Weak::upgrade)
             .context("artwork store unavailable")?;
-        let sessions = self.sessions.get().context("metadata reader unavailable")?;
+        let bytes = self.bytes.get().context("metadata reader unavailable")?;
         if provider == "artist-collage" {
             for library in registry.catalogue().copy_libraries(&input.item_id).await? {
                 artwork
-                    .prefetch_catalogue_collage(registry, sessions, &input.item_id, &library)
+                    .prefetch_catalogue_collage(registry, bytes, &input.item_id, &library)
                     .await?;
             }
         } else {
@@ -1081,7 +1081,7 @@ impl Enricher {
                 if provider == "local-artwork" {
                     for (size, _) in crate::artwork::SIZES {
                         artwork
-                            .catalogue_at(registry, sessions, input, &poster, Some(size))
+                            .catalogue_at(registry, bytes, input, &poster, Some(size))
                             .await?;
                     }
                 } else {

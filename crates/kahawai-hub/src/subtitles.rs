@@ -14,8 +14,8 @@ use anyhow::{Context, Result, bail};
 use kahawai_media::subtitles::{Extracted, decode_text, is_text_format, parse, to_vtt};
 use serde::Serialize;
 
+use crate::bytes::ByteSources;
 use crate::registry::Registry;
-use crate::sessions::Sessions;
 
 #[derive(Debug, Clone, Serialize)]
 pub struct SubtitleEntry {
@@ -256,11 +256,11 @@ impl Subtitles {
     pub async fn vtt(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         track: &crate::tracks::Track,
         shift_ms: i64,
     ) -> Result<String> {
-        let ex = self.load(registry, sessions, track).await?;
+        let ex = self.load(registry, bytes, track).await?;
         Ok(to_vtt(&ex.cues, shift_ms))
     }
 
@@ -276,10 +276,10 @@ impl Subtitles {
     pub async fn ass_for_burn(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         track: &crate::tracks::Track,
     ) -> Option<String> {
-        match self.load(registry, sessions, track).await {
+        match self.load(registry, bytes, track).await {
             Ok(ex) => ex.ass,
             Err(e) => {
                 tracing::warn!(
@@ -305,7 +305,7 @@ impl Subtitles {
     pub async fn ass_body(
         self: &Arc<Self>,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         track: &crate::tracks::Track,
     ) -> Result<AssBody> {
         if let Some(body) = &track.acquired {
@@ -318,7 +318,7 @@ impl Subtitles {
         // Downloaded/OCR ASS serves from the stored body — a hole in
         // the old keyspace (only embedded/sidecar could serve .ass).
         if key.starts_with('d') {
-            let ex = self.load(registry, sessions, track).await?;
+            let ex = self.load(registry, bytes, track).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
         let FileSource {
@@ -342,7 +342,7 @@ impl Subtitles {
 
         // Sidecars are one small read; no streaming needed.
         let Some(n) = key.strip_prefix('e') else {
-            let ex = self.load(registry, sessions, track).await?;
+            let ex = self.load(registry, bytes, track).await?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         };
         let idx: usize = n.parse().context("bad embedded key")?;
@@ -380,17 +380,17 @@ impl Subtitles {
         {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let lease = sessions
+        let lease = bytes
             .open_lease(
                 registry,
                 &module_id,
                 &collection_id,
                 &root_token,
                 &path_rel,
-                crate::sessions::Reader::Viewer,
+                crate::bytes::Reader::Viewer,
             )
             .await?;
-        let source = crate::sessions::LeaseSource {
+        let source = crate::bytes::LeaseSource {
             lease,
             size,
             handle: tokio::runtime::Handle::current(),
@@ -455,7 +455,7 @@ impl Subtitles {
     async fn load(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         track: &crate::tracks::Track,
     ) -> Result<Extracted> {
         if let Some(body) = &track.acquired {
@@ -508,14 +508,14 @@ impl Subtitles {
                 .external_subtitles
                 .get(idx)
                 .context("sidecar index out of range")?;
-            let lease = sessions
+            let lease = bytes
                 .open_lease(
                     registry,
                     &module_id,
                     &collection_id,
                     &root_token,
                     &sidecar.path_rel,
-                    crate::sessions::Reader::Viewer,
+                    crate::bytes::Reader::Viewer,
                 )
                 .await?;
             let bytes = read_all(lease).await?;
@@ -539,17 +539,17 @@ impl Subtitles {
             {
                 return Ok(ex);
             }
-            let lease = sessions
+            let lease = bytes
                 .open_lease(
                     registry,
                     &module_id,
                     &collection_id,
                     &root_token,
                     &path_rel,
-                    crate::sessions::Reader::Viewer,
+                    crate::bytes::Reader::Viewer,
                 )
                 .await?;
-            let source = crate::sessions::LeaseSource {
+            let source = crate::bytes::LeaseSource {
                 lease,
                 size,
                 handle: tokio::runtime::Handle::current(),
@@ -951,7 +951,7 @@ impl Subtitles {
     pub async fn fonts_for_source(
         &self,
         registry: &Registry,
-        sessions: &Sessions,
+        bytes: &ByteSources,
         source: FileSource,
     ) -> Result<Vec<(String, Vec<u8>)>> {
         let FileSource {
@@ -1010,14 +1010,14 @@ impl Subtitles {
                     Vec::new()
                 } else {
                     use tokio_stream::StreamExt;
-                    let lease = sessions
+                    let lease = bytes
                         .open_lease(
                             registry,
                             &module_id,
                             &collection_id,
                             &root_token,
                             &path_rel,
-                            crate::sessions::Reader::Viewer,
+                            crate::bytes::Reader::Viewer,
                         )
                         .await?;
                     let mut out = Vec::with_capacity(declared.len());
@@ -1043,17 +1043,17 @@ impl Subtitles {
                 }
             }
             None => {
-                let lease = sessions
+                let lease = bytes
                     .open_lease(
                         registry,
                         &module_id,
                         &collection_id,
                         &root_token,
                         &path_rel,
-                        crate::sessions::Reader::Viewer,
+                        crate::bytes::Reader::Viewer,
                     )
                     .await?;
-                let source = crate::sessions::LeaseSource {
+                let source = crate::bytes::LeaseSource {
                     lease,
                     size,
                     handle: tokio::runtime::Handle::current(),

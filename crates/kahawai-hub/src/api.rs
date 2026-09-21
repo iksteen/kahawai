@@ -284,7 +284,7 @@ pub fn router(
     net: NetOptions,
 ) -> Router {
     sessions.attach_registry(registry.clone());
-    enricher.attach_sessions(sessions.clone());
+    enricher.attach_bytes(sessions.bytes.clone());
     enricher.attach_artwork(&artwork);
     enricher.start_catalogue(registry.clone());
     let cors = cors_layer(&net.cors_origins);
