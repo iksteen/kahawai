@@ -8,10 +8,13 @@ license.workspace = true
 # build, so anything shared by all the binaries links what the fattest of
 # them asks for; keeping hub, mediahost and transcoder out of this
 # manifest is what stops a satellite from carrying SQLite, axum or an OCR
-# engine it never calls.
+# engine it never calls. kahawai-playback is allowed for the same reason
+# it exists: it is the layer below the roles, and its own manifest keeps
+# the same rule.
 [dependencies]
 kahawai-core = { workspace = true }
 kahawai-media = { workspace = true }
+kahawai-playback = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 figment = { workspace = true }

@@ -13,7 +13,6 @@
 
 use std::path::PathBuf;
 
-use anyhow::Context;
 use anyhow::Result;
 
 pub mod calibrate;
@@ -62,84 +61,11 @@ pub fn load_config(path: Option<&std::path::Path>) -> Result<(config::Config, Op
     Ok((cfg, used))
 }
 
-/// The per-session pipeline worker (§1.1 crash isolation), spawned by
-/// the hub and the transcoder as `<current_exe> remux-worker ...` — so
-/// every binary that supervises sessions carries this arm.
-#[derive(clap::Args)]
-pub struct WorkerArgs {
-    pub socket: PathBuf,
-    pub out_dir: PathBuf,
-    pub size: u64,
-    #[arg(long, default_value = "off")]
-    pub video: String,
-    #[arg(long, default_value = "off")]
-    pub audio: String,
-    #[arg(long, default_value_t = 0)]
-    pub audio_track: usize,
-    #[arg(long, default_value_t = 0)]
-    pub video_track: usize,
-    #[arg(long, default_value_t = 0)]
-    pub start_ms: u64,
-    #[arg(long)]
-    pub sink: Option<String>,
-    /// Additional parts of a split source, in timeline order, as
-    /// `<socket>:<size>`. The positional socket/size is part one.
-    #[arg(long = "part")]
-    pub parts: Vec<String>,
-    /// HUB-15 encode parameters; absent = historical fixed values.
-    #[arg(long)]
-    pub video_kbps: Option<u32>,
-    #[arg(long)]
-    pub max_height: Option<u32>,
-    #[arg(long)]
-    pub max_channels: Option<u32>,
-    // Supervisors pass the value as a separate argv token; attenuation
-    // therefore starts with `-` and must remain a value, not a new flag.
-    #[arg(long, allow_negative_numbers = true)]
-    pub stereo_gain_db: Option<f64>,
-    #[arg(long, allow_negative_numbers = true)]
-    pub native_gain_db: Option<f64>,
-    #[arg(long)]
-    pub loudness_source_channels: Option<u32>,
-    /// JSON `AudioLayoutGain[]`; part of the protocol-4 baseline.
-    #[arg(long)]
-    pub loudness_gains: Option<String>,
-    /// HUB-15a: tone-map HDR to SDR in the video encode chain.
-    #[arg(long)]
-    pub tone_map: bool,
-    /// The source is interlaced: deinterlace before the encoder.
-    #[arg(long)]
-    pub deinterlace: bool,
-    /// The pid this worker belongs to. See the PDEATHSIG guard in
-    /// [`run_remux_worker`]; absent means the guard cannot check and
-    /// leaves the kernel's signal as the only tie.
-    #[arg(long)]
-    pub supervisor_pid: Option<u32>,
-    /// HUB-32b: burn this image subtitle track (e{n}) into the picture.
-    #[arg(long)]
-    pub burn_sub: Option<usize>,
-    /// Display sets to burn, extracted by the mediahost. Present for
-    /// every dispatched session — a worker cannot walk the source
-    /// index itself (every read crosses the byte plane).
-    #[arg(long)]
-    pub burn_sets: Option<PathBuf>,
-    /// HUB-32a: burn this EMBEDDED text subtitle track (e{n}) into the
-    /// picture with libass. A user's SIDECAR .ass burns from
-    /// `--burn-ass-file` instead — the demuxer pad is used for embedded
-    /// tracks because it is what carries the file's attached fonts.
-    #[arg(long)]
-    pub burn_ass: Option<usize>,
-    #[arg(long)]
-    pub burn_ass_file: Option<PathBuf>,
-    /// HUB-15b encode targets + segment container; unknown values fall
-    /// back to the legacy h264/aac/ts.
-    #[arg(long, default_value = "h264")]
-    pub video_codec: String,
-    #[arg(long, default_value = "aac")]
-    pub audio_codec: String,
-    #[arg(long, default_value = "ts")]
-    pub container: String,
-}
+/// The per-session pipeline worker's command line (§1.1 crash isolation),
+/// spawned by the hub and the transcoder as `<current_exe> remux-worker ...`
+/// — so every binary that supervises sessions carries this arm. The struct
+/// lives beside its supervisor-side spelling in `kahawai_playback::job`.
+pub use kahawai_playback::worker::WorkerArgs;
 
 /// HUB-36: measure this box's encoders and write the benchmark cache,
 /// then exit. Runs as a CHILD PROCESS for the same reason pipelines do
@@ -237,54 +163,42 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
     if cfg.transcoder.worker_threads > 0 {
         kahawai_media::remux::set_encoder_threads(cfg.transcoder.worker_threads);
     }
-    let mut all = vec![(w.socket, w.size)];
-    for p in &w.parts {
-        let (sock, sz) = p.rsplit_once(':').context("--part wants <socket>:<size>")?;
-        all.push((PathBuf::from(sock), sz.parse().context("--part size")?));
-    }
-    let parsed_gains: Vec<kahawai_media::loudness::AudioLayoutGain> = w
-        .loudness_gains
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .context("parsing --loudness-gains")?
-        .unwrap_or_default();
-    anyhow::ensure!(
-        parsed_gains.len() <= kahawai_media::loudness::MAX_LAYOUT_GAINS,
-        "too many --loudness-gains entries"
-    );
-    let mut loudness_gains = [None; kahawai_media::loudness::MAX_LAYOUT_GAINS];
-    for (slot, gain) in loudness_gains.iter_mut().zip(parsed_gains) {
-        *slot = Some(gain);
-    }
-    let plan = kahawai_media::remux::RemuxPlan {
-        video: kahawai_media::worker::parse_mode(&w.video),
-        audio: kahawai_media::worker::parse_mode(&w.audio),
-        audio_track: w.audio_track,
-        video_track: w.video_track,
-        video_kbps: w.video_kbps,
-        max_height: w.max_height,
-        max_channels: w.max_channels,
-        stereo_gain_db: w.stereo_gain_db,
-        native_gain_db: w.native_gain_db,
-        loudness_source_channels: w.loudness_source_channels,
-        loudness_gains,
-        tone_map: w.tone_map,
-        deinterlace: w.deinterlace,
-        burn_subtitle: w.burn_sub,
-        burn_ass: w.burn_ass,
-        video_codec: kahawai_media::remux::VideoTarget::from_str(&w.video_codec),
-        audio_codec: kahawai_media::remux::AudioTarget::from_str(&w.audio_codec),
-        segment_format: kahawai_media::remux::SegmentFormat::from_str(&w.container),
-    };
+    // The job arrives spelled as argv; `Job::from_args` is the one parser
+    // of that spelling, paired with the supervisors' `Job::to_argv`.
+    let kahawai_playback::job::WorkerInvocation {
+        job,
+        sockets,
+        out_dir,
+        ..
+    } = kahawai_playback::job::Job::from_args(w)?;
+    let parts: Vec<(PathBuf, u64)> = sockets
+        .into_iter()
+        .zip(job.part_sizes.iter().copied())
+        .collect();
+    let on_disk =
+        |payload: Option<kahawai_playback::job::Payload>, name: &str| -> Result<Option<PathBuf>> {
+            Ok(match payload {
+                None => None,
+                Some(kahawai_playback::job::Payload::Path(path)) => Some(path),
+                // argv only ever names files; bytes here would be a supervisor
+                // that forgot to materialise them, so write them out anyway.
+                Some(kahawai_playback::job::Payload::Bytes(bytes)) => {
+                    let path = out_dir.join(name);
+                    std::fs::write(&path, bytes)?;
+                    Some(path)
+                }
+            })
+        };
+    let burn_sets = on_disk(job.burn_sets, "burn-sets.bin")?;
+    let burn_ass = on_disk(job.burn_ass, "burn.ass")?;
     kahawai_media::worker::run_parts(
-        &all,
-        &w.out_dir,
-        plan,
-        w.start_ms,
-        w.sink.as_deref(),
-        w.burn_sets.as_deref(),
-        w.burn_ass_file.as_deref(),
+        &parts,
+        &out_dir,
+        job.plan,
+        job.start_ms,
+        job.sink.as_deref(),
+        burn_sets.as_deref(),
+        burn_ass.as_deref(),
     )
 }
 

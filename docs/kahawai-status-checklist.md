@@ -1132,8 +1132,11 @@ entries track the extraction of the shared playback mechanics into
       and the seek helpers. Protocol 4.5 adds `StartSession.target_duration_secs`
       so a transcoder's readiness runway follows the hub's declaration.
       `scripts/kahawai-playback.sh check|worker|lean` are the runnable checks.
-- [ ] The `remux-worker` entry in `kahawai-runtime` parses its job through the
-      crate.
+- [x] The `remux-worker` entry in `kahawai-runtime` parses its job through the
+      crate: `WorkerArgs` lives in `kahawai-playback` and `run_remux_worker`
+      is the PDEATHSIG guard, niceness and thread ceiling followed by
+      `Job::from_args`. `crates/kahawai/tests/remux_worker.rs` pins the
+      spawned binary end to end.
 - [ ] The transcoder runs dispatched sessions on the crate's executor.
 - [ ] The hub's registry ranks placement over a fleet snapshot.
 - [ ] The hub runs local remux sessions on the crate's executor, with per-run
