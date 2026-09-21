@@ -593,7 +593,7 @@ impl Run {
             std::fs::read_to_string(self.inner.dir.join("worker.log")).unwrap_or_default();
         *self.inner.worker.lock().unwrap() = None;
         if stopped {
-            let _ = std::fs::remove_dir_all(&self.inner.dir);
+            remove_run_dir(&self.inner.dir);
         } else {
             tracing::warn!(session = %self.inner.session_id, "leaving scratch for a live worker");
         }
@@ -664,7 +664,7 @@ impl Run {
         let bundle = self.bundle("failed start");
         *self.inner.worker.lock().unwrap() = None;
         if stopped {
-            let _ = std::fs::remove_dir_all(&self.inner.dir);
+            remove_run_dir(&self.inner.dir);
         }
         StartFailure {
             error,
@@ -707,6 +707,18 @@ impl Run {
             }
         });
         *self.watcher.lock().unwrap() = Some(task);
+    }
+}
+
+/// Remove a run directory and, when it was the session's last, the
+/// session directory above it — otherwise every session that ever ran
+/// leaves an empty directory under the scratch root until the next
+/// restart sweeps them (observed: one per ended session).
+fn remove_run_dir(dir: &Path) {
+    let _ = std::fs::remove_dir_all(dir);
+    if let Some(session_dir) = dir.parent() {
+        // Fails while other runs of the session remain, which is the point.
+        let _ = std::fs::remove_dir(session_dir);
     }
 }
 

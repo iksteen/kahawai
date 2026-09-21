@@ -117,6 +117,10 @@ async fn an_in_process_run_becomes_ready_and_writes_the_contract_files() {
         !f.scratch.join("s1/r1").exists(),
         "a stopped run's directory is removed"
     );
+    assert!(
+        !f.scratch.join("s1").exists(),
+        "and the session directory with it, once empty"
+    );
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
