@@ -302,7 +302,7 @@ async fn fonts(s: &AppState, id: &str) -> Result<Vec<(String, Vec<u8>)>, ApiErro
     let session = s.sessions.get(id).ok_or_else(session_gone)?;
     let source = session.physical_source().ok_or_else(|| hidden("source"))?;
     s.subtitles
-        .fonts_for_source(&s.registry, &s.sessions, source)
+        .fonts_for_source(&s.registry, &s.sessions.bytes, source)
         .await
         .map_err(internal)
 }
@@ -348,7 +348,12 @@ pub(crate) async fn session_subtitle(
     if ext == "vtt" {
         let body = s
             .subtitles
-            .vtt(&s.registry, &s.sessions, &track, q.shift_ms.round() as i64)
+            .vtt(
+                &s.registry,
+                &s.sessions.bytes,
+                &track,
+                q.shift_ms.round() as i64,
+            )
             .await
             .map_err(internal)?;
         return Ok((
@@ -362,7 +367,7 @@ pub(crate) async fn session_subtitle(
     }
     let body = s
         .subtitles
-        .ass_body(&s.registry, &s.sessions, &track)
+        .ass_body(&s.registry, &s.sessions.bytes, &track)
         .await
         .map_err(internal)?;
     let headers = [(

@@ -352,7 +352,7 @@ pub(super) async fn enrichment_artwork(
         .ok_or_else(|| hidden("artwork"))?;
     let (bytes, mime) = s
         .artwork
-        .catalogue_at(&s.registry, &s.sessions, &input, poster, Some("card"))
+        .catalogue_at(&s.registry, &s.sessions.bytes, &input, poster, Some("card"))
         .await
         .map_err(error)?
         .ok_or_else(|| hidden("artwork"))?;

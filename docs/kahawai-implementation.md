@@ -473,7 +473,7 @@ Restarts update the same bounded session bundle rather than overwriting earlier 
 
 ### 4.6 Session manager
 
-State machine per session: `Negotiated → Provisioning → Streaming → (Seeking|SwitchingQuality)* → Ended`. Direct play sessions hold an `OpenRead` lease against the mediahost and proxy ranges with `Accept-Ranges`/`206`.
+State machine per session: `Negotiated → Provisioning → Streaming → (Seeking|SwitchingQuality)* → Ended`. Direct play sessions hold an `OpenRead` lease against the mediahost and proxy ranges with `Accept-Ranges`/`206`. The byte plane itself — lease minting, `OpenRead`, and the all-in-one short-circuit that reads the local disk under the mediahost's own admission — is `hub/bytes.rs`, shared with subtitle extraction, artwork and `.nfo` reads rather than owned by the session manager.
 
 **Lightweight sessions run entirely inside the hub** — this is why `kahawai-hub` depends on `kahawai-media`. For pure remux, the hub feeds the mediahost byte stream through a local demux-only pipeline (`appsrc ! parsebin ! <selected streams, no decode> ! cmafmux → hlssink3`-style segmenting). The same supervised pipeline may copy video while decoding and encoding audio for codec conversion or downmix. Both are cheap relative to video decode/filter/encode, need no placement, work with zero transcoders attached (AR-10), and keep full transcoders free for video work. Seek = pipeline restart at the target keyframe, same as §6.
 

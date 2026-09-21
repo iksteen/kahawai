@@ -591,7 +591,7 @@ async fn run_hub_inner(
     );
     let enricher = Arc::new(kahawai_hub::enrich::Enricher::new(cfg.data_dir.clone()));
     // HUB-9: local .nfo files are read over the byte plane, like artwork.
-    enricher.attach_sessions(sessions.clone());
+    enricher.attach_bytes(sessions.bytes.clone());
     let artwork = Arc::new(kahawai_hub::artwork::Artwork::new(
         cfg.data_dir.join("artwork"),
         enricher.clone(),
@@ -619,24 +619,26 @@ async fn run_hub_inner(
             )
         });
         let cols = mh.collections.clone();
-        sessions.set_local_source(LOCAL_ID, move |collection, root_token, path| {
-            kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
-        });
+        sessions
+            .bytes
+            .set_local_source(LOCAL_ID, move |collection, root_token, path| {
+                kahawai_mediahost::serve::resolve_rel(&cols, collection, root_token, path)
+            });
         let local_scheduler =
             kahawai_mediahost::scheduler::Scheduler::new(&mh.collections, &mh.scheduler)?;
         let playback_scheduler = local_scheduler.clone();
-        sessions.set_local_playback(move || {
+        sessions.bytes.set_local_playback(move || {
             Box::new(playback_scheduler.enter_playback("local playback byte lease"))
         });
         let viewer_scheduler = local_scheduler.clone();
-        sessions.set_local_activity(move |root_token| {
+        sessions.bytes.set_local_activity(move |root_token| {
             Box::new(viewer_scheduler.enter_interactive(
                 viewer_scheduler.resources([root_token], false),
                 format!("local viewer read {root_token}"),
             ))
         });
         let sweep_scheduler = local_scheduler.clone();
-        sessions.set_local_background(move |root_token| {
+        sessions.bytes.set_local_background(move |root_token| {
             let scheduler = sweep_scheduler.clone();
             let root_token = root_token.to_string();
             Arc::new(move || {

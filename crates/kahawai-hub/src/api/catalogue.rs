@@ -1088,7 +1088,7 @@ pub(super) async fn catalogue_artwork(
         .artwork
         .catalogue_at(
             &s.registry,
-            &s.sessions,
+            &s.sessions.bytes,
             &input,
             poster,
             q.get("size").map(String::as_str),

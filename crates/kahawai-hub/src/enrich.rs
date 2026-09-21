@@ -315,7 +315,7 @@ pub struct Enricher {
     /// The byte plane, for HUB-9: reading a .nfo means leasing it from the
     /// mediahost that holds it. Attached at startup; absent in tests, where
     /// the local provider then simply is not in the chain.
-    sessions: std::sync::OnceLock<Arc<crate::sessions::Sessions>>,
+    bytes: std::sync::OnceLock<Arc<crate::bytes::ByteSources>>,
     /// Weak to avoid the cycle: Artwork uses this enricher for ordinary
     /// provider posters, while artist enrichment asks Artwork to prewarm the
     /// same durable cache before publishing a portrait.
@@ -706,15 +706,15 @@ impl Enricher {
             anidb: Default::default(),
             tvdb: Default::default(),
             anidb_stale: AtomicBool::new(false),
-            sessions: Default::default(),
+            bytes: Default::default(),
             artwork: Default::default(),
         }
     }
 
     /// Wire the byte plane in (HUB-9). Without it the local provider is
     /// left out of the chain rather than failing per item.
-    pub fn attach_sessions(&self, sessions: Arc<crate::sessions::Sessions>) {
-        let _ = self.sessions.set(sessions);
+    pub fn attach_bytes(&self, bytes: Arc<crate::bytes::ByteSources>) {
+        let _ = self.bytes.set(bytes);
     }
 
     pub fn attach_artwork(&self, artwork: &Arc<crate::artwork::Artwork>) {

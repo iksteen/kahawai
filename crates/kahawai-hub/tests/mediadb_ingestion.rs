@@ -1478,13 +1478,15 @@ async fn movie_playback_case(kind: MediaType) {
         "1\n00:00:00,000 --> 00:00:01,000\nCatalogue subtitle\n",
     )
     .unwrap();
-    f.sessions.set_local_source("host", move |_, _, path| {
-        Ok(if path.ends_with(".srt") {
-            subtitle.clone()
-        } else {
-            file.clone()
-        })
-    });
+    f.sessions
+        .bytes
+        .set_local_source("host", move |_, _, path| {
+            Ok(if path.ends_with(".srt") {
+                subtitle.clone()
+            } else {
+                file.clone()
+            })
+        });
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
     let route = format!("/api/v1/catalogue/libraries/{library}/items/{item}");
@@ -1756,6 +1758,7 @@ async fn combined_episode_playback_finishes_captured_coverage_and_next_skips_the
     let file = f.dir.path().join("file.mp4");
     std::fs::write(&file, b"0123456789").unwrap();
     f.sessions
+        .bytes
         .set_local_source("host", move |_, _, _| Ok(file.clone()));
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
@@ -1888,6 +1891,7 @@ async fn skip_segments_follow_the_selected_medium_and_multipart_timeline() {
     let file = f.dir.path().join("video.mp4");
     std::fs::write(&file, b"0123456789").unwrap();
     f.sessions
+        .bytes
         .set_local_source("host", move |_, _, _| Ok(file.clone()));
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
@@ -2186,10 +2190,12 @@ async fn downloaded_subtitle_case(format: &str) {
     let route = format!("/api/v1/catalogue/libraries/{library}/items/{item}");
     let file = f.dir.path().join("video.mp4");
     std::fs::write(&file, b"0123456789").unwrap();
-    f.sessions.set_local_source("host", move |_, _, path| {
-        assert!(!path.starts_with("mediadb-download:"));
-        Ok(file.clone())
-    });
+    f.sessions
+        .bytes
+        .set_local_source("host", move |_, _, path| {
+            assert!(!path.starts_with("mediadb-download:"));
+            Ok(file.clone())
+        });
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
     let (status, result) = f

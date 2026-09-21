@@ -4,6 +4,7 @@ pub mod api;
 pub mod artwork;
 pub mod auth;
 pub mod backup;
+pub mod bytes;
 pub mod db;
 pub mod enrich;
 pub mod enrollment;
