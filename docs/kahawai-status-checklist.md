@@ -1145,7 +1145,13 @@ entries track the extraction of the shared playback mechanics into
       is still prerolling when its EndSession or a replacement StartSession
       arrives ends itself quietly instead of answering the hub with a
       verdict meant for the newer start.
-- [ ] The hub's registry ranks placement over a fleet snapshot.
+- [x] The hub's registry ranks placement over a fleet snapshot: `with_fleet`
+      takes the capability, link, load, drain, pace, link-rate and bench
+      locks once, hands `kahawai_playback::placement` the snapshot, and
+      reserves the chosen box before releasing them. `place` reserves only
+      the target it returns instead of reserving a fleet box and handing it
+      back on repatriation. `pace.rs` keeps the table; the class key and the
+      EWMA are the ranker's.
 - [ ] The hub runs local remux sessions on the crate's executor, with per-run
       directories, a death watch and local pace samples.
 - [ ] The superseded plumbing in the hub, the transcoder and the runtime is

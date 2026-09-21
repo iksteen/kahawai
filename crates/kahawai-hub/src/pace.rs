@@ -10,7 +10,7 @@
 //!   new id and therefore starts learning again from its benchmarks,
 //!   which is correct: it is not provably the same box.
 //! * `work_class` — `{res}|{src}|{dst}[|tm]`, e.g. `2160|hevc|h264|tm`.
-//!   Composed by [`work_class`] and by nothing else. It deliberately
+//!   Composed by `work_class` and by nothing else. It deliberately
 //!   carries the SOURCE codec, the one dimension a benchmark cannot see
 //!   (software AV1 *decode* is invisible to an encoder measurement), and
 //!   the tone-map flag, which on the J5005 was the whole cost.
@@ -40,27 +40,10 @@
 use anyhow::Result;
 use kahawai_sqlite::Database as SqlitePool;
 
-/// EWMA weight for a new sample. See the module doc.
-pub const ALPHA: f64 = 0.3;
-
-/// The reserved module id for work the hub ran itself.
-pub const LOCAL: &str = "local";
-
-/// `{res}|{src}|{dst}[|tm]` — the identity of a KIND of work.
-///
-/// The resolution is bucketed rather than exact because the cost step
-/// that matters is 4K versus not. The cut is `> 1080`, so 1440p lands in
-/// the expensive bucket: it is nearer 1080p in pixels, but guessing HIGH
-/// costs a session placed on a stronger box, where guessing low costs a
-/// viewer a stall. Framerate is deliberately absent: it
-/// would split every class in two for a distinction most libraries never
-/// exercise, and the key is a string, so an fps bucket is additive the
-/// day a real library shows the skew.
-pub fn work_class(height: u32, src_codec: &str, dst_codec: &str, tone_map: bool) -> String {
-    let res = if height > 1080 { "2160" } else { "1080" };
-    let tm = if tone_map { "|tm" } else { "" };
-    format!("{res}|{src}|{dst}{tm}", src = src_codec, dst = dst_codec)
-}
+/// The class key, the EWMA step and its weight, and the reserved local
+/// module id are the ranker's (`kahawai_playback::placement`); this module
+/// owns only the table that persists what they compute.
+pub use kahawai_playback::placement::{ALPHA, LOCAL, blend, work_class};
 
 /// Fold one observation into `(module_id, work_class)`, returning the
 /// new estimate. Write-through: placement reads its own in-memory map,
@@ -97,15 +80,6 @@ pub async fn fold(
     Ok(next)
 }
 
-/// The EWMA step, separated so it can be reasoned about without a
-/// database.
-pub fn blend(prev: Option<f64>, sample: f64) -> f64 {
-    match prev {
-        Some(p) => ALPHA * sample + (1.0 - ALPHA) * p,
-        None => sample,
-    }
-}
-
 /// Everything learned so far, for the placement map at startup.
 pub async fn load_all(pool: &SqlitePool) -> Result<Vec<(String, String, f64)>> {
     Ok(
@@ -123,39 +97,4 @@ pub async fn forget(pool: &SqlitePool, module_id: &str) -> Result<()> {
         .execute(pool)
         .await?;
     Ok(())
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn class_keys_carry_source_codec_and_tonemap() {
-        assert_eq!(work_class(2160, "hevc", "h264", true), "2160|hevc|h264|tm");
-        assert_eq!(work_class(1080, "h264", "h264", false), "1080|h264|h264");
-        // Bucketed at >1080, and anything above lands in the expensive
-        // class: over-estimating costs a stronger box, under-estimating
-        // costs a viewer a stall.
-        assert_eq!(work_class(1080, "av1", "h264", false), "1080|av1|h264");
-        assert_eq!(work_class(1081, "av1", "h264", false), "2160|av1|h264");
-        assert_eq!(work_class(1440, "av1", "h264", false), "2160|av1|h264");
-    }
-
-    #[test]
-    fn ewma_converges_in_about_three_samples_and_no_outlier_dominates() {
-        // First sample is the estimate: nothing to blend against.
-        assert_eq!(blend(None, 4.0), 4.0);
-        // A single outlier moves it by at most ALPHA.
-        let after = blend(Some(4.0), 0.5);
-        assert!(
-            (after - 4.0).abs() <= 4.0 * ALPHA + f64::EPSILON,
-            "one sample moved the estimate {after}"
-        );
-        // A hardware change is believed within ~3 samples.
-        let mut v = 4.0;
-        for _ in 0..3 {
-            v = blend(Some(v), 0.5);
-        }
-        assert!(v < 1.9, "still {v} after three slow runs");
-    }
 }

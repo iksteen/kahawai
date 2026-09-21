@@ -1,7 +1,11 @@
-//! HUB-36 phase 5: the placement policy, stated as cases.
+//! HUB-36 phase 5: the registry's half of placement — the snapshot it
+//! takes under its locks reaches `kahawai_playback::placement` intact, and
+//! the reservation happens in the same critical section.
 //!
-//! Every one of these is a decision that used to be made on codec fit
-//! and session count alone, where the honest answer needs throughput.
+//! The policy itself is stated as cases in
+//! `crates/kahawai-playback/tests/placement.rs`; what is pinned here is
+//! the wiring: capability reports, live links, observed pace, link rate,
+//! the local executor switch and the sender a required feature pairs with.
 
 use kahawai_hub::pace;
 use kahawai_hub::registry::{PlacementNeed, Registry, SUSTAINS};
@@ -78,26 +82,6 @@ fn connect_minor(reg: &Registry, id: &str, protocol_minor: u32, c: CapabilityRep
 }
 
 #[tokio::test]
-async fn protocol_four_baseline_does_not_filter_exact_layout_gains() {
-    let (_d, reg) = registry_with_local_video_executor(false).await;
-    let class = "1080|hevc|h264";
-    connect_minor(&reg, "baseline-fast", 0, caps(true, 9.0, 0.0));
-    connect_minor(&reg, "future-slow", 9, caps(false, 2.0, 0.0));
-    reg.set_pace("baseline-fast", class, 5.0);
-    reg.set_pace("future-slow", class, 2.0);
-
-    let mut exact = need(class);
-    exact.required_protocol_feature = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    assert_eq!(reg.place(&exact).target.as_deref(), Some("baseline-fast"));
-
-    let ordinary = need(class);
-    assert_eq!(
-        reg.place(&ordinary).target.as_deref(),
-        Some("baseline-fast")
-    );
-}
-
-#[tokio::test]
 async fn dispatch_pairs_the_required_protocol_with_the_same_live_sender() {
     let (_d, reg) = registry_with_local_video_executor(false).await;
     let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(2);
@@ -118,22 +102,7 @@ async fn dispatch_pairs_the_required_protocol_with_the_same_live_sender() {
 }
 
 #[tokio::test]
-async fn exact_loudness_gains_are_available_at_protocol_four_minor_zero() {
-    let (_d, reg) = registry_with_local_video_executor(false).await;
-    let class = "1080|hevc|h264";
-    connect_minor(&reg, "baseline", 0, caps(true, 9.0, 0.0));
-    reg.set_pace("baseline", class, 9.0);
-
-    let mut gain = need(class);
-    gain.required_protocol_feature = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    assert_eq!(reg.place(&gain).target.as_deref(), Some("baseline"));
-
-    let ordinary = need(class);
-    assert_eq!(reg.place(&ordinary).target.as_deref(), Some("baseline"));
-}
-
-#[tokio::test]
-async fn a_sustaining_box_beats_a_faster_looking_one_that_is_not() {
+async fn the_registry_snapshot_reaches_the_ranker() {
     let (_d, reg) = registry().await;
     let class = "1080|hevc|h264";
     // "fast" advertises a quicker encoder, but has been MEASURED
@@ -146,76 +115,6 @@ async fn a_sustaining_box_beats_a_faster_looking_one_that_is_not() {
     let p = reg.place(&need(class));
     assert_eq!(p.target.as_deref(), Some("steady"));
     assert_eq!(p.predicted, Some(3.0));
-}
-
-#[tokio::test]
-async fn unmeasured_ranks_as_capable_not_last() {
-    let (_d, reg) = registry().await;
-    let class = "1080|hevc|h264";
-    connect(&reg, "known-slow", caps(true, 9.0, 0.0));
-    connect(&reg, "fresh", caps(true, 9.0, 0.0));
-    // A box that has never run this work has no number at all. It must
-    // still beat one measured below the bar, or a fleet that starts out
-    // unmeasured can never earn a measurement.
-    reg.set_pace("known-slow", class, 0.5);
-
-    let p = reg.place(&need(class));
-    assert_eq!(p.target.as_deref(), Some("fresh"));
-    // It has never RUN this work, but it has been benchmarked, so the
-    // components stand in for the missing observation.
-    assert_eq!(p.predicted, Some(9.0));
-}
-
-#[tokio::test]
-async fn a_box_with_nothing_measured_at_all_still_gets_work() {
-    let (_d, reg) = registry().await;
-    let class = "1080|hevc|h264";
-    // A legacy satellite: reports its encoders, but no speeds (0 on the
-    // wire = unmeasured) and has run nothing. There is no honest number
-    // to give, and refusing it would strand the only box in the fleet.
-    let mut c = caps(true, 0.0, 0.0);
-    c.encoders[0].speed_1080 = None;
-    c.encoders[0].speed_2160 = None;
-    connect(&reg, "legacy", c);
-
-    let p = reg.place(&need(class));
-    assert_eq!(p.target.as_deref(), Some("legacy"));
-    assert_eq!(
-        p.predicted, None,
-        "must not invent a speed it never measured"
-    );
-}
-
-#[tokio::test]
-async fn observed_pace_overrides_the_advertised_benchmark() {
-    let (_d, reg) = registry().await;
-    let class = "1080|hevc|h264";
-    connect(&reg, "box", caps(true, 9.0, 0.0));
-    // The benchmark says 9x; the box has actually done 2.5x on this
-    // work. Observed wins outright and is NOT blended with the parts,
-    // which would count the same cost twice.
-    reg.set_pace("box", class, 2.5);
-    assert_eq!(reg.place(&need(class)).predicted, Some(2.5));
-}
-
-#[tokio::test]
-async fn the_slowest_component_governs_when_nothing_was_observed() {
-    let (_d, reg) = registry().await;
-    let class = "2160|hevc|h264|tm";
-    // Quick encoder, slow tone-map: the chain is its narrowest link,
-    // which on the J5005 was exactly the tone-map.
-    connect(&reg, "box", caps(true, 12.0, 1.5));
-    let mut n = need(class);
-    n.needs_tonemap = true;
-    let p = reg.place(&n);
-    // 2160 speeds are a third of the 1080 figures in this fixture:
-    // encoder 4.0, tone-map 0.5 — the tone-map governs.
-    assert_eq!(p.target.as_deref(), Some("box"));
-    let got = p.predicted.unwrap();
-    assert!(
-        (got - 0.5).abs() < 1e-5,
-        "expected the tone-map term, got {got}"
-    );
 }
 
 #[tokio::test]
@@ -237,48 +136,6 @@ async fn work_repatriates_only_when_no_fleet_box_sustains_and_the_hub_does() {
     reg.set_pace("capable", class, 2.0);
     let p = reg.place(&need(class));
     assert_eq!(p.target.as_deref(), Some("capable"));
-}
-
-#[tokio::test]
-async fn disabling_the_local_video_executor_requires_and_keeps_video_on_the_fleet() {
-    let (_d, reg) = registry_with_local_video_executor(false).await;
-    let class = "1080|hevc|h264";
-
-    let unavailable = reg.place(&need(class));
-    assert!(!unavailable.available);
-    assert_eq!(unavailable.target, None);
-
-    connect(&reg, "external", caps(true, 0.4, 0.0));
-    reg.set_pace("external", class, 0.4);
-    // Even evidence that the hub would be faster must not override the
-    // structural choice to keep encoding off this machine.
-    reg.set_pace(pace::LOCAL, class, 5.0);
-    let placed = reg.place(&need(class));
-    assert!(placed.available);
-    assert_eq!(placed.target.as_deref(), Some("external"));
-}
-
-#[tokio::test]
-async fn audio_only_encode_is_always_lightweight_local_hub_work() {
-    let (_d, reg) = registry_with_local_video_executor(false).await;
-    let audio = PlacementNeed {
-        encode_video: false,
-        encode_audio: true,
-        audio_caps: vec!["audio/x-ac3".into()],
-        audio_codec: "aac".into(),
-        ..PlacementNeed::default()
-    };
-
-    let p = reg.place(&audio);
-    assert!(p.available);
-    assert_eq!(p.target, None);
-    assert_eq!(p.predicted, None);
-
-    // Even a connected full transcoder does not consume lightweight work.
-    connect(&reg, "external", caps(true, 9.0, 0.0));
-    let p = reg.place(&audio);
-    assert!(p.available);
-    assert_eq!(p.target, None);
 }
 
 #[tokio::test]

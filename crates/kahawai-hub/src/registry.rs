@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, SystemTime};
 
 use anyhow::{Context, Result};
+use kahawai_playback::placement::{BoxCaps, BoxSnapshot, EncoderSpeed, FleetSnapshot};
 use kahawai_sqlite::Database;
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -56,90 +57,12 @@ pub(crate) fn source_fingerprint(parts: &[(i64, i64, i64)]) -> String {
     format!("source-sha256-{}", BASE64URL_NOPAD.encode(&hash.finalize()))
 }
 
-/// What a session needs from a transcoder (derived from plan + source).
-#[derive(Debug, Clone, Default)]
-pub struct PlacementNeed {
-    pub encode_video: bool,
-    pub encode_audio: bool,
-    /// Source caps names per kind (any one must be decodable).
-    pub video_caps: Vec<String>,
-    pub audio_caps: Vec<String>,
-    /// HUB-15a: the plan tone-maps — prefer a box reporting the GL
-    /// segment (preference, not filter).
-    pub needs_tonemap: bool,
-    /// HUB-32a: the plan burns ASS subtitles. A HARD filter, unlike
-    /// tone-map, because there is no honest degradation: dropping the
-    /// burn would silently hand back a video with no subtitles at all.
-    /// `assrender` is genuinely absent on some boxes (macOS here), so
-    /// this is a real constraint and not a formality.
-    pub needs_ass_burn: bool,
-    /// Additive wire feature this plan requires. A HARD filter: choosing a
-    /// peer without it would silently drop behavior.
-    pub required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
-    /// HUB-15b: the encode TARGET codec ("h264"/"hevc"/"av1", empty =
-    /// any video encoder qualifies). A HARD filter, unlike tone-map: a
-    /// box without the target's encoder cannot degrade gracefully.
-    pub video_codec: String,
-    /// Same for audio ("aac"/"opus", empty = any).
-    pub audio_codec: String,
-    /// HUB-36: the kind of work this is (`crate::pace::work_class`), or
-    /// None when there is no encode to predict. Placement looks up what
-    /// each box has been MEASURED to achieve on exactly this.
-    pub work_class: Option<String>,
-    /// Source bitrate, for the link term of the prediction: a box that
-    /// cannot pull the bytes fast enough cannot produce fast enough,
-    /// however quick its encoder.
-    pub source_kbps: Option<u32>,
-}
-
-/// Where a session should run, and how fast that is expected to go.
-#[derive(Debug, Clone, PartialEq)]
-pub struct Placement {
-    /// `Some(module_id)` = dispatch to that satellite, `None` = run in
-    /// the hub's own supervised worker.
-    pub target: Option<String>,
-    /// False when video work has neither a suitable satellite nor AIO's
-    /// full local executor. `target = None` alone means local (including
-    /// ordinary hub audio work), so absence needs separate representation.
-    pub available: bool,
-    /// Realtime multiple this placement is expected to sustain. None
-    /// when nothing about this box and this work has been measured —
-    /// which is NOT the same as slow, and is treated as capable.
-    pub predicted: Option<f32>,
-}
-
-/// Below this, a box is not keeping ahead of a viewer with any margin.
-/// Not 1.0: a box that exactly matches realtime stalls the moment
-/// anything else happens on it.
-pub const SUSTAINS: f32 = 1.2;
-
-/// Does this prediction clear the bar? An unmeasured box counts as
-/// sustaining — refusing work for lack of evidence would leave a fresh
-/// fleet unused, and the first session it runs is what produces the
-/// evidence.
-fn sustains(predicted: Option<f32>) -> bool {
-    predicted.is_none_or(|p| p >= SUSTAINS)
-}
+/// Placement vocabulary lives with the ranker; the registry only adds the
+/// locks and the reservation.
+pub use kahawai_playback::placement::{Placement, PlacementNeed, SUSTAINS};
 
 /// SEC-7: how long a renewed-but-unused fingerprint stays admitted.
 pub const RENEWAL_GRACE_SECS: i64 = 24 * 3600;
-
-/// Does this ELEMENT produce this codec? The local benchmark is keyed
-/// by element (a box that gains a hardware encoder must not inherit the
-/// software one's number), so the codec has to be read back off the
-/// name. Substrings rather than a table: every family spells the codec
-/// into the element (`nvh264enc`, `x265enc`, `vtenc_h265_hw`,
-/// `svtav1enc`), and an unknown element simply matches nothing and is
-/// left out of the estimate.
-fn element_encodes(element: &str, codec: &str) -> bool {
-    let e = element.to_ascii_lowercase();
-    match codec {
-        "h264" => e.contains("264"),
-        "hevc" => e.contains("265") || e.contains("hevc"),
-        "av1" => e.contains("av1"),
-        _ => false,
-    }
-}
 
 fn unix_now() -> i64 {
     SystemTime::now()
@@ -302,6 +225,30 @@ pub struct TranscoderCapabilities {
     pub tonemap_speed_1080: Option<f32>,
     #[schema(required)]
     pub tonemap_speed_2160: Option<f32>,
+}
+
+impl From<&TranscoderCapabilities> for BoxCaps {
+    fn from(c: &TranscoderCapabilities) -> Self {
+        BoxCaps {
+            encoders: c
+                .encoders
+                .iter()
+                .map(|e| EncoderSpeed {
+                    codec: e.codec.clone(),
+                    element: e.element.clone(),
+                    hardware: e.hardware,
+                    speed_1080: e.speed_1080,
+                    speed_2160: e.speed_2160,
+                })
+                .collect(),
+            max_sessions: c.max_sessions,
+            decode_caps: c.decode_caps.clone(),
+            tonemap: c.tonemap,
+            ass_burn: c.ass_burn,
+            tonemap_speed_1080: c.tonemap_speed_1080,
+            tonemap_speed_2160: c.tonemap_speed_2160,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -1322,6 +1269,50 @@ impl Registry {
         Ok(())
     }
 
+    /// The fleet as the ranker sees it, plus the load table it must
+    /// reserve against, under one set of locks.
+    ///
+    /// Every placement reads the load and, if it reserves, increments it
+    /// inside this same critical section. Counting only at dispatch-ready
+    /// left a window up to 40 s wide in which every concurrent placement
+    /// read the same load. Measured on a five-transcoder fleet: ten
+    /// concurrent starts all chose one box and its `max_sessions = 2`
+    /// stopped none of them, because the capacity filter and the
+    /// least-loaded tie-break were both reading a number nothing had
+    /// incremented yet.
+    fn with_fleet<R>(&self, f: impl FnOnce(&FleetSnapshot, &mut HashMap<String, usize>) -> R) -> R {
+        let caps = self.transcoder_caps.lock().unwrap().clone();
+        let links = self.tc_links.lock().unwrap();
+        let mut load = self.tc_load.lock().unwrap();
+        let disabled = self.disabled.lock().unwrap();
+        let pace = self.tc_pace.lock().unwrap().clone();
+        let link_rate = self.tc_link_rate.lock().unwrap();
+        let local_bench = self.local_bench.lock().unwrap().clone();
+        let boxes = caps
+            .iter()
+            .filter_map(|(id, c)| {
+                let link = links.get(id)?;
+                Some((
+                    id.clone(),
+                    BoxSnapshot {
+                        caps: BoxCaps::from(c),
+                        protocol: kahawai_proto::ProtocolFeatures::new(link.protocol_minor),
+                        load: load.get(id).copied().unwrap_or(0),
+                        disabled: disabled.contains(id),
+                        link_rate: link_rate.get(id).copied(),
+                    },
+                ))
+            })
+            .collect();
+        let fleet = FleetSnapshot {
+            boxes,
+            pace,
+            local_bench,
+            local_video_executor_enabled: self.local_video_executor_enabled,
+        };
+        f(&fleet, &mut load)
+    }
+
     /// Placement (§4.5): capability fit (encoders AND source decoders)
     /// ≥ capacity ≥ hw-accel ≥ inverse load.
     ///
@@ -1331,7 +1322,7 @@ impl Registry {
     /// to be direct play. See [`Self::reserve_transcoder`] for the one
     /// that takes the slot.
     pub fn pick_transcoder(&self, need: &PlacementNeed) -> Option<String> {
-        self.choose(need, false)
+        self.with_fleet(|fleet, _| kahawai_playback::placement::choose(fleet, need))
     }
 
     /// Pick AND take the slot, in the same critical section that read
@@ -1339,262 +1330,28 @@ impl Registry {
     /// The caller owns the reservation and must return it with
     /// [`Self::tc_session_ended`] on every path that does not end in a
     /// running session.
-    ///
-    /// Counting only at dispatch-ready left a window up to 40 s wide in
-    /// which every concurrent placement read the same load. Measured on
-    /// a five-transcoder fleet: ten concurrent starts all chose one box
-    /// and its `max_sessions = 2` stopped none of them, because the
-    /// capacity filter and the least-loaded tie-break were both reading
-    /// a number nothing had incremented yet.
     pub fn reserve_transcoder(&self, need: &PlacementNeed) -> Option<String> {
-        self.choose(need, true)
-    }
-
-    fn choose(&self, need: &PlacementNeed, reserve: bool) -> Option<String> {
-        let caps = self.transcoder_caps.lock().unwrap().clone();
-        let links = self.tc_links.lock().unwrap();
-        let mut load = self.tc_load.lock().unwrap();
-        let disabled = self.disabled.lock().unwrap();
-        let mut candidates: Vec<(bool, bool, bool, Option<f32>, usize, String)> = caps
-            .iter()
-            .filter(|(id, _)| links.contains_key(*id) && !disabled.contains(*id))
-            .filter_map(|(id, c)| {
-                let encoders = &c.encoders;
-                let has = |codec: &str| encoders.iter().any(|e| e.codec == codec);
-                // HUB-15b: match the TARGET the plan asks for; an empty
-                // need means "any encoder of that kind".
-                let video_ok = || match need.video_codec.as_str() {
-                    "" => ["h264", "hevc", "av1"].iter().any(|c| has(c)),
-                    c => has(c),
-                };
-                let audio_ok = || match need.audio_codec.as_str() {
-                    "" => ["aac", "opus"].iter().any(|c| has(c)),
-                    c => has(c),
-                };
-                if (need.encode_video && !video_ok()) || (need.encode_audio && !audio_ok()) {
-                    return None;
-                }
-                // Decode fit: the box must decode at least one source
-                // stream of each kind it will encode. Empty inventory =
-                // older satellite that didn't report; assume capable
-                // (OPS-7 tolerance).
-                let can = |wanted: &[String]| {
-                    c.decode_caps.is_empty() || wanted.iter().any(|w| c.decode_caps.contains(w))
-                };
-                if (need.encode_video && !can(&need.video_caps))
-                    || (need.encode_audio && !can(&need.audio_caps))
-                {
-                    return None;
-                }
-                let current = load.get(id).copied().unwrap_or(0);
-                let max = c.max_sessions as usize;
-                if max > 0 && current >= max {
-                    return None; // at capacity (TC-6)
-                }
-                // Rank hardware on the codec the session will actually
-                // run (empty need: any hw video encoder counts).
-                if need.required_protocol_feature.is_some_and(|feature| {
-                    !links.get(id).is_some_and(|link| {
-                        kahawai_proto::ProtocolFeatures::new(link.protocol_minor).supports(feature)
-                    })
-                }) {
-                    return None;
-                }
-                if need.needs_ass_burn && !c.ass_burn {
-                    return None; // cannot burn ASS; not a candidate at all
-                }
-                let hw = encoders.iter().any(|e| {
-                    e.hardware
-                        && match need.video_codec.as_str() {
-                            "" => true,
-                            c => e.codec == c,
-                        }
-                });
-                // HUB-15a: an HDR encode prefers a box that can tone-map
-                // — a preference, not a filter: with no capable box the
-                // job still runs (worker encodes as-is, verdict said so).
-                let tm = !need.needs_tonemap || c.tonemap;
-                // HUB-36: what this box is expected to sustain on
-                // exactly this work. None = never measured, which ranks
-                // as neutral rather than last: a fresh box has to run
-                // something before it can be known, and refusing it for
-                // want of evidence is how a fleet stays unused.
-                let predicted = self.predict_fleet(id, need);
-                Some((sustains(predicted), tm, hw, predicted, current, id.clone()))
-            })
-            .collect();
-        // Sustaining first — a box that keeps ahead of the viewer beats
-        // a faster-on-paper one that does not — then tone-map fit, then
-        // hardware, then the prediction itself, then least loaded.
-        candidates.sort_by(|a, b| {
-            let rank = |p: Option<f32>| p.unwrap_or(SUSTAINS);
-            b.0.cmp(&a.0)
-                .then(b.1.cmp(&a.1))
-                .then(b.2.cmp(&a.2))
-                .then(
-                    rank(b.3)
-                        .partial_cmp(&rank(a.3))
-                        .unwrap_or(std::cmp::Ordering::Equal),
-                )
-                .then(a.4.cmp(&b.4))
-        });
-        let winner = candidates.first().map(|c| c.5.clone())?;
-        if reserve {
-            // Still holding `load`: the slot is taken before any other
-            // placement can read the count.
+        self.with_fleet(|fleet, load| {
+            let winner = kahawai_playback::placement::choose(fleet, need)?;
             *load.entry(winner.clone()).or_insert(0) += 1;
-        }
-        Some(winner)
+            Some(winner)
+        })
     }
 
     /// HUB-36 phase 5: where this session should run, and how fast that
-    /// is expected to go.
-    ///
-    /// Audio-only encode is lightweight hub work (AR-10/HUB-16), so it
-    /// never consumes a fleet slot. Video encode is full-transcoder work:
-    /// external fleet first, with AIO's enabled local video executor as
-    /// the measured fallback/repatriation candidate.
+    /// is expected to go — `kahawai_playback::placement::decide` with the
+    /// chosen box reserved under the same lock. Audio-only encode is
+    /// lightweight hub work (AR-10/HUB-16) and never consumes a fleet
+    /// slot; video encode goes to the fleet first, with AIO's enabled
+    /// local video executor as the measured fallback.
     pub fn place(&self, need: &PlacementNeed) -> Placement {
-        if !need.encode_video {
-            return Placement {
-                target: None,
-                available: true,
-                predicted: None,
-            };
-        }
-        let fleet = self.reserve_transcoder(need);
-        let local = self
-            .local_video_executor_enabled
-            .then(|| self.predict_local(need))
-            .flatten();
-        match fleet {
-            None => Placement {
-                target: None,
-                available: self.local_video_executor_enabled,
-                predicted: local,
-            },
-            Some(id) => {
-                let fleet_pred = self.predict_fleet(&id, need);
-                if self.local_video_executor_enabled
-                    && !sustains(fleet_pred)
-                    && sustains(local)
-                    && local.is_some()
-                {
-                    // Reserved above and not used: hand it straight back
-                    // or the box stays counted busy for nothing.
-                    self.tc_session_ended(&id);
-                    tracing::info!(
-                        box_id = %id,
-                        class = need.work_class.as_deref().unwrap_or("-"),
-                        fleet = fleet_pred.unwrap_or(0.0),
-                        local = local.unwrap_or(0.0),
-                        "no fleet box sustains this work; keeping it local"
-                    );
-                    return Placement {
-                        target: None,
-                        available: true,
-                        predicted: local,
-                    };
-                }
-                Placement {
-                    target: Some(id),
-                    available: true,
-                    predicted: fleet_pred,
-                }
+        self.with_fleet(|fleet, load| {
+            let placement = kahawai_playback::placement::decide(fleet, need);
+            if let Some(id) = &placement.target {
+                *load.entry(id.clone()).or_insert(0) += 1;
             }
-        }
-    }
-
-    /// 2160-class work? Read off the class key rather than passed
-    /// separately, so the prediction and the thing being learned can
-    /// never disagree about which bucket they are in.
-    fn is_2160(need: &PlacementNeed) -> bool {
-        need.work_class
-            .as_deref()
-            .is_some_and(|c| c.starts_with("2160|"))
-    }
-
-    /// What a satellite is expected to sustain on this work.
-    ///
-    /// OBSERVED wins outright when present: a measured run already
-    /// contains the decode, the tone-map, the encode AND that box's link
-    /// stalls, so folding the component terms in on top would count the
-    /// same cost twice. Only when nothing has been observed do the parts
-    /// stand in, and then the SLOWEST of them governs — a chain is its
-    /// narrowest link.
-    fn predict_fleet(&self, id: &str, need: &PlacementNeed) -> Option<f32> {
-        if let Some(class) = need.work_class.as_deref()
-            && let Some(observed) = self.pace_of(id, class)
-        {
-            return Some(observed as f32);
-        }
-        let caps = self.transcoder_caps.lock().unwrap().get(id).cloned()?;
-        let big = Self::is_2160(need);
-        let pos = |v: f32| (v > 0.0).then_some(v); // 0 on the wire = unmeasured
-
-        let mut terms: Vec<f32> = Vec::new();
-        let best = caps
-            .encoders
-            .iter()
-            .filter(|e| match need.video_codec.as_str() {
-                "" => true,
-                c => e.codec == c,
-            })
-            .filter_map(|e| if big { e.speed_2160 } else { e.speed_1080 })
-            .filter_map(pos)
-            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
-        terms.extend(best);
-        if need.needs_tonemap {
-            let tm = if big {
-                caps.tonemap_speed_2160
-            } else {
-                caps.tonemap_speed_1080
-            }
-            .and_then(pos);
-            terms.extend(tm);
-        }
-        // The link term applies to DISPATCHED work only: the bytes have
-        // to cross the wire before they can be encoded.
-        if let (Some(kbps), Some(bps)) = (need.source_kbps, self.link_rate_of(id))
-            && kbps > 0
-        {
-            terms.push((bps as f32 * 8.0 / 1000.0) / kbps as f32);
-        }
-        terms
-            .into_iter()
-            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
-    }
-
-    /// The same question for AIO's full local transcoder. No link term:
-    /// the bytes are already here, which is precisely why repatriating can
-    /// beat a faster satellite on a thin wire.
-    fn predict_local(&self, need: &PlacementNeed) -> Option<f32> {
-        if let Some(class) = need.work_class.as_deref()
-            && let Some(observed) = self.pace_of(crate::pace::LOCAL, class)
-        {
-            return Some(observed as f32);
-        }
-        let bench = self.local_bench.lock().unwrap().clone()?;
-        let big = Self::is_2160(need);
-        let pick = |s: &kahawai_media::bench::Speeds| if big { s.s2160 } else { s.s1080 };
-        let mut terms: Vec<f32> = Vec::new();
-        let best = bench
-            .encoders
-            .iter()
-            .filter(|(element, _)| bench.encoder_ready(element))
-            .filter(|(element, _)| match need.video_codec.as_str() {
-                "" => true,
-                c => element_encodes(element, c),
-            })
-            .filter_map(|(_, s)| pick(s))
-            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a| a.max(v))));
-        terms.extend(best);
-        if need.needs_tonemap && bench.tonemap_ready() {
-            terms.extend(bench.tonemap.as_ref().and_then(pick));
-        }
-        terms
-            .into_iter()
-            .fold(None::<f32>, |acc, v| Some(acc.map_or(v, |a: f32| a.min(v))))
+            placement
+        })
     }
 
     /// Enrolled satellites (DB) merged with live connection state.

@@ -16,6 +16,7 @@ ocr = ["dep:leptess"]
 leptess = { version = "0.14", optional = true }
 kahawai-core = { workspace = true }
 kahawai-mediadb = { workspace = true }
+kahawai-playback = { workspace = true }
 kahawai-media = { workspace = true }
 kahawai-proto = { workspace = true }
 kahawai-sqlite = { workspace = true }

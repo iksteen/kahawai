@@ -2082,6 +2082,7 @@ dependencies = [
  "kahawai-media",
  "kahawai-mediadb",
  "kahawai-mediahost",
+ "kahawai-playback",
  "kahawai-proto",
  "kahawai-sqlite",
  "kahawai-transcoder",
