@@ -28,7 +28,7 @@ const inputs = [
   'crates/kahawai-hub/src/opensubtitles.rs',
   'crates/kahawai-hub/src/registry.rs',
   'crates/kahawai-hub/src/segments.rs',
-  'crates/kahawai-hub/src/sessions.rs',
+  'crates/kahawai-hub/src/sessions/mod.rs',
   'crates/kahawai-hub/src/subtitles.rs',
   'crates/kahawai-hub/src/tracks.rs',
   'crates/kahawai-media/Cargo.toml',
