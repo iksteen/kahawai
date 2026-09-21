@@ -138,6 +138,14 @@ Deployment topology, cross-compilation and the NAS/macOS satellites:
   Don't add a sweep — add a row kind and a wake, or react to the landing. `GET /admin/v1/work` and `scripts/kahawai-work.sh` show
   every queue; schema meaning is in `mediadb/subtitles_work.rs` and
   `mediadb/enrichment.rs`.
+- **Pipeline runs** — every remux and transcode, hub-local or dispatched,
+  runs through `playback/executor.rs`; its module doc is the reference for
+  the run-directory contract (`master.m3u8`, `start.pos`, `viewer.pos`,
+  `pace.json`, `facts.jsonl`, `worker.log`, per-run `r<N>` dirs). The job
+  itself and its argv/`StartSession` spellings are `playback/job.rs`; add a
+  field there and the round-trip tests tell you every place it must reach.
+  Placement ranking is `playback/placement.rs`; the registry only holds the
+  locks and takes the reservation.
 - **Caches are not evicted**, by decision (OPS-6): every one is either
   expensive to rebuild (subtitle extractions re-demux a whole file) or
   latency-critical at point of use (artwork during a grid scroll). Don't

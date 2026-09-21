@@ -59,6 +59,9 @@ kahawai/
 │   │                           # renewal shared by networked satellites
 │   ├── kahawai-media/          # gstreamer wrappers: discovery, pipeline builder,
 │   │                           # encoder capability probing
+│   ├── kahawai-playback/       # the pipeline job, its argv/wire codecs, the
+│   │                           # supervised executor, placement ranking
+│   ├── kahawai-mediadb/        # catalogue, metadata and library identities
 │   ├── kahawai-hub/            # hub library (registry, libraries, enrichment,
 │   │                           # sessions, in-hub remuxer, client API)
 │   ├── kahawai-mediahost/      # mediahost library (scanner, watcher, file server)
@@ -982,3 +985,51 @@ a 4.3 mediahost. Revision-less extraction caches and the v1 derived artifacts
 that could have consumed them remain on disk but are not reused. Rebuilding is
 expensive (demux/OCR/rendering), so verified revision-specific results remain
 durable and are reused immediately during playback.
+
+## Playback crate
+
+`kahawai-playback` holds what every process that runs a pipeline used to
+carry a copy of. It sits between `kahawai-media` (the blocking GStreamer
+layer, which it drives) and the role crates (the hub, the transcoder and the
+runtime's `remux-worker` entry, which drive it). Because the lean transcoder
+daemon links it, it may depend on `kahawai-core`, `kahawai-media`,
+`kahawai-proto` and tokio, and never on the hub, mediadb, SQLite, axum or
+the OCR engine; `tests/boundaries.rs` reads its manifest and
+`scripts/kahawai-playback.sh lean` walks the daemon's resolved graph.
+
+* `job` — one pipeline run, fully specified (TC-3): the `RemuxPlan` plus
+  part sizes, start offset, sink override, burn payloads and the playlist's
+  declared target duration. It is spelled three ways and nowhere else:
+  `remux-worker` argv (`to_argv` / `from_args`), `StartSession`
+  (`to_start_session` / `from_start_session`) and the in-process call.
+  Round-trip tests hold the directions together. The wire conventions —
+  NaN for a present-but-unmeasured scalar gain, 1-based burn indexes,
+  0 = unknown target duration — are documented on the module.
+* `executor` — the supervised run (§1.1, TC-4, TC-5): a fresh
+  `<scratch>/<session>/r<N>` directory per run, one Unix socket per part
+  under a short `/tmp/kahawai-XXXX` (SUN_LEN), the 16-byte read protocol
+  served from an async `ByteSource` the caller implements (a lease on the
+  hub, a link round trip on a transcoder), the worker spawned with stdout
+  AND stderr captured or the pipeline started in-process for tests, and a
+  readiness wait on the playlist's runway. `Run` exposes the directory,
+  the viewer position, pace harvesting, a `died` watch and an orderly
+  `end` that waits, gathers the bundle and removes the directory only when
+  the worker is gone. The module doc is the reference for what each file
+  in a run directory means.
+* `playlist` — the readiness runway: three declared target durations,
+  floored at 6.5 s and capped at 30 s, ENDLIST always ready. Protocol 4.5
+  carries the declaration to transcoders (`StartSession.target_duration_secs`)
+  so their runway follows the hub's; older transcoders keep the flat floor.
+* `bundle` — the OPS-10 diagnostics text for a run directory, one shape for
+  both sides of the transcoder link, first-segment SPS/PPS/IDR check
+  included.
+* `placement` — the pure half of HUB-36 placement: `PlacementNeed`,
+  `Placement`, work classes, the pace EWMA and `rank`/`decide` over a
+  `FleetSnapshot`. The registry takes the snapshot under its locks and
+  reserves the chosen box in the same critical section.
+* `seek` — part indexing, host dependence of a multi-part session, and
+  seek-intent coalescing.
+
+`scripts/kahawai-playback.sh check` runs the crate's tests and a real
+pipeline through the executor; `worker` does the same through the spawned
+`remux-worker` child of a freshly built `kahawai` binary.

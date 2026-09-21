@@ -1118,3 +1118,25 @@ not describe this branch's current runtime.
       `scripts/kahawai-mediadb.sh check-cli` exercises commands on a real hub.
       Account CLI listing and library grants use catalogue IDs and version-guarded
       writes; checks cover every account command, viewer access and stale-write errors.
+
+## Playback crate
+
+The checks above describe the hub, the satellites and the media layer. These
+entries track the extraction of the shared playback mechanics into
+`kahawai-playback`, which the role crates adopt one at a time.
+
+- [x] `kahawai-playback` exists with the typed pipeline job and its argv and
+      `StartSession` codecs (round-trip tested in both directions), the
+      supervised executor with its run-directory contract, playlist readiness,
+      the diagnostics bundle, the pure placement ranker over a fleet snapshot,
+      and the seek helpers. Protocol 4.5 adds `StartSession.target_duration_secs`
+      so a transcoder's readiness runway follows the hub's declaration.
+      `scripts/kahawai-playback.sh check|worker|lean` are the runnable checks.
+- [ ] The `remux-worker` entry in `kahawai-runtime` parses its job through the
+      crate.
+- [ ] The transcoder runs dispatched sessions on the crate's executor.
+- [ ] The hub's registry ranks placement over a fleet snapshot.
+- [ ] The hub runs local remux sessions on the crate's executor, with per-run
+      directories, a death watch and local pace samples.
+- [ ] The superseded plumbing in the hub, the transcoder and the runtime is
+      deleted and the transcoder daemon's dependency graph is gated.

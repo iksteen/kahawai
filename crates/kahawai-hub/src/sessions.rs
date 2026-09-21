@@ -2795,6 +2795,10 @@ impl Sessions {
                     video_codec: plan.video_codec.as_str().into(),
                     audio_codec: plan.audio_codec.as_str().into(),
                     container: plan.segment_format.as_str().into(),
+                    // Unknown until the hub speaks through
+                    // `kahawai_playback::job::Job`: the transcoder keeps
+                    // its historical runway meanwhile.
+                    target_duration_secs: 0,
                 },
             )),
         };

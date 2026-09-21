@@ -2222,6 +2222,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kahawai-playback"
+version = "0.0.0-dev"
+dependencies = [
+ "anyhow",
+ "clap",
+ "kahawai-core",
+ "kahawai-media",
+ "kahawai-proto",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "kahawai-proto"
 version = "0.0.0-dev"
 dependencies = [
