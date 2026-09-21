@@ -2256,6 +2256,7 @@ dependencies = [
  "figment",
  "kahawai-core",
  "kahawai-media",
+ "kahawai-playback",
  "libc",
  "serde",
  "serde_json",
