@@ -10,9 +10,11 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
-use crate::bytes::{ByteSources, LeaseSource, Reader};
+use crate::bytes::{ByteSources, Reader};
 use crate::leases::Lease;
 use crate::registry::{LoudnessPreference, Registry};
+use kahawai_playback::executor::Executor;
+use kahawai_playback::seek::{PendingSeek, TimelinePart, part_index, reads_from};
 
 pub use crate::bytes::SourceOffline;
 
@@ -28,18 +30,18 @@ mod start;
 mod tests;
 
 use admission::*;
-pub use local::*;
+use diagnostics::*;
 pub(crate) use negotiation::*;
-use seek::*;
 use start::*;
 
 pub enum Mode {
     Direct {
         lease: Lease,
     },
+    /// Running on the hub's own supervised worker. `None` only while a
+    /// seek-restart swaps runs; the run owns its directory.
     Remux {
-        dir: PathBuf,
-        runner: Mutex<RemuxRunner>,
+        run: Mutex<Option<kahawai_playback::executor::Run>>,
     },
     /// Dispatched to a transcoder module; artifacts proxied on demand.
     /// The module can change: AR-6 reschedules onto a new box.
@@ -135,6 +137,15 @@ pub struct PartSource {
     pub mtime_unix: i64,
     pub base_ms: u64,
     pub duration_ms: u64,
+}
+
+impl TimelinePart for PartSource {
+    fn base_ms(&self) -> u64 {
+        self.base_ms
+    }
+    fn module_id(&self) -> &str {
+        &self.module_id
+    }
 }
 
 /// An initial chapter position is source-relative. Saved resume is item-relative;
@@ -332,10 +343,11 @@ pub struct Sessions {
     scratch_root: PathBuf,
     max_per_user: usize,
     idle_timeout: Duration,
-    /// The binary to spawn as the per-session pipeline worker (the hub
-    /// passes its own executable; the worker is a hidden subcommand).
-    /// None → pipelines run in-process (tests only).
-    worker_exe: Option<PathBuf>,
+    /// Runs the hub's own pipelines (`kahawai_playback::executor`): one
+    /// run directory per attempt under `scratch_root`, the worker being
+    /// this binary's hidden subcommand, or the pipeline in-process for
+    /// tests that have no binary.
+    executor: Executor,
     active: Mutex<HashMap<String, Arc<Session>>>,
     /// True while `active` is empty. Background work that must not
     /// compete with a viewer (idle OCR) waits on this instead of polling
@@ -401,38 +413,16 @@ impl Sessions {
     }
 
     pub fn with_limits(scratch_root: PathBuf, max_per_user: usize, idle_timeout: Duration) -> Self {
-        // Recover crash-interrupted local runs before deleting their scratch.
-        // The durable start header supplies the item identity after memory is lost.
-        if let Some(data_dir) = scratch_root.parent()
-            && let Ok(entries) = std::fs::read_dir(&scratch_root)
-        {
-            for entry in entries.flatten() {
-                let id = entry.file_name().to_string_lossy().into_owned();
-                if let Some(path) = crate::sessionlog::for_session(data_dir, &id)
-                    && let Ok(header) = std::fs::read_to_string(path)
-                    && let Some(item) = header
-                        .lines()
-                        .find_map(|line| line.strip_prefix("item:").map(str::trim))
-                {
-                    crate::sessionlog::store(
-                        data_dir,
-                        item,
-                        &id,
-                        &format!(
-                            "== recovered after hub restart\n{}",
-                            local_bundle(&entry.path())
-                        ),
-                    );
-                }
-            }
-        }
-        let _ = std::fs::remove_dir_all(&scratch_root);
+        // Recover crash-interrupted local runs before the executor deletes
+        // their scratch. The durable start header supplies the item identity
+        // after memory is lost.
+        recover_interrupted_runs(&scratch_root);
         Self {
             bytes: Arc::new(ByteSources::new()),
+            executor: Executor::new(scratch_root.clone(), None),
             scratch_root,
             max_per_user,
             idle_timeout,
-            worker_exe: None,
             active: Mutex::new(HashMap::new()),
             idle: tokio::sync::watch::channel(true).0,
             reserved: Mutex::new(HashMap::new()),
@@ -453,7 +443,7 @@ impl Sessions {
 
     /// Run pipelines in a supervised child process (crash isolation).
     pub fn with_worker_exe(mut self, exe: Option<PathBuf>) -> Self {
-        self.worker_exe = exe;
+        self.executor = Executor::new(self.scratch_root.clone(), exe);
         self
     }
 
@@ -479,6 +469,11 @@ impl Sessions {
                     tracing::info!(session = %id, "ending idle session");
                     sessions.end(&id).await;
                 }
+                // HUB-36: what the local worker measured about itself.
+                let registry = sessions.registry_for_teardown.lock().unwrap().clone();
+                if let Some(registry) = registry {
+                    sessions.harvest_local_pace(&registry).await;
+                }
             }
         });
     }
@@ -489,8 +484,10 @@ impl Sessions {
     pub fn viewer_position(self: &Arc<Self>, registry: &Arc<Registry>, id: &str, position_ms: u64) {
         let Some(session) = self.get(id) else { return };
         match &session.mode {
-            Mode::Remux { dir, .. } => {
-                let _ = std::fs::write(dir.join("viewer.pos"), position_ms.to_string());
+            Mode::Remux { run } => {
+                if let Some(run) = run.lock().unwrap().as_ref() {
+                    run.viewer_position(position_ms);
+                }
             }
             Mode::Transcode { transcoder } => {
                 let tc = transcoder.lock().unwrap().clone();
@@ -623,19 +620,31 @@ impl Sessions {
             kept.insert(id.to_string(), header);
         }
         match &session.mode {
-            Mode::Remux { dir, runner } => {
+            Mode::Remux { run } => {
                 // OPS-10: the hub's OWN worker leaves the same evidence a
-                // satellite's does, and this wipe destroys it. Gather
-                // first, and store directly — a local session never
-                // touches the link. Seek-restarts preserve their evidence in
-                // the same bounded bundle before clearing scratch too.
-                if let Some(data_dir) = self.scratch_root.parent() {
-                    let (item, header) = self.log_header(id);
-                    let body = format!("{header}{}", local_bundle(dir));
-                    crate::sessionlog::store(data_dir, &item, id, &body);
+                // satellite's does, and ending the run destroys its
+                // directory. The run gathers first; store directly — a
+                // local session never touches the link.
+                let run = run.lock().unwrap().take();
+                if let Some(run) = run {
+                    let ended = run.end("hub-local worker").await;
+                    if let Some(data_dir) = self.scratch_root.parent() {
+                        let (item, header) = self.log_header(id);
+                        crate::sessionlog::store(
+                            data_dir,
+                            &item,
+                            id,
+                            &format!("{header}{}", ended.bundle),
+                        );
+                    }
+                    // Cloned out of the lock BEFORE the await: a guard held in
+                    // an `if let` scrutinee lives through its body.
+                    let registry = self.registry_for_teardown.lock().unwrap().clone();
+                    if let (Some(multiple), Some(registry)) = (ended.pace, registry) {
+                        self.fold_local_pace(&registry, &session.pace_class, multiple)
+                            .await;
+                    }
                 }
-                runner.lock().unwrap().stop();
-                let _ = std::fs::remove_dir_all(dir);
             }
             Mode::Transcode { transcoder } => {
                 let transcoder = transcoder.lock().unwrap().clone();

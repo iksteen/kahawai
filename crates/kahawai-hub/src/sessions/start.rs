@@ -466,6 +466,7 @@ impl Sessions {
                                 &tc,
                                 &id,
                                 plan,
+                                negotiated.target_duration_secs,
                                 &parts,
                                 start_idx,
                                 local_ms,
@@ -488,14 +489,14 @@ impl Sessions {
                     }
                     None => {
                         let tail = self.open_part_leases(registry, &parts, start_idx).await?;
-                        let (runner, facts) = match self
-                            .start_remux(
+                        let started = match self
+                            .start_local(
                                 &id,
                                 plan,
                                 negotiated.target_duration_secs,
                                 tail,
                                 local_ms,
-                                "",
+                                None,
                                 burn_sets.as_deref(),
                                 burn_ass_text.as_deref(),
                             )
@@ -514,13 +515,13 @@ impl Sessions {
                                 let tail =
                                     self.open_part_leases(registry, &parts, start_idx).await?;
                                 let r = self
-                                    .start_remux(
+                                    .start_local(
                                         &id,
                                         plan,
                                         negotiated.target_duration_secs,
                                         tail,
                                         local_ms,
-                                        "hlssink2",
+                                        Some("hlssink2"),
                                         burn_sets.as_deref(),
                                         burn_ass_text.as_deref(),
                                     )
@@ -530,10 +531,10 @@ impl Sessions {
                                 r
                             }
                         };
-                        fold_facts(&mut verdict, &facts);
+                        fold_facts(&mut verdict, &started.facts);
+                        self.watch_local_death(&id, started.run.died());
                         Mode::Remux {
-                            runner: Mutex::new(runner),
-                            dir: self.scratch_root.join(&id),
+                            run: Mutex::new(Some(started.run)),
                         }
                     }
                 }

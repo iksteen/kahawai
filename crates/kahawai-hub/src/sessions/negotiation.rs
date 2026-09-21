@@ -96,18 +96,6 @@ pub(super) fn loudness_protocol_feature(
         .then_some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains)
 }
 
-pub(super) fn wire_scalar_loudness(
-    plan: &kahawai_media::remux::RemuxPlan,
-) -> (Option<f64>, Option<f64>, Option<u32>) {
-    // Presence is authoritative in the protocol-4 baseline. Sentinels retain
-    // the worker argv's distinction between absent and an exact 0 dB value.
-    (
-        Some(plan.stereo_gain_db.unwrap_or(f64::NAN)),
-        Some(plan.native_gain_db.unwrap_or(f64::NAN)),
-        Some(plan.loudness_source_channels.unwrap_or(0)),
-    )
-}
-
 pub(super) fn placement_need(
     plan: &kahawai_media::remux::RemuxPlan,
     info: &kahawai_core::media::MediaInfo,

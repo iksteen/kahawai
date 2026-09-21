@@ -4357,8 +4357,14 @@ async fn session_file(
                 };
                 session.touch();
                 let snapshot: Option<Vec<u8>> = match &session.mode {
-                    crate::sessions::Mode::Remux { dir, .. } => {
-                        tokio::fs::read(dir.join(&file)).await.ok()
+                    crate::sessions::Mode::Remux { run } => {
+                        // `None` only while a seek-restart swaps runs: the
+                        // next cycle re-resolves.
+                        let dir = run.lock().unwrap().as_ref().map(|r| r.dir().to_path_buf());
+                        match dir {
+                            Some(dir) => tokio::fs::read(dir.join(&file)).await.ok(),
+                            None => None,
+                        }
                     }
                     crate::sessions::Mode::Transcode { .. } => sessions
                         .fetch_artifact(&registry, &session, &file)
@@ -4394,7 +4400,15 @@ async fn session_file(
             .unwrap());
     }
     let dir = match &session.mode {
-        crate::sessions::Mode::Remux { dir, .. } => dir.clone(),
+        crate::sessions::Mode::Remux { run } => {
+            let dir = run.lock().unwrap().as_ref().map(|r| r.dir().to_path_buf());
+            match dir {
+                Some(dir) => dir,
+                // Mid seek-restart: the client's next request finds the
+                // new run.
+                None => return Err(ApiError::new(ErrorCode::NotFound, "session is restarting")),
+            }
+        }
         crate::sessions::Mode::Transcode { .. } => {
             return transcode_file(&state, &session, &file).await;
         }

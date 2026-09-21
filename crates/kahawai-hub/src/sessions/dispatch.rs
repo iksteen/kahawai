@@ -12,6 +12,7 @@ impl Sessions {
         tc: &str,
         id: &str,
         plan: kahawai_media::remux::RemuxPlan,
+        target_duration_secs: u32,
         parts: &[PartSource],
         start_idx: usize,
         local_ms: u64,
@@ -25,6 +26,7 @@ impl Sessions {
                 tc,
                 id,
                 plan,
+                target_duration_secs,
                 leases,
                 start_idx,
                 local_ms,
@@ -52,6 +54,7 @@ impl Sessions {
                 tc,
                 id,
                 plan,
+                target_duration_secs,
                 leases,
                 start_idx,
                 local_ms,
@@ -73,6 +76,9 @@ impl Sessions {
         transcoder: &str,
         session_id: &str,
         plan: kahawai_media::remux::RemuxPlan,
+        // What the hub's playlist declares; the transcoder's readiness
+        // runway follows it (protocol 4.5).
+        target_duration_secs: u32,
         parts: Vec<(Lease, u64)>,
         part_idx: usize,
         start_ms: u64,
@@ -87,8 +93,25 @@ impl Sessions {
     ) -> Result<Vec<kahawai_media::facts::Fact>> {
         let (ready_tx, ready_rx) = tokio::sync::oneshot::channel();
         anyhow::ensure!(!parts.is_empty(), "no source parts to dispatch");
-        let size = parts[0].1;
-        let tail_sizes: Vec<u64> = parts[1..].iter().map(|(_, n)| *n).collect();
+        // The job, spelled for the wire by the one codec that knows how
+        // (`kahawai_playback::job`): part sizes, sink override, burn
+        // payloads and the declared target duration.
+        let job = kahawai_playback::job::Job {
+            plan,
+            part_sizes: parts.iter().map(|(_, size)| *size).collect(),
+            start_ms,
+            sink: (!sink.is_empty()).then(|| sink.to_string()),
+            burn_sets: (!burn_sets.is_empty())
+                .then_some(kahawai_playback::job::Payload::Bytes(burn_sets)),
+            burn_ass: (!burn_ass_file.is_empty())
+                .then_some(kahawai_playback::job::Payload::Bytes(burn_ass_file)),
+            target_duration_secs: Some(target_duration_secs),
+        };
+        let start = kahawai_proto::v1::HubToTc {
+            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
+                job.to_start_session(session_id)?,
+            )),
+        };
         self.tc_leases
             .lock()
             .unwrap()
@@ -97,55 +120,6 @@ impl Sessions {
             .lock()
             .unwrap()
             .insert(session_id.to_string(), ready_tx);
-        let (stereo_gain_db, native_gain_db, loudness_source_channels) =
-            wire_scalar_loudness(&plan);
-
-        let start = kahawai_proto::v1::HubToTc {
-            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
-                kahawai_proto::v1::StartSession {
-                    session_id: session_id.to_string(),
-                    size,
-                    video: kahawai_media::worker::mode_arg(plan.video).into(),
-                    audio: kahawai_media::worker::mode_arg(plan.audio).into(),
-                    audio_track: plan.audio_track as u32,
-                    video_track: plan.video_track as u32,
-                    start_ms,
-                    sink: sink.into(),
-                    tail_sizes,
-                    video_kbps: plan.video_kbps.unwrap_or(0),
-                    max_height: plan.max_height.unwrap_or(0),
-                    max_channels: plan.max_channels.unwrap_or(0),
-                    stereo_gain_db,
-                    native_gain_db,
-                    loudness_source_channels,
-                    loudness_gains: plan
-                        .loudness_gains
-                        .iter()
-                        .flatten()
-                        .map(|gain| kahawai_proto::v1::AudioLayoutGain {
-                            channels: gain.layout.channels,
-                            channel_mask: gain.layout.channel_mask,
-                            gain_db: gain.gain_db,
-                        })
-                        .collect(),
-                    tone_map: plan.tone_map,
-                    deinterlace: plan.deinterlace,
-                    // 1-based on the wire: 0 means "burn nothing".
-                    burn_subtitle: plan.burn_subtitle.map_or(0, |n| n as u32 + 1),
-                    burn_sets: burn_sets.clone(),
-                    // 1-based on the wire, same as burn_subtitle.
-                    burn_ass: plan.burn_ass.map_or(0, |n| n as u32 + 1),
-                    burn_ass_file: burn_ass_file.clone(),
-                    video_codec: plan.video_codec.as_str().into(),
-                    audio_codec: plan.audio_codec.as_str().into(),
-                    container: plan.segment_format.as_str().into(),
-                    // Unknown until the hub speaks through
-                    // `kahawai_playback::job::Job`: the transcoder keeps
-                    // its historical runway meanwhile.
-                    target_duration_secs: 0,
-                },
-            )),
-        };
         let cleanup = |sessions: &Self| {
             sessions.tc_leases.lock().unwrap().remove(session_id);
             sessions.pending_ready.lock().unwrap().remove(session_id);

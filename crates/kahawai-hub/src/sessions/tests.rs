@@ -4,13 +4,25 @@ fn diagnostics_survive_pipeline_purge_and_hub_restart() {
     let scratch = data.path().join("sessions");
     let sessions = super::Sessions::new(scratch.clone());
     sessions.note_session("session", "stable-item");
-    let run = scratch.join("session");
-    std::fs::create_dir_all(&run).unwrap();
-    std::fs::write(run.join("worker.log"), "first attempt failed").unwrap();
-    sessions.keep_local_logs("session", &run);
-    std::fs::remove_dir_all(&run).unwrap();
-    std::fs::create_dir_all(&run).unwrap();
-    std::fs::write(run.join("worker.log"), "second attempt interrupted").unwrap();
+    // Per-run directories: r1 failed and was bundled on the way out, r2 was
+    // still running when the hub went down.
+    let first = scratch.join("session").join("r1");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::write(first.join("worker.log"), "first attempt failed").unwrap();
+    let (item, header) = sessions.log_header("session");
+    crate::sessionlog::store(
+        data.path(),
+        &item,
+        "session",
+        &format!(
+            "{header}{}",
+            kahawai_playback::bundle::gather("hub-local worker", "session", &first)
+        ),
+    );
+    std::fs::remove_dir_all(&first).unwrap();
+    let second = scratch.join("session").join("r2");
+    std::fs::create_dir_all(&second).unwrap();
+    std::fs::write(second.join("worker.log"), "second attempt interrupted").unwrap();
     drop(sessions);
     let _restarted = super::Sessions::new(scratch.clone());
     assert!(!scratch.exists());
@@ -21,9 +33,9 @@ fn diagnostics_survive_pipeline_purge_and_hub_restart() {
     assert!(body.contains("recovered after hub restart"));
 }
 use super::{
-    LoudnessPreference, Negotiation, PartSource, Sessions, apply_audio_loudness_measurement,
-    fold_facts, local_audio_encoder_names, local_tonemap_available, local_video_encoder_names,
-    part_index, replanned_verdict, same_video_path, source_choice_key, wire_scalar_loudness,
+    LoudnessPreference, Negotiation, PartSource, Sessions, fold_facts, local_audio_encoder_names,
+    local_tonemap_available, local_video_encoder_names, replanned_verdict, same_video_path,
+    source_choice_key,
 };
 
 /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
@@ -273,56 +285,6 @@ fn facts_fold_into_the_verdict_idempotently() {
 }
 
 #[test]
-fn loudness_opt_out_clears_every_gain() {
-    let mut plan = kahawai_media::remux::RemuxPlan::default();
-    let measured = kahawai_media::loudness::AudioLoudnessMeasurement {
-        source: kahawai_media::loudness::AudioLayout::new(6, 0x3f),
-        layouts: vec![
-            kahawai_media::loudness::AudioLayoutLoudness {
-                layout: kahawai_media::loudness::AudioLayout::new(6, 0x3f),
-                loudness: kahawai_media::loudness::AudioLoudness {
-                    integrated_lufs: -24.0,
-                    true_peak_dbtp: -10.0,
-                },
-            },
-            kahawai_media::loudness::AudioLayoutLoudness {
-                layout: kahawai_media::loudness::AudioLayout::new(2, 0x3),
-                loudness: kahawai_media::loudness::AudioLoudness {
-                    integrated_lufs: -26.0,
-                    true_peak_dbtp: -8.0,
-                },
-            },
-        ],
-    };
-    apply_audio_loudness_measurement(
-        &mut plan,
-        LoudnessPreference::Encoded,
-        Some(measured.clone()),
-    );
-    assert_eq!(plan.stereo_gain_db, Some(7.0));
-    assert_eq!(plan.native_gain_db, Some(6.0));
-    assert_eq!(plan.loudness_source_channels, Some(6));
-    assert_eq!(
-        plan.loudness_gains.iter().flatten().count(),
-        2,
-        "every exact layout gets a gain"
-    );
-    apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, Some(measured));
-    assert_eq!(plan.stereo_gain_db, None);
-    assert_eq!(plan.native_gain_db, None);
-    assert_eq!(plan.loudness_source_channels, None);
-    assert!(plan.loudness_gains.iter().all(Option::is_none));
-}
-#[test]
-fn absent_scalar_gain_is_nonfinite_across_old_worker_decoders() {
-    let plan = kahawai_media::remux::RemuxPlan::default();
-    let (stereo, native, channels) = wire_scalar_loudness(&plan);
-    assert!(stereo.is_some_and(f64::is_nan));
-    assert!(native.is_some_and(f64::is_nan));
-    assert_eq!(channels, Some(0));
-}
-
-#[test]
 fn optional_audio_gain_never_changes_the_video_path() {
     let base = kahawai_media::remux::RemuxPlan {
         video: kahawai_media::remux::StreamMode::Encode,
@@ -526,46 +488,4 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
         "protocol 4.0 did not expose exact stereo gain support"
     );
     assert_ne!(baseline.plan.audio, stereo_normal.plan.audio);
-}
-
-fn part(base_ms: u64, duration_ms: u64) -> PartSource {
-    PartSource {
-        head_xxh3: 0,
-        tail_xxh3: 0,
-        file_id: crate::sessions::FileId::Catalogue("fixture".into()),
-        module_id: "m".into(),
-        collection_id: "c".into(),
-        root_token: "root".into(),
-        path_rel: format!("CD{}.avi", base_ms),
-        size: 1,
-        mtime_unix: 0,
-        base_ms,
-        duration_ms,
-    }
-}
-
-/// The CD1→CD2 hand-off is this function and nothing else: when a
-/// part's playlist ends the client seeks to `end + 250 ms`, and which
-/// file that lands in is decided here. Boundaries measured against
-/// the real two-part rip in the library (part 2 based at 3_752_711).
-#[test]
-fn a_timestamp_lands_in_the_part_that_contains_it() {
-    let parts = [part(0, 3_752_711), part(3_752_711, 3_758_967)];
-
-    assert_eq!(part_index(&parts, 0), 0, "start of part one");
-    assert_eq!(part_index(&parts, 3_752_710), 0, "last ms of part one");
-    // base_ms is inclusive: the boundary itself is already part two,
-    // which is why the client's `+250` cannot land back in part one.
-    assert_eq!(part_index(&parts, 3_752_711), 1, "the boundary");
-    assert_eq!(part_index(&parts, 3_752_961), 1, "end-of-part-one + 250");
-    assert_eq!(part_index(&parts, 7_511_677), 1, "last ms of the film");
-    // Past the end clamps to the final part rather than panicking:
-    // a seek beyond the timeline is a UI rounding error, not a crash.
-    assert_eq!(part_index(&parts, u64::MAX), 1, "past the end");
-
-    // Single-file sources take the same path with one part.
-    assert_eq!(part_index(&[part(0, 1_000)], 999), 0);
-    assert_eq!(part_index(&[part(0, 1_000)], 10_000), 0);
-    // No parts at all is not reachable today, but must not panic.
-    assert_eq!(part_index(&[], 42), 0);
 }
