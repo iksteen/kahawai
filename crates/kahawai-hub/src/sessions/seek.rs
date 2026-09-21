@@ -1,55 +1,5 @@
 use super::*;
 
-/// A coalesced seek intent.
-#[derive(Debug, Clone, Copy)]
-pub(super) struct PendingSeek {
-    pub(super) generation: u64,
-    pub(super) position_ms: u64,
-    pub(super) audio_track: Option<u32>,
-    pub(super) video_track: Option<u32>,
-    /// The burn pick changed (subtitle unification): re-plan even when
-    /// the audio/video tracks stayed put.
-    pub(super) replan_subs: bool,
-}
-
-impl PendingSeek {
-    /// The newer intent wins the position; explicit track choices
-    /// survive supersession (None = "keep current").
-    pub(super) fn merge(prev: Option<PendingSeek>, next: PendingSeek) -> PendingSeek {
-        match prev {
-            Some(p) => PendingSeek {
-                audio_track: next.audio_track.or(p.audio_track),
-                video_track: next.video_track.or(p.video_track),
-                replan_subs: next.replan_subs || p.replan_subs,
-                ..next
-            },
-            None => next,
-        }
-    }
-}
-
-/// Index of the part containing `abs_ms`.
-pub(super) fn part_index(parts: &[PartSource], abs_ms: u64) -> usize {
-    parts.iter().rposition(|p| abs_ms >= p.base_ms).unwrap_or(0)
-}
-
-/// Does this session read bytes from `module_id`?
-///
-/// Any part, not just the one it started on. `Session::module_id` is
-/// `parts[start_idx].module_id`, and a multi-part source can have a host per
-/// part — CD1 and CD2 on different mediahosts is ordinary. Keyed on the
-/// starting part alone, a session playing CD2 survived CD2's host leaving.
-///
-/// True for a part already played, on purpose: the viewer can seek back into
-/// it, so the session does still depend on that host.
-///
-/// A free function so the predicate can be tested without standing up a
-/// session: a real multi-part one is remux-only, which means GStreamer and
-/// real media to assert one boolean.
-pub(super) fn reads_from(start_host: &str, parts: &[PartSource], module_id: &str) -> bool {
-    start_host == module_id || parts.iter().any(|p| p.module_id == module_id)
-}
-
 impl Sessions {
     /// Seek-restart (§6): tear the session's pipeline down and start it
     /// again at `position_ms` (keyframe-snapped by the demuxer). Same
@@ -452,24 +402,39 @@ impl Sessions {
             .current_part
             .store(idx, std::sync::atomic::Ordering::SeqCst);
         match &session.mode {
-            Mode::Remux { dir, runner } => {
-                let old = std::mem::replace(&mut *runner.lock().unwrap(), RemuxRunner::Stopped);
-                old.stop_and_wait().await;
-                self.keep_local_logs(&session.id, dir);
-                let _ = std::fs::remove_dir_all(dir);
-                // The old worker's lease died with it; open a fresh one
-                // on whichever part the target lands in.
-                // A seek restarts in the target part and spans the rest
-                // from there: concat cannot serve the seek itself (it
-                // accepts one and then plays from zero — measured), so
-                // the restart stays, but it only ever happens for a seek
-                // now, never for a boundary.
+            Mode::Remux { run } => {
+                // The old run ends first, evidence kept: a seek-restart's
+                // new pipeline never shares a directory with the old one's
+                // drain, but the old lease died with it either way, so a
+                // fresh one is opened on whichever part the target lands in.
+                // A seek restarts in the target part and spans the rest from
+                // there: concat cannot serve the seek itself (it accepts one
+                // and then plays from zero — measured), so the restart
+                // stays, but it only ever happens for a seek now, never for
+                // a boundary.
+                let old = run.lock().unwrap().take();
+                if let Some(old) = old {
+                    let ended = old.end("hub-local worker").await;
+                    if let Some(data_dir) = self.data_dir() {
+                        let (item, header) = self.log_header(&session.id);
+                        crate::sessionlog::store(
+                            data_dir,
+                            &item,
+                            &session.id,
+                            &format!("{header}{}", ended.bundle),
+                        );
+                    }
+                    if let Some(multiple) = ended.pace {
+                        self.fold_local_pace(registry, &session.pace_class, multiple)
+                            .await;
+                    }
+                }
                 let sink = session.sink.lock().unwrap().clone();
                 let burn_sets = session.burn_sets.lock().unwrap().clone();
                 let burn_ass = session.burn_ass_text.lock().unwrap().clone();
                 let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                 let fresh = match self
-                    .start_remux(
+                    .start_local(
                         &session.id,
                         plan,
                         // The session's own value, NOT a fresh
@@ -479,7 +444,7 @@ impl Sessions {
                         session.target_duration_secs,
                         tail,
                         local_ms,
-                        &sink,
+                        (!sink.is_empty()).then_some(sink.as_str()),
                         burn_sets.as_deref(),
                         burn_ass.as_deref(),
                     )
@@ -496,13 +461,13 @@ impl Sessions {
                             "seek restart failed; retrying with fallback sink");
                         let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                         let r = self
-                            .start_remux(
+                            .start_local(
                                 &session.id,
                                 plan,
                                 session.target_duration_secs,
                                 tail,
                                 local_ms,
-                                "hlssink2",
+                                Some("hlssink2"),
                                 burn_sets.as_deref(),
                                 burn_ass.as_deref(),
                             )
@@ -513,9 +478,9 @@ impl Sessions {
                     }
                     Err(e) => return Err(e),
                 };
-                let (fresh, facts) = fresh;
-                fold_facts(&mut session.verdict.lock().unwrap(), &facts);
-                *runner.lock().unwrap() = fresh;
+                fold_facts(&mut session.verdict.lock().unwrap(), &fresh.facts);
+                self.watch_local_death(&session.id, fresh.run.died());
+                *run.lock().unwrap() = Some(fresh.run);
                 Ok(part.base_ms)
             }
             Mode::Transcode { transcoder } => {
@@ -565,6 +530,7 @@ impl Sessions {
                         &tc,
                         &session.id,
                         plan,
+                        session.target_duration_secs,
                         parts,
                         idx,
                         local_ms,
@@ -587,6 +553,7 @@ impl Sessions {
                         &tc,
                         &session.id,
                         plan,
+                        session.target_duration_secs,
                         parts,
                         idx,
                         local_ms,
@@ -602,109 +569,5 @@ impl Sessions {
             }
             Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
         }
-    }
-}
-
-#[cfg(test)]
-mod reads_from_tests {
-    use super::{PartSource, reads_from};
-
-    fn part(host: &str) -> PartSource {
-        PartSource {
-            head_xxh3: 0,
-            tail_xxh3: 0,
-            file_id: crate::sessions::FileId::Catalogue("fixture".into()),
-            module_id: host.into(),
-            collection_id: "movies".into(),
-            root_token: "root".into(),
-            path_rel: "x.mkv".into(),
-            size: 1,
-            mtime_unix: 0,
-            base_ms: 0,
-            duration_ms: 1,
-        }
-    }
-
-    #[test]
-    fn a_session_reads_from_every_host_its_parts_live_on() {
-        // CD1 on A, CD2 on B, started on CD1.
-        let parts = [part("A"), part("B")];
-
-        assert!(reads_from("A", &parts, "A"), "the host it started on");
-        // The one that was missed: B going away used to leave this session
-        // alive on a dead lease, which is the stall AR-6 exists to prevent.
-        assert!(reads_from("A", &parts, "B"), "a later part's host");
-        assert!(!reads_from("A", &parts, "C"), "a host it never reads from");
-    }
-
-    #[test]
-    fn a_part_already_passed_still_counts() {
-        // Deliberate, and the reason the doc no longer claims to have fixed
-        // an "over-match": the position is not the whole story, because the
-        // viewer can seek back into CD1 whenever they like. Ending the
-        // session when its host leaves is the honest answer; the alternative
-        // is a seek that fails minutes later with nothing to explain it.
-        //
-        // Asked from the far side, because `reads_from` has no position to
-        // pass: a session STARTED on CD2 still reads from CD1's host. The
-        // version of this test that asked `reads_from("A", &parts, "A")` was
-        // the first assertion of the test above it word for word, and named a
-        // property this signature cannot express — an implementation that
-        // scanned only the parts from `start_idx` onwards, which is exactly
-        // the "already played does not count" mistake, passed it.
-        let parts = [part("A"), part("B")];
-        assert!(
-            reads_from("B", &parts, "A"),
-            "a session playing CD2 still depends on CD1's host: the viewer \
-             can seek back into it"
-        );
-    }
-
-    #[test]
-    fn a_single_part_session_is_unchanged() {
-        let parts = [part("A")];
-        assert!(reads_from("A", &parts, "A"));
-        assert!(!reads_from("A", &parts, "B"));
-    }
-}
-
-#[cfg(test)]
-mod seek_merge_tests {
-    use super::PendingSeek;
-
-    /// A scrub must not silently discard a queued track switch: the
-    /// newest position wins, explicit track choices carry forward.
-    #[test]
-    fn scrub_keeps_the_queued_track_switch() {
-        let switch = PendingSeek {
-            replan_subs: false,
-            generation: 1,
-            position_ms: 1000,
-            audio_track: Some(1),
-            video_track: None,
-        };
-        let scrub = PendingSeek {
-            replan_subs: false,
-            generation: 2,
-            position_ms: 9000,
-            audio_track: None,
-            video_track: None,
-        };
-        let merged = PendingSeek::merge(Some(switch), scrub);
-        assert_eq!(merged.generation, 2);
-        assert_eq!(merged.position_ms, 9000, "newest position wins");
-        assert_eq!(merged.audio_track, Some(1), "track choice survives");
-        // And an explicit newer choice overrides an older one.
-        let re_switch = PendingSeek {
-            replan_subs: false,
-            generation: 3,
-            position_ms: 9000,
-            audio_track: Some(0),
-            video_track: None,
-        };
-        assert_eq!(
-            PendingSeek::merge(Some(merged), re_switch).audio_track,
-            Some(0)
-        );
     }
 }

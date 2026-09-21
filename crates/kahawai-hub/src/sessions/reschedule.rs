@@ -117,7 +117,17 @@ impl Sessions {
             .unwrap_or_default()
             .into_bytes();
         self.start_transcode(
-            registry, &new_tc, id, plan, parts, idx, local_ms, "", sets, ass,
+            registry,
+            &new_tc,
+            id,
+            plan,
+            session.target_duration_secs,
+            parts,
+            idx,
+            local_ms,
+            "",
+            sets,
+            ass,
         )
         .await?;
         *transcoder.lock().unwrap() = new_tc.clone();

@@ -85,9 +85,15 @@ impl Sessions {
             return Ok(std::fs::read_to_string(path)?);
         };
         match &session.mode {
-            Mode::Remux { dir, .. } => {
+            Mode::Remux { run } => {
                 let (_, header) = self.log_header(id);
-                let body = format!("{header}{}", local_bundle(dir));
+                let bundle = run
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .map(|run| run.bundle("hub-local worker"))
+                    .unwrap_or_else(|| "== hub-local worker: restarting\n".into());
+                let body = format!("{header}{bundle}");
                 crate::sessionlog::store(&data_dir, &session.item_id, id, &body);
                 Ok(crate::sessionlog::for_session(&data_dir, id)
                     .and_then(|p| std::fs::read_to_string(p).ok())
@@ -199,18 +205,52 @@ impl Sessions {
     pub fn data_dir(&self) -> Option<&std::path::Path> {
         self.scratch_root.parent()
     }
+}
 
-    pub(super) fn keep_local_logs(&self, id: &str, dir: &std::path::Path) {
-        if dir.is_dir()
-            && let Some(data_dir) = self.data_dir()
-        {
-            let (item, header) = self.log_header(id);
-            crate::sessionlog::store(
-                data_dir,
-                &item,
-                id,
-                &format!("{header}{}", local_bundle(dir)),
-            );
+/// Hub restart: every run directory still under the scratch root belonged
+/// to a session that was interrupted. Bundle each before the executor
+/// sweeps them, keyed by the item the durable start header names.
+pub(super) fn recover_interrupted_runs(scratch_root: &std::path::Path) {
+    let Some(data_dir) = scratch_root.parent() else {
+        return;
+    };
+    let Ok(sessions) = std::fs::read_dir(scratch_root) else {
+        return;
+    };
+    for entry in sessions.flatten() {
+        let id = entry.file_name().to_string_lossy().into_owned();
+        let Some(item) = crate::sessionlog::for_session(data_dir, &id)
+            .and_then(|path| std::fs::read_to_string(path).ok())
+            .and_then(|header| {
+                header
+                    .lines()
+                    .find_map(|line| line.strip_prefix("item:").map(|s| s.trim().to_string()))
+            })
+        else {
+            continue;
+        };
+        // Per-run directories `r<N>`, in order; a directory holding files
+        // directly is a run from before per-run layout and is bundled as is.
+        let mut runs: Vec<std::path::PathBuf> = std::fs::read_dir(entry.path())
+            .map(|rd| {
+                rd.filter_map(|e| e.ok().map(|e| e.path()))
+                    .filter(|p| p.is_dir())
+                    .collect()
+            })
+            .unwrap_or_default();
+        runs.sort();
+        if runs.is_empty() {
+            runs.push(entry.path());
         }
+        let mut body = String::from("== recovered after hub restart\n");
+        for run in runs {
+            body.push_str(&kahawai_playback::bundle::gather(
+                "hub-local worker",
+                &id,
+                &run,
+            ));
+            body.push('\n');
+        }
+        crate::sessionlog::store(data_dir, &item, &id, &body);
     }
 }

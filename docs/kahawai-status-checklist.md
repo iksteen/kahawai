@@ -1152,7 +1152,11 @@ entries track the extraction of the shared playback mechanics into
       the target it returns instead of reserving a fleet box and handing it
       back on repatriation. `pace.rs` keeps the table; the class key and the
       EWMA are the ranker's.
-- [ ] The hub runs local remux sessions on the crate's executor, with per-run
-      directories, a death watch and local pace samples.
+- [x] The hub runs local remux sessions on the crate's executor, with per-run
+      directories (`<session>/r<N>`, served by the API from the current run,
+      recovered per run after a restart), a death watch that stores the
+      worker's evidence, local pace samples folded into `transcoder_pace`,
+      and the dispatch path speaking `StartSession` through the crate's job
+      codec with the declared target duration.
 - [ ] The superseded plumbing in the hub, the transcoder and the runtime is
       deleted and the transcoder daemon's dependency graph is gated.
