@@ -339,22 +339,9 @@ async fn link_loop(
             msg = inbound.message() => {
                 match msg {
                     Ok(Some(m)) => match m.msg {
-                        Some(hub_to_tc::Msg::StartSession(s)) => {
-                            let runner = runner.clone();
-                            tokio::spawn(async move {
-                                runner.start(
-                                    s.session_id, s.size, &s.video, &s.audio,
-                                    s.audio_track, s.video_track, s.start_ms, &s.sink,
-                                    s.tail_sizes,
-                                    (s.video_kbps, s.max_height, s.max_channels, s.tone_map, s.burn_subtitle),
-                                    s.deinterlace,
-                                    (s.stereo_gain_db, s.native_gain_db, s.loudness_source_channels),
-                                    s.loudness_gains,
-                                    (s.video_codec, s.audio_codec, s.container),
-                                    s.burn_sets, (s.burn_ass, s.burn_ass_file),
-                                ).await;
-                            });
-                        }
+                        // Admits and spawns synchronously: a start the loop
+                        // has handed over is one the teardown can find.
+                        Some(hub_to_tc::Msg::StartSession(s)) => runner.start(s),
                         // Inline, not spawned: EndSession→StartSession
                         // ordering on the link is the seek-restart
                         // contract — a spawned end can outrun the new
