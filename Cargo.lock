@@ -2294,7 +2294,6 @@ dependencies = [
  "kahawai-proto",
  "kahawai-transport",
  "rustls",
- "serde_json",
  "tempfile",
  "tokio",
  "tokio-stream",

@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "1dcc0a35533ed2ef59827abcde40f9a150d5891f661724d053b9cccccd22fcf0",
+  "x-kahawai-source-sha256": "0879259f93efec985aeed9f63cbeece7eb8d64812c65e6db16dddffc1eaa3dd9",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {

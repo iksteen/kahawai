@@ -1158,5 +1158,7 @@ entries track the extraction of the shared playback mechanics into
       worker's evidence, local pace samples folded into `transcoder_pace`,
       and the dispatch path speaking `StartSession` through the crate's job
       codec with the declared target duration.
-- [ ] The superseded plumbing in the hub, the transcoder and the runtime is
-      deleted and the transcoder daemon's dependency graph is gated.
+- [x] The superseded plumbing is gone: no second worker argv, socket server,
+      readiness poll, bundle builder or placement scorer exists outside the
+      crate, and `scripts/kahawai-playback.sh lean` gates the transcoder
+      daemon's resolved dependency graph against hub-only crates.
