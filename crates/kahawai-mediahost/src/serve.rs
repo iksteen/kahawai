@@ -7,13 +7,11 @@ use std::path::PathBuf;
 use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::mediahost_link_client::MediahostLinkClient;
 use kahawai_proto::v1::{ByteChunk, OpenRead};
-use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use kahawai_transport::source_stream::{self, FileReader};
 use tokio_stream::wrappers::ReceiverStream;
 
 use crate::scan::CollectionConfig;
 use crate::scheduler::{Priority, Scheduler};
-
-const CHUNK: usize = 256 * 1024;
 
 async fn enter_operation(
     scheduler: &Scheduler,
@@ -169,96 +167,53 @@ pub async fn serve_lease_scheduled(
     // Dropping the lease resumes scheduled CPU work.
     let _playback = (!background).then(|| scheduler.enter_playback("playback byte lease"));
 
-    // First chunk binds the token; carry a resolution error if there is one.
-    let (bind_error, file, size) = match path {
-        Ok(p) => {
-            let open_permit = enter_operation(
-                &scheduler,
-                &resources,
-                background,
-                owner.clone(),
-                format!("open and stat {root_token}"),
-            )
-            .await?;
-            let f = tokio::fs::File::open(&p)
-                .await
-                .with_context(|| format!("opening {}", p.display()))?;
-            let size = f.metadata().await?.len();
-            drop(open_permit);
-            (String::new(), Some(f), size)
-        }
-        Err(e) => (format!("{e:#}"), None, 0),
+    let admission: source_stream::Admission = std::sync::Arc::new(move || {
+        let scheduler = scheduler.clone();
+        let resources = resources.clone();
+        let owner = owner.clone();
+        let label = format!("source read {root_token}");
+        Box::pin(
+            async move { enter_operation(&scheduler, &resources, background, owner, label).await },
+        )
+    });
+    let opened = match path {
+        Ok(path) => FileReader::open(path, Some(admission)).await,
+        Err(e) => Err(e),
     };
+    // Opening errors must bind the lease too, otherwise the hub waits ten
+    // seconds for a byte channel whose failure never reached it.
     tx.send(ByteChunk {
-        lease_token: lease_token.clone(),
-        offset: 0,
-        data: Vec::new(),
-        eof: false,
-        error: bind_error.clone(),
+        lease_token,
+        continuous_reads: true,
+        error: opened
+            .as_ref()
+            .err()
+            .map(|e| format!("{e:#}"))
+            .unwrap_or_default(),
+        ..Default::default()
     })
     .await
     .ok();
-
     let mut requests = client
         .byte_channel(ReceiverStream::new(rx))
         .await
         .context("opening byte channel")?
         .into_inner();
-    let Some(mut file) = file else {
-        return Ok(()); // error delivered; hub will drop the lease
+    let Ok(file) = opened else {
+        return Ok(());
     };
-
-    while let Some(req) = requests.message().await? {
-        let end = req.offset.saturating_add(req.len).min(size);
-        let mut cur = req.offset.min(size);
-        let seek_permit = enter_operation(
-            &scheduler,
-            &resources,
-            background,
-            owner.clone(),
-            format!("seek {root_token}"),
-        )
-        .await?;
-        file.seek(std::io::SeekFrom::Start(cur)).await?;
-        drop(seek_permit);
-        let mut buf = vec![0u8; CHUNK];
-        while cur < end {
-            let read_permit = enter_operation(
-                &scheduler,
-                &resources,
-                background,
-                owner.clone(),
-                format!("read {root_token}"),
-            )
-            .await?;
-            let want = ((end - cur) as usize).min(CHUNK);
-            let n = file.read(&mut buf[..want]).await?;
-            drop(read_permit);
-            if n == 0 {
+    let (command_tx, command_rx) = tokio::sync::mpsc::channel(2);
+    let commands = async {
+        while let Some(req) = requests.message().await? {
+            if command_tx.send(req).await.is_err() {
                 break;
             }
-            let chunk = ByteChunk {
-                lease_token: String::new(),
-                offset: cur,
-                data: buf[..n].to_vec(),
-                eof: false,
-                error: String::new(),
-            };
-            if tx.send(chunk).await.is_err() {
-                return Ok(()); // hub dropped the lease
-            }
-            cur += n as u64;
         }
-        let eof = ByteChunk {
-            lease_token: String::new(),
-            offset: cur,
-            data: Vec::new(),
-            eof: true,
-            error: String::new(),
-        };
-        if tx.send(eof).await.is_err() {
-            return Ok(());
-        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::select! {
+        result = commands => result?,
+        _ = source_stream::serve(command_rx, tx, file.size, |offset, len| file.read(offset, len)) => {},
     }
     Ok(())
 }

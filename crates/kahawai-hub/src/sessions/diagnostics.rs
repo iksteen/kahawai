@@ -28,6 +28,11 @@ impl Sessions {
             );
         };
         let mut h = String::new();
+        if let Some((parts, _)) = self.tc_leases.lock().unwrap().get(session_id) {
+            for (part, (lease, _)) in parts.iter().enumerate() {
+                let _ = writeln!(h, "== hub source part {part}\n{}", lease.diagnostics());
+            }
+        }
         let _ = writeln!(h, "== hub: session {}", s.id);
         let _ = writeln!(h, "item:       {}", s.item_id);
         let _ = writeln!(h, "user:       {}", s.user_id);

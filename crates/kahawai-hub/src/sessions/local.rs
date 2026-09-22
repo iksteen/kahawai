@@ -11,26 +11,15 @@ pub(super) struct LeaseByteSource {
 }
 
 impl ByteSource for LeaseByteSource {
+    fn diagnostics(&self) -> String {
+        self.lease.diagnostics()
+    }
     fn size(&self) -> u64 {
         self.size
     }
 
     fn read(&self, offset: u64, len: u64) -> BoxFuture<'_, std::io::Result<Vec<u8>>> {
-        Box::pin(async move {
-            let mut stream = self.lease.read_range(offset, len).into_inner();
-            let mut buf = Vec::with_capacity(len as usize);
-            while (buf.len() as u64) < len {
-                match stream.recv().await {
-                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
-                    Some(Err(e)) => {
-                        return Err(std::io::Error::other(format!("lease read failed: {e}")));
-                    }
-                    None => break,
-                }
-            }
-            buf.truncate(len as usize);
-            Ok(buf)
-        })
+        Box::pin(self.lease.read_buffered(offset, len, self.size))
     }
 }
 

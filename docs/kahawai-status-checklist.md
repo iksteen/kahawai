@@ -69,7 +69,13 @@ How something works and why it was built that way belong in
       target verified", nothing more. The probe that ended in fakesink
       passed on a box where every HDR session died at negotiation.
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
-      flow-control window (the frozen-heartbeat lesson, codified)
+      flow-control window (the frozen-heartbeat lesson, codified).
+      Protocol 4.6 adds a separate transcoder source connection, interruptible
+      generation-tagged reads, 16 MiB hub / 2 MiB transcoder read-ahead, and
+      true pull appsrc. Disconnected transcoder byte channels resume from the
+      delivered offset with peer-bound single-reader grants; malformed commands
+      return explicit errors. Older peers retain finite requests; check with
+      `scripts/kahawai-playback.sh pull`.
 
 ## Security & enrollment (SEC)
 

@@ -89,22 +89,14 @@ impl kahawai_media::remux::RemuxSource for LeaseSource {
         }
         tracing::trace!(offset, len, reads = self.reads, "lease read: asking");
         let _guard = self.handle.enter();
-        let mut stream = self.lease.read_range(offset, len).into_inner();
-        let outcome = self.handle.block_on(async {
-            let mut filled = 0usize;
-            while filled < len as usize {
-                match stream.recv().await {
-                    Some(Ok(bytes)) => {
-                        let n = bytes.len().min(buf.len() - filled);
-                        buf[filled..filled + n].copy_from_slice(&bytes[..n]);
-                        filled += n;
-                    }
-                    Some(Err(e)) => return Err(std::io::Error::other(e)),
-                    None => break,
-                }
-            }
-            Ok(filled)
-        });
+        let outcome = self
+            .handle
+            .block_on(self.lease.read_buffered(offset, len, self.size))
+            .map(|data| {
+                let n = data.len();
+                buf[..n].copy_from_slice(&data);
+                n
+            });
         // A read that takes seconds is the byte plane, not the analyzer; a read
         // that never returns does not reach this line at all, which is the
         // distinction worth having in a log.
@@ -124,6 +116,28 @@ impl kahawai_media::remux::RemuxSource for LeaseSource {
             );
         }
         outcome
+    }
+    fn read_at_cancelled(
+        &mut self,
+        offset: u64,
+        buf: &mut [u8],
+        cancel: &kahawai_media::remux::ReadCancellation,
+    ) -> std::io::Result<usize> {
+        cancel.check()?;
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let interrupt = wake.clone();
+        cancel.on_cancel(move || interrupt.notify_one());
+        let data = self.handle.block_on(async {
+            tokio::select! {
+                biased;
+                _ = wake.notified() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "source read cancelled")),
+                result = self.lease.read_buffered(offset, buf.len() as u64, self.size) => result,
+            }
+        })?;
+        cancel.check()?;
+        let n = data.len();
+        buf[..n].copy_from_slice(&data);
+        Ok(n)
     }
 }
 
@@ -284,7 +298,8 @@ impl ByteSources {
         // Left as a plain error it reached `session_refusal` as 409, "give up
         // on this item", for a source that is merely offline; the recovery
         // contract's answer to an absent host is 503 and stand by.
-        self.leases
+        let lease = self
+            .leases
             .establish(&token, registry.send_to_host(module_id, msg))
             .await
             .map_err(|e| {
@@ -293,7 +308,8 @@ impl ByteSources {
                 } else {
                     anyhow::Error::new(SourceOffline).context(format!("{e:#}"))
                 }
-            })
+            })?;
+        Ok(lease)
     }
 }
 
@@ -403,8 +419,8 @@ mod lease_purpose_tests {
         }
         assert_eq!(read, b"bytes");
         assert!(
-            entered_count.load(std::sync::atomic::Ordering::Relaxed) >= 4,
-            "path resolution, open/metadata, seek and read must each be admitted"
+            entered_count.load(std::sync::atomic::Ordering::Relaxed) >= 3,
+            "path resolution, open/metadata and positional read must each be admitted"
         );
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(cpu.load(std::sync::atomic::Ordering::Relaxed), 1);

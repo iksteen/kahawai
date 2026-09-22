@@ -230,7 +230,7 @@ pub async fn link_once(
     scratch: &Path,
     worker_exe: &Option<std::path::PathBuf>,
 ) -> Result<()> {
-    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
+    let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
     // HUB-32b: a StartSession carries the display sets to burn, which
     // run to megabytes on a feature film — well past tonic's 4 MB
     // default, which would drop the link instead of the session.
@@ -292,6 +292,7 @@ pub async fn link_once(
     .context("link closed before capability report")?;
 
     let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
+    runner.set_source_endpoint(hub_addr.to_string(), tls);
     let result = link_loop(&tx, &mut inbound, &runner, &mut capabilities).await;
     runner.end_all().await;
     result

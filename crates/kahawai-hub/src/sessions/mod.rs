@@ -379,6 +379,7 @@ pub struct Sessions {
     /// each by index. Second element is the starting part's index, so a
     /// seek that stays inside it can reuse these leases.
     tc_leases: Mutex<HashMap<String, PartLeases>>,
+    source_grants: Mutex<HashMap<String, dispatch::SourceGrant>>,
     /// Sessions awaiting the transcoder's ready/error verdict; Ok
     /// carries the worker's session facts (AR-13).
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReadyVerdict>>>,
@@ -427,6 +428,7 @@ impl Sessions {
             idle: tokio::sync::watch::channel(true).0,
             reserved: Mutex::new(HashMap::new()),
             tc_leases: Mutex::new(HashMap::new()),
+            source_grants: Mutex::new(HashMap::new()),
             pending_ready: Mutex::new(HashMap::new()),
             pending_logs: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(HashMap::new()),
@@ -648,6 +650,7 @@ impl Sessions {
             }
             Mode::Transcode { transcoder } => {
                 let transcoder = transcoder.lock().unwrap().clone();
+                self.revoke_source_grants(id);
                 self.tc_leases.lock().unwrap().remove(id);
                 self.pending_ready.lock().unwrap().remove(id);
                 if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {

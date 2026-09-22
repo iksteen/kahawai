@@ -63,14 +63,16 @@ impl Media {
         }
     }
 
-    fn source_element(&self) -> Result<gst::Element> {
+    fn source_element(&self) -> Result<(gst::Element, Option<kahawai_media::remux::SourceGuard>)> {
         match self {
             Media::Path(path) => gst::ElementFactory::make("filesrc")
                 .property("location", path)
                 .build()
-                .context("filesrc"),
+                .context("filesrc")
+                .map(|src| (src, None)),
             Media::Remote { open, .. } => {
-                Ok(kahawai_media::remux::seekable_appsrc(open()?).upcast())
+                let (src, guard) = kahawai_media::remux::seekable_appsrc(open()?);
+                Ok((src.upcast(), Some(guard)))
             }
         }
     }
@@ -104,11 +106,12 @@ fn open(
     gst::Pipeline,
     AppSink,
     std::sync::Arc<std::sync::atomic::AtomicBool>,
+    Option<kahawai_media::remux::SourceGuard>,
 )> {
     kahawai_media::init()?;
 
     let pipeline = gst::Pipeline::new();
-    let src = media.source_element()?;
+    let (src, source_guard) = media.source_element()?;
     let decode = kahawai_media::selected_decode::SelectedDecode::new(kind, index, stop_at)?;
 
     // `max-buffers`: with sync=false nothing else throttles the decoder,
@@ -164,7 +167,7 @@ fn open(
         )
         .context("installing selected decoder")?;
 
-    Ok((pipeline, sink, decode.missing_flag()))
+    Ok((pipeline, sink, decode.missing_flag(), source_guard))
 }
 
 /// Land exactly on the requested time. Right for audio and for reading buffer
@@ -205,10 +208,12 @@ fn seek_window(
 
 /// Run a built pipeline over `[start, end)`, handing every sample to
 /// `on_sample` until end of stream.
+#[allow(clippy::too_many_arguments)] // pipeline lifetime plus the selected analysis window
 fn drain(
     pipeline: &gst::Pipeline,
     sink: &AppSink,
     no_wanted_track: &std::sync::atomic::AtomicBool,
+    source_guard: Option<&kahawai_media::remux::SourceGuard>,
     start: f64,
     end: f64,
     flags: gst::SeekFlags,
@@ -309,6 +314,9 @@ fn drain(
         Ok(())
     })();
 
+    if let Some(guard) = source_guard {
+        guard.stop();
+    }
     let _ = pipeline.set_state(gst::State::Null);
     result
 }
@@ -324,7 +332,7 @@ pub fn audio_window(media: &Media, start: f64, end: f64) -> Result<AudioWindow> 
         .field("layout", "interleaved")
         .field("channels", 2i32)
         .build();
-    let (pipeline, sink, missing) = open(
+    let (pipeline, sink, missing, source_guard) = open(
         media,
         kahawai_media::selected_decode::StreamKind::Audio,
         0,
@@ -338,24 +346,33 @@ pub fn audio_window(media: &Media, start: f64, end: f64) -> Result<AudioWindow> 
         channels: 2,
         samples: Vec::new(),
     };
-    drain(&pipeline, &sink, &missing, start, end, ACCURATE, |sample| {
-        if window.rate == 0
-            && let Some(s) = sample.caps().and_then(|c| c.structure(0))
-            && let (Ok(rate), Ok(channels)) = (s.get::<i32>("rate"), s.get::<i32>("channels"))
-        {
-            window.rate = rate as u32;
-            window.channels = channels as u32;
-        }
-        let Some(buffer) = sample.buffer() else {
-            return Ok(());
-        };
-        let map = buffer.map_readable().context("mapping an audio buffer")?;
-        window.samples.extend(
-            map.chunks_exact(2)
-                .map(|b| i16::from_le_bytes([b[0], b[1]])),
-        );
-        Ok(())
-    })?;
+    drain(
+        &pipeline,
+        &sink,
+        &missing,
+        source_guard.as_ref(),
+        start,
+        end,
+        ACCURATE,
+        |sample| {
+            if window.rate == 0
+                && let Some(s) = sample.caps().and_then(|c| c.structure(0))
+                && let (Ok(rate), Ok(channels)) = (s.get::<i32>("rate"), s.get::<i32>("channels"))
+            {
+                window.rate = rate as u32;
+                window.channels = channels as u32;
+            }
+            let Some(buffer) = sample.buffer() else {
+                return Ok(());
+            };
+            let map = buffer.map_readable().context("mapping an audio buffer")?;
+            window.samples.extend(
+                map.chunks_exact(2)
+                    .map(|b| i16::from_le_bytes([b[0], b[1]])),
+            );
+            Ok(())
+        },
+    )?;
 
     if window.rate == 0 {
         bail!("{}: no audio track was decoded", media.name());
@@ -378,7 +395,7 @@ const ENCODED_VIDEO: &str = "video/x-h264; video/x-h265; video/mpeg; video/x-vp8
 pub fn keyframes_window(media: &Media, start: f64, end: f64) -> Result<Vec<f64>> {
     kahawai_media::init()?;
     let encoded = gst::Caps::from_str(ENCODED_VIDEO).context("keyframe caps")?;
-    let (pipeline, sink, missing) = open(
+    let (pipeline, sink, missing, source_guard) = open(
         media,
         kahawai_media::selected_decode::StreamKind::Video,
         0,
@@ -389,23 +406,32 @@ pub fn keyframes_window(media: &Media, start: f64, end: f64) -> Result<Vec<f64>>
 
     let mut times = Vec::new();
     let mut raw = false;
-    drain(&pipeline, &sink, &missing, start, end, ACCURATE, |sample| {
-        // A codec outside the list above reaches us decoded, where every buffer
-        // claims to be a keyframe. Saying so beats snapping to any frame at all.
-        if let Some(s) = sample.caps().and_then(|c| c.structure(0))
-            && s.name() == "video/x-raw"
-        {
-            raw = true;
-            return Ok(());
-        }
-        if let Some(buffer) = sample.buffer()
-            && !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT)
-            && let Some(pts) = buffer.pts()
-        {
-            times.push(pts.nseconds() as f64 / 1e9);
-        }
-        Ok(())
-    })?;
+    drain(
+        &pipeline,
+        &sink,
+        &missing,
+        source_guard.as_ref(),
+        start,
+        end,
+        ACCURATE,
+        |sample| {
+            // A codec outside the list above reaches us decoded, where every buffer
+            // claims to be a keyframe. Saying so beats snapping to any frame at all.
+            if let Some(s) = sample.caps().and_then(|c| c.structure(0))
+                && s.name() == "video/x-raw"
+            {
+                raw = true;
+                return Ok(());
+            }
+            if let Some(buffer) = sample.buffer()
+                && !buffer.flags().contains(gst::BufferFlags::DELTA_UNIT)
+                && let Some(pts) = buffer.pts()
+            {
+                times.push(pts.nseconds() as f64 / 1e9);
+            }
+            Ok(())
+        },
+    )?;
 
     if raw {
         bail!(
@@ -458,7 +484,7 @@ fn luma_shift(format: gstreamer_video::VideoFormat) -> (bool, u32) {
 pub fn luma_window(media: &Media, start: f64, end: f64, threshold: u8) -> Result<Vec<LumaFrame>> {
     kahawai_media::init()?;
     let caps = gst::Caps::from_str(LUMA_FORMATS).context("luma caps")?;
-    let (pipeline, sink, missing) = open(
+    let (pipeline, sink, missing, source_guard) = open(
         media,
         kahawai_media::selected_decode::StreamKind::Video,
         0,
@@ -472,6 +498,7 @@ pub fn luma_window(media: &Media, start: f64, end: f64, threshold: u8) -> Result
         &pipeline,
         &sink,
         &missing,
+        source_guard.as_ref(),
         start - LEAD_IN,
         end,
         ACCURATE,

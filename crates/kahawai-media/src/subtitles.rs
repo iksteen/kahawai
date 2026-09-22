@@ -491,7 +491,7 @@ fn extract_embedded_core(
     }
 
     let pipeline = gst::Pipeline::new();
-    let appsrc = crate::remux::seekable_appsrc(source);
+    let (appsrc, source_guard) = crate::remux::seekable_appsrc(source);
     let parsebin = gst::ElementFactory::make("parsebin").build()?;
     pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
     gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &parsebin])?;
@@ -612,6 +612,7 @@ fn extract_embedded_core(
         std::mem::take(&mut *guard)
     };
     drain(&mut final_taps);
+    drop(source_guard);
     pipeline.set_state(gst::State::Null).ok();
     result?;
 
@@ -647,7 +648,7 @@ fn extract_embedded_core(
 pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(String, Vec<u8>)>> {
     crate::init()?;
     let pipeline = gst::Pipeline::new();
-    let appsrc = crate::remux::seekable_appsrc(source);
+    let (appsrc, source_guard) = crate::remux::seekable_appsrc(source);
     let demux = gst::ElementFactory::make("matroskademux").build()?;
     pipeline.add_many([appsrc.upcast_ref::<gst::Element>(), &demux])?;
     gst::Element::link_many([appsrc.upcast_ref::<gst::Element>(), &demux])?;
@@ -715,6 +716,7 @@ pub fn extract_fonts(source: Box<dyn crate::remux::RemuxSource>) -> Result<Vec<(
             _ => {}
         }
     }
+    drop(source_guard);
     pipeline.set_state(gst::State::Null).ok();
     Ok(fonts)
 }

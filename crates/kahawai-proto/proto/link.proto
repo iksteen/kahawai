@@ -665,11 +665,18 @@ message ByteChunk {
   // Marks the end of one ReadRequest's data.
   bool eof = 4;
   string error = 5;
+  // Nonzero generations support interruptible continuous reads (4.6).
+  uint64 generation = 6;
+  // First binding chunk advertises this exact channel, avoiding a control-link
+  // reconnect/version race while OpenRead is outstanding. Absent = legacy.
+  bool continuous_reads = 7;
 }
 
 message ReadRequest {
   uint64 offset = 1;
   uint64 len = 2;
+  // Zero retains the legacy finite-range contract.
+  uint64 generation = 3;
 }
 
 // First message on every link (AR-7): version negotiation input.
@@ -699,6 +706,15 @@ message Heartbeat {}
 
 service TranscoderLink {
   rpc Link(stream TcToHub) returns (stream HubToTc);
+  // Separate connection: source backpressure must never stall control.
+  rpc SourceChannel(stream SourceCommand) returns (stream ByteChunk);
+}
+
+message SourceCommand {
+  // First message binds a run/part/peer-specific token, one live channel at a time.
+  // The same peer may rebind after disconnection while the grant remains alive.
+  string source_token = 1;
+  ReadRequest read = 2;
 }
 
 message TcToHub {
@@ -710,9 +726,8 @@ message TcToHub {
     CapabilityReport capabilities = 3;
     SessionReady session_ready = 4;
     SessionError session_error = 5;
-    // Source byte plane and artifact delivery ride the control link
-    // (ponytail: same shapes as a dedicated channel, one less stream;
-    // split out if profiling demands).
+    // Legacy source reads (through 4.5); upgraded peers use SourceChannel.
+    // Artifact delivery retains its existing message contract.
     SourceRead source_read = 6;
     ArtifactData artifact_data = 7;
     // HUB-36: what this box actually achieved, sent on the heartbeat
@@ -963,6 +978,8 @@ message StartSession {
   // (three target durations, floored at 6.5 s, capped at 30 s). 0 = unknown:
   // a hub too old to say, and the flat 6.5 s floor those hubs always got.
   uint32 target_duration_secs = 26;
+  // Dispatcher-owned routing, one token per part. Empty = legacy reads.
+  repeated string source_tokens = 27;
 }
 
 message EndSession {

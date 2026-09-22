@@ -107,10 +107,52 @@ impl Sessions {
                 .then_some(kahawai_playback::job::Payload::Bytes(burn_ass_file)),
             target_duration_secs: Some(target_duration_secs),
         };
+        let mut message = job.to_start_session(session_id)?;
+        self.revoke_source_grants(session_id);
+        if registry
+            .transcoder_protocol_features(transcoder)
+            .is_some_and(|f| f.supports(kahawai_proto::ProtocolFeature::ContinuousSourceReads))
+        {
+            let mut grants = self.source_grants.lock().unwrap();
+            for (lease, size) in &parts {
+                let token = crate::leases::new_lease_token();
+                let (alive, _) = tokio::sync::watch::channel(());
+                grants.insert(
+                    token.clone(),
+                    SourceGrant {
+                        session: session_id.into(),
+                        peer: transcoder.into(),
+                        lease: lease.clone(),
+                        size: *size,
+                        claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        alive,
+                    },
+                );
+                message.source_tokens.push(token);
+            }
+        }
+        struct PendingGrants<'a> {
+            grants: &'a Mutex<HashMap<String, SourceGrant>>,
+            tokens: Vec<String>,
+            armed: bool,
+        }
+        impl Drop for PendingGrants<'_> {
+            fn drop(&mut self) {
+                if self.armed {
+                    let mut grants = self.grants.lock().unwrap();
+                    for token in &self.tokens {
+                        grants.remove(token);
+                    }
+                }
+            }
+        }
+        let mut pending_grants = PendingGrants {
+            grants: &self.source_grants,
+            tokens: message.source_tokens.clone(),
+            armed: true,
+        };
         let start = kahawai_proto::v1::HubToTc {
-            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(
-                job.to_start_session(session_id)?,
-            )),
+            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(message)),
         };
         self.tc_leases
             .lock()
@@ -121,6 +163,7 @@ impl Sessions {
             .unwrap()
             .insert(session_id.to_string(), ready_tx);
         let cleanup = |sessions: &Self| {
+            sessions.revoke_source_grants(session_id);
             sessions.tc_leases.lock().unwrap().remove(session_id);
             sessions.pending_ready.lock().unwrap().remove(session_id);
         };
@@ -133,6 +176,7 @@ impl Sessions {
         }
         match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
             Ok(Ok(Ok(facts))) => {
+                pending_grants.armed = false;
                 // No increment here: the slot has been held since the
                 // pick. Counting again would double it.
                 tracing::info!(session = session_id, transcoder, "session dispatched");
@@ -301,5 +345,92 @@ impl Sessions {
                 }
             }
         }
+    }
+}
+
+/// Lifetime of one run/part capability. Dropping the sender stops an already
+/// bound channel too; consuming a token alone would not revoke active readers.
+pub(super) struct SourceGrant {
+    session: String,
+    peer: String,
+    lease: Lease,
+    size: u64,
+    claimed: Arc<std::sync::atomic::AtomicBool>,
+    alive: tokio::sync::watch::Sender<()>,
+}
+/// Only the live byte channel owns this claim. A disconnected channel may
+/// release it for the same peer; revocation still removes the grant entirely.
+pub(crate) struct SourceClaim(Arc<std::sync::atomic::AtomicBool>);
+impl Drop for SourceClaim {
+    fn drop(&mut self) {
+        self.0.store(false, std::sync::atomic::Ordering::Release);
+    }
+}
+impl Sessions {
+    pub(super) fn revoke_source_grants(&self, session: &str) {
+        self.source_grants
+            .lock()
+            .unwrap()
+            .retain(|_, g| g.session != session);
+    }
+    pub(crate) fn claim_source(
+        &self,
+        token: &str,
+        peer: &str,
+    ) -> Result<(Lease, u64, tokio::sync::watch::Receiver<()>, SourceClaim), tonic::Status> {
+        let mut grants = self.source_grants.lock().unwrap();
+        let grant = grants
+            .get_mut(token)
+            .filter(|g| g.peer == peer)
+            .ok_or_else(|| tonic::Status::permission_denied("unknown or foreign source token"))?;
+        grant
+            .claimed
+            .compare_exchange(
+                false,
+                true,
+                std::sync::atomic::Ordering::AcqRel,
+                std::sync::atomic::Ordering::Acquire,
+            )
+            .map_err(|_| tonic::Status::already_exists("source channel still active"))?;
+        Ok((
+            grant.lease.clone(),
+            grant.size,
+            grant.alive.subscribe(),
+            SourceClaim(grant.claimed.clone()),
+        ))
+    }
+}
+
+#[cfg(test)]
+mod source_token_tests {
+    use super::*;
+    #[tokio::test]
+    async fn source_capability_rebinds_only_after_release_and_never_after_revocation() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"example").unwrap();
+        let sessions = Sessions::new(dir.path().join("runs"));
+        let (alive, _) = tokio::sync::watch::channel(());
+        sessions.source_grants.lock().unwrap().insert(
+            "old-token".into(),
+            SourceGrant {
+                session: "same-session-id".into(),
+                peer: "assigned-tc".into(),
+                lease: Lease::local(path),
+                size: 7,
+                claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                alive,
+            },
+        );
+        assert!(sessions.claim_source("old-token", "other-tc").is_err());
+        let (_, _, _, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
+        assert!(sessions.claim_source("old-token", "assigned-tc").is_err());
+        drop(claim);
+        assert!(sessions.claim_source("old-token", "other-tc").is_err());
+        let (_, _, mut live, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
+        sessions.revoke_source_grants("same-session-id");
+        assert!(live.changed().await.is_err());
+        drop(claim);
+        assert!(sessions.claim_source("old-token", "assigned-tc").is_err());
     }
 }

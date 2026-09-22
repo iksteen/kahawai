@@ -410,10 +410,14 @@ impl MediahostLink for MediahostLinkService {
             .sessions
             .bytes
             .leases
-            .fulfill(&first.lease_token)
+            .fulfill(&first.lease_token, first.continuous_reads)
             .ok_or_else(|| Status::not_found("unknown or expired lease token"))?;
 
         tokio::spawn(async move {
+            if !first.error.is_empty() {
+                let _ = chunk_tx.send(first).await;
+                return;
+            }
             while let Ok(Some(chunk)) = inbound.message().await {
                 if chunk_tx.send(chunk).await.is_err() {
                     break; // lease dropped

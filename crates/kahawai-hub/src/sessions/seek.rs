@@ -502,6 +502,7 @@ impl Sessions {
                 // the target stays inside the same part (works even when
                 // the mediahost link is flapping). Crossing parts needs
                 // a lease on the other file.
+                self.revoke_source_grants(&session.id);
                 let held = self.tc_leases.lock().unwrap().remove(&session.id);
                 let parts = match held {
                     Some((parts, held_idx)) if held_idx == idx => parts,

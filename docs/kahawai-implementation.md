@@ -120,6 +120,56 @@ Three gRPC services, all initiated module→hub (AR-3) over mTLS (the satellite'
 
 **Byte plane.** For a networked mediahost, bulk media bytes ride a separate gRPC connection: tonic byte-chunk streams over mTLS, with a one-time token minted on the control stream binding the channel to a specific read lease. The hard-won invariant (AR-12): **the byte plane MUST be a separate HTTP/2 connection from the control link**. HTTP/2 flow control is per-connection as well as per-stream: in early implementation, a single stalled lease stream (client paused, pipeline backpressured) exhausted the shared connection-level window and froze heartbeats for 40 s at a time, producing false disconnects and spurious failovers. Separate connections make a stalled lease stall only itself. The in-process mediahost takes neither connection: path resolution and file reads stay local as described in §2.
 
+**Pull and read-ahead (protocol 4.6).** Pipeline appsrc uses `RandomAccess`, byte
+format and a known size, and answers each demand exactly (short only at EOF).
+Its single feeder has no speculative ring; the hub holds at most 16 MiB of
+read-ahead per activated part and a remote transcoder holds another 2 MiB.
+These temporary buffers trade bounded RAM/speculative I/O for memory-speed
+hits; a miss costs a source seek and fresh bytes. Disjoint ranges survive
+seeks, with one eighth of capacity made available on a miss by dropping old
+retained ranges in insertion order (not by distance from the read cursor).
+Partially consumed blocks count their full allocation until released; the
+allowance bounds retained RAM, not just bytes still readable. This avoids
+repeated copies, but a backward miss can discard useful forward ranges and
+require another fetch. A demand at the current prefetch boundary also makes room
+for an incoming chunk, without restarting the upstream stream; buffered skips
+remain hits. Consumed blocks are released; speculative reading stops at
+capacity. Bounded 256 KiB transport chunks and outstanding demand responses
+are additional memory, not included in the read-ahead allowance.
+
+A mediahost continuously serves a range toward EOF, interrupted by a newer
+generation. Command intake remains live during disk admission or a blocked
+send; receivers discard old-generation chunks. Positional disk reads avoid
+shared seek-position races, and storage permits cover only actual operations.
+`TranscoderLink.SourceChannel` uses its own HTTP/2 connection and a capability
+bound to the assigned peer, run and part, with only one active channel per grant.
+After that channel exits, the same peer may rebind while the grant is alive.
+The transcoder reconnects from the last byte delivered to read-ahead, retaining
+its generation and buffered data; newer seeks replace the retry cursor. Retries
+wait 200 ms, have a 10 s outage budget and bound connect/bind waits at 2 s each,
+within the existing 30 s demand deadline. Authorization and protocol errors are
+terminal, not retried. Ending or replacing a run revokes active channels and
+future rebinds. Malformed commands produce explicit status and peer diagnostics
+without exposing bearer tokens. Protocol-4.5 and older peers retain finite
+requests in either upgrade order; an old mediahost seek drains at most the
+current 4 MiB request. Regular HTTP ranges remain finite.
+
+The worker socket remains offset/length based. Cancelling a pull closes that
+connection, and the executor accepts a replacement, cancelling the old read.
+Source guards interrupt demand before pipeline teardown. appsrc also has a
+source-local URI: pull demuxers need it for a common stream-ID prefix, or
+parsebin's stream-ID sorting randomly reorders tracks. Run bundles include
+buffer occupancy, generation, hit/miss, byte and wait counters; worker logs
+record the actual pad scheduling mode. `scripts/kahawai-playback.sh pull`
+checks real demuxers, bounded buffering, legacy requests and network playback.
+
+Transcoder bandwidth samples exclude intervals interrupted by consumer
+backpressure. After such an interruption, queued arrivals are ignored until
+a receive waits for more data; its completion starts a fresh measurement.
+Samples also restart on a new seek generation or EOF, so buffered dequeue
+speed and time spent idle cannot masquerade as source-link bandwidth.
+
+
 Content identity (MH-5):
 
 ```rust
@@ -653,7 +703,7 @@ Missing attachment/chapter declarations, keyframe bounds and video geometry ente
 
 **Capability probing at startup.** Enumerate the `gst::ElementFactory` list and rank encoders: `vah264enc`/`vaapih264enc`, `nvh264enc`, `qsvh264enc`, VideoToolbox, then software (and the HEVC/AV1 equivalents). Presence is insufficient: each candidate encodes five test frames before it can be declared (TC-1), and failures retain the full GStreamer error before the preference list falls through (TC-6). The test dimensions are fixed to the nearest ordinary 640×480 size allowed by that encoder's own system-memory sink caps, rather than one universal size: Mesa's gfx1200 `vah265enc`, for example, accepts widths from 384 while the old 320×240 probe falsely classified working AMD HEVC hardware as broken. A session whose demuxed caps state exact dimensions applies the same sink-cap check before selecting its encoder; an incompatible candidate falls through instead of failing during pipeline negotiation.
 
-**Pipeline construction per `TranscodeSpec`.** Source is a custom `appsrc`-backed element fed from the hub byte plane (or direct file in all-in-one), pushed into:
+**Pipeline construction per `TranscodeSpec`.** Source is a random-access `appsrc` fed from bounded byte-plane read-ahead (or direct file in all-in-one), with the demuxer pulling byte ranges through:
 
 ```
 appsrc ! parsebin ! streamselect
@@ -926,7 +976,7 @@ Negotiation engine: exhaustive table-driven unit tests (capability × source mat
 
 *Latency at point of use.* **Artwork** is genuinely cheap to refetch — one small ranged read, or one GET to an unmetered image CDN — and it is still not evictable, because it is tiny and wanted *instantly*: a grid scroll wants dozens of posters at once, and a miss is a blank tile plus a round trip precisely where latency is visible. Cheap to reproduce is not the same as cheap to miss. The arithmetic settles it: capping artwork at 100 MiB reclaimed 89 MB out of a 2.7 GB data dir, in exchange for stalls.
 
-What is left is transient and already bounded by lifecycle: session scratch is wiped at startup, torn down per session, and idle-reaped. So there is no janitor. Disk is not the scarce resource here — provider entitlements, mediahost I/O and interaction latency are. Should a deployment genuinely need a cap (hub `data_dir` on a small SD card), the honest design is an admin-triggered purge that states what it will cost, not a silent hourly sweep. Hub stream proxying uses fixed bounded buffers (64 KiB chunks, bounded channel per session) so a slow client applies backpressure to the mediahost read instead of ballooning hub memory — this also caps per-session memory for the in-hub remuxer via `appsrc` `max-bytes`.
+What is left is transient and already bounded by lifecycle: session scratch is wiped at startup, torn down per session, and idle-reaped. So there is no janitor. Disk is not the scarce resource here — provider entitlements, mediahost I/O and interaction latency are. Should a deployment genuinely need a cap (hub `data_dir` on a small SD card), the honest design is an admin-triggered purge that states what it will cost, not a silent hourly sweep. Hub stream proxying uses bounded channels so a slow client applies backpressure to the mediahost. Pipeline read-ahead is bounded separately: 16 MiB per hub source part and 2 MiB per remote transcoder source part, plus bounded transport queues and the current demand response. The worker has no speculative appsrc ring.
 
 *The one exception, and why it is not a quota.* At startup the artwork cache drops resized derivatives that can never be served again: a size no longer in the code's list, or a copy whose original is gone. That is unreachability, not size — nothing is removed for being large, and the sizes still in use are kept forever like everything else here. Variant directories are named for their pixel count, so editing a size is itself what makes the old copies stale; a derivative is named after its original's cache key, so "is the original still there" is one `exists()`. `tests/artwork_sizes.rs` pins which files the sweep may touch, since it is code that deletes.
 

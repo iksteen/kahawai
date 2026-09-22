@@ -276,6 +276,7 @@ impl Job {
         };
         Ok(StartSession {
             session_id: session_id.to_string(),
+            source_tokens: Vec::new(),
             size: self.size(),
             video: mode_arg(plan.video).into(),
             audio: mode_arg(plan.audio).into(),
