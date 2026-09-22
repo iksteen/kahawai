@@ -10,6 +10,9 @@
 //! Unchanged media reuses its stored probe and hashes; sidecars are refreshed
 //! independently. Only new/changed media, stale discovery generations and an
 //! explicit deep scan invoke discovery. Failed root walks never remove sources.
+//! A rescan that finds nothing changed writes no file row at all: presence is
+//! settled by comparing the walk against the stored inventory in memory, so
+//! the catalogue commits twice (begin and finish) however large the walk.
 
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
@@ -135,7 +138,9 @@ pub(crate) async fn scan_local_collection(
     let changed_files = std::sync::Arc::new(changed_files);
     let include_audio = cfg.media_type == "music";
     let music = cfg.media_type == "music";
-    let mut unavailable_roots = std::collections::HashSet::new();
+    // Roots settled by this scan: reconciled ones are exact, unavailable ones
+    // are left alone. finish_scan sweeps only what is outside this set.
+    let mut retained_roots = std::collections::HashSet::new();
     let (mut scanned, mut failed, mut skipped, mut refreshed) = (0u32, 0u32, 0u32, 0u32);
 
     let mut inventories = Vec::new();
@@ -153,7 +158,7 @@ pub(crate) async fn scan_local_collection(
             Ok(paths) => paths,
             Err(error) => {
                 failed += 1;
-                unavailable_roots.insert(root_token.clone());
+                retained_roots.insert(root_token.clone());
                 tracing::warn!(collection = %cfg.name, %root_token,
                     error = format!("{error:#}"), "collection root unavailable");
                 continue;
@@ -169,8 +174,9 @@ pub(crate) async fn scan_local_collection(
             })
             .collect();
         catalog
-            .reconcile_root(&cfg.name, &root_token, &present, generation)
+            .reconcile_root(&cfg.name, &root_token, &present)
             .await?;
+        retained_roots.insert(root_token.clone());
         inventories.push((root_token, paths));
     }
     for (root_token, paths) in inventories {
@@ -307,7 +313,7 @@ pub(crate) async fn scan_local_collection(
         },
     );
     let version = catalog
-        .finish_scan(&cfg.name, generation, &unavailable_roots)
+        .finish_scan(&cfg.name, generation, &retained_roots)
         .await?;
     tracing::info!(collection = %cfg.name, scanned, refreshed, failed, skipped, version,
         "local catalogue scan complete");
@@ -1263,6 +1269,67 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn an_unchanged_rescan_writes_no_file_rows() {
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        let counters = ScanCounters::new();
+        seed_scan_file(&catalog, root.path(), "Movie.mp4").await;
+        seed_scan_file(&catalog, root.path(), "Neighbour.mp4").await;
+        let written = catalog.seen_generations("movies").await;
+        let before = run_local_scan(&cfg, &catalog, &counters, false).await;
+        assert_eq!(
+            run_local_scan(&cfg, &catalog, &counters, false).await,
+            before
+        );
+        assert_eq!(counters.counts("movies").skipped, 2);
+        // Two scans later the rows still carry the generation that wrote
+        // them: presence was settled without touching them.
+        assert_eq!(catalog.seen_generations("movies").await, written);
+        std::fs::remove_file(root.path().join("Neighbour.mp4")).unwrap();
+        assert!(run_local_scan(&cfg, &catalog, &counters, false).await > before);
+        let known = catalog.known_files("movies").await.unwrap();
+        assert_eq!(known.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_root_dropped_from_the_configuration_is_swept_at_finish() {
+        let state = tempfile::tempdir().unwrap();
+        let kept = tempfile::tempdir().unwrap();
+        let dropped = tempfile::tempdir().unwrap();
+        let both = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![kept.path().into(), dropped.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&both))
+            .await
+            .unwrap();
+        let counters = ScanCounters::new();
+        let stays = seed_scan_file(&catalog, kept.path(), "Movie.mp4").await;
+        let goes = seed_scan_file(&catalog, dropped.path(), "Other.mp4").await;
+        let only_kept = CollectionConfig {
+            roots: vec![kept.path().into()],
+            ..both
+        };
+        run_local_scan(&only_kept, &catalog, &counters, false).await;
+        let known = catalog.known_files("movies").await.unwrap();
+        let key = |file: &FileRecord| {
+            let source = file.source.as_ref().unwrap();
+            (source.root_token.clone(), source.path_rel.clone())
+        };
+        assert!(known.contains_key(&key(&stays)));
+        assert!(!known.contains_key(&key(&goes)));
+    }
+
+    #[tokio::test]
     async fn renamed_sources_are_removed_before_discovery_and_unavailable_roots_survive() {
         let state = tempfile::tempdir().unwrap();
         let root = tempfile::tempdir().unwrap();
@@ -1290,14 +1357,13 @@ mod tests {
             .await
             .unwrap()
             .current_version;
-        let generation = catalog.begin_scan("movies").await.unwrap();
+        catalog.begin_scan("movies").await.unwrap();
         let token = old.source.as_ref().unwrap().root_token.clone();
         catalog
             .reconcile_root(
                 "movies",
                 &token,
                 &["Movie (2009).mp4".into(), "Neighbour.mp4".into()],
-                generation,
             )
             .await
             .unwrap();
