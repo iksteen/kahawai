@@ -35,7 +35,6 @@
 use std::collections::HashMap;
 
 use kahawai_media::bench::BenchResults;
-use kahawai_proto::{ProtocolFeature, ProtocolFeatures};
 
 /// EWMA weight for a new pace sample. See the module doc.
 pub const ALPHA: f64 = 0.3;
@@ -109,9 +108,6 @@ pub struct PlacementNeed {
     /// `assrender` is genuinely absent on some boxes (macOS here), so
     /// this is a real constraint and not a formality.
     pub needs_ass_burn: bool,
-    /// Additive wire feature this plan requires. A HARD filter: choosing a
-    /// peer without it would silently drop behavior.
-    pub required_protocol_feature: Option<ProtocolFeature>,
     /// HUB-15b: the encode TARGET codec ("h264"/"hevc"/"av1", empty =
     /// any video encoder qualifies). A HARD filter, unlike tone-map: a
     /// box without the target's encoder cannot degrade gracefully.
@@ -161,8 +157,7 @@ pub struct BoxCaps {
     pub encoders: Vec<EncoderSpeed>,
     /// 0 = unlimited.
     pub max_sessions: u32,
-    /// Empty inventory = an older satellite that did not report; assumed
-    /// capable (OPS-7 tolerance).
+    /// Reported decoder input caps; an empty inventory cannot decode.
     pub decode_caps: Vec<String>,
     pub tonemap: bool,
     pub ass_burn: bool,
@@ -174,8 +169,6 @@ pub struct BoxCaps {
 #[derive(Debug, Clone)]
 pub struct BoxSnapshot {
     pub caps: BoxCaps,
-    /// Additive wire features this box's link understands.
-    pub protocol: ProtocolFeatures,
     /// Sessions currently placed on it (reservations included).
     pub load: usize,
     /// Admin-drained: skipped entirely.
@@ -244,9 +237,7 @@ pub fn rank(fleet: &FleetSnapshot, need: &PlacementNeed) -> Vec<Candidate> {
             }
             // Decode fit: the box must decode at least one source stream
             // of each kind it will encode.
-            let can = |wanted: &[String]| {
-                caps.decode_caps.is_empty() || wanted.iter().any(|w| caps.decode_caps.contains(w))
-            };
+            let can = |wanted: &[String]| wanted.iter().any(|w| caps.decode_caps.contains(w));
             if (need.encode_video && !can(&need.video_caps))
                 || (need.encode_audio && !can(&need.audio_caps))
             {
@@ -256,12 +247,7 @@ pub fn rank(fleet: &FleetSnapshot, need: &PlacementNeed) -> Vec<Candidate> {
             if max > 0 && b.load >= max {
                 return None; // at capacity (TC-6)
             }
-            if need
-                .required_protocol_feature
-                .is_some_and(|feature| !b.protocol.supports(feature))
-            {
-                return None;
-            }
+
             if need.needs_ass_burn && !caps.ass_burn {
                 return None; // cannot burn ASS; not a candidate at all
             }

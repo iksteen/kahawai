@@ -855,7 +855,7 @@ async fn protocol_4_rejects_an_invalid_root_binding() {
 }
 
 #[tokio::test]
-async fn protocol_3_mediahost_is_rejected_during_hello() {
+async fn protocol_4_mediahost_is_rejected_during_hello() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "01OLD", "protocol-two").await;
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
@@ -867,7 +867,7 @@ async fn protocol_3_mediahost_is_rejected_during_hello() {
     tx.send(kahawai_proto::v1::HostToHub {
         msg: Some(kahawai_proto::v1::host_to_hub::Msg::Hello(
             kahawai_proto::v1::Hello {
-                protocol_major: 3,
+                protocol_major: 4,
                 protocol_minor: 6,
                 name: "old".into(),
                 build: String::new(),

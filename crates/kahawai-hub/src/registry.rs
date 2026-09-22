@@ -76,7 +76,6 @@ static NEXT_HOST_LINK_GENERATION: AtomicU64 = AtomicU64::new(1);
 #[derive(Clone)]
 pub(crate) struct HostLink {
     tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
-    protocol_minor: u32,
     generation: u64,
     segment_detector_generation: i64,
     discovery: Arc<Mutex<HashMap<String, kahawai_proto::v1::DiscoveryStatus>>>,
@@ -89,21 +88,7 @@ impl HostLink {
     }
 
     pub(crate) fn supports_segment_detection(&self) -> bool {
-        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::SegmentDetection)
-            && self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
-    }
-    pub(crate) fn supports_revisioned_subtitles(&self) -> bool {
-        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::RevisionedSubtitles)
-    }
-    pub(crate) fn supports_image_subs_worklists(&self) -> bool {
-        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::ImageSubsWorklists)
-    }
-    pub(crate) fn supports_loudness_analysis(&self) -> bool {
-        kahawai_proto::ProtocolFeatures::new(self.protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::AudioLoudnessAnalysis)
+        self.segment_detector_generation == kahawai_core::segments::DETECTOR_GENERATION
     }
 
     pub(crate) async fn send(&self, msg: kahawai_proto::v1::HubToHost) -> Result<()> {
@@ -127,15 +112,9 @@ pub struct DeletedSatellite {
 
 type TcSender = tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToTc, tonic::Status>>;
 
-struct TcLink {
-    sender: TcSender,
-    protocol_minor: u32,
-}
-
 pub enum RescanResult {
     Requested,
     Offline,
-    Unsupported,
 }
 
 pub struct Registry {
@@ -159,10 +138,8 @@ pub struct Registry {
     /// lightweight remux/audio worker is always available; only AIO may add
     /// video encode, tone-map and subtitle burn-in here.
     local_video_executor_enabled: bool,
-    /// Sender and negotiated minor are one link fact. Keeping them in separate
-    /// maps let a reconnect briefly pair the new sender with the old minor,
-    /// defeating protocol-feature hard filters during exactly that window.
-    tc_links: Mutex<HashMap<String, TcLink>>,
+    /// Current command sender for each connected transcoder.
+    tc_links: Mutex<HashMap<String, TcSender>>,
     /// Dispatched sessions per transcoder (inverse-load placement).
     tc_load: Mutex<HashMap<String, usize>>,
     /// HUB-36: measured pace per `(module_id, work_class)`, loaded from
@@ -182,7 +159,7 @@ pub struct Registry {
     /// it inside `unregister_link` look free. Only `set_disabled` and
     /// `delete_satellite` may touch it.
     disabled: Mutex<std::collections::HashSet<String>>,
-    /// Command senders and negotiated protocol minors for connected hosts.
+    /// Command senders and detector generations for connected hosts.
     links: Mutex<HashMap<String, HostLink>>,
     catalog_apply_locks: Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
     /// Live per-collection scan progress (HUB-35): last report wins.
@@ -589,7 +566,6 @@ impl Registry {
         &self,
         module_id: &str,
         tx: tokio::sync::mpsc::Sender<Result<kahawai_proto::v1::HubToHost, tonic::Status>>,
-        protocol_minor: u32,
         segment_detector_generation: i64,
     ) -> (u64, Option<u64>) {
         let generation = NEXT_HOST_LINK_GENERATION.fetch_add(1, Ordering::Relaxed);
@@ -605,7 +581,6 @@ impl Registry {
             module_id.to_string(),
             HostLink {
                 tx,
-                protocol_minor,
                 generation,
                 segment_detector_generation,
                 discovery: Default::default(),
@@ -693,12 +668,7 @@ impl Registry {
             let Some(link) = links.get(module) else {
                 return RescanResult::Offline;
             };
-            if deep
-                && !kahawai_proto::ProtocolFeatures::new(link.protocol_minor)
-                    .supports(kahawai_proto::ProtocolFeature::DeepRescan)
-            {
-                return RescanResult::Unsupported;
-            }
+
             link.tx.clone()
         };
         let message = kahawai_proto::v1::HubToHost {
@@ -801,11 +771,7 @@ impl Registry {
         let Some(link) = link.get(module_id) else {
             return false;
         };
-        if !kahawai_proto::ProtocolFeatures::new(link.protocol_minor)
-            .supports(kahawai_proto::ProtocolFeature::DiscoveryPriorityHints)
-        {
-            return false;
-        }
+
         link.tx
             .try_send(Ok(kahawai_proto::v1::HubToHost {
                 msg: Some(kahawai_proto::v1::hub_to_host::Msg::DiscoveryPriorityHint(
@@ -847,14 +813,6 @@ impl Registry {
     pub fn host_supports_segment_detection(&self, module_id: &str) -> bool {
         self.host_link(module_id)
             .is_some_and(|link| link.supports_segment_detection())
-    }
-    pub fn host_supports_image_subs_worklists(&self, module_id: &str) -> bool {
-        self.host_link(module_id)
-            .is_some_and(|link| link.supports_image_subs_worklists())
-    }
-    pub fn host_supports_loudness_analysis(&self, module_id: &str) -> bool {
-        self.host_link(module_id)
-            .is_some_and(|link| link.supports_loudness_analysis())
     }
 
     pub fn catalogue(&self) -> &kahawai_mediadb::Store {
@@ -1108,37 +1066,11 @@ impl Registry {
         self.transcoder_caps.lock().unwrap().remove(module_id);
     }
 
-    pub fn register_tc_link(&self, module_id: &str, protocol_minor: u32, tx: TcSender) {
-        self.tc_links.lock().unwrap().insert(
-            module_id.to_string(),
-            TcLink {
-                sender: tx,
-                protocol_minor,
-            },
-        );
-    }
-
-    pub fn transcoder_protocol_minor(&self, module_id: &str) -> Option<u32> {
+    pub fn register_tc_link(&self, module_id: &str, tx: TcSender) {
         self.tc_links
             .lock()
             .unwrap()
-            .get(module_id)
-            .map(|link| link.protocol_minor)
-    }
-
-    pub fn transcoder_protocol_features(
-        &self,
-        module_id: &str,
-    ) -> Option<kahawai_proto::ProtocolFeatures> {
-        self.transcoder_protocol_minor(module_id)
-            .map(kahawai_proto::ProtocolFeatures::new)
-    }
-
-    pub fn transcoder_supports_layout_gains(&self, module_id: &str) -> bool {
-        self.transcoder_protocol_features(module_id)
-            .is_some_and(|features| {
-                features.supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains)
-            })
+            .insert(module_id.to_string(), tx);
     }
 
     /// Drop a transcoder link only if it is still the one the caller owns.
@@ -1153,7 +1085,7 @@ impl Registry {
     pub fn unregister_tc_link_if_current(&self, module_id: &str, tx: &TcSender) -> bool {
         let mut links = self.tc_links.lock().unwrap();
         match links.get(module_id) {
-            Some(current) if current.sender.same_channel(tx) => {
+            Some(current) if current.same_channel(tx) => {
                 links.remove(module_id);
                 drop(links);
                 self.tc_load.lock().unwrap().remove(module_id);
@@ -1169,30 +1101,12 @@ impl Registry {
         module_id: &str,
         msg: kahawai_proto::v1::HubToTc,
     ) -> anyhow::Result<()> {
-        self.send_to_tc_requiring(module_id, msg, None).await
-    }
-
-    pub async fn send_to_tc_requiring(
-        &self,
-        module_id: &str,
-        msg: kahawai_proto::v1::HubToTc,
-        required: Option<kahawai_proto::ProtocolFeature>,
-    ) -> anyhow::Result<()> {
         let tx = {
             let links = self.tc_links.lock().unwrap();
             let link = links
                 .get(module_id)
                 .ok_or_else(|| anyhow::anyhow!("transcoder {module_id} not connected"))?;
-            anyhow::ensure!(
-                required.is_none_or(|feature| {
-                    kahawai_proto::ProtocolFeatures::new(link.protocol_minor).supports(feature)
-                }),
-                "transcoder {module_id} no longer supports the required protocol feature"
-            );
-            // The sender and minor came from one locked link entry. A
-            // reconnect after this clone can only close this compatible
-            // sender; it cannot redirect the message to an incompatible one.
-            link.sender.clone()
+            link.clone()
         };
         tx.send(Ok(msg))
             .await
@@ -1291,12 +1205,11 @@ impl Registry {
         let boxes = caps
             .iter()
             .filter_map(|(id, c)| {
-                let link = links.get(id)?;
+                links.get(id)?;
                 Some((
                     id.clone(),
                     BoxSnapshot {
                         caps: BoxCaps::from(c),
-                        protocol: kahawai_proto::ProtocolFeatures::new(link.protocol_minor),
                         load: load.get(id).copied().unwrap_or(0),
                         disabled: disabled.contains(id),
                         link_rate: link_rate.get(id).copied(),

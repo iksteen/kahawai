@@ -28,6 +28,11 @@ impl Sessions {
             );
         };
         let mut h = String::new();
+        if let Some(held) = self.dispatched_sources.lock().unwrap().get(session_id) {
+            for (part, lease) in held.parts.iter().enumerate() {
+                let _ = writeln!(h, "== hub source part {part}\n{}", lease.diagnostics());
+            }
+        }
         let _ = writeln!(h, "== hub: session {}", s.id);
         let _ = writeln!(h, "item:       {}", s.item_id);
         let _ = writeln!(h, "user:       {}", s.user_id);

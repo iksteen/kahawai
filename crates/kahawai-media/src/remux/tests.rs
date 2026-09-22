@@ -836,7 +836,7 @@ fn offset_seek_is_delivered_once() {
     let source = dir.path().join("in.mkv");
     crate::testutil::render_h264_aac_mkv(&source);
     let pipeline = gst::Pipeline::new();
-    let src = seekable_appsrc(Box::new(FileSource::open(&source).unwrap()));
+    let (src, _source_guard) = seekable_appsrc(Box::new(FileSource::open(&source).unwrap()));
     let parsebin = gst::ElementFactory::make("parsebin").build().unwrap();
     pipeline.add_many([src.upcast_ref(), &parsebin]).unwrap();
     src.link(&parsebin).unwrap();
@@ -2353,4 +2353,99 @@ fn video_dts_defects(seg: &std::path::Path) -> (usize, usize) {
         }
     }
     (missing, non_mono)
+}
+
+/// Non-interleaved MP4 needs tiny reads at distant offsets, rather than a
+/// sequential walk through every video packet before the first audio packet.
+#[test]
+fn pull_starts_non_interleaved_mp4_without_reading_the_whole_file() {
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+    if !crate::testutil::require_h264_aac_fixture() {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("non-interleaved.mp4");
+    let aac = aac_encoder().unwrap();
+    crate::testutil::render(&format!(
+        "videotestsrc num-buffers=600 ! video/x-raw,format=I420,width=640,height=360,framerate=30/1 ! x264enc speed-preset=ultrafast bitrate=4000 key-int-max=30 ! h264parse ! mp4mux name=m interleave-time={} interleave-bytes={} ! filesink location=\"{}\" audiotestsrc num-buffers=870 ! audioconvert ! {aac} ! aacparse ! m.",
+        u64::MAX,
+        u64::MAX,
+        path.display()
+    ));
+    struct Counted {
+        file: FileSource,
+        read: Arc<AtomicU64>,
+    }
+    impl RemuxSource for Counted {
+        fn size(&self) -> u64 {
+            self.file.size()
+        }
+        fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+            let n = self.file.read_at(offset, buf)?;
+            self.read.fetch_add(n as u64, Ordering::SeqCst);
+            Ok(n)
+        }
+    }
+    let size = std::fs::metadata(&path).unwrap().len();
+    let read = Arc::new(AtomicU64::new(0));
+    let (src, guard) = seekable_appsrc(Box::new(Counted {
+        file: FileSource::open(&path).unwrap(),
+        read: read.clone(),
+    }));
+    let pipeline = gst::Pipeline::new();
+    let demux = gst::ElementFactory::make("qtdemux").build().unwrap();
+    pipeline
+        .add_many([src.upcast_ref::<gst::Element>(), &demux])
+        .unwrap();
+    src.link(&demux).unwrap();
+    let seen = Arc::new(AtomicUsize::new(0));
+    let first_both = Arc::new(AtomicU64::new(0));
+    let cost = first_both.clone();
+    let weak = pipeline.downgrade();
+    demux.connect_pad_added(move |_, pad| {
+        let pipe = weak.upgrade().unwrap();
+        let sink = gst::ElementFactory::make("fakesink")
+            .property("sync", false)
+            .property("async", false)
+            .build()
+            .unwrap();
+        pipe.add(&sink).unwrap();
+        sink.sync_state_with_parent().unwrap();
+        pad.link(&sink.static_pad("sink").unwrap()).unwrap();
+        let flag = if pad.name().starts_with("video") {
+            1
+        } else {
+            2
+        };
+        let (seen, cost, read) = (seen.clone(), cost.clone(), read.clone());
+        pad.add_probe(gst::PadProbeType::BUFFER, move |_, _| {
+            if seen.fetch_or(flag, Ordering::SeqCst) | flag == 3 {
+                let _ = cost.compare_exchange(
+                    0,
+                    read.load(Ordering::SeqCst),
+                    Ordering::SeqCst,
+                    Ordering::SeqCst,
+                );
+            }
+            gst::PadProbeReturn::Ok
+        });
+    });
+    pipeline.set_state(gst::State::Playing).unwrap();
+    let result = pipeline.bus().unwrap().timed_pop_filtered(
+        gst::ClockTime::from_seconds(15),
+        &[gst::MessageType::Eos, gst::MessageType::Error],
+    );
+    let mode = src.static_pad("src").unwrap().mode();
+    guard.stop();
+    pipeline.set_state(gst::State::Null).unwrap();
+    assert_eq!(mode, gst::PadMode::Pull);
+    assert_eq!(result.map(|m| m.type_()), Some(gst::MessageType::Eos));
+    let cost = first_both.load(Ordering::SeqCst);
+    println!(
+        "non-interleaved MP4: {cost} bytes read before both streams start; file={size} bytes; mode={mode:?}"
+    );
+    assert!(
+        cost > 0 && cost < size / 4,
+        "both streams required {cost}/{size} bytes"
+    );
 }

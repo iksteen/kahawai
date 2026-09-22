@@ -1,6 +1,7 @@
 use super::*;
 
 pub struct RemuxJob {
+    sources: Vec<SourceGuard>,
     pipeline: gst::Pipeline,
     error: Arc<Mutex<Option<String>>>,
     finished: Arc<std::sync::atomic::AtomicBool>,
@@ -211,8 +212,10 @@ pub fn start_parts(
     // The first part owns the start offset and the seek gate; later parts
     // are held by concat until it EOSes, then play from their own zero.
     let mut parsebins = Vec::with_capacity(sources.len());
+    let mut source_guards = Vec::with_capacity(sources.len());
     for source in sources {
-        let appsrc = seekable_appsrc(source);
+        let (appsrc, guard) = seekable_appsrc(source);
+        source_guards.push(guard);
         let parsebin = gst::ElementFactory::make("parsebin").build()?;
         // Keep parsebin's own parser away from AV1, and only AV1.
         //
@@ -413,6 +416,7 @@ pub fn start_parts(
     }
     pipeline.set_state(gst::State::Playing)?;
     Ok(RemuxJob {
+        sources: source_guards,
         pipeline,
         error,
         finished,
@@ -432,6 +436,9 @@ impl RemuxJob {
 
     /// Hard stop (session teardown).
     pub fn stop(&self) {
+        for source in &self.sources {
+            source.stop();
+        }
         self.stopping
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let _ = self.pipeline.set_state(gst::State::Null);
@@ -653,7 +660,7 @@ mod concat_spike {
     fn concat_pipeline(
         parts: &[std::path::PathBuf],
         tail: &[&str],
-    ) -> (gst::Pipeline, gst::Element) {
+    ) -> (gst::Pipeline, gst::Element, Vec<SourceGuard>) {
         crate::init().unwrap();
         let pipeline = gst::Pipeline::new();
         let concat = gst::ElementFactory::make("concat").build().unwrap();
@@ -665,8 +672,10 @@ mod concat_spike {
             prev.link(&el).unwrap();
             prev = el;
         }
+        let mut source_guards = Vec::new();
         for part in parts {
-            let src = seekable_appsrc(Box::new(FileSource::open(part).unwrap()));
+            let (src, guard) = seekable_appsrc(Box::new(FileSource::open(part).unwrap()));
+            source_guards.push(guard);
             let parsebin = gst::ElementFactory::make("parsebin").build().unwrap();
             pipeline
                 .add_many([src.upcast_ref::<gst::Element>(), &parsebin])
@@ -709,7 +718,7 @@ mod concat_spike {
                     .expect("a part exposed a second stream; concat_pipeline seats one per part");
             });
         }
-        (pipeline, prev)
+        (pipeline, prev, source_guards)
     }
 
     fn run_to_eos(pipeline: &gst::Pipeline, secs: u64) -> Option<gst::Message> {
@@ -1252,7 +1261,7 @@ mod concat_spike {
         let out = dir.path().join("hls");
         std::fs::create_dir_all(&out).unwrap();
 
-        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse"]);
+        let (pipeline, tail, _source_guards) = concat_pipeline(&parts, &["h264parse"]);
         let sink = gst::ElementFactory::make("hlssink3")
             .property("target-duration", 2u32)
             .property("playlist-length", 0u32)
@@ -1313,7 +1322,7 @@ mod concat_spike {
             fixture(dir.path(), "s1.mkv", "smpte"),
             fixture(dir.path(), "s2.mkv", "ball"),
         ];
-        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
+        let (pipeline, tail, _source_guards) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
         tail.set_property("sync", false);
 
         // First buffer PTS after the seek: where playback actually resumed.
@@ -1360,7 +1369,7 @@ mod concat_spike {
         );
 
         // (b) the realistic case: scrub while playing.
-        let (pipeline, tail) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
+        let (pipeline, tail, _source_guards) = concat_pipeline(&parts, &["h264parse", "fakesink"]);
         tail.set_property("sync", false);
         let live: Arc<Mutex<Option<u64>>> = Arc::new(Mutex::new(None));
         let live2 = live.clone();

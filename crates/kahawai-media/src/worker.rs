@@ -14,21 +14,28 @@ use anyhow::{Context, Result};
 
 use crate::remux::{self, RemuxPlan, RemuxSource, StreamMode};
 
-/// Cap on a single read request, both sides (sanity, not throughput —
-/// the remux feeder already reads in ≤4 MiB chunks).
+/// Cap on a single socket read request, both sides. Larger GStreamer
+/// demands are assembled from bounded reads by the pull feeder.
 pub const MAX_READ: u64 = 8 * 1024 * 1024;
 
 struct SocketSource {
     stream: UnixStream,
+    path: std::path::PathBuf,
+    interrupted: std::sync::Arc<std::sync::atomic::AtomicBool>,
     size: u64,
 }
 
-impl RemuxSource for SocketSource {
-    fn size(&self) -> u64 {
-        self.size
+impl SocketSource {
+    fn prepare(&mut self) -> std::io::Result<()> {
+        if self
+            .interrupted
+            .swap(false, std::sync::atomic::Ordering::AcqRel)
+        {
+            self.stream = UnixStream::connect(&self.path)?;
+        }
+        Ok(())
     }
-
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+    fn request(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
         let mut req = [0u8; 16];
         req[..8].copy_from_slice(&offset.to_le_bytes());
         req[8..].copy_from_slice(&(buf.len() as u64).to_le_bytes());
@@ -41,6 +48,36 @@ impl RemuxSource for SocketSource {
         }
         self.stream.read_exact(&mut buf[..n])?;
         Ok(n)
+    }
+}
+impl RemuxSource for SocketSource {
+    fn size(&self) -> u64 {
+        self.size
+    }
+    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.prepare()?;
+        self.request(offset, buf)
+    }
+    fn read_at_cancelled(
+        &mut self,
+        offset: u64,
+        buf: &mut [u8],
+        cancel: &remux::ReadCancellation,
+    ) -> std::io::Result<usize> {
+        cancel.check()?;
+        self.prepare()?;
+        let interrupt = self.stream.try_clone()?;
+        let interrupted = self.interrupted.clone();
+        cancel.on_cancel(move || {
+            interrupted.store(true, std::sync::atomic::Ordering::Release);
+            let _ = interrupt.shutdown(std::net::Shutdown::Both);
+        });
+        cancel.check()?;
+        // Do not reconnect between registration and I/O: cancellation owns
+        // exactly this socket, even if it races the first write.
+        let result = self.request(offset, buf);
+        cancel.check()?;
+        result
     }
 }
 
@@ -103,6 +140,8 @@ pub fn run_parts(
             .with_context(|| format!("connecting to {}", socket.display()))?;
         sources.push(Box::new(SocketSource {
             stream,
+            path: socket.clone(),
+            interrupted: Default::default(),
             size: *size,
         }));
     }
@@ -143,4 +182,71 @@ pub fn run_parts(
         anyhow::bail!("{e}");
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod source_cancellation_tests {
+    use super::*;
+    use std::sync::Arc;
+    #[test]
+    fn cancelled_socket_read_reconnects_without_accepting_old_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        let source = SocketSource {
+            stream: UnixStream::connect(&path).unwrap(),
+            path,
+            size: 100,
+            interrupted: Default::default(),
+        };
+        let first = Arc::new(remux::ReadCancellation::default());
+        let second = Arc::new(remux::ReadCancellation::default());
+        let (entered, waiting) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut old, _) = listener.accept().unwrap();
+            let mut req = [0; 16];
+            old.read_exact(&mut req).unwrap();
+            entered.send(()).unwrap();
+            // The cancelled connection cannot contribute a response to its replacement.
+            let mut byte = [0];
+            assert_eq!(old.read(&mut byte).unwrap(), 0);
+            for offset in [21u64, 42] {
+                let (mut conn, _) = listener.accept().unwrap();
+                conn.read_exact(&mut req).unwrap();
+                assert_eq!(u64::from_le_bytes(req[..8].try_into().unwrap()), offset);
+                conn.write_all(&8u64.to_le_bytes()).unwrap();
+                conn.write_all(&[offset as u8; 8]).unwrap();
+            }
+        });
+        let (cancel, done) = (first.clone(), second.clone());
+        let client = std::thread::spawn(move || {
+            let mut source = source;
+            let mut buf = [0; 8];
+            assert_eq!(
+                source
+                    .read_at_cancelled(0, &mut buf, &cancel)
+                    .unwrap_err()
+                    .kind(),
+                std::io::ErrorKind::Interrupted
+            );
+            assert_eq!(source.read_at_cancelled(21, &mut buf, &done).unwrap(), 8);
+            assert_eq!(buf, [21; 8]);
+            // A cancellation racing publication, after I/O has returned, must
+            // still reconnect on the NEXT demand.
+            done.cancel();
+            assert_eq!(
+                source
+                    .read_at_cancelled(42, &mut buf, &remux::ReadCancellation::default())
+                    .unwrap(),
+                8
+            );
+            assert_eq!(buf, [42; 8]);
+        });
+        waiting
+            .recv_timeout(std::time::Duration::from_secs(2))
+            .unwrap();
+        first.cancel();
+        client.join().unwrap();
+        server.join().unwrap();
+    }
 }

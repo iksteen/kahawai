@@ -7,7 +7,6 @@ use kahawai_playback::placement::{
     ALPHA, BoxCaps, BoxSnapshot, EncoderSpeed, FleetSnapshot, LOCAL, PlacementNeed, SUSTAINS,
     blend, decide, rank, work_class,
 };
-use kahawai_proto::{ProtocolFeature, ProtocolFeatures};
 
 fn caps(hardware: bool, s1080: f32, tonemap: f32) -> BoxCaps {
     BoxCaps {
@@ -35,7 +34,6 @@ fn need(class: &str) -> PlacementNeed {
         audio_caps: vec![],
         needs_tonemap: false,
         needs_ass_burn: false,
-        required_protocol_feature: None,
         video_codec: "h264".into(),
         audio_codec: String::new(),
         work_class: Some(class.into()),
@@ -51,15 +49,10 @@ fn fleet(local_video_executor: bool) -> FleetSnapshot {
 }
 
 fn connect(fleet: &mut FleetSnapshot, id: &str, caps: BoxCaps) {
-    connect_minor(fleet, id, kahawai_proto::PROTOCOL_MINOR, caps);
-}
-
-fn connect_minor(fleet: &mut FleetSnapshot, id: &str, minor: u32, caps: BoxCaps) {
     fleet.boxes.insert(
         id.into(),
         BoxSnapshot {
             caps,
-            protocol: ProtocolFeatures::new(minor),
             load: 0,
             disabled: false,
             link_rate: None,
@@ -69,47 +62,6 @@ fn connect_minor(fleet: &mut FleetSnapshot, id: &str, minor: u32, caps: BoxCaps)
 
 fn set_pace(fleet: &mut FleetSnapshot, id: &str, class: &str, multiple: f64) {
     fleet.pace.insert((id.into(), class.into()), multiple);
-}
-
-#[test]
-fn protocol_four_baseline_does_not_filter_exact_layout_gains() {
-    let mut f = fleet(false);
-    let class = "1080|hevc|h264";
-    connect_minor(&mut f, "baseline-fast", 0, caps(true, 9.0, 0.0));
-    connect_minor(&mut f, "future-slow", 9, caps(false, 2.0, 0.0));
-    set_pace(&mut f, "baseline-fast", class, 5.0);
-    set_pace(&mut f, "future-slow", class, 2.0);
-
-    let mut exact = need(class);
-    exact.required_protocol_feature = Some(ProtocolFeature::ExactAudioLoudnessGains);
-    assert_eq!(decide(&f, &exact).target.as_deref(), Some("baseline-fast"));
-    assert_eq!(
-        decide(&f, &need(class)).target.as_deref(),
-        Some("baseline-fast")
-    );
-}
-
-#[test]
-fn a_required_feature_a_box_lacks_removes_it_from_the_running() {
-    let mut f = fleet(false);
-    let class = "1080|hevc|h264";
-    connect_minor(&mut f, "old", 4, caps(true, 9.0, 0.0));
-    connect_minor(&mut f, "new", 5, caps(false, 2.0, 0.0));
-    let mut n = need(class);
-    n.required_protocol_feature = Some(ProtocolFeature::ReadinessRunway);
-    assert_eq!(decide(&f, &n).target.as_deref(), Some("new"));
-}
-
-#[test]
-fn exact_loudness_gains_are_available_at_protocol_four_minor_zero() {
-    let mut f = fleet(false);
-    let class = "1080|hevc|h264";
-    connect_minor(&mut f, "baseline", 0, caps(true, 9.0, 0.0));
-    set_pace(&mut f, "baseline", class, 9.0);
-    let mut gain = need(class);
-    gain.required_protocol_feature = Some(ProtocolFeature::ExactAudioLoudnessGains);
-    assert_eq!(decide(&f, &gain).target.as_deref(), Some("baseline"));
-    assert_eq!(decide(&f, &need(class)).target.as_deref(), Some("baseline"));
 }
 
 #[test]
@@ -359,4 +311,13 @@ fn ewma_converges_in_about_three_samples_and_no_outlier_dominates() {
         v = blend(Some(v), 0.5);
     }
     assert!(v < 1.9, "still {v} after three slow runs");
+}
+
+#[test]
+fn an_empty_decoder_inventory_is_not_assumed_capable() {
+    let mut f = fleet(false);
+    let mut c = caps(true, 9.0, 0.0);
+    c.decode_caps.clear();
+    connect(&mut f, "no-decoders", c);
+    assert!(decide(&f, &need("1080|hevc|h264")).target.is_none());
 }

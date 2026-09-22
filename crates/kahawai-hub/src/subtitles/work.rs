@@ -283,12 +283,6 @@ impl Subtitles {
         let mut next_due: Option<i64> = None;
         for host in connected_mediahosts(registry) {
             for kind in SUBTITLE_KINDS {
-                if kind == "sets" && !registry.host_supports_image_subs_worklists(&host) {
-                    // An older host takes one request per track and would
-                    // lose its link to a batch; its rows wait for an
-                    // upgrade, visible as pending.
-                    continue;
-                }
                 let (running, due) = store
                     .subtitle_dispatch_state(kind, &host, now, REFILL_AT)
                     .await?;
@@ -742,7 +736,7 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("host", tx, 0);
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
         assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
         let sent = drain(&mut rx);
@@ -828,7 +822,7 @@ mod tests {
         )
         .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(32);
-        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("host", tx, 0);
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
         assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
         let sent = drain(&mut rx);
@@ -873,7 +867,7 @@ mod tests {
         ])
         .await;
         let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("host", tx, 0);
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
 
         assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
@@ -1000,28 +994,29 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_older_host_is_not_offered_sets_and_a_send_failure_releases_the_batch() {
+    async fn all_hosts_receive_both_worklists_and_send_failure_releases_the_batch() {
         let (_dir, registry, subs) = fixture(vec![(
             "Film.mkv",
             serde_json::json!({"container":"mkv","subtitles":[
                 {"format":"subrip","language":"eng"},{"format":"pgs","language":"eng"}]}),
         )])
         .await;
-        // Protocol 4.3: text worklists yes, image worklists no.
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.register_link("host", tx, 3, 0);
+        registry.register_link("host", tx, 0);
         registry.connected("host", "mediahost", "Fixture", "fp", "test");
         assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
         let sent = drain(&mut rx);
         assert!(
-            matches!(sent.as_slice(), [p::hub_to_host::Msg::SubsWorklist(_)]),
+            matches!(
+                sent.as_slice(),
+                [
+                    p::hub_to_host::Msg::SubsWorklist(_),
+                    p::hub_to_host::Msg::ImageSubsWorklist(_)
+                ]
+            ),
             "{sent:?}"
         );
-        assert_eq!(
-            states(&registry, "sets").await,
-            vec![("pending".into(), 1)],
-            "waits for an upgrade"
-        );
+        assert_eq!(states(&registry, "sets").await, vec![("running".into(), 1)]);
         assert_eq!(states(&registry, "text").await, vec![("running".into(), 1)]);
 
         // The link is full: the offer cannot be delivered, so the batch
@@ -1032,10 +1027,10 @@ mod tests {
                 .release_subtitle_host("host")
                 .await
                 .unwrap(),
-            1
+            2
         );
         let (tx, rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("host", tx, 0);
         drop(rx);
         assert!(
             subs.step(&registry).await.is_err(),

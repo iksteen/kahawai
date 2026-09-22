@@ -172,7 +172,6 @@ impl Subtitles {
             ImageSetsState::Ready(path) => path,
             ImageSetsState::RetryOnReconnect => return Ok(OcrGeneration::RetryOnReconnect),
             ImageSetsState::NotYet => return Ok(OcrGeneration::RetryLater),
-            ImageSetsState::Unavailable => bail!("display sets unavailable"),
         };
         tokio::task::spawn_blocking(move || -> Result<OcrGeneration> {
             let _guard = guard;

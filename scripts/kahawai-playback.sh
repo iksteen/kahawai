@@ -4,10 +4,27 @@
 set -euo pipefail
 task_repo=$(cd "$(dirname "$0")/.." && pwd)
 cd "$task_repo"
+. scripts/kahawai-gst-env.sh
 case "${1:-check}" in
     check)
         cargo test -p kahawai-playback
         cargo run --quiet -p kahawai-playback --example playback_check
+        ;;
+    pull)
+        export KAHAWAI_MEDIA_TEST_STRICT=1
+        # Exact pull requests, distant demux offsets, bounded transport,
+        # protocol-5 descriptors, real mTLS remux/transcode, and the supervised worker.
+        cargo test -p kahawai-media --lib remux:: -- --test-threads=1 --nocapture
+        cargo test -p kahawai-transport --lib
+        cargo test -p kahawai-playback --test job_codecs
+        cargo test -p kahawai-hub --test link_wire --test transcoder_wire
+        cargo test -p kahawai-transcoder --lib stream_rate
+        cargo test -p kahawai-transcoder --lib source_
+        cargo test -p kahawai-hub --lib source_
+        cargo test -p kahawai-hub --lib streaming_tests
+        cargo test -p kahawai-hub --test remux_play --test transcode_dispatch
+        cargo build --bin kahawai
+        cargo run --quiet -p kahawai-playback --example playback_check -- --worker-exe target/debug/kahawai
         ;;
     slow)
         # The deadline test spends thirty seconds of wall clock on purpose.
@@ -33,7 +50,7 @@ case "${1:-check}" in
         echo "kahawai-transcoderd stays lean"
         ;;
     *)
-        echo "usage: kahawai-playback.sh [check|slow|worker|lean]" >&2
+        echo "usage: kahawai-playback.sh [check|pull|slow|worker|lean]" >&2
         exit 2
         ;;
 esac

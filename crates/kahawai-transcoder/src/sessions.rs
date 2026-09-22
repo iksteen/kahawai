@@ -1,7 +1,8 @@
 //! Dispatched session execution (§6, TC-3..5): each session runs on the
 //! same supervised executor the hub uses locally
 //! (`kahawai_playback::executor`), fed over its Unix socket by a byte
-//! source that pulls each read from the hub over the control link.
+//! source with bounded read-ahead on a dedicated byte connection and
+//! mandatory per-part source grants.
 //! Artifacts (playlist/segments) are read from the run directory and
 //! streamed back on request; the run's diagnostics bundle goes back at
 //! session end and whenever the hub asks (OPS-10).
@@ -15,16 +16,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kahawai_playback::executor::{BoxFuture, ByteSource, Death, Executor, Run};
-use kahawai_playback::job::Job;
 use kahawai_proto::v1::{
     ArtifactData, PaceReport, PaceSample, SessionError, SessionFact, SessionReady, StartSession,
     TcToHub, tc_to_hub,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const ARTIFACT_CHUNK: usize = 256 * 1024;
 
@@ -38,19 +37,39 @@ const LINK_MIN_READ: usize = 1024 * 1024;
 /// should drift toward the sustained truth rather than chase spikes.
 const LINK_ALPHA: f64 = 0.2;
 
-/// How long one source read may wait on the hub before the worker is
-/// told the bytes are not coming. If the hub dropped the read (lease
-/// gone, session torn down) the worker must error out, not hang.
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+/// Sample continuous arrivals only. After consumer backpressure, discard
+/// queued arrivals until a receive actually waits, then use its completion
+/// as the next baseline (without crediting that partially buffered message).
+#[derive(Default)]
+struct StreamRateSample {
+    started: Option<std::time::Instant>,
+    bytes: usize,
+}
+impl StreamRateSample {
+    fn received(
+        &mut self,
+        bytes: usize,
+        waited: bool,
+        now: std::time::Instant,
+    ) -> Option<(usize, std::time::Duration)> {
+        let Some(started) = self.started else {
+            if waited {
+                self.started = Some(now);
+            }
+            return None;
+        };
+        self.bytes += bytes;
+        if self.bytes < LINK_MIN_READ {
+            return None;
+        }
+        let bytes = std::mem::take(&mut self.bytes);
+        self.started = Some(now);
+        Some((bytes, now.duration_since(started)))
+    }
+}
 
 /// The link as a byte plane: shared by every part of every session.
-struct LinkReads {
-    link: mpsc::Sender<TcToHub>,
-    /// In-flight source reads keyed by request id — NEVER by session:
-    /// seek-restarts reuse the session id, and a stale response from the
-    /// previous worker must not satisfy the new worker's read.
-    pending: Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>,
-    next_req: AtomicU64,
+struct LinkRate {
     /// Bytes/sec the source plane sustains, EWMA over LARGE reads only
     /// (see `LINK_MIN_READ`). None until one is seen — a box that has
     /// only ever served small reads has no measured bandwidth, which is
@@ -58,7 +77,7 @@ struct LinkReads {
     link_rate: Mutex<Option<f64>>,
 }
 
-impl LinkReads {
+impl LinkRate {
     /// Fold one completed source read into the link-rate EWMA. Small
     /// reads are ignored (see `LINK_MIN_READ`).
     fn fold_link_rate(&self, bytes: usize, elapsed: std::time::Duration) {
@@ -74,59 +93,215 @@ impl LinkReads {
     }
 }
 
-/// One part of one session, read through the hub.
-struct LinkByteSource {
-    reads: Arc<LinkReads>,
-    session_id: String,
-    part: u32,
+struct BufferedSource {
+    buffer: kahawai_transport::read_ahead::ReadAhead,
     size: u64,
 }
-
-impl ByteSource for LinkByteSource {
+impl ByteSource for BufferedSource {
+    fn diagnostics(&self) -> String {
+        self.buffer.diagnostics()
+    }
     fn size(&self) -> u64 {
         self.size
     }
-
     fn read(&self, offset: u64, len: u64) -> BoxFuture<'_, std::io::Result<Vec<u8>>> {
-        Box::pin(async move {
-            let req_id = self.reads.next_req.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = oneshot::channel();
-            self.reads.pending.lock().unwrap().insert(req_id, tx);
-            let sent = self
-                .reads
-                .link
-                .send(TcToHub {
-                    msg: Some(tc_to_hub::Msg::SourceRead(kahawai_proto::v1::SourceRead {
-                        session_id: self.session_id.clone(),
-                        offset,
-                        len,
-                        req: req_id,
-                        part: self.part,
-                    })),
-                })
-                .await;
-            if sent.is_err() {
-                self.reads.pending.lock().unwrap().remove(&req_id);
-                return Err(std::io::Error::other("link closed"));
-            }
-            let started = std::time::Instant::now();
-            match tokio::time::timeout(READ_TIMEOUT, rx).await {
-                Ok(Ok(data)) => {
-                    // Timed at the LEASE round trip, not the local write:
-                    // this is what the source plane sustains for this box
-                    // (HUB-36).
-                    self.reads.fold_link_rate(data.len(), started.elapsed());
-                    Ok(data)
-                }
-                Ok(Err(_)) | Err(_) => {
-                    self.reads.pending.lock().unwrap().remove(&req_id);
-                    Err(std::io::Error::other(format!(
-                        "source read {req_id} unanswered"
-                    )))
-                }
-            }
-        })
+        Box::pin(self.buffer.read(offset, len))
     }
+}
+
+// A retry never replays bytes already handed to read-ahead, even if it has
+// not consumed them yet. Seeks replace the cursor; stale arrivals cannot move it.
+#[derive(Default)]
+struct SourceResume(Option<kahawai_proto::v1::ReadRequest>, u64);
+impl SourceResume {
+    fn delivered(&mut self, (generation, offset, len, eof): (u64, u64, u64, bool)) {
+        if let Some(read) = &mut self.0
+            && read.generation == generation
+            && read.offset == offset
+        {
+            self.1 = self.1.saturating_add(len);
+            read.offset = read.offset.saturating_add(len);
+            read.len = read.len.saturating_sub(len);
+            if eof {
+                read.len = 0;
+            }
+        }
+    }
+}
+
+async fn stream_source(
+    address: &str,
+    tls: Arc<rustls::ClientConfig>,
+    token: String,
+    requests: mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
+    chunks: mpsc::Sender<kahawai_proto::v1::ByteChunk>,
+    rates: Arc<LinkRate>,
+) -> anyhow::Result<()> {
+    stream_source_with(
+        || kahawai_transport::tls::grpc_channel_with(address, tls.clone()),
+        token,
+        requests,
+        chunks,
+        rates,
+    )
+    .await
+}
+
+async fn stream_source_with<F, Fut>(
+    mut connect: F,
+    token: String,
+    mut requests: mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
+    chunks: mpsc::Sender<kahawai_proto::v1::ByteChunk>,
+    rates: Arc<LinkRate>,
+) -> anyhow::Result<()>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<tonic::transport::Channel>>,
+{
+    let resume = Mutex::new(SourceResume::default());
+    let mut recovery_started = None;
+    loop {
+        // Consume seeks queued during an outage before replaying the cursor.
+        while let Ok(read) = requests.try_recv() {
+            resume.lock().unwrap().0 = Some(read);
+        }
+        let before = resume.lock().unwrap().1;
+        let attempt = async {
+            // Bound handshaking too; it must not bypass the demand deadline.
+            let channel =
+                tokio::time::timeout(std::time::Duration::from_secs(2), connect()).await??;
+            source_attempt(channel, &token, &mut requests, &chunks, &rates, &resume).await
+        };
+        let result = tokio::select! {
+            _ = chunks.closed() => return Ok(()),
+            result = attempt => result,
+        };
+        let Err(error) = result else {
+            return Ok(());
+        };
+        if let Some(status) = error.downcast_ref::<tonic::Status>()
+            && matches!(
+                status.code(),
+                tonic::Code::InvalidArgument
+                    | tonic::Code::PermissionDenied
+                    | tonic::Code::Unauthenticated
+                    | tonic::Code::FailedPrecondition
+                    | tonic::Code::Unimplemented
+                    | tonic::Code::OutOfRange
+            )
+        {
+            return Err(error);
+        }
+        let after = resume.lock().unwrap().1;
+        // Successful delivery resets the outage budget; merely reconnecting
+        // or receiving a new seek does not prolong an unavailable source.
+        if after > before {
+            recovery_started = None;
+        }
+        let started = recovery_started.get_or_insert_with(tokio::time::Instant::now);
+        if started.elapsed() >= std::time::Duration::from_secs(10) {
+            return Err(error);
+        }
+        tracing::warn!(error = %error, "source connection lost; reconnecting");
+        tokio::select! {
+            _ = chunks.closed() => return Ok(()),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(200)) => {},
+        }
+    }
+}
+
+async fn source_attempt(
+    channel: tonic::transport::Channel,
+    token: &str,
+    requests: &mut mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
+    chunks: &mpsc::Sender<kahawai_proto::v1::ByteChunk>,
+    rates: &LinkRate,
+    resume: &Mutex<SourceResume>,
+) -> anyhow::Result<()> {
+    use kahawai_proto::v1::{SourceCommand, transcoder_link_client::TranscoderLinkClient};
+    let mut client = TranscoderLinkClient::new(channel);
+    let (tx, rx) = mpsc::channel(2);
+    tx.send(SourceCommand {
+        source_token: token.into(),
+        read: None,
+    })
+    .await?;
+    let mut inbound = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        client.source_channel(tokio_stream::wrappers::ReceiverStream::new(rx)),
+    )
+    .await??
+    .into_inner();
+    let replay = resume.lock().unwrap().0;
+    if let Some(read) = replay {
+        tx.send(SourceCommand {
+            source_token: String::new(),
+            read: Some(read),
+        })
+        .await?;
+    }
+    let send = async {
+        while let Some(read) = requests.recv().await {
+            resume.lock().unwrap().0 = Some(read);
+            tx.send(SourceCommand {
+                source_token: String::new(),
+                read: Some(read),
+            })
+            .await?;
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    let receive = async {
+        let mut sample = StreamRateSample::default();
+        let mut generation = 0;
+        loop {
+            let mut waited = false;
+            let message = inbound.message();
+            tokio::pin!(message);
+            let next = std::future::poll_fn(|cx| {
+                let result = std::future::Future::poll(message.as_mut(), cx);
+                waited |= result.is_pending();
+                result
+            })
+            .await?;
+            let Some(chunk) = next else {
+                anyhow::bail!("source connection closed");
+            };
+            let delivered = (
+                chunk.generation,
+                chunk.offset,
+                chunk.data.len() as u64,
+                chunk.eof,
+            );
+            let terminal = !chunk.error.is_empty();
+            if chunk.generation != generation || chunk.eof || !chunk.error.is_empty() {
+                sample = StreamRateSample::default();
+                generation = chunk.generation;
+            }
+            if !chunk.data.is_empty()
+                && let Some((bytes, elapsed)) =
+                    sample.received(chunk.data.len(), waited, std::time::Instant::now())
+            {
+                rates.fold_link_rate(bytes, elapsed);
+            }
+            match chunks.try_send(chunk) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Closed(_)) => break,
+                Err(mpsc::error::TrySendError::Full(chunk)) => {
+                    sample = StreamRateSample::default();
+                    if chunks.send(chunk).await.is_err() {
+                        break;
+                    }
+                }
+            }
+            if terminal {
+                return Ok(());
+            }
+            resume.lock().unwrap().delivered(delivered);
+        }
+        Ok::<_, anyhow::Error>(())
+    };
+    tokio::select! { result = send => result, result = receive => result }
 }
 
 struct Session {
@@ -159,11 +334,18 @@ struct Starting {
     pending: HashMap<String, (tokio::task::Id, tokio::task::AbortHandle)>,
 }
 
+/// Immutable byte-plane endpoint belonging to this control link.
+pub struct SourceEndpoint {
+    pub address: String,
+    pub tls: Arc<rustls::ClientConfig>,
+}
+
 /// All state for one hub link's dispatched sessions.
 pub struct Runner {
     executor: Executor,
+    source_endpoint: SourceEndpoint,
     link: mpsc::Sender<TcToHub>,
-    reads: Arc<LinkReads>,
+    reads: Arc<LinkRate>,
     sessions: Mutex<HashMap<String, Session>>,
     generations: Mutex<HashMap<String, Generations>>,
     /// Start admission. A start registers in `sessions` only once its
@@ -188,16 +370,16 @@ impl Runner {
         scratch_root: PathBuf,
         worker_exe: Option<PathBuf>,
         link: mpsc::Sender<TcToHub>,
+        source_endpoint: SourceEndpoint,
     ) -> Arc<Self> {
         Arc::new(Self {
             // Sessions never survive a link; stale scratch is garbage,
             // and the executor sweeps it.
             executor: Executor::new(scratch_root, worker_exe),
-            link: link.clone(),
-            reads: Arc::new(LinkReads {
-                link,
-                pending: Mutex::new(HashMap::new()),
-                next_req: AtomicU64::new(1),
+            source_endpoint,
+
+            link,
+            reads: Arc::new(LinkRate {
                 link_rate: Mutex::new(None),
             }),
             sessions: Mutex::new(HashMap::new()),
@@ -239,7 +421,7 @@ impl Runner {
 
     async fn start_inner(self: &Arc<Self>, msg: StartSession) {
         let session_id = msg.session_id.clone();
-        let job = match Job::from_start_session(&msg) {
+        let dispatch = match kahawai_playback::job::Dispatch::from_start_session(&msg) {
             Ok(job) => job,
             Err(e) => {
                 let _ = self
@@ -249,6 +431,7 @@ impl Runner {
                 return;
             }
         };
+
         // Replace any previous run first (seek-restart reuses the id),
         // then take the generation that outlives that end.
         self.end(&session_id).await;
@@ -258,19 +441,32 @@ impl Runner {
             g.latest += 1;
             g.latest
         };
-        let sources: Vec<Arc<dyn ByteSource>> = job
-            .part_sizes
-            .iter()
-            .enumerate()
-            .map(|(part, size)| {
-                Arc::new(LinkByteSource {
-                    reads: self.reads.clone(),
-                    session_id: session_id.clone(),
-                    part: part as u32,
-                    size: *size,
-                }) as Arc<dyn ByteSource>
-            })
-            .collect();
+        let job = dispatch.job;
+        let SourceEndpoint { address, tls } = &self.source_endpoint;
+        let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(dispatch.sources.len());
+        for descriptor in dispatch.sources {
+            let (address, tls, rates) = (address.clone(), tls.clone(), self.reads.clone());
+            let size = descriptor.size;
+            let buffer = kahawai_transport::read_ahead::ReadAhead::new(
+                size,
+                kahawai_transport::read_ahead::TRANSCODER_CAPACITY,
+                move |requests, chunks| async move {
+                    if let Err(error) = stream_source(
+                        &address,
+                        tls,
+                        descriptor.source_token,
+                        requests,
+                        chunks,
+                        rates,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "transcoder source channel failed");
+                    }
+                },
+            );
+            sources.push(Arc::new(BufferedSource { buffer, size }));
+        }
         let started = match self.executor.start(&session_id, job, sources).await {
             Ok(started) => started,
             Err(failure) => {
@@ -391,15 +587,6 @@ impl Runner {
             samples,
             link_bytes_per_sec: rate.unwrap_or(0.0) as u64,
         })
-    }
-
-    /// Hub answered a source read. Stale responses (request id no
-    /// longer pending — e.g. from a worker a seek-restart replaced) are
-    /// dropped on the floor.
-    pub fn source_data(&self, req: u64, data: Vec<u8>) {
-        if let Some(tx) = self.reads.pending.lock().unwrap().remove(&req) {
-            let _ = tx.send(data);
-        }
     }
 
     /// Hub wants an artifact: stream it back in chunks.
@@ -576,78 +763,180 @@ fn session_error(session_id: &str, error: String, worker_log: String) -> TcToHub
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
-    fn reads() -> (Arc<LinkReads>, mpsc::Receiver<TcToHub>) {
-        let (tx, rx) = mpsc::channel(4);
-        (
-            Arc::new(LinkReads {
-                link: tx,
-                pending: Mutex::new(HashMap::new()),
-                next_req: AtomicU64::new(1),
-                link_rate: Mutex::new(None),
-            }),
+    #[tokio::test]
+    async fn source_reconnect_resumes_exactly_after_delivered_bytes() {
+        use kahawai_proto::v1::{
+            ByteChunk, SourceCommand,
+            transcoder_link_server::{TranscoderLink, TranscoderLinkServer},
+        };
+        use tokio_stream::wrappers::{ReceiverStream, TcpListenerStream};
+        use tonic::{Request, Response, Status, Streaming};
+        #[derive(Clone)]
+        struct Flaky(Arc<AtomicU64>, Arc<Mutex<Vec<u64>>>);
+        #[tonic::async_trait]
+        impl TranscoderLink for Flaky {
+            type LinkStream = ReceiverStream<Result<kahawai_proto::v1::HubToTc, Status>>;
+            async fn link(
+                &self,
+                _: Request<Streaming<TcToHub>>,
+            ) -> Result<Response<Self::LinkStream>, Status> {
+                panic!("byte recovery must not reconnect the control link")
+            }
+            type SourceChannelStream = ReceiverStream<Result<ByteChunk, Status>>;
+            async fn source_channel(
+                &self,
+                request: Request<Streaming<SourceCommand>>,
+            ) -> Result<Response<Self::SourceChannelStream>, Status> {
+                let mut inbound = request.into_inner();
+                let bind = inbound.message().await?.unwrap();
+                assert_eq!(bind.source_token, "same-grant");
+                assert!(bind.read.is_none());
+                let attempt = self.0.fetch_add(1, Ordering::SeqCst);
+                // Simulate the hub still disposing of the first channel.
+                if attempt == 1 {
+                    return Err(Status::already_exists("previous channel still active"));
+                }
+                let offsets = self.1.clone();
+                let (tx, rx) = mpsc::channel(2);
+                tokio::spawn(async move {
+                    let read = inbound.message().await.unwrap().unwrap().read.unwrap();
+                    offsets.lock().unwrap().push(read.offset);
+                    assert_eq!(read.generation, 1);
+                    assert_eq!(read.offset + read.len, 16384);
+                    let end = if attempt == 0 { 4096 } else { 16384 };
+                    tx.send(Ok(ByteChunk {
+                        generation: read.generation,
+                        offset: read.offset,
+                        data: (read.offset..end).map(|n| (n % 251) as u8).collect(),
+                        ..Default::default()
+                    }))
+                    .await
+                    .unwrap();
+                    if attempt != 0 {
+                        tx.send(Ok(ByteChunk {
+                            generation: read.generation,
+                            offset: end,
+                            eof: true,
+                            ..Default::default()
+                        }))
+                        .await
+                        .unwrap();
+                        // A healthy source remains open for future seeks.
+                        let _ = inbound.message().await;
+                    }
+                    drop(tx);
+                });
+                Ok(Response::new(ReceiverStream::new(rx)))
+            }
+        }
+        let attempts = Arc::new(AtomicU64::new(0));
+        let offsets = Arc::new(Mutex::new(Vec::new()));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = format!("http://{}", listener.local_addr().unwrap());
+        let service = Flaky(attempts.clone(), offsets.clone());
+        let server = tokio::spawn(
+            tonic::transport::Server::builder()
+                .add_service(TranscoderLinkServer::new(service))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let rates = reads();
+        let buffer = kahawai_transport::read_ahead::ReadAhead::new(
+            16384,
+            kahawai_transport::source_stream::CHUNK,
+            move |requests, chunks| async move {
+                stream_source_with(
+                    || {
+                        let address = address.clone();
+                        async move {
+                            Ok(tonic::transport::Endpoint::from_shared(address)?
+                                .connect()
+                                .await?)
+                        }
+                    },
+                    "same-grant".into(),
+                    requests,
+                    chunks,
+                    rates,
+                )
+                .await
+                .unwrap();
+            },
+        );
+        let bytes = tokio::time::timeout(std::time::Duration::from_secs(5), buffer.read(0, 16384))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            bytes,
+            (0..16384).map(|n| (n % 251) as u8).collect::<Vec<_>>()
+        );
+        assert_eq!(*offsets.lock().unwrap(), vec![0, 4096]);
+        assert_eq!(attempts.load(Ordering::SeqCst), 3);
+        drop(buffer);
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn source_reconnect_does_not_retry_authorization_failures() {
+        let calls = AtomicU64::new(0);
+        let (_requests, rx) = mpsc::channel(2);
+        let (tx, _chunks) = mpsc::channel(2);
+        let rates = reads();
+        let error = stream_source_with(
+            || {
+                calls.fetch_add(1, Ordering::SeqCst);
+                async { Err(tonic::Status::permission_denied("grant revoked").into()) }
+            },
+            "revoked".into(),
             rx,
+            tx,
+            rates,
         )
-    }
-
-    #[tokio::test]
-    async fn a_read_the_hub_drops_fails_the_worker_instead_of_hanging() {
-        // The hub tore the session down (lease gone) and will never answer
-        // this request: the read must come back as an error so the pipeline
-        // errors out rather than waiting for ever.
-        let (reads, mut rx) = reads();
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 0,
-            size: 100,
-        };
-        let read = tokio::spawn(async move { source.read(0, 16).await });
-        let sent = rx.recv().await.unwrap();
-        let Some(tc_to_hub::Msg::SourceRead(req)) = sent.msg else {
-            panic!("expected a SourceRead");
-        };
-        // Dropping the pending sender is what a torn-down session looks
-        // like from here: nobody will ever call `source_data` for it.
-        reads.pending.lock().unwrap().remove(&req.req);
-        assert!(read.await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn a_closed_link_fails_the_read_and_releases_its_slot() {
-        let (reads, rx) = reads();
-        drop(rx);
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 0,
-            size: 100,
-        };
-        assert!(source.read(0, 16).await.is_err());
-        assert!(
-            reads.pending.lock().unwrap().is_empty(),
-            "the pending slot is released"
+        .await
+        .unwrap_err();
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            error.downcast_ref::<tonic::Status>().unwrap().code(),
+            tonic::Code::PermissionDenied
         );
     }
 
-    #[tokio::test]
-    async fn an_answered_read_returns_the_hubs_bytes() {
-        let (reads, mut rx) = reads();
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 2,
-            size: 100,
-        };
-        let read = tokio::spawn(async move { source.read(10, 4).await });
-        let sent = rx.recv().await.unwrap();
-        let Some(tc_to_hub::Msg::SourceRead(req)) = sent.msg else {
-            panic!("expected a SourceRead");
-        };
-        assert_eq!((req.offset, req.len, req.part), (10, 4, 2));
-        let tx = reads.pending.lock().unwrap().remove(&req.req).unwrap();
-        tx.send(vec![1, 2, 3, 4]).unwrap();
-        assert_eq!(read.await.unwrap().unwrap(), vec![1, 2, 3, 4]);
+    #[test]
+    fn source_resume_ignores_old_generation_and_retains_new_seek() {
+        use kahawai_proto::v1::ReadRequest;
+        let mut resume = SourceResume(
+            Some(ReadRequest {
+                offset: 100,
+                len: 900,
+                generation: 2,
+            }),
+            0,
+        );
+        resume.delivered((1, 100, 30, false));
+        assert_eq!(resume.0.unwrap().offset, 100);
+        resume.delivered((2, 100, 30, false));
+        assert_eq!(resume.0.unwrap().offset, 130);
+        assert_eq!(resume.0.unwrap().len, 870);
+    }
+
+    fn reads() -> Arc<LinkRate> {
+        Arc::new(LinkRate {
+            link_rate: Mutex::new(None),
+        })
+    }
+
+    fn source_endpoint() -> SourceEndpoint {
+        let _ = rustls::crypto::ring::default_provider().install_default();
+        SourceEndpoint {
+            address: "https://127.0.0.1:1".into(),
+            tls: Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
+        }
     }
 
     /// A stand-in for the `remux-worker` child that never produces a
@@ -695,7 +984,11 @@ mod tests {
     fn stalled_session() -> StartSession {
         StartSession {
             session_id: "s".into(),
-            size: 1,
+            sources: vec![kahawai_proto::v1::SourceDescriptor {
+                size: 1,
+                source_token: "test-source".into(),
+            }],
+            target_duration_secs: 6,
             video: "copy".into(),
             audio: "copy".into(),
             ..Default::default()
@@ -704,7 +997,12 @@ mod tests {
 
     async fn stalled_start(dir: &std::path::Path) -> (Arc<Runner>, mpsc::Receiver<TcToHub>, u32) {
         let (tx, rx) = mpsc::channel(8);
-        let runner = Runner::new(dir.join("sessions"), Some(stalled_worker(dir)), tx);
+        let runner = Runner::new(
+            dir.join("sessions"),
+            Some(stalled_worker(dir)),
+            tx,
+            source_endpoint(),
+        );
         runner.start(stalled_session());
         let pid = worker_pid(&dir.join("sessions")).await;
         assert!(alive(pid));
@@ -764,6 +1062,7 @@ mod tests {
             dir.path().join("sessions"),
             Some(stalled_worker(dir.path())),
             tx,
+            source_endpoint(),
         );
         runner.end_all().await;
         runner.start(stalled_session());
@@ -782,11 +1081,7 @@ mod tests {
 
     #[test]
     fn small_reads_do_not_move_the_link_rate() {
-        let (tx, _rx) = mpsc::channel(1);
-        let reads = LinkReads {
-            link: tx,
-            pending: Mutex::new(HashMap::new()),
-            next_req: AtomicU64::new(1),
+        let reads = LinkRate {
             link_rate: Mutex::new(None),
         };
         reads.fold_link_rate(1024, std::time::Duration::from_millis(1));
@@ -796,5 +1091,36 @@ mod tests {
         reads.fold_link_rate(LINK_MIN_READ, std::time::Duration::from_millis(500));
         let blended = reads.link_rate.lock().unwrap().unwrap();
         assert!(blended > LINK_MIN_READ as f64 && blended < 2.0 * LINK_MIN_READ as f64);
+    }
+
+    #[test]
+    fn stream_rate_discards_backlogged_bytes_before_measuring_fresh_arrivals() {
+        use std::time::{Duration, Instant};
+        let start = Instant::now();
+        let mut sample = StreamRateSample::default();
+        // A slow consumer has let several MiB accumulate in transport buffers.
+        // Draining them immediately must never manufacture a fast-link sample.
+        for _ in 0..16 {
+            assert!(sample.received(LINK_MIN_READ, false, start).is_none());
+        }
+        assert!(sample.received(LINK_MIN_READ, true, start).is_none());
+        assert_eq!(
+            sample.received(LINK_MIN_READ, true, start + Duration::from_secs(2)),
+            Some((LINK_MIN_READ, Duration::from_secs(2)))
+        );
+        // Backpressure invalidates even a partially collected sample.
+        assert!(
+            sample
+                .received(LINK_MIN_READ / 2, false, start + Duration::from_secs(3))
+                .is_none()
+        );
+        sample = StreamRateSample::default();
+        let resumed = start + Duration::from_secs(60);
+        assert!(sample.received(LINK_MIN_READ, false, resumed).is_none());
+        assert!(sample.received(LINK_MIN_READ, true, resumed).is_none());
+        assert_eq!(
+            sample.received(LINK_MIN_READ, true, resumed + Duration::from_secs(1)),
+            Some((LINK_MIN_READ, Duration::from_secs(1)))
+        );
     }
 }

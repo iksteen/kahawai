@@ -171,12 +171,7 @@ async fn every_queue_is_listed_in_one_shape_for_administrators_only() {
         .unwrap();
     registry.connected("host", "mediahost", "NAS", "fp", "test");
     let generation = registry
-        .register_link(
-            "host",
-            tokio::sync::mpsc::channel(1).0,
-            kahawai_proto::PROTOCOL_MINOR,
-            0,
-        )
+        .register_link("host", tokio::sync::mpsc::channel(1).0, 0)
         .0;
     registry.report_discovery(
         "host",

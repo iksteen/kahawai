@@ -1162,7 +1162,7 @@ pub(super) async fn refresh_library(
         .ok_or_else(|| hidden("library"))?;
     let mut asked = 0;
     let mut offline = 0;
-    let mut unsupported = 0;
+    let unsupported = 0;
     for collection in s
         .registry
         .catalogue()
@@ -1179,7 +1179,6 @@ pub(super) async fn refresh_library(
             {
                 crate::registry::RescanResult::Requested => asked += 1,
                 crate::registry::RescanResult::Offline => offline += 1,
-                crate::registry::RescanResult::Unsupported => unsupported += 1,
             }
         }
     }

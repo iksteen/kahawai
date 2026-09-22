@@ -44,6 +44,71 @@ impl TranscoderLinkService {
 #[tonic::async_trait]
 impl TranscoderLink for TranscoderLinkService {
     type LinkStream = ReceiverStream<Result<HubToTc, Status>>;
+    type SourceChannelStream = ReceiverStream<Result<kahawai_proto::v1::ByteChunk, Status>>;
+    async fn source_channel(
+        &self,
+        request: Request<Streaming<kahawai_proto::v1::SourceCommand>>,
+    ) -> Result<Response<Self::SourceChannelStream>, Status> {
+        let peer = peer_identity(&request)
+            .ok_or_else(|| Status::unauthenticated("client certificate required"))?;
+        if peer.module_type != "transcoder" {
+            return Err(Status::permission_denied("not a transcoder certificate"));
+        }
+        let peer_id = peer.module_id.clone();
+        let mut inbound = request.into_inner();
+        let first = tokio::time::timeout(std::time::Duration::from_secs(10), inbound.message())
+            .await
+            .map_err(|_| Status::deadline_exceeded("source binding timed out"))??
+            .ok_or_else(|| Status::invalid_argument("missing source binding"))?;
+        if first.read.is_some() {
+            return Err(Status::invalid_argument(
+                "first source message must only bind a token",
+            ));
+        }
+        let (source, mut alive, claim) =
+            self.sessions.claim_source(&first.source_token, &peer_id)?;
+        let (out, rx) = tokio::sync::mpsc::channel(2);
+        tokio::spawn(async move {
+            let _claim = claim;
+            let (commands, requests) = tokio::sync::mpsc::channel(2);
+            let (chunks, mut data) = tokio::sync::mpsc::channel(2);
+            let receive = async {
+                let mut generation = 0;
+                while let Some(command) = inbound.message().await? {
+                    let read = validate_source_command(command, generation)?;
+                    generation = read.generation;
+                    if commands.send(read).await.is_err() {
+                        break;
+                    }
+                }
+                Ok::<_, Status>(())
+            };
+            let send = async {
+                while let Some(chunk) = data.recv().await {
+                    if out.send(Ok(chunk)).await.is_err() {
+                        break;
+                    }
+                }
+            };
+            let result = tokio::select! {
+                _ = alive.changed() => Err(Status::failed_precondition("source grant revoked")),
+                _ = out.closed() => Ok(()),
+                result = receive => result,
+                _ = send => Ok(()),
+                _ = kahawai_transport::source_stream::serve(requests, chunks, source.size(), |offset, len| { let source = &source; async move {
+                    Ok(source.read(offset, len as u64).await?)
+                }}) => Ok(()),
+            };
+            if let Err(error) = result {
+                tracing::warn!(module_id = %peer_id, code = ?error.code(), reason = %error.message(), "source channel closed with error");
+                // Do not let an unresponsive peer retain its claim indefinitely.
+                let _ =
+                    tokio::time::timeout(std::time::Duration::from_secs(1), out.send(Err(error)))
+                        .await;
+            }
+        });
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
 
     async fn link(
         &self,
@@ -80,7 +145,7 @@ impl TranscoderLink for TranscoderLinkService {
         // Sender first, then "present" — the same reason as the mediahost link:
         // the renewal settlement below is DB work, and a box announced as
         // present without a way to reach it is a placement target that fails.
-        registry.register_tc_link(&module_id, hello.protocol_minor, tx.clone());
+        registry.register_tc_link(&module_id, tx.clone());
         registry.connected(
             &module_id,
             &peer.module_type,
@@ -281,24 +346,7 @@ impl TranscoderLink for TranscoderLinkService {
                                 });
                             }
                         }
-                        tc_to_hub::Msg::SourceRead(r) => {
-                            let sessions = sessions.clone();
-                            let registry = registry.clone();
-                            let module_id = module_id.clone();
-                            tokio::spawn(async move {
-                                sessions
-                                    .source_read(
-                                        &registry,
-                                        &module_id,
-                                        &r.session_id,
-                                        r.offset,
-                                        r.len,
-                                        r.req,
-                                        r.part,
-                                    )
-                                    .await;
-                            });
-                        }
+
                         tc_to_hub::Msg::ArtifactData(d) => sessions.artifact_chunk(d),
                         tc_to_hub::Msg::Hello(_) | tc_to_hub::Msg::Heartbeat(_) => {}
                     },
@@ -342,5 +390,60 @@ impl TranscoderLink for TranscoderLinkService {
         });
 
         Ok(Response::new(ReceiverStream::new(rx)))
+    }
+}
+
+/// Never include bearer tokens in diagnostics.
+fn validate_source_command(
+    command: kahawai_proto::v1::SourceCommand,
+    previous: u64,
+) -> Result<kahawai_proto::v1::ReadRequest, Status> {
+    if !command.source_token.is_empty() {
+        return Err(Status::invalid_argument(
+            "unexpected source token after binding",
+        ));
+    }
+    let read = command
+        .read
+        .ok_or_else(|| Status::invalid_argument("missing source read"))?;
+    if read.generation == 0 || read.generation <= previous {
+        return Err(Status::invalid_argument(
+            "source generation must increase and be nonzero",
+        ));
+    }
+    Ok(read)
+}
+
+#[cfg(test)]
+mod source_command_tests {
+    use super::*;
+    #[test]
+    fn malformed_commands_have_explicit_status_without_exposing_tokens() {
+        use kahawai_proto::v1::{ReadRequest, SourceCommand};
+        for command in [
+            SourceCommand {
+                source_token: "secret-token".into(),
+                read: Some(ReadRequest {
+                    generation: 2,
+                    ..Default::default()
+                }),
+            },
+            SourceCommand::default(),
+            SourceCommand {
+                read: Some(ReadRequest::default()),
+                ..Default::default()
+            },
+            SourceCommand {
+                read: Some(ReadRequest {
+                    generation: 1,
+                    ..Default::default()
+                }),
+                ..Default::default()
+            },
+        ] {
+            let error = validate_source_command(command, 1).unwrap_err();
+            assert_eq!(error.code(), tonic::Code::InvalidArgument);
+            assert!(!error.message().contains("secret-token"));
+        }
     }
 }

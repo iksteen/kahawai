@@ -68,6 +68,9 @@ pub type BoxFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 /// Random-access bytes for one part, served to the worker over its
 /// socket (or to an in-process pipeline through [`BlockingSource`]).
 pub trait ByteSource: Send + Sync + 'static {
+    fn diagnostics(&self) -> String {
+        String::new()
+    }
     fn size(&self) -> u64;
     /// Up to `len` bytes at `offset`. A short or empty answer is EOF at
     /// that offset; an error closes the worker's socket, so the pipeline
@@ -183,6 +186,28 @@ impl RemuxSource for BlockingSource {
         buf[..n].copy_from_slice(&data[..n]);
         Ok(n)
     }
+    fn read_at_cancelled(
+        &mut self,
+        offset: u64,
+        buf: &mut [u8],
+        cancel: &kahawai_media::remux::ReadCancellation,
+    ) -> std::io::Result<usize> {
+        cancel.check()?;
+        let wake = Arc::new(tokio::sync::Notify::new());
+        let interrupt = wake.clone();
+        cancel.on_cancel(move || interrupt.notify_one());
+        let result = self.handle.block_on(async {
+            tokio::select! {
+                biased;
+                _ = wake.notified() => Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "source read cancelled")),
+                result = self.source.read(offset, buf.len() as u64) => result,
+            }
+        })?;
+        cancel.check()?;
+        let n = result.len().min(buf.len());
+        buf[..n].copy_from_slice(&result[..n]);
+        Ok(n)
+    }
 }
 
 /// Runs pipelines under a scratch root, one directory per run.
@@ -253,16 +278,7 @@ impl Executor {
         job: &Job,
         sources: &[Arc<dyn ByteSource>],
     ) -> Result<Run> {
-        anyhow::ensure!(
-            !job.part_sizes.is_empty(),
-            "no source parts for the session"
-        );
-        anyhow::ensure!(
-            sources.len() == job.part_sizes.len(),
-            "{} sources for {} parts",
-            sources.len(),
-            job.part_sizes.len()
-        );
+        anyhow::ensure!(!sources.is_empty(), "no sources for the run");
         let run_no = self.run_seq.fetch_add(1, Ordering::Relaxed);
         let dir = self
             .scratch_root
@@ -293,22 +309,30 @@ impl Executor {
             // the accept is already pending when it connects.
             let source = source.clone();
             serving.push(tokio::spawn(async move {
-                match listener.accept().await {
-                    Ok((conn, _)) => {
+                let mut serving = tokio::task::JoinSet::new();
+                // The listener remains for the run: a flushing seek closes a
+                // blocked socket read and opens a replacement connection.
+                while let Ok((conn, _)) = listener.accept().await {
+                    serving.abort_all();
+                    while serving.join_next().await.is_some() {}
+                    let source = source.clone();
+                    serving.spawn(async move {
                         if let Err(e) = serve_reads(conn, source).await {
                             tracing::debug!(error = format!("{e:#}"), "worker read channel closed");
                         }
-                    }
-                    Err(e) => tracing::warn!(error = %e, "worker never connected"),
+                    });
                 }
             }));
-            sockets.push(sock);
+            sockets.push(crate::job::WorkerSource {
+                socket: sock,
+                size: sources[n].size(),
+            });
         }
 
         let worker = match &self.worker_exe {
             Some(exe) => {
                 let argv = job.to_argv(&ArgvLayout {
-                    sockets: &sockets,
+                    sources: &sockets,
                     out_dir: &dir,
                     burn_sets: burn_sets.as_deref(),
                     burn_ass: burn_ass.as_deref(),
@@ -371,6 +395,7 @@ impl Executor {
                 worker: Mutex::new(Some(worker)),
                 _socket_dir: socket_dir,
                 serving: Mutex::new(serving),
+                sources: sources.to_vec(),
                 died,
             }),
             watcher: Mutex::new(None),
@@ -460,6 +485,7 @@ impl Worker {
 }
 
 struct Inner {
+    sources: Vec<Arc<dyn ByteSource>>,
     session_id: String,
     dir: PathBuf,
     /// `None` once ended.
@@ -509,6 +535,11 @@ impl Run {
 
     pub fn session_id(&self) -> &str {
         &self.inner.session_id
+    }
+
+    /// Retain byte sources across a replacement run, preserving read-ahead.
+    pub fn sources(&self) -> Vec<Arc<dyn ByteSource>> {
+        self.inner.sources.clone()
     }
 
     /// Pacing (§4.6): where the viewer is, for the worker to throttle
@@ -570,7 +601,14 @@ impl Run {
 
     /// The diagnostics bundle of this run as it is now (OPS-10).
     pub fn bundle(&self, label: &str) -> String {
-        bundle::gather(label, &self.inner.session_id, &self.inner.dir)
+        let mut out = bundle::gather(label, &self.inner.session_id, &self.inner.dir);
+        for (part, source) in self.inner.sources.iter().enumerate() {
+            let stats = source.diagnostics();
+            if !stats.is_empty() {
+                out.push_str(&format!("\n== source part {part}\n{stats}\n"));
+            }
+        }
+        out
     }
 
     /// Stop, wait [`STOP_GRACE`], gather the bundle and the final pace

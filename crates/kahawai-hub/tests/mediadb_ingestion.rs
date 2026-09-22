@@ -2408,7 +2408,7 @@ async fn downloaded_subtitle_case(format: &str) {
 }
 
 #[tokio::test]
-async fn library_rescan_uses_committed_membership_and_negotiated_deep_support() {
+async fn library_rescan_uses_committed_membership_and_all_hosts_support_deep() {
     let f = Fixture::new().await;
     let store = f.registry.catalogue();
     let mut members = Vec::new();
@@ -2444,9 +2444,8 @@ async fn library_rescan_uses_committed_membership_and_negotiated_deep_support() 
         .unwrap();
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
     let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(8);
-    f.registry
-        .register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
-    f.registry.register_link("older", old_tx, 1, 0);
+    f.registry.register_link("host", tx, 0);
+    f.registry.register_link("older", old_tx, 0);
     let path = format!("/admin/v1/catalogue/libraries/{library}/refresh");
     assert_eq!(
         f.request("POST", &path, json!({}), None).await.0,
@@ -2463,10 +2462,7 @@ async fn library_rescan_uses_committed_membership_and_negotiated_deep_support() 
             )
             .await;
         assert_eq!(status, StatusCode::OK);
-        assert_eq!(
-            body,
-            json!({"asked": if deep {1} else {2}, "offline":1,"unsupported":usize::from(deep)})
-        );
+        assert_eq!(body, json!({"asked":2, "offline":1,"unsupported":0}));
         let p::hub_to_host::Msg::RescanRequest(request) = receive(&mut rx).await else {
             panic!("expected rescan")
         };
@@ -2476,17 +2472,10 @@ async fn library_rescan_uses_committed_membership_and_negotiated_deep_support() 
             rx.try_recv().is_err(),
             "excluded collection was not scanned"
         );
-        if deep {
-            assert!(
-                old_rx.try_recv().is_err(),
-                "old host must not silently downgrade deep intent"
-            );
-        } else {
-            let p::hub_to_host::Msg::RescanRequest(request) = receive(&mut old_rx).await else {
-                panic!("expected rescan")
-            };
-            assert!(!request.deep);
-        }
+        let p::hub_to_host::Msg::RescanRequest(request) = receive(&mut old_rx).await else {
+            panic!("expected rescan")
+        };
+        assert_eq!(request.deep, deep);
     }
     assert_eq!(
         f.request(
@@ -2535,9 +2524,7 @@ async fn segment_admin_reports_live_sources_without_a_manual_trigger() {
     f.registry
         .connected("host", "mediahost", "Fixture", "fixture-cert", "test");
     let (tx, mut rx) = tokio::sync::mpsc::channel(8);
-    let (generation, _) = f
-        .registry
-        .register_link("host", tx, kahawai_proto::PROTOCOL_MINOR, 0);
+    let (generation, _) = f.registry.register_link("host", tx, 0);
     let path = "/admin/v1/segments";
     assert_eq!(
         f.request("GET", path, json!({}), None).await.0,
@@ -2599,8 +2586,7 @@ async fn segment_admin_reports_live_sources_without_a_manual_trigger() {
         "status reads never trigger discovery"
     );
     let (new_tx, _new_rx) = tokio::sync::mpsc::channel(8);
-    f.registry
-        .register_link("host", new_tx, kahawai_proto::PROTOCOL_MINOR, 0);
+    f.registry.register_link("host", new_tx, 0);
     f.registry.report_discovery(
         "host",
         generation,

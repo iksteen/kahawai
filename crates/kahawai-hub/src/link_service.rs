@@ -106,11 +106,9 @@ fn register_host_link(
     registry: &Registry,
     module_id: &str,
     tx: tokio::sync::mpsc::Sender<Result<HubToHost, Status>>,
-    protocol_minor: u32,
     segment_detector_generation: i64,
 ) -> u64 {
-    let (generation, _) =
-        registry.register_link(module_id, tx, protocol_minor, segment_detector_generation);
+    let (generation, _) = registry.register_link(module_id, tx, segment_detector_generation);
     generation
 }
 
@@ -148,7 +146,6 @@ pub fn local_link(
             &registry,
             &module_id,
             hub_tx,
-            PROTOCOL_MINOR,
             kahawai_core::segments::DETECTOR_GENERATION,
         );
         drop(guard);
@@ -246,7 +243,6 @@ impl MediahostLink for MediahostLinkService {
             &registry,
             &module_id,
             tx.clone(),
-            hello.protocol_minor,
             hello.segment_detector_generation,
         );
         registry.connected(
@@ -414,6 +410,10 @@ impl MediahostLink for MediahostLinkService {
             .ok_or_else(|| Status::not_found("unknown or expired lease token"))?;
 
         tokio::spawn(async move {
+            if !first.error.is_empty() {
+                let _ = chunk_tx.send(first).await;
+                return;
+            }
             while let Ok(Some(chunk)) = inbound.message().await {
                 if chunk_tx.send(chunk).await.is_err() {
                     break; // lease dropped
@@ -830,7 +830,6 @@ mod forget_link_tests {
             .register_link(
                 "01HOST",
                 tx.clone(),
-                kahawai_proto::PROTOCOL_MINOR,
                 kahawai_core::segments::DETECTOR_GENERATION,
             )
             .0;
@@ -874,7 +873,6 @@ mod forget_link_tests {
         let (old_generation, _) = registry.register_link(
             "01HOST",
             old_tx.clone(),
-            kahawai_proto::PROTOCOL_MINOR,
             kahawai_core::segments::DETECTOR_GENERATION,
         );
 
@@ -883,7 +881,6 @@ mod forget_link_tests {
         registry.register_link(
             "01HOST",
             new_tx.clone(),
-            kahawai_proto::PROTOCOL_MINOR,
             kahawai_core::segments::DETECTOR_GENERATION,
         );
         registry.connected("01HOST", "mediahost", "nas", "fp", "test");
@@ -905,7 +902,7 @@ mod forget_link_tests {
     }
 
     #[tokio::test]
-    async fn protocol_four_baseline_opens_discovery_but_detector_generation_still_matches() {
+    async fn segment_detection_requires_matching_algorithm_generation() {
         let dir = tempfile::tempdir().unwrap();
         let db = crate::db::open(dir.path()).await.unwrap();
         let registry = Registry::new(
@@ -917,31 +914,21 @@ mod forget_link_tests {
         registry.register_link(
             "host",
             baseline_tx,
-            0,
             kahawai_core::segments::DETECTOR_GENERATION,
         );
         assert!(registry.host_supports_segment_detection("host"));
-        assert!(registry.host_supports_loudness_analysis("host"));
 
         let (mismatch_tx, _mismatch_rx) = tokio::sync::mpsc::channel(1);
         registry.register_link(
             "host",
             mismatch_tx,
-            kahawai_proto::PROTOCOL_MINOR,
             kahawai_core::segments::DETECTOR_GENERATION - 1,
         );
         assert!(!registry.host_supports_segment_detection("host"));
-        assert!(registry.host_supports_loudness_analysis("host"));
 
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link(
-            "host",
-            new_tx,
-            kahawai_proto::PROTOCOL_MINOR,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
+        registry.register_link("host", new_tx, kahawai_core::segments::DETECTOR_GENERATION);
         assert!(registry.host_supports_segment_detection("host"));
-        assert!(registry.host_supports_loudness_analysis("host"));
     }
 }
 

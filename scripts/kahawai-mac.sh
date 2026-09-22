@@ -283,7 +283,7 @@ wait_for() {
     return 1
 }
 
-deploy() {
+stage() {
     local host="${1:-$HOST_DEFAULT}"
     local repo; repo=$(cd "$(dirname "$0")/.." && pwd)
     echo "==> syncing source to $host" >&2
@@ -302,16 +302,7 @@ deploy() {
     rsync -a --delete "$repo/web/dist/" "$host:kahawai-src/web/dist/"
     prune_orphans "$host" "$repo"
 
-    # Where each log ends BEFORE the restart: "link established" and "hub
-    # up" are lines the previous run also wrote, and grepping the tail
-    # would report a start that never happened.
-    local mark aio_mark
-    mark=$(ssh "$host" 'wc -l < ~/kahawai-transcoder.log 2>/dev/null || echo 0')
-    # The redirection itself fails when the log does not exist yet, and
-    # the shell says so on stderr before `|| echo 0` supplies the answer.
-    aio_mark=$(ssh "$host" '{ wc -l < ~/kahawai-all-in-one.log; } 2>/dev/null || echo 0')
-
-    echo "==> building + signing + restarting on $host" >&2
+    echo "==> building + signing staged binaries on $host" >&2
     # Only host-independent values cross the wire: KEYCHAIN and PASSFILE
     # live under $HOME, and interpolating them here would ship the DEV
     # BOX's home directory to the mac — where the keychain then never
@@ -338,14 +329,16 @@ export KAHAWAI_BUILD
 # this and the binaries link stock gstreamer, and any patched plugin
 # beside it is a second copy of a library in one process, which on macOS
 # is a crash rather than a warning.
-KEG=/opt/homebrew/opt/kahawai-gstreamer
-if [ -d "$KEG/lib/pkgconfig" ]; then
-    export PKG_CONFIG_PATH="$KEG/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
-    echo "building against $(pkg-config --modversion gstreamer-1.0) from $KEG"
-else
-    echo "WARNING: no patched GStreamer keg at $KEG — building against the" >&2
-    echo "         system's unpatched GStreamer. See HomebrewFormula/." >&2
-fi
+KEG=/opt/homebrew/Cellar/kahawai-gstreamer/1.28.7
+[ -d "$KEG/lib/pkgconfig" ] || { echo "missing patched GStreamer: $KEG" >&2; exit 1; }
+[ "$(cd /opt/homebrew/opt/kahawai-gstreamer && pwd -P)" = "$KEG" ] || {
+    echo "patched GStreamer runtime link does not resolve to $KEG" >&2; exit 1;
+}
+export PKG_CONFIG_PATH="$KEG/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+[ "$(pkg-config --variable=prefix gstreamer-1.0)" = "$KEG" ] || {
+    echo "pkg-config did not select the patched keg" >&2; exit 1;
+}
+export CARGO_TARGET_DIR=target/staged
 # Two binaries, because this box is two things. The lean transcoder (no
 # hub, no mediahost, no Tesseract) still dials the dev box's hub; the
 # everything binary runs this box's own all-in-one hub, and that one does
@@ -354,7 +347,14 @@ export KAHAWAI_REQUIRE_WEB=1
 cargo build --release -p kahawai-transcoderd \
     --bin kahawai-transcoder 2>&1 | tail -1
 cargo build --release -p kahawai --bin kahawai 2>&1 | tail -1
-BINS="target/release/kahawai-transcoder target/release/kahawai"
+BINS="target/staged/release/kahawai-transcoder target/staged/release/kahawai"
+for BIN in $BINS; do
+    links=$(otool -L "$BIN")
+    echo "$links" | grep -q "kahawai-gstreamer/.*libgstreamer"
+    if echo "$links" | grep -E "/(opt|Cellar)/gstreamer/"; then
+        echo "stock GStreamer linked by $BIN" >&2; exit 1
+    fi
+done
 # The transcoder runs as a launchd DAEMON (system domain): daemons are
 # auto-allowed by Local Network privacy (TN3179) and start at boot.
 # Deploys stay sudo-free: KeepAlive respawns the process we kill.
@@ -393,33 +393,46 @@ else
     echo "         the binary stays ad-hoc signed and macOS will drop its" >&2
     echo "         Local Network permission — expect 'No route to host'." >&2
 fi
-# Daemon: kill and let KeepAlive respawn (kickstart on the system
-# domain would need sudo). Agent fallback: kickstart as before.
-if [ -f "/Library/LaunchDaemons/$AIO_AGENT.plist" ]; then
-    pkill -f "[k]ahawai-src/target/release/kahawai --config" || true
-else
-    echo "WARNING: no all-in-one LaunchDaemon — run 'kahawai-mac.sh provision'" >&2
-fi
-if [ -f "/Library/LaunchDaemons/$AGENT.plist" ]; then
-    pkill -f "kahawai-src/target/release/kahawai-transcoder" || true
-    pkill -f "kahawai-src/target/release/kahawai transcoder" || true
-else
-    launchctl kickstart -k "gui/$(id -u)/$AGENT"
-fi
 REMOTE
-
-    # Both, each from its own log: a deploy that brings the hub up and
-    # leaves the transcoder dead reads as a success if only one is checked.
-    # Waiting for a daemon that is not installed would fail for a reason
-    # the deploy cannot fix, so say which it is.
-    if ssh "$host" "test -f /Library/LaunchDaemons/$AIO_AGENT.plist"; then
-        wait_for "$host" '~/kahawai-all-in-one.log' "$aio_mark" "hub up" "hub up" || return 1
-    else
-        echo "==> all-in-one daemon not installed; skipping its check" >&2
-    fi
-    wait_for "$host" '~/kahawai-transcoder.log' "$mark" "link established" \
-        "link established|tone-map" || return 1
+    echo "==> staged both binaries; services unchanged" >&2
 }
+
+activate() {
+    local host="${1:-$HOST_DEFAULT}" mark aio_mark
+    mark=$(ssh "$host" 'wc -l < ~/kahawai-transcoder.log')
+    aio_mark=$(ssh "$host" 'wc -l < ~/kahawai-all-in-one.log')
+    ssh "$host" bash -s <<'REMOTE'
+set -euo pipefail
+cd ~/kahawai-src
+for name in kahawai kahawai-transcoder; do
+    test -x "target/staged/release/$name"
+    codesign --verify "target/staged/release/$name"
+done
+old_aio=$(pgrep -f '[k]ahawai-src/target/release/kahawai --config')
+old_tc=$(pgrep -f '[k]ahawai-src/target/release/kahawai-transcoder')
+for name in kahawai kahawai-transcoder; do
+    cp -p "target/release/$name" "target/release/$name.previous"
+    cp -p "target/staged/release/$name" "target/release/$name.next"
+    mv -f "target/release/$name.next" "target/release/$name"
+done
+kill $old_aio $old_tc
+for attempt in $(seq 1 30); do
+    new_aio=$(pgrep -f '[k]ahawai-src/target/release/kahawai --config' || true)
+    new_tc=$(pgrep -f '[k]ahawai-src/target/release/kahawai-transcoder' || true)
+    if [ -n "$new_aio" ] && [ -n "$new_tc" ] && [ "$new_aio" != "$old_aio" ] && [ "$new_tc" != "$old_tc" ]; then
+        echo "AIO: $old_aio -> $new_aio; transcoder: $old_tc -> $new_tc"
+        exit 0
+    fi
+    sleep 1
+done
+echo "launchd did not replace both processes" >&2
+exit 1
+REMOTE
+    wait_for "$host" '~/kahawai-all-in-one.log' "$aio_mark" "hub up" "hub up"
+    wait_for "$host" '~/kahawai-transcoder.log' "$mark" "link established" "link established|tone-map"
+}
+
+deploy() { stage "$@" && activate "$@"; }
 
 # Everything a fresh satellite needs, in the order the parts depend on
 # each other: GStreamer and the patched plugins first, because the plist
@@ -444,14 +457,18 @@ case "${1:-}" in
     daemons) [ "$(uname)" = Darwin ] || { echo "run daemons ON the mac" >&2; exit 2; }
              install_daemon ;;
     deploy) shift; deploy "${1:-}" ;;
+    stage) shift; stage "${1:-}" ;;
+    activate) shift; activate "${1:-}" ;;
     prune) shift
            prune_orphans "${1:-$HOST_DEFAULT}" \
                "$(cd "$(dirname "$0")/.." && pwd)" ;;
-    *) echo "usage: $0 {setup|provision|daemons|deploy|prune [host]}" >&2
+    *) echo "usage: $0 {setup|provision|daemons|deploy|stage|activate|prune [host]}" >&2
        echo "  setup      ON the mac, once: signing identity, then provision" >&2
        echo "  provision  ON the mac: both launchd daemons (sudo)" >&2
        echo "  daemons    ON the mac: just the launchd daemons (sudo)" >&2
        echo "  deploy     FROM the dev box: sync, build, sign, restart" >&2
+       echo "  stage      FROM the dev box: sync, build and sign without activation" >&2
+       echo "  activate   FROM the dev box: replace both staged binaries and restart" >&2
        echo "  prune      FROM the dev box: delete satellite files the repo dropped" >&2
        exit 2 ;;
 esac

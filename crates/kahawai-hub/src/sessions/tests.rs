@@ -34,8 +34,7 @@ fn diagnostics_survive_pipeline_purge_and_hub_restart() {
 }
 use super::{
     LoudnessPreference, Negotiation, PartSource, Sessions, fold_facts, local_audio_encoder_names,
-    local_tonemap_available, local_video_encoder_names, replanned_verdict, same_video_path,
-    source_choice_key,
+    local_tonemap_available, local_video_encoder_names, replanned_verdict, source_choice_key,
 };
 
 /// The per-user cap has to hold when starts ARRIVE TOGETHER, which
@@ -202,7 +201,7 @@ async fn the_full_local_executor_keeps_its_audio_targets() {
         force_measurement: None,
     };
 
-    let facts = negotiation.probe(&Default::default(), false, None);
+    let facts = negotiation.probe(&Default::default(), false);
     assert_eq!(facts.full_audio_targets, expected);
     let mut profile = kahawai_core::media::CapabilityProfile::default();
     profile.containers.clear();
@@ -285,27 +284,6 @@ fn facts_fold_into_the_verdict_idempotently() {
 }
 
 #[test]
-fn optional_audio_gain_never_changes_the_video_path() {
-    let base = kahawai_media::remux::RemuxPlan {
-        video: kahawai_media::remux::StreamMode::Encode,
-        tone_map: true,
-        ..Default::default()
-    };
-    let mut gain_only = base;
-    gain_only.stereo_gain_db = Some(3.0);
-    assert!(same_video_path(&base, &gain_only));
-
-    let mut different_codec = base;
-    different_codec.video_codec = kahawai_media::remux::VideoTarget::Hevc;
-    different_codec.segment_format = kahawai_media::remux::SegmentFormat::Fmp4;
-    assert!(!same_video_path(&base, &different_codec));
-
-    let mut missing_tonemap = base;
-    missing_tonemap.tone_map = false;
-    assert!(!same_video_path(&base, &missing_tonemap));
-}
-
-#[test]
 fn a_track_replan_refuses_empty_output_and_refreshes_its_verdict() {
     let empty = kahawai_media::remux::RemuxPlan::default();
     assert!(replanned_verdict(&empty, "new video verdict", "new audio verdict").is_err());
@@ -319,7 +297,7 @@ fn a_track_replan_refuses_empty_output_and_refreshes_its_verdict() {
 }
 
 #[tokio::test]
-async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
+async fn forced_video_encode_uses_exact_layout_gains() {
     use kahawai_core::media::{AudioStream, MediaInfo, VideoStream};
     use kahawai_proto::v1::{CapabilityReport, EncoderCap};
 
@@ -331,11 +309,11 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
         kahawai_mediadb::Store::in_memory().await.unwrap(),
     )
     .with_local_video_executor(false);
-    let connect = |id: &str, minor: u32, hardware: bool| {
+    let connect = |id: &str, hardware: bool| {
         let (tx, rx) = tokio::sync::mpsc::channel(8);
         std::mem::forget(rx);
         registry.connected(id, "transcoder", id, "fp", "test");
-        registry.register_tc_link(id, minor, tx.clone());
+        registry.register_tc_link(id, tx.clone());
         registry.set_transcoder_caps(
             id,
             &CapabilityReport {
@@ -362,8 +340,8 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
         );
         tx
     };
-    let baseline_fast = connect("baseline-fast", 0, true);
-    let _baseline_slow = connect("baseline-slow", 0, false);
+    let baseline_fast = connect("baseline-fast", true);
+    let _baseline_slow = connect("baseline-slow", false);
 
     let sessions = Sessions::new(dir.path().join("sessions"));
     let negotiation =
@@ -417,24 +395,6 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
             .collect(),
     };
 
-    assert!(
-        negotiation
-            .probe(&info, false, None)
-            .full_protocol
-            .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
-        "protocol 4.0 did not expose inherited exact layout gains"
-    );
-    assert!(
-        negotiation
-            .probe(
-                &info,
-                false,
-                Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
-            )
-            .full_protocol
-            .supports(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains),
-        "the exact probe lost a protocol-4 baseline feature"
-    );
     let normal = negotiation.plan_with_probe(&parts, &info, false, None);
     assert_eq!(normal.plan.video, kahawai_media::remux::StreamMode::Encode);
     assert_ne!(normal.plan.audio, kahawai_media::remux::StreamMode::Encode);
@@ -485,7 +445,7 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
     assert_eq!(
         baseline.plan.audio,
         kahawai_media::remux::StreamMode::Encode,
-        "protocol 4.0 did not expose exact stereo gain support"
+        "forced encode did not apply the measured stereo gain"
     );
     assert_ne!(baseline.plan.audio, stereo_normal.plan.audio);
 }

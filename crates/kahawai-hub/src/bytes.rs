@@ -21,7 +21,9 @@ use std::sync::{Arc, Mutex};
 use anyhow::{Context, Result};
 use kahawai_proto::v1::{HubToHost, OpenRead, hub_to_host};
 
-use crate::leases::{Lease, Leases, LocalAdmission, new_lease_token};
+use crate::leases::{
+    Lease, LeaseTransport, Leases, LocalAdmission, PipelineSource, new_lease_token,
+};
 use crate::registry::Registry;
 
 /// Who a read lease is for. It travels to the mediahost, which serves both
@@ -60,72 +62,6 @@ impl std::fmt::Display for SourceOffline {
 }
 
 impl std::error::Error for SourceOffline {}
-
-/// Adapts a mediahost read lease to the remuxer's random-access source
-/// trait; runs on the remux feeder thread, bridging into the runtime.
-pub(crate) struct LeaseSource {
-    pub(crate) lease: Lease,
-    pub(crate) size: u64,
-    pub(crate) handle: tokio::runtime::Handle,
-    /// Reads served, for the log line that says whether a stalled consumer ever
-    /// got its first byte.
-    pub(crate) reads: u64,
-}
-
-impl kahawai_media::remux::RemuxSource for LeaseSource {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read_at(&mut self, offset: u64, buf: &mut [u8]) -> std::io::Result<usize> {
-        if offset >= self.size {
-            return Ok(0);
-        }
-        let len = (buf.len() as u64).min(self.size - offset);
-        self.reads += 1;
-        let started = std::time::Instant::now();
-        if self.reads % 64 == 1 {
-            tracing::debug!(offset, len, reads = self.reads, "lease read");
-        }
-        tracing::trace!(offset, len, reads = self.reads, "lease read: asking");
-        let _guard = self.handle.enter();
-        let mut stream = self.lease.read_range(offset, len).into_inner();
-        let outcome = self.handle.block_on(async {
-            let mut filled = 0usize;
-            while filled < len as usize {
-                match stream.recv().await {
-                    Some(Ok(bytes)) => {
-                        let n = bytes.len().min(buf.len() - filled);
-                        buf[filled..filled + n].copy_from_slice(&bytes[..n]);
-                        filled += n;
-                    }
-                    Some(Err(e)) => return Err(std::io::Error::other(e)),
-                    None => break,
-                }
-            }
-            Ok(filled)
-        });
-        // A read that takes seconds is the byte plane, not the analyzer; a read
-        // that never returns does not reach this line at all, which is the
-        // distinction worth having in a log.
-        tracing::trace!(
-            offset,
-            ok = outcome.is_ok(),
-            seconds = started.elapsed().as_secs_f64(),
-            "lease read: answered"
-        );
-        if started.elapsed() > std::time::Duration::from_secs(5) {
-            tracing::warn!(
-                offset,
-                len,
-                seconds = started.elapsed().as_secs_f64(),
-                ok = outcome.is_ok(),
-                "slow lease read"
-            );
-        }
-        outcome
-    }
-}
 
 type LocalResolver = Arc<dyn Fn(&str, &str, &str) -> Result<PathBuf> + Send + Sync>;
 type LocalActivity = Arc<dyn Fn(&str) -> Box<dyn Send + Sync> + Send + Sync>;
@@ -193,8 +129,6 @@ impl ByteSources {
         *self.local_playback.lock().unwrap() = Some(Arc::new(enter));
     }
 
-    /// Open a read lease on an arbitrary path within a collection (also
-    /// used for sidecar subtitle files, which are not `files` rows).
     pub(crate) async fn open_lease(
         &self,
         registry: &Registry,
@@ -204,6 +138,53 @@ impl ByteSources {
         path_rel: &str,
         reader: Reader,
     ) -> Result<Lease> {
+        Ok(self
+            .open_transport(
+                registry,
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                reader,
+            )
+            .await?
+            .finite())
+    }
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn open_source(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+        reader: Reader,
+        size: u64,
+    ) -> Result<PipelineSource> {
+        Ok(self
+            .open_transport(
+                registry,
+                module_id,
+                collection_id,
+                root_token,
+                path_rel,
+                reader,
+            )
+            .await?
+            .buffered(size))
+    }
+
+    /// Open a read lease on an arbitrary path within a collection (also
+    /// used for sidecar subtitle files, which are not `files` rows).
+    pub(crate) async fn open_transport(
+        &self,
+        registry: &Registry,
+        module_id: &str,
+        collection_id: &str,
+        root_token: &str,
+        path_rel: &str,
+        reader: Reader,
+    ) -> Result<LeaseTransport> {
         // AR-5/AR-11: the in-process mediahost's byte plane is a
         // function call — resolve the path and read the disk directly.
         let local = {
@@ -264,7 +245,7 @@ impl ByteSources {
             .await
             .context("local media path resolution task failed")?;
             drop(resolution_permit);
-            return Ok(Lease::local_guarded(path?, admission, playback));
+            return Ok(LeaseTransport::local_guarded(path?, admission, playback));
         }
         let token = new_lease_token();
         let msg = HubToHost {
@@ -284,7 +265,8 @@ impl ByteSources {
         // Left as a plain error it reached `session_refusal` as 409, "give up
         // on this item", for a source that is merely offline; the recovery
         // contract's answer to an absent host is 503 and stand by.
-        self.leases
+        let lease = self
+            .leases
             .establish(&token, registry.send_to_host(module_id, msg))
             .await
             .map_err(|e| {
@@ -293,7 +275,8 @@ impl ByteSources {
                 } else {
                     anyhow::Error::new(SourceOffline).context(format!("{e:#}"))
                 }
-            })
+            })?;
+        Ok(lease)
     }
 }
 
@@ -314,12 +297,7 @@ mod lease_purpose_tests {
             kahawai_mediadb::Store::in_memory().await.unwrap(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.register_link(
-            "01MH",
-            tx,
-            kahawai_proto::PROTOCOL_MINOR,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
+        registry.register_link("01MH", tx, kahawai_core::segments::DETECTOR_GENERATION);
 
         let bytes = std::sync::Arc::new(ByteSources::new());
         // Nobody answers the OpenRead, so the lease never establishes; the
@@ -403,8 +381,8 @@ mod lease_purpose_tests {
         }
         assert_eq!(read, b"bytes");
         assert!(
-            entered_count.load(std::sync::atomic::Ordering::Relaxed) >= 4,
-            "path resolution, open/metadata, seek and read must each be admitted"
+            entered_count.load(std::sync::atomic::Ordering::Relaxed) >= 3,
+            "path resolution, open/metadata and positional read must each be admitted"
         );
         assert_eq!(active.load(std::sync::atomic::Ordering::Relaxed), 0);
         assert_eq!(cpu.load(std::sync::atomic::Ordering::Relaxed), 1);

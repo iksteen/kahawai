@@ -78,7 +78,6 @@ async fn main() -> Result<()> {
             audio: StreamMode::Copy,
             ..RemuxPlan::default()
         },
-        part_sizes: vec![size],
         start_ms: 0,
         sink: None,
         burn_sets: None,
@@ -93,6 +92,7 @@ async fn main() -> Result<()> {
             .map(Path::display)
             .map_or("in-process".to_string(), |p| p.to_string())
     );
+    let began = std::time::Instant::now();
     let started = match executor.start("check", job, vec![source]).await {
         Ok(started) => started,
         Err(failure) => {
@@ -100,7 +100,11 @@ async fn main() -> Result<()> {
             anyhow::bail!("start failed: {failure}");
         }
     };
-    println!("ready in {}", started.run.dir().display());
+    println!(
+        "ready in {:.3}s: {}",
+        began.elapsed().as_secs_f64(),
+        started.run.dir().display()
+    );
     for name in ["master.m3u8", "segment00000.ts", "start.pos"] {
         anyhow::ensure!(started.run.dir().join(name).exists(), "{name} missing");
     }
