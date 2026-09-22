@@ -38,6 +38,11 @@
 //! `scanning` and the generations are the whole of what a scan writes about
 //! itself; its file counts are a progress line and live in the runtime
 //! (`scan::ScanCounters`), so a rescan that changes nothing commits twice.
+//! `catalog_files.seen_generation` is the last scan generation that wrote the
+//! row (an upsert, a refresh or a recorded error). A file the scan left alone
+//! keeps its old value: presence is settled per root by `reconcile_root`
+//! without writing, and `finish_scan` consults the column only for roots the
+//! scan neither walked nor found unavailable.
 //! `catalog_files.music_tag_generation` is local probe bookkeeping, not a
 //! source revision. A newer tag mapper re-probes only stale music rows and
 //! leaves byte-derived records attached to the unchanged source. Advancing it
@@ -544,6 +549,29 @@ impl Catalog {
         })
     }
 
+    /// Every file row's `seen_generation`, keyed by root and path.
+    #[cfg(test)]
+    pub(crate) async fn seen_generations(
+        &self,
+        collection: &str,
+    ) -> HashMap<(String, String), i64> {
+        sqlx::query(
+            "SELECT root_token,path_rel,seen_generation FROM catalog_files WHERE collection_id=?",
+        )
+        .bind(collection)
+        .fetch_all(&self.db)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|row| {
+            (
+                (row.get("root_token"), row.get("path_rel")),
+                row.get("seen_generation"),
+            )
+        })
+        .collect()
+    }
+
     pub async fn mark_seen(
         &self,
         collection: &str,
@@ -855,34 +883,38 @@ impl Catalog {
     /// Never call this on a failed/partial walk: an unavailable mount is not
     /// evidence that its sources have disappeared. Cancellation after this
     /// commit is safe: every deletion was confirmed by the completed walk.
+    ///
+    /// The comparison is a read and a set difference; a row that is still
+    /// present is not written. Marking every present row "seen" used to cost
+    /// one statement per file under the writer lock and dirtied nearly every
+    /// page of `catalog_files`, so a no-change rescan of a large collection
+    /// held the writer for seconds and pushed tens of megabytes through the
+    /// WAL. `finish_scan` sweeps only roots that were not reconciled.
     pub(crate) async fn reconcile_root(
         &self,
         collection: &str,
         root: &str,
         present: &[String],
-        generation: i64,
     ) -> Result<()> {
-        let mut tx = self.db.begin().await?;
-        for path in present {
-            sqlx::query("UPDATE catalog_files SET seen_generation=? WHERE collection_id=? AND root_token=? AND path_rel=?")
-                .bind(generation)
-                .bind(collection)
-                .bind(root)
-                .bind(path)
-                .execute(&mut *tx)
-                .await?;
-        }
-        let absent: Vec<String> = sqlx::query_scalar(
-            "SELECT path_rel FROM catalog_files WHERE collection_id=? AND root_token=? AND seen_generation!=?",
+        let stored: Vec<String> = sqlx::query_scalar(
+            "SELECT path_rel FROM catalog_files WHERE collection_id=? AND root_token=?",
         )
         .bind(collection)
         .bind(root)
-        .bind(generation)
-        .fetch_all(&mut *tx)
+        .fetch_all(&self.db)
         .await?;
+        let present: HashSet<&str> = present.iter().map(String::as_str).collect();
+        let absent: Vec<String> = stored
+            .into_iter()
+            .filter(|path| !present.contains(path.as_str()))
+            .collect();
+        if absent.is_empty() {
+            return Ok(());
+        }
+        let mut tx = self.db.begin().await?;
         let mut published = None;
-        for path in absent {
-            published = Some(Self::remove_file(&mut tx, collection, root, &path).await?);
+        for path in &absent {
+            published = Some(Self::remove_file(&mut tx, collection, root, path).await?);
         }
         tx.commit().await?;
         if let Some(version) = published {
@@ -912,26 +944,32 @@ impl Catalog {
         Ok(version)
     }
 
+    /// Complete a scan: sweep rows this generation never wrote in roots the
+    /// scan did not settle, then mark the collection scanned. `retained_roots`
+    /// are the settled ones: a root `reconcile_root` completed is already
+    /// exact, and an unavailable root is not evidence of anything. What is
+    /// left is a root that was neither walked nor found missing, which is a
+    /// root no longer configured.
     pub async fn finish_scan(
         &self,
         collection: &str,
         generation: i64,
-        unavailable_roots: &HashSet<String>,
+        retained_roots: &HashSet<String>,
     ) -> Result<u64> {
+        let retained = serde_json::to_string(&retained_roots.iter().collect::<Vec<_>>())?;
         let stale = sqlx::query(
             "SELECT root_token,path_rel FROM catalog_files
-              WHERE collection_id=? AND seen_generation!=?",
+              WHERE collection_id=? AND seen_generation!=?
+                AND root_token NOT IN (SELECT value FROM json_each(?))",
         )
         .bind(collection)
         .bind(generation)
+        .bind(retained)
         .fetch_all(&self.db)
         .await?;
         let mut tx = self.db.begin().await?;
         for row in stale {
             let root: String = row.get("root_token");
-            if unavailable_roots.contains(&root) {
-                continue;
-            }
             let path: String = row.get("path_rel");
             Self::remove_file(&mut tx, collection, &root, &path).await?;
         }
