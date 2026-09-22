@@ -164,15 +164,21 @@ impl LocalRuntime {
                 std::collections::HashMap<String, kahawai_proto::v1::DiscoveryStatus>,
             >,
         > = std::sync::Arc::new(std::sync::RwLock::new(Default::default()));
+        let scan_counters = scan::ScanCounters::new();
         let status_catalog = catalog.clone();
         let status_collections = collections.clone();
         let status_state = discovery_status.clone();
+        let status_counters = scan_counters.clone();
         guards.push(tokio::spawn(async move {
             let mut ticker = tokio::time::interval(Duration::from_secs(30));
             loop {
                 ticker.tick().await;
                 for collection in &status_collections {
-                    match status_catalog.discovery_status(&collection.name).await {
+                    let counts = status_counters.counts(&collection.name);
+                    match status_catalog
+                        .discovery_status(&collection.name, counts)
+                        .await
+                    {
                         Ok(mut status) => {
                             status.segments_enabled = Some(detect_segments);
                             if !detect_segments {
@@ -201,6 +207,7 @@ impl LocalRuntime {
             triggers.insert(collection.name.clone(), sink.clone());
             let collection = collection.clone();
             let catalog = catalog.clone();
+            let counters = scan_counters.clone();
             let scan_scheduler = scheduler.clone();
             let overflow = sink.overflow.clone();
             let mut watch_waiter = watch_waiter.clone();
@@ -247,6 +254,7 @@ impl LocalRuntime {
                     if let Err(error) = scan::scan_local_collection(
                         collection.clone(),
                         catalog.clone(),
+                        counters.clone(),
                         trigger.changed_files,
                         trigger.deep,
                         permit,
@@ -2487,7 +2495,7 @@ mod scheduler_integration_tests {
         assert!(
             runtime
                 .catalog
-                .discovery_status("movies")
+                .discovery_status("movies", Default::default())
                 .await
                 .unwrap()
                 .scanning

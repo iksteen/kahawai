@@ -35,6 +35,9 @@
 //! `completed_generation` distinguishes a fresh/aborted first scan from a
 //! catalogue with a complete prior manifest. Only the former delays offers;
 //! ordinary process restarts can reconnect from SQLite while rescanning.
+//! `scanning` and the generations are the whole of what a scan writes about
+//! itself; its file counts are a progress line and live in the runtime
+//! (`scan::ScanCounters`), so a rescan that changes nothing commits twice.
 //! `catalog_files.music_tag_generation` is local probe bookkeeping, not a
 //! source revision. A newer tag mapper re-probes only stale music rows and
 //! leaves byte-derived records attached to the unchanged source. Advancing it
@@ -426,7 +429,7 @@ impl Catalog {
     pub async fn begin_scan(&self, collection: &str) -> Result<i64> {
         let generation: i64 = sqlx::query_scalar(
             "UPDATE catalog_collections
-                SET scan_generation=scan_generation+1,scanning=1,scanned=0,failed=0,skipped=0
+                SET scan_generation=scan_generation+1,scanning=1
               WHERE id=? RETURNING scan_generation",
         )
         .bind(collection)
@@ -435,34 +438,20 @@ impl Catalog {
         Ok(generation)
     }
 
-    pub async fn scan_progress(
-        &self,
-        collection: &str,
-        scanned: u32,
-        failed: u32,
-        skipped: u32,
-    ) -> Result<()> {
-        sqlx::query("UPDATE catalog_collections SET scanned=?,failed=?,skipped=? WHERE id=?")
-            .bind(scanned as i64)
-            .bind(failed as i64)
-            .bind(skipped as i64)
-            .bind(collection)
-            .execute(&self.db)
-            .await?;
-        Ok(())
-    }
-
     /// A live, local view of work ownership. Counts are source counts rather
     /// than hub queue rows: the same missing answer is computed once even when
-    /// several hubs subscribe to the collection.
-    pub async fn discovery_status(&self, collection: &str) -> Result<DiscoveryStatus> {
-        let row = sqlx::query(
-            "SELECT media_type,scanning,scanned,failed,skipped
-               FROM catalog_collections WHERE id=?",
-        )
-        .bind(collection)
-        .fetch_one(&self.db)
-        .await?;
+    /// several hubs subscribe to the collection. The scan in flight is the
+    /// runtime's (`scan::ScanCounters`), not the catalogue's: `counts` is
+    /// copied into the report as given.
+    pub async fn discovery_status(
+        &self,
+        collection: &str,
+        counts: crate::scan::ScanCounts,
+    ) -> Result<DiscoveryStatus> {
+        let row = sqlx::query("SELECT media_type,scanning FROM catalog_collections WHERE id=?")
+            .bind(collection)
+            .fetch_one(&self.db)
+            .await?;
         let media_type: String = row.get("media_type");
         let pending = |kind: &'static str| async move {
             sqlx::query_scalar::<_, i64>(
@@ -544,9 +533,9 @@ impl Catalog {
         Ok(DiscoveryStatus {
             collection_id: collection.to_string(),
             scanning: row.get::<i64, _>("scanning") != 0,
-            scanned: row.get::<i64, _>("scanned") as u32,
-            failed: row.get::<i64, _>("failed") as u32,
-            skipped: row.get::<i64, _>("skipped") as u32,
+            scanned: counts.scanned,
+            failed: counts.failed,
+            skipped: counts.skipped,
             pending_cheap: cheap as u64,
             pending_hashes: hashes as u64,
             pending_segments: segments as u64,
@@ -2769,7 +2758,7 @@ mod tests {
         );
         assert_eq!(
             catalog
-                .discovery_status("movies")
+                .discovery_status("movies", Default::default())
                 .await
                 .unwrap()
                 .pending_loudness,
@@ -2906,7 +2895,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             catalog
-                .discovery_status("movies")
+                .discovery_status("movies", Default::default())
                 .await
                 .unwrap()
                 .pending_cheap,
@@ -2957,7 +2946,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             catalog
-                .discovery_status("movies")
+                .discovery_status("movies", Default::default())
                 .await
                 .unwrap()
                 .pending_cheap,
@@ -3099,7 +3088,7 @@ mod tests {
 
             assert_eq!(
                 catalog
-                    .discovery_status("series")
+                    .discovery_status("series", Default::default())
                     .await
                     .unwrap()
                     .pending_segments,
@@ -3161,7 +3150,7 @@ mod tests {
         for finish_all in [false, true] {
             assert_eq!(
                 catalog
-                    .discovery_status("series")
+                    .discovery_status("series", Default::default())
                     .await
                     .unwrap()
                     .pending_segments,
@@ -3209,7 +3198,7 @@ mod tests {
         }
         assert_eq!(
             catalog
-                .discovery_status("series")
+                .discovery_status("series", Default::default())
                 .await
                 .unwrap()
                 .pending_segments,
@@ -3303,7 +3292,7 @@ mod tests {
 
         assert_eq!(
             catalog
-                .discovery_status(collection_id)
+                .discovery_status(collection_id, Default::default())
                 .await
                 .unwrap()
                 .pending_segments,

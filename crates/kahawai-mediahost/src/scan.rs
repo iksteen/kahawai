@@ -28,6 +28,51 @@ const MEDIA_EXTS: &[&str] = &[
     "flac", "mp3", "ogg", "oga", "opus", "m4a", "aac", "wav", // audio
 ];
 const BATCH: usize = 32;
+
+/// Counts of the scan in flight, one per collection.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ScanCounts {
+    /// Files discovered or refreshed this scan.
+    pub scanned: u32,
+    pub failed: u32,
+    /// Unchanged files answered from the stored probe.
+    pub skipped: u32,
+}
+
+/// Live scan counters, held in memory by the runtime that owns the scan
+/// tasks. They are a progress line for the hub's admin view and nothing
+/// decides on them, so they are not durable: SQLite used to carry them and
+/// every refresh was one fsynced autocommit — fifty-odd per no-change walk of
+/// a large music collection on a NAS whose fsync costs 40–240 ms. The
+/// `scanning` flag and the generations stay in the catalogue; they are what
+/// offers and the replay floor are decided on.
+#[derive(Debug, Clone, Default)]
+pub struct ScanCounters(
+    std::sync::Arc<std::sync::Mutex<std::collections::HashMap<String, ScanCounts>>>,
+);
+
+impl ScanCounters {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set(&self, collection: &str, counts: ScanCounts) {
+        self.0
+            .lock()
+            .unwrap()
+            .insert(collection.to_string(), counts);
+    }
+
+    /// Zero until the first scan of this process starts.
+    pub fn counts(&self, collection: &str) -> ScanCounts {
+        self.0
+            .lock()
+            .unwrap()
+            .get(collection)
+            .copied()
+            .unwrap_or_default()
+    }
+}
 const DISCOVER_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -79,11 +124,13 @@ where
 pub(crate) async fn scan_local_collection(
     cfg: CollectionConfig,
     catalog: crate::catalog::Catalog,
+    counters: ScanCounters,
     changed_files: std::collections::HashSet<PathBuf>,
     deep: bool,
     permit: crate::scheduler::JobPermit,
 ) -> Result<u64> {
     let generation = catalog.begin_scan(&cfg.name).await?;
+    counters.set(&cfg.name, ScanCounts::default());
     let known = std::sync::Arc::new(catalog.known_files(&cfg.name).await?);
     let changed_files = std::sync::Arc::new(changed_files);
     let include_audio = cfg.media_type == "music";
@@ -241,16 +288,24 @@ pub(crate) async fn scan_local_collection(
             catalog
                 .baseline_sidecars(&cfg.name, &root_token, &baselines)
                 .await?;
-            if (scanned + refreshed + failed + skipped).is_multiple_of(500) {
-                catalog
-                    .scan_progress(&cfg.name, scanned + refreshed, failed, skipped)
-                    .await?;
-            }
+            counters.set(
+                &cfg.name,
+                ScanCounts {
+                    scanned: scanned + refreshed,
+                    failed,
+                    skipped,
+                },
+            );
         }
     }
-    catalog
-        .scan_progress(&cfg.name, scanned + refreshed, failed, skipped)
-        .await?;
+    counters.set(
+        &cfg.name,
+        ScanCounts {
+            scanned: scanned + refreshed,
+            failed,
+            skipped,
+        },
+    );
     let version = catalog
         .finish_scan(&cfg.name, generation, &unavailable_roots)
         .await?;
@@ -999,6 +1054,7 @@ mod tests {
     async fn run_local_scan(
         cfg: &CollectionConfig,
         catalog: &crate::catalog::Catalog,
+        counters: &ScanCounters,
         deep: bool,
     ) -> u64 {
         let admission = scan_admission(cfg);
@@ -1015,6 +1071,7 @@ mod tests {
         scan_local_collection(
             cfg.clone(),
             catalog.clone(),
+            counters.clone(),
             Default::default(),
             deep,
             permit,
@@ -1076,6 +1133,7 @@ mod tests {
         let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
             .await
             .unwrap();
+        let counters = ScanCounters::new();
         std::fs::write(root.path().join("Movie.nfo"), "<movie/>").unwrap();
         let mut file = seed_scan_file(&catalog, root.path(), "Movie.mp4").await;
         let mut info: kahawai_core::media::MediaInfo =
@@ -1088,21 +1146,27 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(run_local_scan(&cfg, &catalog, false).await, before);
-        let status = catalog.discovery_status("movies").await.unwrap();
+        assert_eq!(
+            run_local_scan(&cfg, &catalog, &counters, false).await,
+            before
+        );
+        let status = counters.counts("movies");
         assert_eq!((status.scanned, status.skipped, status.failed), (0, 1, 0));
         let known = catalog.known_files("movies").await.unwrap();
         let info: kahawai_core::media::MediaInfo =
             serde_json::from_str(&known.values().next().unwrap().streams_json).unwrap();
         assert!(info.sidecar_revision.is_some());
-        assert_eq!(run_local_scan(&cfg, &catalog, false).await, before);
+        assert_eq!(
+            run_local_scan(&cfg, &catalog, &counters, false).await,
+            before
+        );
         std::fs::write(
             root.path().join("Movie.nfo"),
             "<movie><plot>changed</plot></movie>",
         )
         .unwrap();
-        assert!(run_local_scan(&cfg, &catalog, false).await > before);
-        assert_eq!(catalog.discovery_status("movies").await.unwrap().failed, 0);
+        assert!(run_local_scan(&cfg, &catalog, &counters, false).await > before);
+        assert_eq!(counters.counts("movies").failed, 0);
     }
 
     #[tokio::test]
@@ -1117,10 +1181,11 @@ mod tests {
         let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
             .await
             .unwrap();
+        let counters = ScanCounters::new();
         let original = seed_scan_file(&catalog, root.path(), "Movie.mp4").await;
         seed_scan_file(&catalog, root.path(), "Neighbour.mp4").await;
-        run_local_scan(&cfg, &catalog, false).await;
-        let status = catalog.discovery_status("movies").await.unwrap();
+        run_local_scan(&cfg, &catalog, &counters, false).await;
+        let status = counters.counts("movies");
         assert_eq!((status.scanned, status.skipped, status.failed), (0, 2, 0));
         let subtitle = root.path().join("Movie.en.srt");
         let nfo = root.path().join("Movie.nfo");
@@ -1145,8 +1210,8 @@ mod tests {
                 Some(bytes) => std::fs::write(path, bytes).unwrap(),
                 None => std::fs::remove_file(path).unwrap(),
             }
-            run_local_scan(&cfg, &catalog, false).await;
-            let status = catalog.discovery_status("movies").await.unwrap();
+            run_local_scan(&cfg, &catalog, &counters, false).await;
+            let status = counters.counts("movies");
             assert_eq!(
                 (status.scanned, status.skipped, status.failed),
                 (affected, 2 - affected, 0)
@@ -1162,8 +1227,8 @@ mod tests {
                 serde_json::from_str(&current.streams_json).unwrap();
             assert_eq!(info.duration_ms, Some(1234));
             previous = current.streams_json.clone();
-            run_local_scan(&cfg, &catalog, false).await;
-            assert_eq!(catalog.discovery_status("movies").await.unwrap().skipped, 2);
+            run_local_scan(&cfg, &catalog, &counters, false).await;
+            assert_eq!(counters.counts("movies").skipped, 2);
         }
         // A content-write event is stronger evidence than a matching second-
         // resolution mtime, but must never force a neighbour to be probed.
@@ -1181,18 +1246,19 @@ mod tests {
         scan_local_collection(
             cfg.clone(),
             catalog.clone(),
+            counters.clone(),
             [root.path().join("Movie.mp4")].into(),
             false,
             permit,
         )
         .await
         .unwrap();
-        let status = catalog.discovery_status("movies").await.unwrap();
+        let status = counters.counts("movies");
         assert_eq!((status.skipped, status.failed), (1, 1));
         // The remaining unchanged neighbour must actually be probed when the
         // user forces a deep scan; the failed source is retried as well.
-        run_local_scan(&cfg, &catalog, true).await;
-        let status = catalog.discovery_status("movies").await.unwrap();
+        run_local_scan(&cfg, &catalog, &counters, true).await;
+        let status = counters.counts("movies");
         assert_eq!((status.scanned, status.skipped, status.failed), (0, 0, 2));
     }
 
@@ -1209,6 +1275,7 @@ mod tests {
         let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
             .await
             .unwrap();
+        let counters = ScanCounters::new();
         let old = seed_scan_file(&catalog, root.path(), "Movie (2019).mp4").await;
         seed_scan_file(&catalog, root.path(), "Neighbour.mp4").await;
         let unavailable = seed_scan_file(&catalog, missing.path(), "Keep.mp4").await;
@@ -1236,7 +1303,13 @@ mod tests {
             .unwrap();
         // No probe and no finish_scan call: the tombstone is already durable
         // and streamable while the collection is still marked scanning.
-        assert!(catalog.discovery_status("movies").await.unwrap().scanning);
+        assert!(
+            catalog
+                .discovery_status("movies", Default::default())
+                .await
+                .unwrap()
+                .scanning
+        );
         let delta = catalog.delta("movies", before, false).await.unwrap();
         assert!(delta.records.iter().any(|r| r.kind == "file" && r.deleted));
         let known = catalog.known_files("movies").await.unwrap();
@@ -1244,8 +1317,8 @@ mod tests {
         assert!(known.contains_key(&(token, "Neighbour.mp4".into())));
         let source = unavailable.source.unwrap();
         assert!(known.contains_key(&(source.root_token.clone(), source.path_rel.clone())));
-        run_local_scan(&cfg, &catalog, false).await;
-        let status = catalog.discovery_status("movies").await.unwrap();
+        run_local_scan(&cfg, &catalog, &counters, false).await;
+        let status = counters.counts("movies");
         assert_eq!((status.skipped, status.failed), (1, 2)); // new invalid file + unavailable root
         assert!(
             catalog
@@ -1457,10 +1530,16 @@ id: nl, index: 1
             )
             .await
             .unwrap();
-        let current =
-            scan_local_collection(cfg, catalog.clone(), Default::default(), false, permit)
-                .await
-                .unwrap();
+        let current = scan_local_collection(
+            cfg,
+            catalog.clone(),
+            ScanCounters::new(),
+            Default::default(),
+            false,
+            permit,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             current, original_version,
