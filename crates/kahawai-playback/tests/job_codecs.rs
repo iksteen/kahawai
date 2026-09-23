@@ -9,7 +9,7 @@ use std::path::{Path, PathBuf};
 
 use kahawai_media::loudness::{AudioLayout, AudioLayoutGain, MAX_LAYOUT_GAINS};
 use kahawai_media::remux::{AudioTarget, RemuxPlan, SegmentFormat, StreamMode, VideoTarget};
-use kahawai_playback::job::{ArgvLayout, Job, Payload};
+use kahawai_playback::job::{ArgvLayout, Dispatch, Job, Payload, WorkerSource};
 use kahawai_playback::worker::WorkerArgs;
 use kahawai_proto::v1::{SourceDescriptor, StartSession};
 
@@ -69,7 +69,6 @@ fn full_plan() -> RemuxPlan {
 fn full_job() -> Job {
     Job {
         plan: full_plan(),
-        part_sizes: vec![100, 200],
         start_ms: 1234,
         sink: Some("hlssink2".into()),
         burn_sets: Some(Payload::Bytes(vec![1, 2, 3])),
@@ -85,10 +84,19 @@ fn same_plan(a: &RemuxPlan, b: &RemuxPlan) {
 #[test]
 fn argv_round_trips_every_field_including_negative_gains() {
     let job = full_job();
-    let sockets = [PathBuf::from("/tmp/a.sock"), PathBuf::from("/tmp/b.sock")];
+    let sources = [
+        WorkerSource {
+            socket: "/tmp/a.sock".into(),
+            size: 100,
+        },
+        WorkerSource {
+            socket: "/tmp/b.sock".into(),
+            size: 200,
+        },
+    ];
     let argv = job
         .to_argv(&ArgvLayout {
-            sockets: &sockets,
+            sources: &sources,
             out_dir: Path::new("/tmp/out"),
             burn_sets: Some(Path::new("/tmp/out/burn-sets.bin")),
             burn_ass: Some(Path::new("/tmp/out/burn.ass")),
@@ -97,7 +105,6 @@ fn argv_round_trips_every_field_including_negative_gains() {
         .unwrap();
     let back = Job::from_args(parse(argv)).unwrap();
     same_plan(&back.job.plan, &job.plan);
-    assert_eq!(back.job.part_sizes, job.part_sizes);
     assert_eq!(back.job.start_ms, job.start_ms);
     assert_eq!(back.job.sink, job.sink);
     assert_eq!(
@@ -112,7 +119,7 @@ fn argv_round_trips_every_field_including_negative_gains() {
         back.job.target_duration_secs, None,
         "argv never carries the runway"
     );
-    assert_eq!(back.sockets, sockets);
+    assert_eq!(back.sources, sources);
     assert_eq!(back.out_dir, PathBuf::from("/tmp/out"));
     assert_eq!(back.supervisor_pid, Some(42));
 }
@@ -122,10 +129,19 @@ fn argv_matches_the_hub_and_transcoder_spelling() {
     // A golden token list: a renamed or reordered flag is a visible diff
     // here before it is a worker that refuses to start.
     let job = full_job();
-    let sockets = [PathBuf::from("/tmp/a.sock"), PathBuf::from("/tmp/b.sock")];
+    let sources = [
+        WorkerSource {
+            socket: "/tmp/a.sock".into(),
+            size: 100,
+        },
+        WorkerSource {
+            socket: "/tmp/b.sock".into(),
+            size: 200,
+        },
+    ];
     let argv = job
         .to_argv(&ArgvLayout {
-            sockets: &sockets,
+            sources: &sources,
             out_dir: Path::new("/tmp/out"),
             burn_sets: Some(Path::new("/tmp/out/burn-sets.bin")),
             burn_ass: Some(Path::new("/tmp/out/burn.ass")),
@@ -203,17 +219,19 @@ fn a_bare_plan_spells_only_what_it_has() {
             audio: StreamMode::Copy,
             ..RemuxPlan::default()
         },
-        part_sizes: vec![10],
         start_ms: 0,
         sink: None,
         burn_sets: None,
         burn_ass: None,
         target_duration_secs: None,
     };
-    let sockets = [PathBuf::from("/tmp/a.sock")];
+    let sources = [WorkerSource {
+        socket: "/tmp/a.sock".into(),
+        size: 10,
+    }];
     let argv = job
         .to_argv(&ArgvLayout {
-            sockets: &sockets,
+            sources: &sources,
             out_dir: Path::new("/tmp/out"),
             burn_sets: None,
             burn_ass: None,
@@ -256,25 +274,25 @@ fn a_bare_plan_spells_only_what_it_has() {
 }
 
 #[test]
-fn sockets_and_parts_must_line_up() {
+fn worker_requires_a_source() {
     let job = full_job();
-    let one = [PathBuf::from("/tmp/a.sock")];
+
     let err = job
         .to_argv(&ArgvLayout {
-            sockets: &one,
+            sources: &[],
             out_dir: Path::new("/tmp/out"),
             burn_sets: None,
             burn_ass: None,
             supervisor_pid: None,
         })
         .unwrap_err();
-    assert!(err.to_string().contains("1 sockets for 2 parts"), "{err}");
+    assert!(err.to_string().contains("at least one source"), "{err}");
 }
 
 #[test]
 fn wire_round_trips_a_full_plan() {
     let job = full_job();
-    let msg = job.to_start_session("s1", &descriptors()).unwrap();
+    let msg = dispatch(&job).to_start_session("s1").unwrap();
     assert_eq!(msg.session_id, "s1");
     assert_eq!(msg.sources, descriptors());
     assert_eq!(msg.burn_subtitle, 4, "1-based on the wire");
@@ -294,9 +312,8 @@ fn wire_round_trips_a_full_plan() {
         ("hevc", "opus", "fmp4")
     );
 
-    let back = Job::from_start_session(&msg).unwrap();
+    let back = Dispatch::from_start_session(&msg).unwrap().job;
     same_plan(&back.plan, &job.plan);
-    assert_eq!(back.part_sizes, job.part_sizes);
     assert_eq!(back.start_ms, job.start_ms);
     assert_eq!(back.sink, job.sink);
     assert_eq!(back.burn_sets, job.burn_sets);
@@ -307,12 +324,13 @@ fn wire_round_trips_a_full_plan() {
 #[test]
 fn absent_optional_gains_stay_absent_after_decode() {
     // No measurement must not read as unity gain.
-    let job = Job::from_start_session(&StartSession {
+    let job = Dispatch::from_start_session(&StartSession {
         sources: descriptors(),
         target_duration_secs: 6,
         ..Default::default()
     })
-    .unwrap();
+    .unwrap()
+    .job;
     assert_eq!(job.plan.stereo_gain_db, None);
     assert_eq!(job.plan.native_gain_db, None);
     assert_eq!(job.plan.loudness_source_channels, None);
@@ -329,11 +347,11 @@ fn unmeasured_scalar_gains_stay_absent() {
     job.plan.stereo_gain_db = None;
     job.plan.native_gain_db = None;
     job.plan.loudness_source_channels = None;
-    let msg = job.to_start_session("s", &descriptors()).unwrap();
+    let msg = dispatch(&job).to_start_session("s").unwrap();
     assert_eq!(msg.stereo_gain_db, None);
     assert_eq!(msg.native_gain_db, None);
     assert_eq!(msg.loudness_source_channels, None);
-    let back = Job::from_start_session(&msg).unwrap();
+    let back = Dispatch::from_start_session(&msg).unwrap().job;
     assert_eq!(back.plan.stereo_gain_db, None);
     assert_eq!(back.plan.native_gain_db, None);
     assert_eq!(back.plan.loudness_source_channels, None);
@@ -341,33 +359,46 @@ fn unmeasured_scalar_gains_stay_absent() {
 
 #[test]
 fn dispatch_requires_sources_tokens_and_target_duration() {
-    let mut message = full_job().to_start_session("s", &descriptors()).unwrap();
+    let mut message = dispatch(&full_job()).to_start_session("s").unwrap();
     message.sources.clear();
-    assert!(Job::from_start_session(&message).is_err());
+    assert!(Dispatch::from_start_session(&message).is_err());
     message.sources = descriptors();
     message.sources[1].source_token.clear();
-    assert!(Job::from_start_session(&message).is_err());
+    assert!(Dispatch::from_start_session(&message).is_err());
     message.sources = descriptors();
     message.target_duration_secs = 0;
-    assert!(Job::from_start_session(&message).is_err());
+    assert!(Dispatch::from_start_session(&message).is_err());
     let mut job = full_job();
     job.target_duration_secs = None;
-    assert!(job.to_start_session("s", &descriptors()).is_err());
+    assert!(dispatch(&job).to_start_session("s").is_err());
 }
 
 #[test]
 fn an_exact_zero_db_gain_survives_both_codecs() {
     let mut job = full_job();
     job.plan.stereo_gain_db = Some(0.0);
-    let msg = job.to_start_session("s", &descriptors()).unwrap();
+    let msg = dispatch(&job).to_start_session("s").unwrap();
     assert_eq!(
-        Job::from_start_session(&msg).unwrap().plan.stereo_gain_db,
+        Dispatch::from_start_session(&msg)
+            .unwrap()
+            .job
+            .plan
+            .stereo_gain_db,
         Some(0.0)
     );
-    let sockets = [PathBuf::from("/a"), PathBuf::from("/b")];
+    let sources = [
+        WorkerSource {
+            socket: "/a".into(),
+            size: 100,
+        },
+        WorkerSource {
+            socket: "/b".into(),
+            size: 200,
+        },
+    ];
     let argv = job
         .to_argv(&ArgvLayout {
-            sockets: &sockets,
+            sources: &sources,
             out_dir: Path::new("/o"),
             burn_sets: None,
             burn_ass: None,
@@ -387,7 +418,7 @@ fn a_payload_held_as_a_file_is_read_onto_the_wire() {
     std::fs::write(&sets, [9, 8, 7]).unwrap();
     let mut job = full_job();
     job.burn_sets = Some(Payload::Path(sets));
-    let msg = job.to_start_session("s", &descriptors()).unwrap();
+    let msg = dispatch(&job).to_start_session("s").unwrap();
     assert_eq!(msg.burn_sets, vec![9, 8, 7]);
 }
 
@@ -402,4 +433,10 @@ fn descriptors() -> Vec<SourceDescriptor> {
             source_token: "part-b".into(),
         },
     ]
+}
+fn dispatch(job: &Job) -> Dispatch {
+    Dispatch {
+        job: job.clone(),
+        sources: descriptors(),
+    }
 }

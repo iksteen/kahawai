@@ -19,7 +19,7 @@ impl Sessions {
         sets_bytes: &[u8],
         ass_bytes: &[u8],
     ) -> Result<(Vec<kahawai_media::facts::Fact>, String)> {
-        let leases = self.open_part_leases(registry, parts, start_idx).await?;
+        let leases = self.open_part_sources(registry, parts, start_idx).await?;
         let first = match self
             .start_transcode(
                 registry,
@@ -47,7 +47,7 @@ impl Sessions {
         // crash hlssink3 but mux fine on hlssink2 (upstream fix pending).
         tracing::warn!(session = %id, error = format!("{first:#}"),
             "start failed; retrying with fallback sink");
-        let leases = self.open_part_leases(registry, parts, start_idx).await?;
+        let leases = self.open_part_sources(registry, parts, start_idx).await?;
         let f = self
             .start_transcode(
                 registry,
@@ -77,9 +77,9 @@ impl Sessions {
         session_id: &str,
         plan: kahawai_media::remux::RemuxPlan,
         // What the hub's playlist declares; the transcoder's readiness
-        // runway follows it (protocol 4.5).
+        // runway follows it.
         target_duration_secs: u32,
-        parts: Vec<(Lease, u64)>,
+        parts: Vec<Arc<dyn ByteSource>>,
         part_idx: usize,
         start_ms: u64,
         sink: &str,
@@ -98,7 +98,6 @@ impl Sessions {
         // payloads and the declared target duration.
         let job = kahawai_playback::job::Job {
             plan,
-            part_sizes: parts.iter().map(|(_, size)| *size).collect(),
             start_ms,
             sink: (!sink.is_empty()).then(|| sink.to_string()),
             burn_sets: (!burn_sets.is_empty())
@@ -107,85 +106,44 @@ impl Sessions {
                 .then_some(kahawai_playback::job::Payload::Bytes(burn_ass_file)),
             target_duration_secs: Some(target_duration_secs),
         };
-        let mut descriptors = Vec::with_capacity(parts.len());
-        self.revoke_source_grants(session_id);
-        {
-            let mut grants = self.source_grants.lock().unwrap();
-            for (lease, size) in &parts {
-                let token = crate::leases::new_lease_token();
-                let (alive, _) = tokio::sync::watch::channel(());
-                grants.insert(
-                    token.clone(),
-                    SourceGrant {
-                        session: session_id.into(),
-                        peer: transcoder.into(),
-                        lease: lease.clone(),
-                        size: *size,
-                        claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        alive,
-                    },
-                );
-                descriptors.push(kahawai_proto::v1::SourceDescriptor {
-                    size: *size,
-                    source_token: token,
-                });
-            }
+        let (grants, descriptors) = GrantOwner::new(self.source_grants.clone(), transcoder, &parts);
+        let message = kahawai_playback::job::Dispatch {
+            job,
+            sources: descriptors,
         }
-        struct PendingGrants<'a> {
-            grants: &'a Mutex<HashMap<String, SourceGrant>>,
-            tokens: Vec<String>,
-            armed: bool,
-        }
-        impl Drop for PendingGrants<'_> {
-            fn drop(&mut self) {
-                if self.armed {
-                    let mut grants = self.grants.lock().unwrap();
-                    for token in &self.tokens {
-                        grants.remove(token);
-                    }
-                }
-            }
-        }
-        let mut pending_grants = PendingGrants {
-            grants: &self.source_grants,
-            tokens: descriptors.iter().map(|s| s.source_token.clone()).collect(),
-            armed: true,
-        };
-        let message = job.to_start_session(session_id, &descriptors)?;
+        .to_start_session(session_id)?;
         let start = kahawai_proto::v1::HubToTc {
             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(message)),
         };
-        self.tc_leases
-            .lock()
-            .unwrap()
-            .insert(session_id.to_string(), (parts, part_idx));
         self.pending_ready
             .lock()
             .unwrap()
             .insert(session_id.to_string(), ready_tx);
-        let cleanup = |sessions: &Self| {
-            sessions.revoke_source_grants(session_id);
-            sessions.tc_leases.lock().unwrap().remove(session_id);
-            sessions.pending_ready.lock().unwrap().remove(session_id);
+        let mut pending = PendingReady {
+            wait: ready_rx,
+            registry: &self.pending_ready,
+            id: session_id,
         };
-        if let Err(e) = registry.send_to_tc(transcoder, start).await {
-            cleanup(self);
-            return Err(e);
-        }
-        match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
+        registry.send_to_tc(transcoder, start).await?;
+        match tokio::time::timeout(Duration::from_secs(40), &mut pending.wait).await {
             Ok(Ok(Ok(facts))) => {
-                pending_grants.armed = false;
+                self.dispatched_sources.lock().unwrap().insert(
+                    session_id.to_string(),
+                    DispatchedSources {
+                        parts,
+                        part_idx,
+                        _grants: grants,
+                    },
+                );
                 // No increment here: the slot has been held since the
                 // pick. Counting again would double it.
                 tracing::info!(session = session_id, transcoder, "session dispatched");
                 Ok(facts)
             }
             Ok(Ok(Err(e))) => {
-                cleanup(self);
                 bail!("transcoder rejected session: {e}");
             }
             Ok(Err(_)) | Err(_) => {
-                cleanup(self);
                 let _ = registry
                     .send_to_tc(
                         transcoder,
@@ -283,15 +241,82 @@ impl Sessions {
     }
 }
 
+/// A cancelled startup removes its own readiness waiter, without touching a
+/// newer waiter installed under the same session ID.
+struct PendingReady<'a> {
+    wait: tokio::sync::oneshot::Receiver<ReadyVerdict>,
+    registry: &'a Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReadyVerdict>>>,
+    id: &'a str,
+}
+impl Drop for PendingReady<'_> {
+    fn drop(&mut self) {
+        self.wait.close();
+        let mut pending = self.registry.lock().unwrap();
+        if pending
+            .get(self.id)
+            .is_some_and(|sender| sender.is_closed())
+        {
+            pending.remove(self.id);
+        }
+    }
+}
+
 /// Lifetime of one run/part capability. Dropping the sender stops an already
 /// bound channel too; consuming a token alone would not revoke active readers.
 pub(super) struct SourceGrant {
-    session: String,
     peer: String,
-    lease: Lease,
-    size: u64,
+    source: Arc<dyn ByteSource>,
     claimed: Arc<std::sync::atomic::AtomicBool>,
     alive: tokio::sync::watch::Sender<()>,
+}
+/// Owns exactly one run's grants, including while its start is pending.
+/// Dropping it revokes active readers without touching a replacement run.
+pub(super) struct GrantOwner {
+    registry: Arc<Mutex<HashMap<String, SourceGrant>>>,
+    tokens: Vec<String>,
+}
+impl GrantOwner {
+    fn new(
+        registry: Arc<Mutex<HashMap<String, SourceGrant>>>,
+        peer: &str,
+        parts: &[Arc<dyn ByteSource>],
+    ) -> (Self, Vec<kahawai_proto::v1::SourceDescriptor>) {
+        let mut owner = Self {
+            registry,
+            tokens: Vec::with_capacity(parts.len()),
+        };
+        let mut descriptors = Vec::with_capacity(parts.len());
+        {
+            let mut grants = owner.registry.lock().unwrap();
+            for source in parts {
+                let token = crate::leases::new_lease_token();
+                let (alive, _) = tokio::sync::watch::channel(());
+                grants.insert(
+                    token.clone(),
+                    SourceGrant {
+                        peer: peer.into(),
+                        source: source.clone(),
+                        claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                        alive,
+                    },
+                );
+                owner.tokens.push(token.clone());
+                descriptors.push(kahawai_proto::v1::SourceDescriptor {
+                    size: source.size(),
+                    source_token: token,
+                });
+            }
+        }
+        (owner, descriptors)
+    }
+}
+impl Drop for GrantOwner {
+    fn drop(&mut self) {
+        let mut grants = self.registry.lock().unwrap();
+        for token in &self.tokens {
+            grants.remove(token);
+        }
+    }
 }
 /// Only the live byte channel owns this claim. A disconnected channel may
 /// release it for the same peer; revocation still removes the grant entirely.
@@ -301,18 +326,18 @@ impl Drop for SourceClaim {
         self.0.store(false, std::sync::atomic::Ordering::Release);
     }
 }
+type ClaimedSource = (
+    Arc<dyn ByteSource>,
+    tokio::sync::watch::Receiver<()>,
+    SourceClaim,
+);
+
 impl Sessions {
-    pub(super) fn revoke_source_grants(&self, session: &str) {
-        self.source_grants
-            .lock()
-            .unwrap()
-            .retain(|_, g| g.session != session);
-    }
     pub(crate) fn claim_source(
         &self,
         token: &str,
         peer: &str,
-    ) -> Result<(Lease, u64, tokio::sync::watch::Receiver<()>, SourceClaim), tonic::Status> {
+    ) -> Result<ClaimedSource, tonic::Status> {
         let mut grants = self.source_grants.lock().unwrap();
         let grant = grants
             .get_mut(token)
@@ -328,8 +353,7 @@ impl Sessions {
             )
             .map_err(|_| tonic::Status::already_exists("source channel still active"))?;
         Ok((
-            grant.lease.clone(),
-            grant.size,
+            grant.source.clone(),
             grant.alive.subscribe(),
             SourceClaim(grant.claimed.clone()),
         ))
@@ -340,6 +364,41 @@ impl Sessions {
 mod source_token_tests {
     use super::*;
     #[tokio::test]
+    async fn cancelled_start_revokes_only_its_grants_and_preserves_reused_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source");
+        std::fs::write(&path, b"example").unwrap();
+        let sessions = Sessions::new(dir.path().join("runs"));
+        let source: Arc<dyn ByteSource> =
+            Arc::new(crate::leases::LeaseTransport::local_guarded(path, None, None).buffered(7));
+        let (pending, old) = GrantOwner::new(
+            sessions.source_grants.clone(),
+            "tc",
+            std::slice::from_ref(&source),
+        );
+        let (replacement, new) = GrantOwner::new(sessions.source_grants.clone(), "tc", &[source]);
+        let (_, mut live, claim) = sessions.claim_source(&old[0].source_token, "tc").unwrap();
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let start = tokio::spawn(async move {
+            let _pending = pending;
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+        });
+        ready.await.unwrap();
+        start.abort();
+        assert!(start.await.unwrap_err().is_cancelled());
+        assert!(live.changed().await.is_err());
+        drop(claim);
+        assert!(sessions.claim_source(&old[0].source_token, "tc").is_err());
+        let (source, mut live, claim) = sessions.claim_source(&new[0].source_token, "tc").unwrap();
+        assert_eq!(source.read(0, 7).await.unwrap(), b"example");
+        drop(replacement);
+        assert!(live.changed().await.is_err());
+        drop(claim);
+        assert!(sessions.source_grants.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
     async fn source_capability_rebinds_only_after_release_and_never_after_revocation() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source");
@@ -349,21 +408,24 @@ mod source_token_tests {
         sessions.source_grants.lock().unwrap().insert(
             "old-token".into(),
             SourceGrant {
-                session: "same-session-id".into(),
                 peer: "assigned-tc".into(),
-                lease: Lease::local(path),
-                size: 7,
+                source: Arc::new(
+                    crate::leases::LeaseTransport::local_guarded(path, None, None).buffered(7),
+                ),
                 claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 alive,
             },
         );
         assert!(sessions.claim_source("old-token", "other-tc").is_err());
-        let (_, _, _, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
+        let (_, _, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
         assert!(sessions.claim_source("old-token", "assigned-tc").is_err());
         drop(claim);
         assert!(sessions.claim_source("old-token", "other-tc").is_err());
-        let (_, _, mut live, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
-        sessions.revoke_source_grants("same-session-id");
+        let (_, mut live, claim) = sessions.claim_source("old-token", "assigned-tc").unwrap();
+        drop(GrantOwner {
+            registry: sessions.source_grants.clone(),
+            tokens: vec!["old-token".into()],
+        });
         assert!(live.changed().await.is_err());
         drop(claim);
         assert!(sessions.claim_source("old-token", "assigned-tc").is_err());

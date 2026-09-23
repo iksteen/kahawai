@@ -334,10 +334,16 @@ struct Starting {
     pending: HashMap<String, (tokio::task::Id, tokio::task::AbortHandle)>,
 }
 
+/// Immutable byte-plane endpoint belonging to this control link.
+pub struct SourceEndpoint {
+    pub address: String,
+    pub tls: Arc<rustls::ClientConfig>,
+}
+
 /// All state for one hub link's dispatched sessions.
 pub struct Runner {
     executor: Executor,
-    source_endpoint: Mutex<Option<(String, Arc<rustls::ClientConfig>)>>,
+    source_endpoint: SourceEndpoint,
     link: mpsc::Sender<TcToHub>,
     reads: Arc<LinkRate>,
     sessions: Mutex<HashMap<String, Session>>,
@@ -360,20 +366,17 @@ pub struct Runner {
 }
 
 impl Runner {
-    pub fn set_source_endpoint(&self, address: String, tls: Arc<rustls::ClientConfig>) {
-        *self.source_endpoint.lock().unwrap() = Some((address, tls));
-    }
-
     pub fn new(
         scratch_root: PathBuf,
         worker_exe: Option<PathBuf>,
         link: mpsc::Sender<TcToHub>,
+        source_endpoint: SourceEndpoint,
     ) -> Arc<Self> {
         Arc::new(Self {
             // Sessions never survive a link; stale scratch is garbage,
             // and the executor sweeps it.
             executor: Executor::new(scratch_root, worker_exe),
-            source_endpoint: Mutex::new(None),
+            source_endpoint,
 
             link,
             reads: Arc::new(LinkRate {
@@ -418,7 +421,7 @@ impl Runner {
 
     async fn start_inner(self: &Arc<Self>, msg: StartSession) {
         let session_id = msg.session_id.clone();
-        let job = match kahawai_playback::job::Job::from_start_session(&msg) {
+        let dispatch = match kahawai_playback::job::Dispatch::from_start_session(&msg) {
             Ok(job) => job,
             Err(e) => {
                 let _ = self
@@ -438,20 +441,10 @@ impl Runner {
             g.latest += 1;
             g.latest
         };
-        let endpoint = self.source_endpoint.lock().unwrap().clone();
-        let Some((address, tls)) = endpoint else {
-            let _ = self
-                .link
-                .send(session_error(
-                    &session_id,
-                    "missing source endpoint".into(),
-                    String::new(),
-                ))
-                .await;
-            return;
-        };
-        let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(msg.sources.len());
-        for descriptor in msg.sources {
+        let job = dispatch.job;
+        let SourceEndpoint { address, tls } = &self.source_endpoint;
+        let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(dispatch.sources.len());
+        for descriptor in dispatch.sources {
             let (address, tls, rates) = (address.clone(), tls.clone(), self.reads.clone());
             let size = descriptor.size;
             let buffer = kahawai_transport::read_ahead::ReadAhead::new(
@@ -934,16 +927,16 @@ mod tests {
         })
     }
 
-    fn source_endpoint() -> (String, Arc<rustls::ClientConfig>) {
+    fn source_endpoint() -> SourceEndpoint {
         let _ = rustls::crypto::ring::default_provider().install_default();
-        (
-            "https://127.0.0.1:1".into(),
-            Arc::new(
+        SourceEndpoint {
+            address: "https://127.0.0.1:1".into(),
+            tls: Arc::new(
                 rustls::ClientConfig::builder()
                     .with_root_certificates(rustls::RootCertStore::empty())
                     .with_no_client_auth(),
             ),
-        )
+        }
     }
 
     /// A stand-in for the `remux-worker` child that never produces a
@@ -1004,9 +997,12 @@ mod tests {
 
     async fn stalled_start(dir: &std::path::Path) -> (Arc<Runner>, mpsc::Receiver<TcToHub>, u32) {
         let (tx, rx) = mpsc::channel(8);
-        let runner = Runner::new(dir.join("sessions"), Some(stalled_worker(dir)), tx);
-        let endpoint = source_endpoint();
-        runner.set_source_endpoint(endpoint.0, endpoint.1);
+        let runner = Runner::new(
+            dir.join("sessions"),
+            Some(stalled_worker(dir)),
+            tx,
+            source_endpoint(),
+        );
         runner.start(stalled_session());
         let pid = worker_pid(&dir.join("sessions")).await;
         assert!(alive(pid));
@@ -1066,10 +1062,9 @@ mod tests {
             dir.path().join("sessions"),
             Some(stalled_worker(dir.path())),
             tx,
+            source_endpoint(),
         );
         runner.end_all().await;
-        let endpoint = source_endpoint();
-        runner.set_source_endpoint(endpoint.0, endpoint.1);
         runner.start(stalled_session());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(runner.starting.lock().unwrap().pending.is_empty());

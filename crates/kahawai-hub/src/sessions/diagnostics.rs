@@ -28,8 +28,8 @@ impl Sessions {
             );
         };
         let mut h = String::new();
-        if let Some((parts, _)) = self.tc_leases.lock().unwrap().get(session_id) {
-            for (part, (lease, _)) in parts.iter().enumerate() {
+        if let Some(held) = self.dispatched_sources.lock().unwrap().get(session_id) {
+            for (part, lease) in held.parts.iter().enumerate() {
                 let _ = writeln!(h, "== hub source part {part}\n{}", lease.diagnostics());
             }
         }

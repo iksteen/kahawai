@@ -78,7 +78,6 @@ async fn main() -> Result<()> {
             audio: StreamMode::Copy,
             ..RemuxPlan::default()
         },
-        part_sizes: vec![size],
         start_ms: 0,
         sink: None,
         burn_sets: None,

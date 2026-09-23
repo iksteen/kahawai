@@ -74,7 +74,8 @@ How something works and why it was built that way belong in
       generation-tagged reads, 16 MiB hub / 2 MiB transcoder read-ahead, and
       true pull appsrc. Disconnected transcoder byte channels resume from the
       delivered offset with peer-bound single-reader grants; malformed commands
-      return explicit errors. Protocol-4 peers
+      return explicit errors. Finite and buffered sources have separate construction;
+      run-owned grants revoke on teardown or cancelled startup. Protocol-4 peers
       are rejected, and minor feature gates are removed. Check with
       `scripts/kahawai-playback.sh pull`.
 

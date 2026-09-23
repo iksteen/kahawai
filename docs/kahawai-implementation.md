@@ -154,6 +154,15 @@ without exposing bearer tokens. Protocol 5 rejects all protocol-4 peers; there
 are no minor feature gates or control-link byte reads. Regular HTTP ranges
 remain finite and use the same nonzero, increasing generation contract.
 
+A fresh mediahost transport is consumed once into either a finite `Lease` or a
+sized `PipelineSource`; there is no runtime mode switch. The latter is the
+shared adapter for worker playback and `BlockingSource` analysis. `Job` holds
+processing options only; `Dispatch` adds mandatory ordered `{size, source_token}`
+descriptors, while worker invocation pairs each socket with its size. The hub's
+per-run grant owner revokes exactly its own tokens on drop, including failed or
+cancelled starts. Successful starts transfer that owner into the dispatched run;
+seeks and failover can retain its sources while replacing the grants.
+
 The worker socket remains offset/length based. Cancelling a pull closes that
 connection, and the executor accepts a replacement, cancelling the old read.
 Source guards interrupt demand before pipeline teardown. appsrc also has a
@@ -1055,12 +1064,12 @@ daemon links it, it may depend on `kahawai-core`, `kahawai-media`,
 the OCR engine; `tests/boundaries.rs` reads its manifest and
 `scripts/kahawai-playback.sh lean` walks the daemon's resolved graph.
 
-* `job` — one pipeline run (TC-3): the `RemuxPlan`, part sizes, start
-  offset, sink override, burn payloads and declared target duration. The wire
-  codec pairs each part size with its mandatory source grant. Worker argv
-  still pairs the job's sizes with the supervisor's ordered socket list.
-  Round-trip tests cover both codecs. Gains use protobuf presence; dispatch
-  requires a positive target duration.
+* `job` — processing options (TC-3): the `RemuxPlan`, start offset, sink
+  override, burn payloads and declared target duration. `Dispatch` adds
+  mandatory ordered source descriptors for `StartSession`; `WorkerInvocation`
+  binds socket and size together for every part. Round-trip tests cover both
+  codecs. Wire conventions are documented on the module: optional gains,
+  1-based burn indexes and mandatory positive dispatch target duration.
 * `executor` — the supervised run (§1.1, TC-4, TC-5): a fresh
   `<scratch>/<session>/r<N>` directory per run, one Unix socket per part
   under a short `/tmp/kahawai-XXXX` (SUN_LEN), the 16-byte read protocol

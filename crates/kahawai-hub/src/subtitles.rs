@@ -379,22 +379,21 @@ impl Subtitles {
         {
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
-        let lease = bytes
-            .open_lease(
+        let source = bytes
+            .open_source(
                 registry,
                 &module_id,
                 &collection_id,
                 &root_token,
                 &path_rel,
                 crate::bytes::Reader::Viewer,
+                size,
             )
             .await?;
-        let source = crate::bytes::LeaseSource {
-            lease,
-            size,
-            handle: tokio::runtime::Handle::current(),
-            reads: 0,
-        };
+        let source = kahawai_playback::executor::BlockingSource::new(
+            Arc::new(source),
+            tokio::runtime::Handle::current(),
+        );
         let (tx, rx) = tokio::sync::mpsc::channel::<String>(256);
         let this = self.clone();
         let (module_id2, collection_id2, root_token2, path_rel2) = (
@@ -538,22 +537,21 @@ impl Subtitles {
             {
                 return Ok(ex);
             }
-            let lease = bytes
-                .open_lease(
+            let source = bytes
+                .open_source(
                     registry,
                     &module_id,
                     &collection_id,
                     &root_token,
                     &path_rel,
                     crate::bytes::Reader::Viewer,
+                    size,
                 )
                 .await?;
-            let source = crate::bytes::LeaseSource {
-                lease,
-                size,
-                handle: tokio::runtime::Handle::current(),
-                reads: 0,
-            };
+            let source = kahawai_playback::executor::BlockingSource::new(
+                Arc::new(source),
+                tokio::runtime::Handle::current(),
+            );
             // Last-resort lease pass: extract every text track in the one
             // read and cache them all — a second track request must never
             // pay a second full read.
@@ -1036,22 +1034,21 @@ impl Subtitles {
                 }
             }
             None => {
-                let lease = bytes
-                    .open_lease(
+                let source = bytes
+                    .open_source(
                         registry,
                         &module_id,
                         &collection_id,
                         &root_token,
                         &path_rel,
                         crate::bytes::Reader::Viewer,
+                        size,
                     )
                     .await?;
-                let source = crate::bytes::LeaseSource {
-                    lease,
-                    size,
-                    handle: tokio::runtime::Handle::current(),
-                    reads: 0,
-                };
+                let source = kahawai_playback::executor::BlockingSource::new(
+                    Arc::new(source),
+                    tokio::runtime::Handle::current(),
+                );
                 tokio::task::spawn_blocking(move || {
                     kahawai_media::subtitles::extract_fonts(Box::new(source))
                 })

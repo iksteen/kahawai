@@ -97,11 +97,14 @@ impl Sessions {
             .store(idx, std::sync::atomic::Ordering::SeqCst);
         // Reuse the hub-held lease when the position is still in its
         // part — the mediahost may be unreachable during a fleet blip.
-        self.revoke_source_grants(id);
-        let held = self.tc_leases.lock().unwrap().remove(id);
+
+        let held = self.dispatched_sources.lock().unwrap().remove(id);
         let parts = match held {
-            Some((parts, held_idx)) if held_idx == idx => parts,
-            _ => self.open_part_leases(registry, &session.parts, idx).await?,
+            Some(held) if held.part_idx == idx => held.parts,
+            _ => {
+                self.open_part_sources(registry, &session.parts, idx)
+                    .await?
+            }
         };
         let sets = session
             .burn_sets

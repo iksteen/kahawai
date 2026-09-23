@@ -167,14 +167,11 @@ pub fn run_remux_worker(cfg: &config::Config, w: WorkerArgs) -> Result<()> {
     // of that spelling, paired with the supervisors' `Job::to_argv`.
     let kahawai_playback::job::WorkerInvocation {
         job,
-        sockets,
+        sources,
         out_dir,
         ..
     } = kahawai_playback::job::Job::from_args(w)?;
-    let parts: Vec<(PathBuf, u64)> = sockets
-        .into_iter()
-        .zip(job.part_sizes.iter().copied())
-        .collect();
+    let parts: Vec<(PathBuf, u64)> = sources.into_iter().map(|s| (s.socket, s.size)).collect();
     let on_disk =
         |payload: Option<kahawai_playback::job::Payload>, name: &str| -> Result<Option<PathBuf>> {
             Ok(match payload {

@@ -366,21 +366,18 @@ impl Sessions {
             .context("session has no parts")?
             .clone();
         let local_ms = position_ms.saturating_sub(part.base_ms);
-        session
+        let previous_idx = session
             .current_part
-            .store(idx, std::sync::atomic::Ordering::SeqCst);
+            .swap(idx, std::sync::atomic::Ordering::SeqCst);
         match &session.mode {
             Mode::Remux { run } => {
-                // The old run ends first, evidence kept: a seek-restart's
-                // new pipeline never shares a directory with the old one's
-                // drain, but the old lease died with it either way, so a
-                // fresh one is opened on whichever part the target lands in.
-                // A seek restarts in the target part and spans the rest from
-                // there: concat cannot serve the seek itself (it accepts one
-                // and then plays from zero — measured), so the restart
-                // stays, but it only ever happens for a seek now, never for
-                // a boundary.
+                // Keep the same sources across same-part restarts. A new run
+                // gets a new output directory but retains buffered byte ranges.
                 let old = run.lock().unwrap().take();
+                let retained = old
+                    .as_ref()
+                    .filter(|_| previous_idx == idx)
+                    .map(|old| old.sources());
                 if let Some(old) = old {
                     let ended = old.end("hub-local worker").await;
                     if let Some(data_dir) = self.data_dir() {
@@ -400,7 +397,13 @@ impl Sessions {
                 let sink = session.sink.lock().unwrap().clone();
                 let burn_sets = session.burn_sets.lock().unwrap().clone();
                 let burn_ass = session.burn_ass_text.lock().unwrap().clone();
-                let tail = self.open_part_leases(registry, &session.parts, idx).await?;
+                let tail = match retained {
+                    Some(sources) => sources,
+                    None => {
+                        self.open_part_sources(registry, &session.parts, idx)
+                            .await?
+                    }
+                };
                 let fresh = match self
                     .start_local(
                         &session.id,
@@ -410,7 +413,7 @@ impl Sessions {
                         // keeps the playlist it already has and §6.2.1
                         // forbids the declaration moving under it.
                         session.target_duration_secs,
-                        tail,
+                        tail.clone(),
                         local_ms,
                         (!sink.is_empty()).then_some(sink.as_str()),
                         burn_sets.as_deref(),
@@ -427,7 +430,6 @@ impl Sessions {
                         // content crashes hlssink3 on EVERY restart.
                         tracing::warn!(session = %session.id, error = format!("{first:#}"),
                             "seek restart failed; retrying with fallback sink");
-                        let tail = self.open_part_leases(registry, &session.parts, idx).await?;
                         let r = self
                             .start_local(
                                 &session.id,
@@ -470,11 +472,14 @@ impl Sessions {
                 // the target stays inside the same part (works even when
                 // the mediahost link is flapping). Crossing parts needs
                 // a lease on the other file.
-                self.revoke_source_grants(&session.id);
-                let held = self.tc_leases.lock().unwrap().remove(&session.id);
+
+                let held = self.dispatched_sources.lock().unwrap().remove(&session.id);
                 let parts = match held {
-                    Some((parts, held_idx)) if held_idx == idx => parts,
-                    _ => self.open_part_leases(registry, &session.parts, idx).await?,
+                    Some(held) if held.part_idx == idx => held.parts,
+                    _ => {
+                        self.open_part_sources(registry, &session.parts, idx)
+                            .await?
+                    }
                 };
                 let sink = session.sink.lock().unwrap().clone();
                 // Read outside the call: a guard held across .await
@@ -516,7 +521,9 @@ impl Sessions {
                     }
                     tracing::warn!(session = %session.id, error = format!("{first:#}"),
                         "seek restart failed; retrying with fallback sink");
-                    let parts = self.open_part_leases(registry, &session.parts, idx).await?;
+                    let parts = self
+                        .open_part_sources(registry, &session.parts, idx)
+                        .await?;
                     self.start_transcode(
                         registry,
                         &tc,

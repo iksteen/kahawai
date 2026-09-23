@@ -1,23 +1,16 @@
 //! One pipeline run, fully specified by the hub (TC-3), and its spellings.
 //!
-//! A [`Job`] is what a supervisor hands the pipeline: the `RemuxPlan` plus
-//! everything the plan does not carry — the sizes of the parts, where to
-//! start, which HLS sink to force, the display sets and sidecar script a
-//! burn needs, and how much runway the playlist must show before the run
-//! counts as ready. It crosses three boundaries and is spelled ONCE for
-//! each: as `remux-worker` argv towards the child process, as
-//! `StartSession` towards a transcoder, and as a direct call for the
-//! in-process runs tests use.
+//! [`Job`] describes processing only. [`Dispatch`] adds ordered, mandatory
+//! source descriptors for the hub-to-transcoder wire. [`WorkerInvocation`]
+//! binds each worker socket to its size; neither uses parallel source arrays.
+//! Runtime byte sources own the sizes used to construct both forms.
 //!
-//! The hub, the transcoder and the runtime each used to keep their own copy
-//! of these spellings. They drifted the way copies do: one side never
-//! learned the stdout-capture fix, the other never learned the readiness
-//! runway. The round-trip tests in `tests/job_codecs.rs` are what keep the
-//! two directions of each codec agreeing now.
-//!
-//! Protocol 5 binds each dispatched size to a nonempty source token and
-//! requires a positive target duration. Optional gains preserve absence;
-//! burn indexes are 1-based on the wire, and ceilings use zero for unset.
+//! Round-trip tests in `tests/job_codecs.rs` keep the wire and argv codecs
+//! aligned. Burn indexes are 1-based on the wire (zero means no burn), and
+//! bitrate, height and channel ceilings use zero for unset. Optional gains
+//! distinguish an unmeasured layout from an exact 0 dB measurement.
+//! Dispatch requires a positive target duration; workers do not need that
+//! supervisor-only readiness setting.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -26,7 +19,7 @@ use anyhow::{Context, Result};
 use kahawai_media::loudness::{AudioLayout, AudioLayoutGain, MAX_LAYOUT_GAINS};
 use kahawai_media::remux::{AudioTarget, RemuxPlan, SegmentFormat, VideoTarget};
 use kahawai_media::worker::{mode_arg, parse_mode};
-use kahawai_proto::v1::StartSession;
+use kahawai_proto::v1::{SourceDescriptor, StartSession};
 
 use crate::worker::WorkerArgs;
 
@@ -51,14 +44,44 @@ impl Payload {
     }
 }
 
+/// An inseparable worker source binding; size comes from the byte source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerSource {
+    pub socket: PathBuf,
+    pub size: u64,
+}
+
+/// Processing options plus mandatory dispatch routing. Tokens do not belong
+/// to the transport-independent job or cross into the worker subprocess.
+#[derive(Debug, Clone)]
+pub struct Dispatch {
+    pub job: Job,
+    pub sources: Vec<SourceDescriptor>,
+}
+impl Dispatch {
+    pub fn to_start_session(&self, session_id: &str) -> Result<StartSession> {
+        self.job.to_start_session(session_id, &self.sources)
+    }
+    pub fn from_start_session(message: &StartSession) -> Result<Self> {
+        Ok(Self {
+            job: Job::from_start_session(message)?,
+            sources: message.sources.clone(),
+        })
+    }
+}
+fn validate_sources(sources: &[SourceDescriptor]) -> Result<()> {
+    anyhow::ensure!(!sources.is_empty(), "a dispatch needs at least one source");
+    anyhow::ensure!(
+        sources.iter().all(|s| !s.source_token.is_empty()),
+        "empty source grant"
+    );
+    Ok(())
+}
+
 /// One pipeline run.
 #[derive(Debug, Clone)]
 pub struct Job {
     pub plan: RemuxPlan,
-    /// Part sizes in timeline order. `[0]` is the positional size of the
-    /// worker argv; the rest use `--part`. Wire sizes are paired with grants
-    /// in `StartSession.sources`. Never empty.
-    pub part_sizes: Vec<u64>,
     /// Offset within the FIRST part; later parts play whole.
     pub start_ms: u64,
     /// HLS sink override. `None` follows the preference order; the TC-6
@@ -76,8 +99,8 @@ pub struct Job {
 #[derive(Debug)]
 pub struct WorkerInvocation {
     pub job: Job,
-    /// One socket per part, in the same order as `job.part_sizes`.
-    pub sockets: Vec<PathBuf>,
+    /// Ordered socket and size bindings.
+    pub sources: Vec<WorkerSource>,
     pub out_dir: PathBuf,
     pub supervisor_pid: Option<u32>,
 }
@@ -85,8 +108,8 @@ pub struct WorkerInvocation {
 /// Where the supervisor put the things argv points at.
 #[derive(Debug, Clone, Copy)]
 pub struct ArgvLayout<'a> {
-    /// One socket per part, in `part_sizes` order.
-    pub sockets: &'a [PathBuf],
+    /// Ordered socket and size bindings.
+    pub sources: &'a [WorkerSource],
     pub out_dir: &'a Path,
     /// The display-set file, once materialised.
     pub burn_sets: Option<&'a Path>,
@@ -96,14 +119,6 @@ pub struct ArgvLayout<'a> {
 }
 
 impl Job {
-    pub fn size(&self) -> u64 {
-        self.part_sizes[0]
-    }
-
-    pub fn tail_sizes(&self) -> &[u64] {
-        &self.part_sizes[1..]
-    }
-
     /// The exact gains the plan carries, in slot order.
     pub fn exact_gains(&self) -> Vec<AudioLayoutGain> {
         self.plan.loudness_gains.iter().flatten().copied().collect()
@@ -111,19 +126,16 @@ impl Job {
 
     /// The `remux-worker` argv, subcommand token first.
     pub fn to_argv(&self, layout: &ArgvLayout<'_>) -> Result<Vec<OsString>> {
-        anyhow::ensure!(!self.part_sizes.is_empty(), "a job needs at least one part");
         anyhow::ensure!(
-            layout.sockets.len() == self.part_sizes.len(),
-            "{} sockets for {} parts",
-            layout.sockets.len(),
-            self.part_sizes.len()
+            !layout.sources.is_empty(),
+            "a run needs at least one source"
         );
         let plan = &self.plan;
         let mut argv: Vec<OsString> = vec![
             "remux-worker".into(),
-            layout.sockets[0].clone().into(),
+            layout.sources[0].socket.clone().into(),
             layout.out_dir.to_path_buf().into(),
-            self.part_sizes[0].to_string().into(),
+            layout.sources[0].size.to_string().into(),
         ];
         let mut push = |flag: &str, value: Option<String>| {
             argv.push(flag.into());
@@ -139,7 +151,8 @@ impl Job {
         // One socket per part: the worker joins them with concat into a
         // single pipeline, so a CD1->CD2 boundary is not a restart. Part
         // one keeps the historical positional spelling.
-        for (sock, size) in layout.sockets[1..].iter().zip(&self.part_sizes[1..]) {
+        for source in &layout.sources[1..] {
+            let (sock, size) = (&source.socket, source.size);
             push("--part", Some(format!("{}:{size}", sock.display())));
         }
         for (flag, value) in [
@@ -201,14 +214,18 @@ impl Job {
 
     /// The child side of [`Self::to_argv`].
     pub fn from_args(args: WorkerArgs) -> Result<WorkerInvocation> {
-        let mut sockets = vec![args.socket];
-        let mut part_sizes = vec![args.size];
+        let mut sources = vec![WorkerSource {
+            socket: args.socket,
+            size: args.size,
+        }];
         for part in &args.parts {
             let (sock, size) = part
                 .rsplit_once(':')
                 .context("--part wants <socket>:<size>")?;
-            sockets.push(PathBuf::from(sock));
-            part_sizes.push(size.parse().context("--part size")?);
+            sources.push(WorkerSource {
+                socket: PathBuf::from(sock),
+                size: size.parse().context("--part size")?,
+            });
         }
         let parsed: Vec<AudioLayoutGain> = args
             .loudness_gains
@@ -241,7 +258,6 @@ impl Job {
         Ok(WorkerInvocation {
             job: Job {
                 plan,
-                part_sizes,
                 start_ms: args.start_ms,
                 sink: args.sink,
                 burn_sets: args.burn_sets.map(Payload::Path),
@@ -250,27 +266,19 @@ impl Job {
                 // supervisor's business.
                 target_duration_secs: None,
             },
-            sockets,
+            sources,
             out_dir: args.out_dir,
             supervisor_pid: args.supervisor_pid,
         })
     }
 
     /// The wire spelling, hub → transcoder. Reads file-held payloads.
-    pub fn to_start_session(
+    fn to_start_session(
         &self,
         session_id: &str,
-        sources: &[kahawai_proto::v1::SourceDescriptor],
+        sources: &[SourceDescriptor],
     ) -> Result<StartSession> {
-        anyhow::ensure!(!self.part_sizes.is_empty(), "a job needs at least one part");
         validate_sources(sources)?;
-        anyhow::ensure!(
-            sources
-                .iter()
-                .map(|s| s.size)
-                .eq(self.part_sizes.iter().copied()),
-            "source sizes do not match parts"
-        );
         anyhow::ensure!(
             self.target_duration_secs.is_some_and(|n| n > 0),
             "dispatch requires a target duration"
@@ -321,7 +329,7 @@ impl Job {
     }
 
     /// The transcoder side of [`Self::to_start_session`].
-    pub fn from_start_session(msg: &StartSession) -> Result<Job> {
+    fn from_start_session(msg: &StartSession) -> Result<Job> {
         validate_sources(&msg.sources)?;
         anyhow::ensure!(msg.target_duration_secs > 0, "missing target duration");
         let positive = |v: u32| (v > 0).then_some(v);
@@ -354,10 +362,8 @@ impl Job {
             audio_codec: AudioTarget::from_str(&msg.audio_codec),
             segment_format: SegmentFormat::from_str(&msg.container),
         };
-        let part_sizes = msg.sources.iter().map(|s| s.size).collect();
         Ok(Job {
             plan,
-            part_sizes,
             start_ms: msg.start_ms,
             sink: (!msg.sink.is_empty()).then(|| msg.sink.clone()),
             burn_sets: (!msg.burn_sets.is_empty()).then(|| Payload::Bytes(msg.burn_sets.clone())),
@@ -382,13 +388,4 @@ fn layout_gains(
         *slot = Some(gain);
     }
     Ok(slots)
-}
-
-fn validate_sources(sources: &[kahawai_proto::v1::SourceDescriptor]) -> Result<()> {
-    anyhow::ensure!(!sources.is_empty(), "a dispatch needs at least one source");
-    anyhow::ensure!(
-        sources.iter().all(|s| !s.source_token.is_empty()),
-        "empty source grant"
-    );
-    Ok(())
 }

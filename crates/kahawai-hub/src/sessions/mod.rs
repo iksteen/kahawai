@@ -13,7 +13,7 @@ use anyhow::{Context, Result, bail};
 use crate::bytes::{ByteSources, Reader};
 use crate::leases::Lease;
 use crate::registry::{LoudnessPreference, Registry};
-use kahawai_playback::executor::Executor;
+use kahawai_playback::executor::{ByteSource, Executor};
 use kahawai_playback::seek::{PendingSeek, TimelinePart, part_index, reads_from};
 
 pub use crate::bytes::SourceOffline;
@@ -332,9 +332,12 @@ impl Session {
 /// session facts, AR-13) or an error string.
 type ReadyVerdict = Result<Vec<kahawai_media::facts::Fact>, String>;
 
-/// Leases for every part of one session (with sizes), plus the index
-/// of the part playback started in.
-type PartLeases = (Vec<(Lease, u64)>, usize);
+/// Ordered sources retained across same-part restarts, with this run's grants.
+struct DispatchedSources {
+    parts: Vec<Arc<dyn ByteSource>>,
+    part_idx: usize,
+    _grants: dispatch::GrantOwner,
+}
 
 pub struct Sessions {
     /// The byte plane: leases and the all-in-one short-circuit.
@@ -369,17 +372,10 @@ pub struct Sessions {
     /// `known_sessions`, which already tracks ids `active` cannot
     /// answer for.
     reserved: Mutex<HashMap<String, String>>,
-    /// Source leases for dispatched sessions (the transcoder pulls bytes
-    /// over its link; lives from dispatch to session end).
-    /// Hub-held source leases of dispatched sessions: (lease, size,
-    /// part index) — reused across restarts within the same part so
-    /// recovery works even when the mediahost link is flapping.
-    /// Every part from the session's starting part onward, in timeline
-    /// order: the transcoder joins them into one pipeline and asks for
-    /// each by index. Second element is the starting part's index, so a
-    /// seek that stays inside it can reuse these leases.
-    tc_leases: Mutex<HashMap<String, PartLeases>>,
-    source_grants: Mutex<HashMap<String, dispatch::SourceGrant>>,
+    /// Successful dispatched runs retain ordered sources and own their grants.
+    /// Replacing a run revokes its grants while allowing source reuse.
+    dispatched_sources: Mutex<HashMap<String, DispatchedSources>>,
+    source_grants: Arc<Mutex<HashMap<String, dispatch::SourceGrant>>>,
     /// Sessions awaiting the transcoder's ready/error verdict; Ok
     /// carries the worker's session facts (AR-13).
     pending_ready: Mutex<HashMap<String, tokio::sync::oneshot::Sender<ReadyVerdict>>>,
@@ -427,8 +423,8 @@ impl Sessions {
             active: Mutex::new(HashMap::new()),
             idle: tokio::sync::watch::channel(true).0,
             reserved: Mutex::new(HashMap::new()),
-            tc_leases: Mutex::new(HashMap::new()),
-            source_grants: Mutex::new(HashMap::new()),
+            dispatched_sources: Mutex::new(HashMap::new()),
+            source_grants: Arc::new(Mutex::new(HashMap::new())),
             pending_ready: Mutex::new(HashMap::new()),
             pending_logs: Mutex::new(HashMap::new()),
             known_sessions: Mutex::new(HashMap::new()),
@@ -650,8 +646,8 @@ impl Sessions {
             }
             Mode::Transcode { transcoder } => {
                 let transcoder = transcoder.lock().unwrap().clone();
-                self.revoke_source_grants(id);
-                self.tc_leases.lock().unwrap().remove(id);
+
+                self.dispatched_sources.lock().unwrap().remove(id);
                 self.pending_ready.lock().unwrap().remove(id);
                 if let Some(registry) = self.registry_for_teardown.lock().unwrap().clone() {
                     registry.tc_session_ended(&transcoder);

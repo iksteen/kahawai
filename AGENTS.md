@@ -149,8 +149,10 @@ Deployment topology, cross-compilation and the NAS/macOS satellites:
 - **Byte plane** — `crates/kahawai-transport/src/read_ahead.rs` defines the
   bounded range buffer, demand admission and allocation accounting;
   `source_stream.rs` beside it defines interruptible generations and positional
-  disk reads. Hub leases adapt mediahost streams; transcoder `sessions.rs`
-  owns byte-channel retry cursors and bandwidth sampling. Run/peer grants live
+  disk reads. Hub `leases.rs` constructs finite leases or sized buffered sources
+  from fresh transports; `playback/job.rs` separates jobs, dispatch descriptors
+  and worker socket/size bindings. Transcoder `sessions.rs`
+  owns byte-channel retry cursors and bandwidth sampling. Run-owned peer grants live
   in hub `sessions/dispatch.rs`, with binding and protocol diagnostics in
   `transcoder_link.rs`. `scripts/kahawai-playback.sh pull` exercises the contract.
 - **Caches are not evicted**, by decision (OPS-6): every one is either

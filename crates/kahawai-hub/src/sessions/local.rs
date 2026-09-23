@@ -1,27 +1,7 @@
 use super::*;
 
-use kahawai_playback::executor::{BoxFuture, ByteSource, Death, Started};
+use kahawai_playback::executor::{ByteSource, Death, Started};
 use kahawai_playback::job::{Job, Payload};
-
-/// A mediahost read lease as the executor's byte source: the hub's
-/// worker reads the same lease a direct-play client would stream.
-pub(super) struct LeaseByteSource {
-    pub(super) lease: Lease,
-    pub(super) size: u64,
-}
-
-impl ByteSource for LeaseByteSource {
-    fn diagnostics(&self) -> String {
-        self.lease.diagnostics()
-    }
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read(&self, offset: u64, len: u64) -> BoxFuture<'_, std::io::Result<Vec<u8>>> {
-        Box::pin(self.lease.read_buffered(offset, len, self.size))
-    }
-}
 
 impl Sessions {
     /// ONE attempt at running a pipeline on the hub's own supervised
@@ -41,7 +21,7 @@ impl Sessions {
         // What the playlist will DECLARE: the readiness gate hands over
         // enough runway for a client reloading at that cadence.
         target_duration_secs: u32,
-        parts: Vec<(Lease, u64)>,
+        parts: Vec<Arc<dyn ByteSource>>,
         start_ms: u64,
         sink: Option<&str>,
         // HUB-32b: display sets the mediahost walked for us.
@@ -53,18 +33,13 @@ impl Sessions {
     ) -> Result<Started> {
         let job = Job {
             plan,
-            part_sizes: parts.iter().map(|(_, size)| *size).collect(),
             start_ms,
             sink: sink.map(str::to_string),
             burn_sets: burn_sets.map(|p| Payload::Path(p.to_path_buf())),
             burn_ass: burn_ass.map(|text| Payload::Bytes(text.as_bytes().to_vec())),
             target_duration_secs: Some(target_duration_secs),
         };
-        let sources: Vec<Arc<dyn ByteSource>> = parts
-            .into_iter()
-            .map(|(lease, size)| Arc::new(LeaseByteSource { lease, size }) as Arc<dyn ByteSource>)
-            .collect();
-        match self.executor.start(session_id, job, sources).await {
+        match self.executor.start(session_id, job, parts).await {
             Ok(started) => Ok(started),
             Err(failure) => {
                 if let Some(data_dir) = self.data_dir() {

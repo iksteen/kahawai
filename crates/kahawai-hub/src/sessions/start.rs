@@ -292,18 +292,6 @@ impl Sessions {
         let local_ms = start_ms.saturating_sub(part.base_ms);
         let (module_id, path_rel, size) =
             (part.module_id.clone(), part.path_rel.clone(), part.size);
-        let lease = self
-            .bytes
-            .open_lease(
-                registry,
-                &part.module_id,
-                &part.collection_id,
-                &part.root_token,
-                &part.path_rel,
-                Reader::Viewer,
-            )
-            .await?;
-
         let mut chosen_sink = String::new();
         let mut verdict = None;
         let mut session_plan = None;
@@ -314,7 +302,20 @@ impl Sessions {
         // string, so the two can never describe different things.
         let mut session_class = String::new();
         let session_mode = match mode {
-            "direct" => Mode::Direct { lease },
+            "direct" => {
+                let lease = self
+                    .bytes
+                    .open_lease(
+                        registry,
+                        &part.module_id,
+                        &part.collection_id,
+                        &part.root_token,
+                        &part.path_rel,
+                        Reader::Viewer,
+                    )
+                    .await?;
+                Mode::Direct { lease }
+            }
             "remux" => {
                 // The muxer stalls on unfed pads, so only claim what the
                 // plan will actually feed — the negotiated plan is the
@@ -429,7 +430,7 @@ impl Sessions {
                         }
                     }
                     None => {
-                        let tail = self.open_part_leases(registry, &parts, start_idx).await?;
+                        let tail = self.open_part_sources(registry, &parts, start_idx).await?;
                         let started = match self
                             .start_local(
                                 &id,
@@ -454,7 +455,7 @@ impl Sessions {
                                 tracing::warn!(session = %id, error = format!("{first:#}"),
                                     "start failed; retrying with fallback sink");
                                 let tail =
-                                    self.open_part_leases(registry, &parts, start_idx).await?;
+                                    self.open_part_sources(registry, &parts, start_idx).await?;
                                 let r = self
                                     .start_local(
                                         &id,
@@ -552,26 +553,27 @@ impl Sessions {
     /// before it ends, but the branch has to exist before that happens.
     /// Costs one lease per remaining part instead of one per session —
     /// paid once, at the start, rather than as a stall at every boundary.
-    pub(super) async fn open_part_leases(
+    pub(super) async fn open_part_sources(
         &self,
         registry: &Registry,
         parts: &[PartSource],
         from: usize,
-    ) -> Result<Vec<(Lease, u64)>> {
+    ) -> Result<Vec<Arc<dyn ByteSource>>> {
         let mut out = Vec::with_capacity(parts.len().saturating_sub(from));
         for part in &parts[from..] {
             let lease = self
                 .bytes
-                .open_lease(
+                .open_source(
                     registry,
                     &part.module_id,
                     &part.collection_id,
                     &part.root_token,
                     &part.path_rel,
                     Reader::Viewer,
+                    part.size,
                 )
                 .await?;
-            out.push((lease, part.size));
+            out.push(Arc::new(lease) as Arc<dyn ByteSource>);
         }
         Ok(out)
     }

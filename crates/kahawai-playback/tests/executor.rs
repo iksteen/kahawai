@@ -64,14 +64,13 @@ fn fixture() -> Option<Fixture> {
     })
 }
 
-fn copy_job(size: u64) -> Job {
+fn copy_job() -> Job {
     Job {
         plan: RemuxPlan {
             video: StreamMode::Copy,
             audio: StreamMode::Copy,
             ..RemuxPlan::default()
         },
-        part_sizes: vec![size],
         start_ms: 0,
         sink: None,
         burn_sets: None,
@@ -86,7 +85,7 @@ async fn an_in_process_run_becomes_ready_and_writes_the_contract_files() {
     let executor = Executor::new(f.scratch.clone(), None);
     let source = FileSource::open(&f.media);
     let started = executor
-        .start("s1", copy_job(source.size()), vec![source])
+        .start("s1", copy_job(), vec![source])
         .await
         .unwrap_or_else(|e| panic!("{e}\n{}", e.bundle));
     let run = started.run;
@@ -129,13 +128,13 @@ async fn a_seek_restart_gets_a_fresh_run_dir() {
     let executor = Executor::new(f.scratch.clone(), None);
     let source = FileSource::open(&f.media);
     let first = executor
-        .start("s1", copy_job(source.size()), vec![source.clone()])
+        .start("s1", copy_job(), vec![source.clone()])
         .await
         .unwrap();
     assert!(first.run.dir().ends_with("r1"));
     first.run.end("test").await;
     let second = executor
-        .start("s1", copy_job(source.size()), vec![source])
+        .start("s1", copy_job(), vec![source])
         .await
         .unwrap();
     assert!(
@@ -153,7 +152,7 @@ async fn viewer_position_lands_in_the_run_dir() {
     let executor = Executor::new(f.scratch.clone(), None);
     let source = FileSource::open(&f.media);
     let started = executor
-        .start("s1", copy_job(source.size()), vec![source])
+        .start("s1", copy_job(), vec![source])
         .await
         .unwrap();
     started.run.viewer_position(4321);
@@ -170,7 +169,7 @@ async fn a_finished_run_reports_its_death_as_finished() {
     let executor = Executor::new(f.scratch.clone(), None);
     let source = FileSource::open(&f.media);
     let started = executor
-        .start("s1", copy_job(source.size()), vec![source])
+        .start("s1", copy_job(), vec![source])
         .await
         .unwrap();
     // A ten-second all-copy remux finishes well inside this.
@@ -194,13 +193,15 @@ async fn a_finished_run_reports_its_death_as_finished() {
 async fn a_job_with_no_parts_is_refused_before_anything_is_spawned() {
     let dir = tempfile::tempdir().unwrap();
     let executor = Executor::new(dir.path().join("sessions"), None);
-    let mut job = copy_job(1);
-    job.part_sizes.clear();
+    let job = copy_job();
     let failure = match executor.start("s1", job, Vec::new()).await {
         Err(failure) => failure,
         Ok(_) => panic!("a job with no parts started"),
     };
-    assert!(failure.to_string().contains("no source parts"), "{failure}");
+    assert!(
+        failure.to_string().contains("no sources for the run"),
+        "{failure}"
+    );
     assert!(!dir.path().join("sessions/s1").exists());
 }
 
@@ -225,7 +226,7 @@ async fn a_source_that_never_answers_fails_the_start_inside_the_deadline() {
     let executor = Executor::new(dir.path().join("sessions"), None);
     let started = std::time::Instant::now();
     let outcome = executor
-        .start("s1", copy_job(1 << 20), vec![Arc::new(Silent)])
+        .start("s1", copy_job(), vec![Arc::new(Silent)])
         .await;
     assert!(outcome.is_err());
     assert!(
@@ -277,7 +278,7 @@ async fn dropping_a_run_kills_its_worker() {
     let script = fake_worker(dir.path());
     let executor = Executor::new(dir.path().join("sessions"), Some(script));
     let started = executor
-        .start("s1", copy_job(1), vec![Arc::new(OneByte)])
+        .start("s1", copy_job(), vec![Arc::new(OneByte)])
         .await
         .unwrap_or_else(|e| panic!("{e}\n{}", e.bundle));
     let pid: u32 = std::fs::read_to_string(started.run.dir().join("pid"))

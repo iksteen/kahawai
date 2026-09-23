@@ -291,8 +291,15 @@ pub async fn link_once(
     .await
     .context("link closed before capability report")?;
 
-    let runner = sessions::Runner::new(scratch.to_path_buf(), worker_exe.clone(), tx.clone());
-    runner.set_source_endpoint(hub_addr.to_string(), tls);
+    let runner = sessions::Runner::new(
+        scratch.to_path_buf(),
+        worker_exe.clone(),
+        tx.clone(),
+        sessions::SourceEndpoint {
+            address: hub_addr.to_string(),
+            tls,
+        },
+    );
     let result = link_loop(&tx, &mut inbound, &runner, &mut capabilities).await;
     runner.end_all().await;
     result

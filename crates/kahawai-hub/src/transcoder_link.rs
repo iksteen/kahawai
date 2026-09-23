@@ -65,7 +65,7 @@ impl TranscoderLink for TranscoderLinkService {
                 "first source message must only bind a token",
             ));
         }
-        let (lease, size, mut alive, claim) =
+        let (source, mut alive, claim) =
             self.sessions.claim_source(&first.source_token, &peer_id)?;
         let (out, rx) = tokio::sync::mpsc::channel(2);
         tokio::spawn(async move {
@@ -95,8 +95,8 @@ impl TranscoderLink for TranscoderLinkService {
                 _ = out.closed() => Ok(()),
                 result = receive => result,
                 _ = send => Ok(()),
-                _ = kahawai_transport::source_stream::serve(requests, chunks, size, |offset, len| { let lease = &lease; async move {
-                    Ok(lease.read_buffered(offset, len as u64, size).await?)
+                _ = kahawai_transport::source_stream::serve(requests, chunks, source.size(), |offset, len| { let source = &source; async move {
+                    Ok(source.read(offset, len as u64).await?)
                 }}) => Ok(()),
             };
             if let Err(error) = result {

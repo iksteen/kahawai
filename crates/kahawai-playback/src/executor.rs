@@ -278,16 +278,7 @@ impl Executor {
         job: &Job,
         sources: &[Arc<dyn ByteSource>],
     ) -> Result<Run> {
-        anyhow::ensure!(
-            !job.part_sizes.is_empty(),
-            "no source parts for the session"
-        );
-        anyhow::ensure!(
-            sources.len() == job.part_sizes.len(),
-            "{} sources for {} parts",
-            sources.len(),
-            job.part_sizes.len()
-        );
+        anyhow::ensure!(!sources.is_empty(), "no sources for the run");
         let run_no = self.run_seq.fetch_add(1, Ordering::Relaxed);
         let dir = self
             .scratch_root
@@ -332,13 +323,16 @@ impl Executor {
                     });
                 }
             }));
-            sockets.push(sock);
+            sockets.push(crate::job::WorkerSource {
+                socket: sock,
+                size: sources[n].size(),
+            });
         }
 
         let worker = match &self.worker_exe {
             Some(exe) => {
                 let argv = job.to_argv(&ArgvLayout {
-                    sockets: &sockets,
+                    sources: &sockets,
                     out_dir: &dir,
                     burn_sets: burn_sets.as_deref(),
                     burn_ass: burn_ass.as_deref(),
@@ -541,6 +535,11 @@ impl Run {
 
     pub fn session_id(&self) -> &str {
         &self.inner.session_id
+    }
+
+    /// Retain byte sources across a replacement run, preserving read-ahead.
+    pub fn sources(&self) -> Vec<Arc<dyn ByteSource>> {
+        self.inner.sources.clone()
     }
 
     /// Pacing (§4.6): where the viewer is, for the worker to throttle
