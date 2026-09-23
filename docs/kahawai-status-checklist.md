@@ -71,7 +71,7 @@ How something works and why it was built that way belong in
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified).
       Protocol 5 requires a separate transcoder source connection, interruptible
-      generation-tagged reads, 16 MiB hub / 2 MiB transcoder read-ahead, and
+      generation-tagged reads, 32 MiB hub / 2 MiB transcoder read-ahead with demand-driven LRU eviction, and
       true pull appsrc. Disconnected transcoder byte channels resume from the
       delivered offset with peer-bound single-reader grants; malformed commands
       return explicit errors. Overlapping demux reads reuse retained block prefixes

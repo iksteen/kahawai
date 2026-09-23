@@ -389,7 +389,7 @@ mod streaming_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("source");
         let file = std::fs::File::create(&path).unwrap();
-        let size = 40 * 1024 * 1024;
+        let size = 3 * HUB_CAPACITY as u64;
         file.set_len(size).unwrap();
         let lease = LeaseTransport::local_guarded(path, None, None).buffered(size);
         assert_eq!(lease.read(0, 1).await.unwrap(), [0]);
@@ -402,8 +402,10 @@ mod streaming_tests {
             vec![0; 17]
         );
         file.set_len(0).unwrap();
+        // Outside both the initial prefetch and the retained EOF region:
+        // truncation must be observed by fresh I/O, not hidden by a buffer hit.
         assert!(
-            timeout(Duration::from_secs(2), lease.read(25 * 1024 * 1024, 19))
+            timeout(Duration::from_secs(2), lease.read(size / 2, 19))
                 .await
                 .unwrap()
                 .is_err()

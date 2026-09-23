@@ -122,28 +122,26 @@ Three gRPC services, all initiated module→hub (AR-3) over mTLS (the satellite'
 
 **Pull and read-ahead (protocol 5.0).** Pipeline appsrc uses `RandomAccess`, byte
 format and a known size, and answers each demand exactly (short only at EOF).
-Its single feeder has no speculative ring; the hub holds at most 16 MiB of
+Its single feeder has no speculative ring; the hub holds at most 32 MiB of
 read-ahead per activated part and a remote transcoder holds another 2 MiB.
 These temporary buffers trade bounded RAM/speculative I/O for memory-speed
-hits; a miss costs a source seek and fresh bytes. Each read releases blocks
-entirely before its starting offset; its starting block and subsequent blocks
-remain readable even if the request reaches their ends. This spends more of
-the same memory allowance on repeat/overlap hits, reducing forward prefetch
-in exchange for avoiding repeat source I/O and demand-time network latency.
-On a miss, one eighth of capacity is made available by dropping old
-retained ranges in insertion order (not by distance from the read cursor).
-Retained blocks count their full allocation until released, and
-their already-returned prefixes remain readable. Typefinding and demuxing
-repeat and overlap reads; hiding a retained prefix caused network seeks and
-discarded in-flight data despite those bytes still being resident. The
-allowance bounds retained RAM. This avoids repeated copies, but a backward
-miss can discard useful forward ranges and
-require another fetch. A demand at the current prefetch boundary also makes room
-for an incoming chunk, without restarting the upstream stream; buffered skips
-remain hits. Capacity-pressure reclamation can release even the starting
-block so reads larger than capacity can progress. Speculative reading stops
-at capacity. Bounded 256 KiB transport chunks and outstanding demand responses
-are additional memory, not included in the read-ahead allowance.
+hits; a miss costs a source seek and fresh bytes. Forward reads do not release
+earlier blocks: poorly interleaved audio/video can alternate between two
+advancing file regions. Releasing everything before the later read repeatedly
+forced the earlier region to be fetched again even when the gap fit in RAM.
+The 32 MiB hub budget spends another 16 MiB per activated part on headroom for
+that pattern; retention, rather than capacity alone, avoids the refetch latency.
+On a miss, one eighth of capacity is made available by dropping the least
+recently used retained blocks. Demand hits move their blocks to the back of
+the eviction queue; incoming prefetch is appended there too. Retained blocks
+count their full allocation, and already-returned prefixes remain readable.
+A demand at the current prefetch boundary makes room for an incoming chunk
+without restarting the upstream stream; buffered skips remain hits. Reclamation
+can release even the starting block so reads larger than capacity can progress.
+Speculative reading stops at capacity. Bounded 256 KiB transport chunks and
+outstanding demand responses are additional memory, not included in the
+read-ahead allowance. This is bounded retention, not a guarantee that either
+of two regions survives arbitrary demand or prefetch pressure.
 
 A mediahost continuously serves a range toward EOF, interrupted by a newer
 generation. Command intake remains live during disk admission or a blocked
@@ -1001,7 +999,7 @@ Negotiation engine: exhaustive table-driven unit tests (capability × source mat
 
 *Latency at point of use.* **Artwork** is genuinely cheap to refetch — one small ranged read, or one GET to an unmetered image CDN — and it is still not evictable, because it is tiny and wanted *instantly*: a grid scroll wants dozens of posters at once, and a miss is a blank tile plus a round trip precisely where latency is visible. Cheap to reproduce is not the same as cheap to miss. The arithmetic settles it: capping artwork at 100 MiB reclaimed 89 MB out of a 2.7 GB data dir, in exchange for stalls.
 
-What is left is transient and already bounded by lifecycle: session scratch is wiped at startup, torn down per session, and idle-reaped. So there is no janitor. Disk is not the scarce resource here — provider entitlements, mediahost I/O and interaction latency are. Should a deployment genuinely need a cap (hub `data_dir` on a small SD card), the honest design is an admin-triggered purge that states what it will cost, not a silent hourly sweep. Hub stream proxying uses bounded channels so a slow client applies backpressure to the mediahost. Pipeline read-ahead is bounded separately: 16 MiB per hub source part and 2 MiB per remote transcoder source part, plus bounded transport queues and the current demand response. The worker has no speculative appsrc ring.
+What is left is transient and already bounded by lifecycle: session scratch is wiped at startup, torn down per session, and idle-reaped. So there is no janitor. Disk is not the scarce resource here — provider entitlements, mediahost I/O and interaction latency are. Should a deployment genuinely need a cap (hub `data_dir` on a small SD card), the honest design is an admin-triggered purge that states what it will cost, not a silent hourly sweep. Hub stream proxying uses bounded channels so a slow client applies backpressure to the mediahost. Pipeline read-ahead is bounded separately: 32 MiB per hub source part and 2 MiB per remote transcoder source part, plus bounded transport queues and the current demand response. The worker has no speculative appsrc ring.
 
 *The one exception, and why it is not a quota.* At startup the artwork cache drops resized derivatives that can never be served again: a size no longer in the code's list, or a copy whose original is gone. That is unreachability, not size — nothing is removed for being large, and the sizes still in use are kept forever like everything else here. Variant directories are named for their pixel count, so editing a size is itself what makes the old copies stale; a derivative is named after its original's cache key, so "is the original still there" is one `exists()`. `tests/artwork_sizes.rs` pins which files the sweep may touch, since it is code that deletes.
 
