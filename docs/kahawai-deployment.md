@@ -22,6 +22,35 @@ docker exec -it <container-name> kahawai hub init-admin
 
 Neither first-admin path exists after setup succeeds.
 
+## Protocol 5 fleet cutover
+
+Protocol 5 peers reject protocol 4. Stage every binary before activating the
+fleet; both hubs (Linux AIO and Mac AIO) and every NAS/Mac satellite must switch
+in the same maintenance window. Temporary version refusals during that window
+are expected; there is no minor-version compatibility mode.
+
+```sh
+scripts/kahawai-mac.sh stage
+scripts/kahawai-silence.sh ingmar@192.168.0.109 --stage
+scripts/kahawai-restart.sh all-in-one --build
+scripts/kahawai-mac.sh activate
+scripts/kahawai-silence.sh ingmar@192.168.0.109 --activate
+```
+
+Mac staging builds in `target/staged` and requires the patched
+`/opt/homebrew/Cellar/kahawai-gstreamer/1.28.7` keg, checks dynamic links and signs
+both binaries. Activation saves `.previous` binaries, replaces both executable
+paths and kills the old daemon PIDs so launchd respawns them; it verifies changed
+PIDs and fresh startup/link log entries. NAS staging writes `.kahawai-stage`;
+activation preserves `.previous` binaries and checks the old processes stopped
+before starting the replacements. Back up the local AIO binary before rebuilding
+as well. If verification fails, restore the saved binaries on **all** hosts and
+restart the fleet together; no database migration is part of this cutover.
+
+Verify hub health/build, new satellite link logs, patched GStreamer linkage and
+actual direct/remux/transcode playback after activation. A build alone is not a
+successful rollout.
+
 ## Reverse proxy
 
 ```toml
