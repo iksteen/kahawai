@@ -75,7 +75,10 @@ How something works and why it was built that way belong in
       true pull appsrc. Disconnected transcoder byte channels resume from the
       delivered offset with peer-bound single-reader grants; malformed commands
       return explicit errors. Overlapping demux reads reuse retained block prefixes
-      without restarting the byte stream. Finite and buffered sources have separate construction;
+      without restarting the byte stream, including repeated reads ending at block
+      boundaries. Reads release blocks before their starting offset, with pressure
+      reclamation allowing requests larger than capacity to progress.
+      Finite and buffered sources have separate construction;
       run-owned grants revoke on teardown or cancelled startup. Protocol-4 peers
       are rejected, and minor feature gates are removed. Check with
       `scripts/kahawai-playback.sh pull`.

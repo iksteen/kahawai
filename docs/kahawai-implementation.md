@@ -125,10 +125,14 @@ format and a known size, and answers each demand exactly (short only at EOF).
 Its single feeder has no speculative ring; the hub holds at most 16 MiB of
 read-ahead per activated part and a remote transcoder holds another 2 MiB.
 These temporary buffers trade bounded RAM/speculative I/O for memory-speed
-hits; a miss costs a source seek and fresh bytes. Disjoint ranges survive
-seeks, with one eighth of capacity made available on a miss by dropping old
+hits; a miss costs a source seek and fresh bytes. Each read releases blocks
+entirely before its starting offset; its starting block and subsequent blocks
+remain readable even if the request reaches their ends. This spends more of
+the same memory allowance on repeat/overlap hits, reducing forward prefetch
+in exchange for avoiding repeat source I/O and demand-time network latency.
+On a miss, one eighth of capacity is made available by dropping old
 retained ranges in insertion order (not by distance from the read cursor).
-Partially consumed blocks count their full allocation until released, and
+Retained blocks count their full allocation until released, and
 their already-returned prefixes remain readable. Typefinding and demuxing
 repeat and overlap reads; hiding a retained prefix caused network seeks and
 discarded in-flight data despite those bytes still being resident. The
@@ -136,8 +140,9 @@ allowance bounds retained RAM. This avoids repeated copies, but a backward
 miss can discard useful forward ranges and
 require another fetch. A demand at the current prefetch boundary also makes room
 for an incoming chunk, without restarting the upstream stream; buffered skips
-remain hits. Consumed blocks are released; speculative reading stops at
-capacity. Bounded 256 KiB transport chunks and outstanding demand responses
+remain hits. Capacity-pressure reclamation can release even the starting
+block so reads larger than capacity can progress. Speculative reading stops
+at capacity. Bounded 256 KiB transport chunks and outstanding demand responses
 are additional memory, not included in the read-ahead allowance.
 
 A mediahost continuously serves a range toward EOF, interrupted by a newer

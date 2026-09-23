@@ -1,11 +1,14 @@
 //! Bounded, disposable transport read-ahead, not a persistent media cache.
 //! Demand hits cost a memory copy; misses cost a remote seek/read. Retain
 //! disjoint ranges for demuxers alternating audio/video offsets. Speculation
-//! stops at capacity; only a demand miss may reclaim retained ranges.
+//! stops at capacity. Each demand releases blocks entirely before its starting
+//! offset, retaining the starting block even when the read reaches its end.
 //! Capacity and diagnostics count full retained allocations, including consumed
-//! prefixes of partial blocks. Those prefixes remain readable: demuxers repeat
+//! prefixes of blocks. Those prefixes remain readable: demuxers repeat
 //! and overlap requests. This avoids copying on every small demand and
-//! bounds RAM rather than just readable bytes. Reclamation is FIFO by insertion,
+//! bounds RAM rather than just readable bytes. Under capacity pressure a demand
+//! miss may also reclaim blocks, including the starting block of a large read.
+//! That fallback is FIFO by insertion,
 //! not cursor-relative: a backward miss can discard useful bytes ahead and pay
 //! to fetch them again. No guarantee of retaining the nearest ranges is implied.
 use kahawai_proto::v1::{ByteChunk, ReadRequest};
@@ -192,6 +195,21 @@ impl ReadAhead {
         let _serial = self.shared.serial.lock().await;
         let len = len.min(self.size.saturating_sub(offset));
         let mut out = Vec::new();
+        if len != 0 {
+            let mut state = self.shared.state.lock().unwrap();
+            let mut removed = 0;
+            state.blocks.retain(|block| {
+                let before = block.offset + block.data.len() as u64 <= offset;
+                if before {
+                    removed += block.data.len();
+                }
+                !before
+            });
+            state.bytes -= removed;
+            if removed != 0 {
+                self.shared.changed.notify_waiters();
+            }
+        }
         let started = std::time::Instant::now();
         while (out.len() as u64) < len {
             let pos = offset + out.len() as u64;
@@ -209,17 +227,11 @@ impl ReadAhead {
                     .iter()
                     .position(|b| b.offset <= pos && pos - b.offset < b.data.len() as u64)
                 {
-                    let block = state.blocks.remove(index).unwrap();
-                    state.bytes -= block.data.len();
+                    let block = &state.blocks[index];
                     let skip = (pos - block.offset) as usize;
                     let n = (len as usize - out.len()).min(block.data.len() - skip);
                     out.extend_from_slice(&block.data[skip..skip + n]);
-                    if skip + n < block.data.len() {
-                        state.bytes += block.data.len();
-                        state.blocks.insert(index, block);
-                    }
                     state.hits += 1;
-                    self.shared.changed.notify_waiters();
                     true
                 } else {
                     // Demand must be able to admit the next chunk even when
@@ -367,6 +379,31 @@ mod tests {
             );
         }
     }
+    #[tokio::test]
+    async fn repeated_boundary_and_multiblock_reads_remain_resident() {
+        let (buffer, _) = source(4 * CHUNK);
+        bounded(&buffer, 0, 1).await;
+        let offset = CHUNK as u64 - 4096;
+        for len in [4096, CHUNK as u64 + 4096] {
+            assert_eq!(
+                bounded(&buffer, offset, len).await,
+                data(offset, len as usize)
+            );
+            let generation = buffer.shared.state.lock().unwrap().generation;
+            assert_eq!(
+                bounded(&buffer, offset, len).await,
+                data(offset, len as usize)
+            );
+            assert_eq!(buffer.shared.state.lock().unwrap().generation, generation);
+        }
+        // Advancing the request start past the first block releases it, while
+        // reading to the end of the second block retains that second block.
+        bounded(&buffer, CHUNK as u64, CHUNK as u64).await;
+        let state = buffer.shared.state.lock().unwrap();
+        assert!(!state.blocks.iter().any(|b| b.offset == 0));
+        assert!(state.blocks.iter().any(|b| b.offset == CHUNK as u64));
+    }
+
     #[tokio::test]
     async fn demand_at_full_prefetch_boundary_reclaims_space_without_seeking() {
         let capacity = 2 * CHUNK;
