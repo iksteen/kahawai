@@ -3,7 +3,8 @@
 //! disjoint ranges for demuxers alternating audio/video offsets. Speculation
 //! stops at capacity; only a demand miss may reclaim retained ranges.
 //! Capacity and diagnostics count full retained allocations, including consumed
-//! prefixes of partial blocks. This avoids copying on every small demand and
+//! prefixes of partial blocks. Those prefixes remain readable: demuxers repeat
+//! and overlap requests. This avoids copying on every small demand and
 //! bounds RAM rather than just readable bytes. Reclamation is FIFO by insertion,
 //! not cursor-relative: a backward miss can discard useful bytes ahead and pay
 //! to fetch them again. No guarantee of retaining the nearest ranges is implied.
@@ -22,7 +23,6 @@ pub const TRANSCODER_CAPACITY: usize = 2 * 1024 * 1024;
 const TIMEOUT: Duration = Duration::from_secs(30);
 struct Block {
     offset: u64,
-    start: usize,
     data: Vec<u8>,
 }
 #[derive(Default)]
@@ -134,7 +134,6 @@ impl ReadAhead {
                                     state.received += chunk.data.len() as u64;
                                     state.blocks.push_back(Block {
                                         offset: chunk.offset,
-                                        start: 0,
                                         data: chunk.data,
                                     });
                                 }
@@ -205,16 +204,17 @@ impl ReadAhead {
                 if let Some(error) = &state.error {
                     return Err(io::Error::other(error.clone()));
                 }
-                if let Some(index) = state.blocks.iter().position(|b| {
-                    b.offset + b.start as u64 <= pos && pos - b.offset < b.data.len() as u64
-                }) {
-                    let mut block = state.blocks.remove(index).unwrap();
+                if let Some(index) = state
+                    .blocks
+                    .iter()
+                    .position(|b| b.offset <= pos && pos - b.offset < b.data.len() as u64)
+                {
+                    let block = state.blocks.remove(index).unwrap();
                     state.bytes -= block.data.len();
                     let skip = (pos - block.offset) as usize;
                     let n = (len as usize - out.len()).min(block.data.len() - skip);
                     out.extend_from_slice(&block.data[skip..skip + n]);
                     if skip + n < block.data.len() {
-                        block.start = skip + n;
                         state.bytes += block.data.len();
                         state.blocks.insert(index, block);
                     }
@@ -341,6 +341,31 @@ mod tests {
         let generation = buffer.shared.state.lock().unwrap().generation;
         assert_eq!(bounded(&buffer, 10, 33).await, data(10, 33));
         assert_eq!(buffer.shared.state.lock().unwrap().generation, generation);
+    }
+    #[tokio::test]
+    async fn overlapping_demux_reads_reuse_retained_prefixes() {
+        let (buffer, _) = source(4 * CHUNK);
+        bounded(&buffer, 0, 4096).await;
+        let generation = buffer.shared.state.lock().unwrap().generation;
+        // Typefinding rereads the header, then scans with overlapping windows.
+        // Matroska also expands a short header read into a larger block read.
+        for (offset, len) in [
+            (0, 4096),
+            (4032, 4096),
+            (8064, 4096),
+            (8982, 65536),
+            (8982, 100000),
+        ] {
+            assert_eq!(
+                bounded(&buffer, offset, len).await,
+                data(offset, len as usize)
+            );
+            assert_eq!(
+                buffer.shared.state.lock().unwrap().generation,
+                generation,
+                "resident bytes at {offset}+{len} caused a network seek"
+            );
+        }
     }
     #[tokio::test]
     async fn demand_at_full_prefetch_boundary_reclaims_space_without_seeking() {

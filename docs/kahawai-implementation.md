@@ -128,9 +128,12 @@ These temporary buffers trade bounded RAM/speculative I/O for memory-speed
 hits; a miss costs a source seek and fresh bytes. Disjoint ranges survive
 seeks, with one eighth of capacity made available on a miss by dropping old
 retained ranges in insertion order (not by distance from the read cursor).
-Partially consumed blocks count their full allocation until released; the
-allowance bounds retained RAM, not just bytes still readable. This avoids
-repeated copies, but a backward miss can discard useful forward ranges and
+Partially consumed blocks count their full allocation until released, and
+their already-returned prefixes remain readable. Typefinding and demuxing
+repeat and overlap reads; hiding a retained prefix caused network seeks and
+discarded in-flight data despite those bytes still being resident. The
+allowance bounds retained RAM. This avoids repeated copies, but a backward
+miss can discard useful forward ranges and
 require another fetch. A demand at the current prefetch boundary also makes room
 for an incoming chunk, without restarting the upstream stream; buffered skips
 remain hits. Consumed blocks are released; speculative reading stops at
