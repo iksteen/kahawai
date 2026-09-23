@@ -81,7 +81,9 @@ How something works and why it was built that way belong in
       Finite and buffered sources have separate construction;
       run-owned grants revoke on teardown or cancelled startup. Protocol-4 peers
       are rejected, and minor feature gates are removed. Check with
-      `scripts/kahawai-playback.sh pull`.
+      `scripts/kahawai-playback.sh pull`. Out-of-band layout candidate scanning:
+      `scripts/kahawai-interleave.py` (see `docs/kahawai-interleave-scan.md`);
+      reports sustained audio/video byte separation for manual hub testing.
 
 ## Security & enrollment (SEC)
 
