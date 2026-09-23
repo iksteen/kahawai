@@ -70,24 +70,9 @@ impl FileReader {
 }
 
 pub async fn serve<F, Fut>(
-    requests: mpsc::Receiver<ReadRequest>,
-    chunks: mpsc::Sender<ByteChunk>,
-    size: u64,
-    read: F,
-) where
-    F: Fn(u64, usize) -> Fut,
-    Fut: Future<Output = Result<Vec<u8>>>,
-{
-    serve_batched(requests, chunks, size, CHUNK, read).await
-}
-
-/// Legacy request/reply peers need larger fetches to amortize network RTT.
-/// Delivery still uses bounded CHUNK messages, and commands interrupt either wait.
-pub async fn serve_batched<F, Fut>(
     mut requests: mpsc::Receiver<ReadRequest>,
     chunks: mpsc::Sender<ByteChunk>,
     size: u64,
-    batch: usize,
     read: F,
 ) where
     F: Fn(u64, usize) -> Fut,
@@ -96,10 +81,11 @@ pub async fn serve_batched<F, Fut>(
     let mut newest = 0;
     let mut request = requests.recv().await;
     while let Some(req) = request.take() {
-        if newest != 0 && req.generation <= newest {
+        if req.generation <= newest {
             let _ = chunks
                 .send(ByteChunk {
-                    error: "non-increasing source generation".into(),
+                    error: "zero or non-increasing source generation".into(),
+                    generation: req.generation,
                     ..Default::default()
                 })
                 .await;
@@ -110,7 +96,7 @@ pub async fn serve_batched<F, Fut>(
             let mut offset = req.offset.min(size);
             let end = req.offset.saturating_add(req.len).min(size);
             while offset < end {
-                let want = (end - offset).min(batch as u64) as usize;
+                let want = (end - offset).min(CHUNK as u64) as usize;
                 let result = read(offset, want).await;
                 let data = match result {
                     Ok(data) if data.len() == want => data,
@@ -161,6 +147,41 @@ pub async fn serve_batched<F, Fut>(
             _ = chunks.closed() => return,
             next = requests.recv() => request = next,
             _ = transfer => request = requests.recv().await,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn zero_and_repeated_generations_are_rejected_before_io() {
+        for generations in [vec![0], vec![1, 1], vec![2, 1]] {
+            let (tx, rx) = mpsc::channel(2);
+            let (chunks, mut received) = mpsc::channel(2);
+            let server = tokio::spawn(serve(rx, chunks, 0, |_, _| async {
+                panic!("an empty source must not perform IO");
+                #[allow(unreachable_code)]
+                Ok(Vec::new())
+            }));
+            for (n, generation) in generations.iter().copied().enumerate() {
+                tx.send(ReadRequest {
+                    generation,
+                    offset: 0,
+                    len: 1,
+                })
+                .await
+                .unwrap();
+                let chunk = received.recv().await.unwrap();
+                if n + 1 == generations.len() {
+                    assert!(chunk.error.contains("generation"));
+                } else {
+                    assert!(chunk.eof);
+                    assert_eq!(chunk.generation, generation);
+                }
+            }
+            server.await.unwrap();
         }
     }
 }

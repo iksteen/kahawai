@@ -70,11 +70,12 @@ How something works and why it was built that way belong in
       passed on a box where every HDR session died at negotiation.
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified).
-      Protocol 4.6 adds a separate transcoder source connection, interruptible
+      Protocol 5 requires a separate transcoder source connection, interruptible
       generation-tagged reads, 16 MiB hub / 2 MiB transcoder read-ahead, and
       true pull appsrc. Disconnected transcoder byte channels resume from the
       delivered offset with peer-bound single-reader grants; malformed commands
-      return explicit errors. Older peers retain finite requests; check with
+      return explicit errors. Protocol-4 peers
+      are rejected, and minor feature gates are removed. Check with
       `scripts/kahawai-playback.sh pull`.
 
 ## Security & enrollment (SEC)
@@ -902,11 +903,11 @@ How something works and why it was built that way belong in
       audit, reasoning in implementation §10. The one deletion is
       unreachability, not quota: resized artwork whose size left the code
       list, or whose original is gone, dropped at startup.
-- [x] OPS-7 Cross-version satellite compatibility: protocol gated on major
-      version (Hello/HelloAck). Protocol 4 is a coordinated authority cutover:
-      protocol-3 peers are refused with both versions and an upgrade
-      instruction. A full mediahost rescan is explicitly accepted; hub-owned
-      user state survives while the physical projection is replaced.
+- [x] OPS-7 Satellite protocol gated on major version (Hello/HelloAck).
+      Protocol 5 is a coordinated fleet cutover: protocol-4 peers are refused
+      with both versions and an upgrade instruction. Minor is informational;
+      all current wire features are mandatory. No persisted-data migration is
+      required by this cutover; hub-owned state and caches survive.
 - [x] OPS-8 Reverse-proxy support: trusted_proxies (exact IPs and CIDR
       ranges — docker/traefik bridges) gate X-Forwarded-For for OPS-2
       throttling (rightmost-untrusted, spoof-safe), configurable CORS

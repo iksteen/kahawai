@@ -283,15 +283,7 @@ impl Sessions {
                     )
                 })
                 .unwrap_or_default();
-            let executor_protocol = match &session.mode {
-                Mode::Transcode { transcoder } => {
-                    let tc = transcoder.lock().unwrap().clone();
-                    registry
-                        .transcoder_protocol_features(&tc)
-                        .unwrap_or_default()
-                }
-                _ => kahawai_proto::ProtocolFeatures::current(),
-            };
+
             let force_measurement = if session.force_loudness && session.parts.len() == 1 {
                 session.parts[0]
                     .file_id
@@ -341,7 +333,7 @@ impl Sessions {
                     force_audio_encode,
                 )
             };
-            let mut sp = negotiate(force_measurement.is_some());
+            let sp = negotiate(force_measurement.is_some());
             plan = sp.plan;
             fill_audio_loudness_gains(
                 registry,
@@ -351,31 +343,7 @@ impl Sessions {
                 force_measurement.clone(),
             )
             .await?;
-            if loudness_protocol_feature(&plan)
-                .is_some_and(|feature| !executor_protocol.supports(feature))
-            {
-                // A track switch cannot move the session to a newer worker.
-                // Drop a force-only encode rather than paying for unity gain;
-                // an already-required encode remains playable without the
-                // optional normalization fields its worker cannot understand.
-                if force_measurement.is_some() {
-                    sp = negotiate(false);
-                    plan = sp.plan;
-                    fill_audio_loudness_gains(
-                        registry,
-                        &session.parts,
-                        &mut plan,
-                        session.loudness,
-                        force_measurement,
-                    )
-                    .await?;
-                }
-                if loudness_protocol_feature(&plan)
-                    .is_some_and(|feature| !executor_protocol.supports(feature))
-                {
-                    apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
-                }
-            }
+
             let verdict = replanned_verdict(&plan, &sp.video_verdict, &sp.audio_verdict)?;
             let mut subs = sp.subtitles;
             fill_verdict_track_ids(registry, &session.parts, &mut subs).await;

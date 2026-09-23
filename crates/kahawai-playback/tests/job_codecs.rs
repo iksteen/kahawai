@@ -11,7 +11,7 @@ use kahawai_media::loudness::{AudioLayout, AudioLayoutGain, MAX_LAYOUT_GAINS};
 use kahawai_media::remux::{AudioTarget, RemuxPlan, SegmentFormat, StreamMode, VideoTarget};
 use kahawai_playback::job::{ArgvLayout, Job, Payload};
 use kahawai_playback::worker::WorkerArgs;
-use kahawai_proto::v1::StartSession;
+use kahawai_proto::v1::{SourceDescriptor, StartSession};
 
 /// The command line as the binaries declare it: a hidden subcommand
 /// carrying `WorkerArgs`.
@@ -274,10 +274,9 @@ fn sockets_and_parts_must_line_up() {
 #[test]
 fn wire_round_trips_a_full_plan() {
     let job = full_job();
-    let msg = job.to_start_session("s1").unwrap();
+    let msg = job.to_start_session("s1", &descriptors()).unwrap();
     assert_eq!(msg.session_id, "s1");
-    assert_eq!(msg.size, 100);
-    assert_eq!(msg.tail_sizes, vec![200]);
+    assert_eq!(msg.sources, descriptors());
     assert_eq!(msg.burn_subtitle, 4, "1-based on the wire");
     assert_eq!(msg.burn_ass, 1, "1-based on the wire");
     assert_eq!(msg.stereo_gain_db, Some(-2.5));
@@ -307,9 +306,13 @@ fn wire_round_trips_a_full_plan() {
 
 #[test]
 fn absent_optional_gains_stay_absent_after_decode() {
-    // Mirrors the proto crate's own presence test: an old hub sends no
-    // gain fields at all, and that must not read as unity gain.
-    let job = Job::from_start_session(&StartSession::default()).unwrap();
+    // No measurement must not read as unity gain.
+    let job = Job::from_start_session(&StartSession {
+        sources: descriptors(),
+        target_duration_secs: 6,
+        ..Default::default()
+    })
+    .unwrap();
     assert_eq!(job.plan.stereo_gain_db, None);
     assert_eq!(job.plan.native_gain_db, None);
     assert_eq!(job.plan.loudness_source_channels, None);
@@ -318,21 +321,18 @@ fn absent_optional_gains_stay_absent_after_decode() {
     assert_eq!(job.plan.burn_ass, None);
     assert_eq!(job.sink, None);
     assert_eq!(job.burn_sets, None);
-    assert_eq!(job.part_sizes, vec![0]);
 }
 
 #[test]
-fn nan_scalar_gain_means_absent_not_zero() {
+fn unmeasured_scalar_gains_stay_absent() {
     let mut job = full_job();
     job.plan.stereo_gain_db = None;
     job.plan.native_gain_db = None;
     job.plan.loudness_source_channels = None;
-    let msg = job.to_start_session("s").unwrap();
-    // Present on the wire, so a protocol-4 peer sees the field, but NaN so
-    // it cannot be mistaken for an exact 0 dB.
-    assert!(msg.stereo_gain_db.unwrap().is_nan());
-    assert!(msg.native_gain_db.unwrap().is_nan());
-    assert_eq!(msg.loudness_source_channels, Some(0));
+    let msg = job.to_start_session("s", &descriptors()).unwrap();
+    assert_eq!(msg.stereo_gain_db, None);
+    assert_eq!(msg.native_gain_db, None);
+    assert_eq!(msg.loudness_source_channels, None);
     let back = Job::from_start_session(&msg).unwrap();
     assert_eq!(back.plan.stereo_gain_db, None);
     assert_eq!(back.plan.native_gain_db, None);
@@ -340,22 +340,26 @@ fn nan_scalar_gain_means_absent_not_zero() {
 }
 
 #[test]
-fn zero_target_duration_means_unknown() {
+fn dispatch_requires_sources_tokens_and_target_duration() {
+    let mut message = full_job().to_start_session("s", &descriptors()).unwrap();
+    message.sources.clear();
+    assert!(Job::from_start_session(&message).is_err());
+    message.sources = descriptors();
+    message.sources[1].source_token.clear();
+    assert!(Job::from_start_session(&message).is_err());
+    message.sources = descriptors();
+    message.target_duration_secs = 0;
+    assert!(Job::from_start_session(&message).is_err());
     let mut job = full_job();
     job.target_duration_secs = None;
-    let msg = job.to_start_session("s").unwrap();
-    assert_eq!(msg.target_duration_secs, 0);
-    assert_eq!(
-        Job::from_start_session(&msg).unwrap().target_duration_secs,
-        None
-    );
+    assert!(job.to_start_session("s", &descriptors()).is_err());
 }
 
 #[test]
 fn an_exact_zero_db_gain_survives_both_codecs() {
     let mut job = full_job();
     job.plan.stereo_gain_db = Some(0.0);
-    let msg = job.to_start_session("s").unwrap();
+    let msg = job.to_start_session("s", &descriptors()).unwrap();
     assert_eq!(
         Job::from_start_session(&msg).unwrap().plan.stereo_gain_db,
         Some(0.0)
@@ -383,6 +387,19 @@ fn a_payload_held_as_a_file_is_read_onto_the_wire() {
     std::fs::write(&sets, [9, 8, 7]).unwrap();
     let mut job = full_job();
     job.burn_sets = Some(Payload::Path(sets));
-    let msg = job.to_start_session("s").unwrap();
+    let msg = job.to_start_session("s", &descriptors()).unwrap();
     assert_eq!(msg.burn_sets, vec![9, 8, 7]);
+}
+
+fn descriptors() -> Vec<SourceDescriptor> {
+    vec![
+        SourceDescriptor {
+            size: 100,
+            source_token: "part-a".into(),
+        },
+        SourceDescriptor {
+            size: 200,
+            source_token: "part-b".into(),
+        },
+    ]
 }

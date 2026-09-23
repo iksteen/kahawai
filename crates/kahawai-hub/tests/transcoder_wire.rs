@@ -129,7 +129,7 @@ async fn open_link(
 }
 
 #[tokio::test]
-async fn protocol_2_transcoder_is_rejected_during_hello() {
+async fn protocol_4_transcoder_is_rejected_during_hello() {
     let hub = spawn_hub().await;
     let id = enroll(&hub, "transcoder", "01OLDTC", "old-tc");
     let tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
@@ -140,7 +140,7 @@ async fn protocol_2_transcoder_is_rejected_during_hello() {
     let (tx, rx) = tokio::sync::mpsc::channel(1);
     tx.send(TcToHub {
         msg: Some(tc_to_hub::Msg::Hello(Hello {
-            protocol_major: 2,
+            protocol_major: 4,
             protocol_minor: 4,
             name: "old-tc".into(),
             build: String::new(),
@@ -386,11 +386,7 @@ async fn capacity_holds_when_placements_arrive_together() {
     // the fourth caller must be refused.
     for (id, max) in [("box-a", 2u32), ("box-b", 1)] {
         registry.connected(id, "transcoder", id, "fp", "build");
-        registry.register_tc_link(
-            id,
-            kahawai_proto::PROTOCOL_MINOR,
-            tokio::sync::mpsc::channel(1).0,
-        );
+        registry.register_tc_link(id, tokio::sync::mpsc::channel(1).0);
         registry.set_transcoder_caps(
             id,
             &CapabilityReport {

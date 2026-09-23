@@ -348,9 +348,7 @@ async fn link_loop(
                         // contract — a spawned end can outrun the new
                         // run's registration and kill it.
                         Some(hub_to_tc::Msg::EndSession(e)) => runner.end(&e.session_id).await,
-                        Some(hub_to_tc::Msg::SourceData(d)) => {
-                            runner.source_data(d.req, d.data);
-                        }
+
                         Some(hub_to_tc::Msg::ViewerPosition(v)) => {
                             runner.viewer_position(&v.session_id, v.position_ms);
                         }

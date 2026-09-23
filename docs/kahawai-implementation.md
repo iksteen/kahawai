@@ -120,7 +120,7 @@ Three gRPC services, all initiated module→hub (AR-3) over mTLS (the satellite'
 
 **Byte plane.** For a networked mediahost, bulk media bytes ride a separate gRPC connection: tonic byte-chunk streams over mTLS, with a one-time token minted on the control stream binding the channel to a specific read lease. The hard-won invariant (AR-12): **the byte plane MUST be a separate HTTP/2 connection from the control link**. HTTP/2 flow control is per-connection as well as per-stream: in early implementation, a single stalled lease stream (client paused, pipeline backpressured) exhausted the shared connection-level window and froze heartbeats for 40 s at a time, producing false disconnects and spurious failovers. Separate connections make a stalled lease stall only itself. The in-process mediahost takes neither connection: path resolution and file reads stay local as described in §2.
 
-**Pull and read-ahead (protocol 4.6).** Pipeline appsrc uses `RandomAccess`, byte
+**Pull and read-ahead (protocol 5.0).** Pipeline appsrc uses `RandomAccess`, byte
 format and a known size, and answers each demand exactly (short only at EOF).
 Its single feeder has no speculative ring; the hub holds at most 16 MiB of
 read-ahead per activated part and a remote transcoder holds another 2 MiB.
@@ -150,9 +150,9 @@ wait 200 ms, have a 10 s outage budget and bound connect/bind waits at 2 s each,
 within the existing 30 s demand deadline. Authorization and protocol errors are
 terminal, not retried. Ending or replacing a run revokes active channels and
 future rebinds. Malformed commands produce explicit status and peer diagnostics
-without exposing bearer tokens. Protocol-4.5 and older peers retain finite
-requests in either upgrade order; an old mediahost seek drains at most the
-current 4 MiB request. Regular HTTP ranges remain finite.
+without exposing bearer tokens. Protocol 5 rejects all protocol-4 peers; there
+are no minor feature gates or control-link byte reads. Regular HTTP ranges
+remain finite and use the same nonzero, increasing generation contract.
 
 The worker socket remains offset/length based. Cancelling a pull closes that
 connection, and the executor accepts a replacement, cancelling the old read.
@@ -532,9 +532,17 @@ State machine per session: `Negotiated → Provisioning → Streaming → (Seeki
 
 **Measured audio loudness normalisation (HUB-38).** A scalar native LUFS/true-peak pair cannot predict a downmix: output energy contains cross-channel correlation terms, post-matrix true peak depends on sample phase, and EBU relative gating must be rerun over the converted blocks. The owning mediahost therefore decodes each non-music stream once and tees it into bounded `audioconvert` + `ebur128` histogram branches for the untouched decoded layout and every smaller canonical layout playback may emit (7.1 variants, 5.1, stereo, mono). Measurements are keyed by exact `(channels, channel-mask)`, revision-guarded on the hub, target −18 LUFS, and cap measured true peak at −1 dBTP. Playback waits for the worker's actual post-conversion caps and selects only the matching static gain; it never derives one layout from another.
 
-The global preference has three states: the empty/default value applies gain only when negotiation already encodes audio, `off` suppresses it, and `force` asks negotiation to replace measured direct/copied audio with an encode. Force is admitted only for a single-part source, an exact measured output layout, a compatible audio encoder, and an unchanged video mode. The hub preflights its local AAC/Opus layout before replacing direct/copy; an unsupported layout retains the ordinary plan rather than paying for a no-op transcode. Protocol 4.0 includes exact per-layout loudness maps as baseline wire state: an executor may fold a nominal 7.1 source to 5.1, so source channel count cannot prove which scalar will apply. Default normalization re-probes against an exact-gain-capable worker but accepts the result only when the complete video path (codec, container, filters and subtitle burn) is unchanged. If no such worker can run the ordinary encode—or final ASS/capacity placement races the probe—placement retries the original plan without optional gain, so playback remains usable without normalization. Force likewise falls back to the ordinary plan rather than paying for a no-op encode. Explicit `mode=direct` remains original bytes.
+The global preference has three states: the empty/default value applies gain only when negotiation already encodes audio, `off` suppresses it, and `force` asks negotiation to replace measured direct/copied audio with an encode. Force is admitted only for a single-part source, an exact measured output layout, a compatible audio encoder, and an unchanged video mode. The hub preflights its local AAC/Opus layout before replacing direct/copy; an unsupported layout retains the ordinary plan rather than paying for a no-op transcode. Protocol 5 includes exact per-layout loudness maps on every executor: a worker
+may fold a nominal 7.1 source to 5.1, so source channel count cannot prove which
+scalar will apply. There is no protocol-specific replanning or gain suppression.
+Force still requires a usable measurement and codec/layout support; missing
+measurements retain the ordinary plan. Explicit `mode=direct` remains original
+bytes.
 
-Protocol thresholds live in `kahawai_proto::ProtocolFeature`; every feature inherited by the breaking 4.0 cutover has minimum minor zero, while future additive features can acquire a later threshold. Planners and registries carry a typed required feature rather than comparing minor numbers. The exact-gain requirement is repeated on the final `PlacementNeed`, not only the earlier capability probe, because load/pace may choose a different box between planning and reservation. Track switches cannot move an existing session, so they likewise suppress unsupported normalization and undo a force-only encode. Scalar wire fields use protobuf presence, and explicit NaN/zero sentinels preserve absence through the worker argv boundary.
+Protocol 5 has one baseline with no minor feature thresholds. Placement uses
+reported hardware capabilities, load and measured throughput. Empty decoder
+inventories are not assumed capable. Scalar wire fields use protobuf presence:
+absent means unmeasured and an explicit zero remains an exact 0 dB gain.
 
 Rebuild cost is one source-local full audio decode plus one conversion/meter branch per bounded output layout. That is deliberately more CPU than the former native+stereo pair, paid once in background, because retaining enough covariance and oversampled phase history to derive arbitrary LUFS and true peak would approach decoded-signal storage. Point-of-use cost remains one indexed lookup and one fixed `volume` multiplier; no rolling normalizer changes programme dynamics.
 
@@ -681,7 +689,7 @@ Viewer byte leases hold an interactive CPU reservation until they close, for bot
 
 FIFO and the existing useful order (for example movies then newest first for loudness) apply only within a scheduled type. Admission stays work-conserving while a higher job is blocked by some other resource; when that blocker clears, any newly conflicting lower job is interrupted at its next checkpoint. Jobs blocked by an interactive reservation do not preempt work they cannot yet replace. ED2K checks every hash chunk, sequential subtitle demux every bus cycle, scans within directory walks and stat batches, byte reads every 256 KiB, and loudness/season analysis at decoder callbacks. The permit follows spawned blocking work, so aborting its async waiter cannot accidentally admit a conflicting replacement while the old thread still reads. There is no second activity flag or special loudness-versus-segments rule.
 
-Protocol 4.1 adds lossy exact-source demand hints. Starting playback sends a 15-minute segment hint and returning up-next sends a 30-minute hint; a queued matching season is immediately reclassified as demand, the hint expires rather than becoming durable policy, and disconnect removes that hub's hints and requester-owned work. Protocol-4.0 peers continue without hints. Hints change only admission priority: the mediahost still groups a season, selects sources, owns revision claims and commits one result for every hub.
+Protocol 4.1 adds lossy exact-source demand hints. Starting playback sends a 15-minute segment hint and returning up-next sends a 30-minute hint; a queued matching season is immediately reclassified as demand, the hint expires rather than becoming durable policy, and disconnect removes that hub's hints and requester-owned work. Hints change only admission priority: the mediahost still groups a season, selects sources, owns revision claims and commits one result for every hub.
 
 Missing attachment/chapter declarations, keyframe bounds and video geometry enter bounded local exact-source retry lists (64 sparse reads, or 8 geometry probes, at a time); a retryable I/O-weather failure explicitly releases its still-running local claim, while a stored measured-unknown or terminal answer settles that revision. Every running claim captures the catalogue source version, not only size/mtime, so replacement bytes with preserved timestamps cannot accept an old worker result. The scheduler never overwrites a running claim on a timer: worker completion or process restart releases it, preventing a late answer from attaching to replacement bytes. A stale-revision result is discarded, but a SQLite/I/O failure while committing a current result is retried in the process-local fact sink until it lands. Segment work stays one season at a time; after exhausting viable cohorts it waits for the completed scan generation to change instead of reparsing the whole library every 15 seconds. Discovery counts are computed once process-wide and shared by every link. Urgent subtitle/image extraction remains hub-initiated because its result is hub cache state tied to a viewer or hub policy. All runners keep control-link intake and heartbeats independent of blocking file work.
 
@@ -1047,19 +1055,17 @@ daemon links it, it may depend on `kahawai-core`, `kahawai-media`,
 the OCR engine; `tests/boundaries.rs` reads its manifest and
 `scripts/kahawai-playback.sh lean` walks the daemon's resolved graph.
 
-* `job` — one pipeline run, fully specified (TC-3): the `RemuxPlan` plus
-  part sizes, start offset, sink override, burn payloads and the playlist's
-  declared target duration. It is spelled three ways and nowhere else:
-  `remux-worker` argv (`to_argv` / `from_args`), `StartSession`
-  (`to_start_session` / `from_start_session`) and the in-process call.
-  Round-trip tests hold the directions together. The wire conventions —
-  NaN for a present-but-unmeasured scalar gain, 1-based burn indexes,
-  0 = unknown target duration — are documented on the module.
+* `job` — one pipeline run (TC-3): the `RemuxPlan`, part sizes, start
+  offset, sink override, burn payloads and declared target duration. The wire
+  codec pairs each part size with its mandatory source grant. Worker argv
+  still pairs the job's sizes with the supervisor's ordered socket list.
+  Round-trip tests cover both codecs. Gains use protobuf presence; dispatch
+  requires a positive target duration.
 * `executor` — the supervised run (§1.1, TC-4, TC-5): a fresh
   `<scratch>/<session>/r<N>` directory per run, one Unix socket per part
   under a short `/tmp/kahawai-XXXX` (SUN_LEN), the 16-byte read protocol
   served from an async `ByteSource` the caller implements (a lease on the
-  hub, a link round trip on a transcoder), the worker spawned with stdout
+  hub, a 2 MiB read-ahead buffer on a transcoder), the worker spawned with stdout
   AND stderr captured or the pipeline started in-process for tests, and a
   readiness wait on the playlist's runway. `Run` exposes the directory,
   the viewer position, pace harvesting, a `died` watch and an orderly
@@ -1067,9 +1073,9 @@ the OCR engine; `tests/boundaries.rs` reads its manifest and
   the worker is gone. The module doc is the reference for what each file
   in a run directory means.
 * `playlist` — the readiness runway: three declared target durations,
-  floored at 6.5 s and capped at 30 s, ENDLIST always ready. Protocol 4.5
-  carries the declaration to transcoders (`StartSession.target_duration_secs`)
-  so their runway follows the hub's; older transcoders keep the flat floor.
+  floored at 6.5 s and capped at 30 s, ENDLIST always ready. Dispatch requires
+  `StartSession.target_duration_secs`, so every transcoder follows the hub's
+  declaration.
 * `bundle` — the OPS-10 diagnostics text for a run directory, one shape for
   both sides of the transcoder link, first-segment SPS/PPS/IDR check
   included.

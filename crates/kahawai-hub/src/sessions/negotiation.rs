@@ -62,21 +62,6 @@ pub(super) async fn fill_audio_loudness_gains(
     apply_audio_loudness_measurement(plan, preference, measured);
     Ok(())
 }
-pub(super) fn same_video_path(
-    left: &kahawai_media::remux::RemuxPlan,
-    right: &kahawai_media::remux::RemuxPlan,
-) -> bool {
-    left.video == right.video
-        && left.video_track == right.video_track
-        && left.video_kbps == right.video_kbps
-        && left.max_height == right.max_height
-        && left.tone_map == right.tone_map
-        && left.deinterlace == right.deinterlace
-        && left.burn_subtitle == right.burn_subtitle
-        && left.burn_ass == right.burn_ass
-        && left.video_codec == right.video_codec
-        && left.segment_format == right.segment_format
-}
 
 pub(super) fn replanned_verdict(
     plan: &kahawai_media::remux::RemuxPlan,
@@ -85,15 +70,6 @@ pub(super) fn replanned_verdict(
 ) -> Result<(String, String)> {
     anyhow::ensure!(plan.playable(), "selected track is not playable");
     Ok((video_verdict.to_owned(), audio_verdict.to_owned()))
-}
-
-pub(super) fn loudness_protocol_feature(
-    plan: &kahawai_media::remux::RemuxPlan,
-) -> Option<kahawai_proto::ProtocolFeature> {
-    plan.loudness_gains
-        .iter()
-        .any(Option::is_some)
-        .then_some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains)
 }
 
 pub(super) fn placement_need(
@@ -122,10 +98,6 @@ pub(super) fn placement_need(
         audio_caps: kahawai_media::remux::source_caps_names("audio", info),
         needs_tonemap: plan.tone_map,
         needs_ass_burn: burns_ass,
-        // Audio-only sessions stay local (`Registry::place`), while a session
-        // already bound to a full transcoder remains remote even if a track
-        // switch changes video to copy. Preserve the feature for failover.
-        required_protocol_feature: loudness_protocol_feature(plan),
         video_codec: if plan.video == StreamMode::Encode {
             plan.video_codec.as_str().to_string()
         } else {
@@ -163,8 +135,6 @@ pub(crate) struct ExecutorFacts {
     pub full_audio_targets: Vec<String>,
     /// Audio targets of the hub's lightweight local worker.
     pub local_audio_targets: Vec<String>,
-    /// Additive protocol features understood by the selected full executor.
-    pub full_protocol: kahawai_proto::ProtocolFeatures,
     /// HUB-32b: this source's display-set timeline is readable where
     /// the encode would run.
     pub burn_capable: bool,
@@ -397,7 +367,6 @@ impl<'a> Negotiation<'a> {
         &self,
         info: &kahawai_core::media::MediaInfo,
         burn_capable: bool,
-        required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
     ) -> ExecutorFacts {
         // HUB-15a: would the box that runs a video encode of THIS
         // source tone-map? Same placement question the real dispatch
@@ -410,11 +379,6 @@ impl<'a> Negotiation<'a> {
             video_caps: kahawai_media::remux::source_caps_names("video", info),
             audio_caps: vec![],
             needs_tonemap: true,
-            // Gain fields are additive on the wire but cannot degrade to an
-            // old worker silently ignoring normalization. The ordinary probe
-            // stays broad and is repeated with the exact required feature only
-            // after the plan proves it needs gain.
-            required_protocol_feature,
             // Not yet known here: the probe runs before the plan picks
             // a subtitle tier, and asking for the burn would narrow the
             // pool that DECIDES it.
@@ -432,7 +396,7 @@ impl<'a> Negotiation<'a> {
             source_kbps: None,
         };
         let local_audio_targets = local_audio_encoder_names();
-        let (tonemap, video_targets, full_audio_targets, full_protocol) =
+        let (tonemap, video_targets, full_audio_targets) =
             match self.registry.pick_transcoder(&need) {
                 Some(tc) => {
                     let targets = self.registry.transcoder_encoders(&tc);
@@ -440,24 +404,19 @@ impl<'a> Negotiation<'a> {
                         self.registry.transcoder_reports_tonemap(&tc),
                         video_encoder_names(&targets),
                         audio_encoder_names(&targets),
-                        self.registry
-                            .transcoder_protocol_features(&tc)
-                            .unwrap_or_default(),
                     )
                 }
                 None if self.registry.local_video_executor_enabled() => (
                     local_tonemap_available(self.registry),
                     local_video_encoder_names(self.registry),
                     local_audio_targets.clone(),
-                    kahawai_proto::ProtocolFeatures::current(),
                 ),
-                None => (false, Vec::new(), Vec::new(), Default::default()),
+                None => (false, Vec::new(), Vec::new()),
             };
         ExecutorFacts {
             tonemap,
             video_targets,
             full_audio_targets,
-            full_protocol,
             local_audio_targets,
             burn_capable,
         }
@@ -527,9 +486,9 @@ impl<'a> Negotiation<'a> {
         kahawai_media::negotiate::SourcePlan,
         kahawai_media::negotiate::SourcePlan,
     ) {
-        let ordinary_facts = self.probe(info, burn_capable, None);
+        let ordinary_facts = self.probe(info, burn_capable);
         let ordinary = self.plan_with_force(parts, info, &ordinary_facts, false);
-        let Some(measurement) = measurement else {
+        let Some(_measurement) = measurement else {
             return (ordinary.clone(), ordinary);
         };
         let forced = self.plan_with_force(parts, info, &ordinary_facts, true);
@@ -541,39 +500,9 @@ impl<'a> Negotiation<'a> {
         let selected = if !usable_force(&forced) {
             ordinary.clone()
         } else {
-            let mut measured_plan = forced.plan;
-            apply_audio_loudness_measurement(
-                &mut measured_plan,
-                LoudnessPreference::Force,
-                Some(measurement.clone()),
-            );
-            let required = (measured_plan.video == kahawai_media::remux::StreamMode::Encode)
-                .then(|| loudness_protocol_feature(&measured_plan))
-                .flatten();
-            if required.is_none_or(|feature| ordinary_facts.full_protocol.supports(feature)) {
-                forced
-            } else {
-                let exact_facts = self.probe(info, burn_capable, required);
-                let exact = self.plan_with_force(parts, info, &exact_facts, true);
-                if usable_force(&exact) {
-                    exact
-                } else {
-                    ordinary.clone()
-                }
-            }
+            forced
         };
         (ordinary, selected)
-    }
-
-    pub(super) fn plan_for_protocol(
-        &self,
-        parts: &[PartSource],
-        info: &kahawai_core::media::MediaInfo,
-        burn_capable: bool,
-        required_protocol_feature: Option<kahawai_proto::ProtocolFeature>,
-    ) -> kahawai_media::negotiate::SourcePlan {
-        let facts = self.probe(info, burn_capable, required_protocol_feature);
-        self.plan_with_force(parts, info, &facts, false)
     }
 
     pub(super) fn plan_with_probe(

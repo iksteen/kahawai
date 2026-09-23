@@ -330,12 +330,7 @@ mod lease_purpose_tests {
             kahawai_mediadb::Store::in_memory().await.unwrap(),
         );
         let (tx, mut rx) = tokio::sync::mpsc::channel(4);
-        registry.register_link(
-            "01MH",
-            tx,
-            kahawai_proto::PROTOCOL_MINOR,
-            kahawai_core::segments::DETECTOR_GENERATION,
-        );
+        registry.register_link("01MH", tx, kahawai_core::segments::DETECTOR_GENERATION);
 
         let bytes = std::sync::Arc::new(ByteSources::new());
         // Nobody answers the OpenRead, so the lease never establishes; the

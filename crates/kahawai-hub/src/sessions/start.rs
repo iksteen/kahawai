@@ -270,7 +270,7 @@ impl Sessions {
         // No refusal to raise: the ladder is a permutation and flatten
         // is always possible, so `AssPolicy::choose` is total and a burn
         // is only ever planned when some box can perform it.
-        let mut burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
+        let burns_ass = sp.plan.burn_ass.is_some() || sp.burn_ass_sidecar.is_some();
         if sp.cost == kahawai_media::negotiate::Cost::Unplayable && mode != "direct" {
             // The verdict names the actual blocker — a client refusing
             // the encode target reads very differently from a fleet
@@ -281,7 +281,7 @@ impl Sessions {
                 sp.audio_verdict
             );
         }
-        let mut negotiated = sp;
+        let negotiated = sp;
         let mode = mode.as_str();
         if parts.len() > 1 && mode == "direct" {
             bail!("multi-part sources play via remux/transcode, not direct");
@@ -319,11 +319,6 @@ impl Sessions {
                 // The muxer stalls on unfed pads, so only claim what the
                 // plan will actually feed — the negotiated plan is the
                 // single source of truth with the pipeline's link logic.
-                let ordinary_negotiated = if neg.loudness.force() {
-                    neg.plan_for_protocol(&parts, &info, burn_capable, None)
-                } else {
-                    negotiated.clone()
-                };
                 let mut plan = negotiated.plan;
                 if !plan.playable() {
                     bail!(
@@ -340,38 +335,7 @@ impl Sessions {
                     neg.force_measurement.clone(),
                 )
                 .await?;
-                if !neg.loudness.force()
-                    && plan.video == kahawai_media::remux::StreamMode::Encode
-                    && let Some(required) = loudness_protocol_feature(&plan)
-                {
-                    let mut candidate =
-                        neg.plan_for_protocol(&parts, &info, burn_capable, Some(required));
-                    if !candidate.plan.playable()
-                        || candidate.incomplete != ordinary_negotiated.incomplete
-                        || candidate.plan.audio != plan.audio
-                        || !same_video_path(&candidate.plan, &plan)
-                        || candidate.burn_sidecar != ordinary_negotiated.burn_sidecar
-                        || candidate.burn_ass_sidecar != ordinary_negotiated.burn_ass_sidecar
-                    {
-                        // Default normalization is optional and must not alter
-                        // the video or subtitle path. If no exact-gain worker
-                        // can execute that path, preserve playback without gain.
-                        apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
-                    } else {
-                        fill_audio_loudness_gains(
-                            registry,
-                            &parts,
-                            &mut candidate.plan,
-                            neg.loudness,
-                            None,
-                        )
-                        .await?;
-                        plan = candidate.plan;
-                        burns_ass = candidate.plan.burn_ass.is_some()
-                            || candidate.burn_ass_sidecar.is_some();
-                        negotiated = candidate;
-                    }
-                }
+
                 verdict = Some((
                     negotiated.video_verdict.clone(),
                     negotiated.audio_verdict.clone(),
@@ -395,31 +359,8 @@ impl Sessions {
                         }
                     }
                 };
-                let mut placement = place(&session_needs);
-                if !placement.available && session_needs.required_protocol_feature.is_some() {
-                    // Capacity and hard constraints can change after the
-                    // compatible probe. Retry the exact ordinary plan with no
-                    // protocol requirement rather than turning that race into
-                    // a playback failure or a force-only unity-gain encode.
-                    negotiated = ordinary_negotiated;
-                    plan = negotiated.plan;
-                    apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
-                    burns_ass = plan.burn_ass.is_some() || negotiated.burn_ass_sidecar.is_some();
-                    verdict = Some((
-                        negotiated.video_verdict.clone(),
-                        negotiated.audio_verdict.clone(),
-                    ));
-                    session_plan = Some(plan);
-                    (session_needs, session_class) =
-                        placement_need(&plan, &info, &parts, burns_ass);
-                    placement = place(&session_needs);
-                }
-                anyhow::ensure!(
-                    plan.playable(),
-                    "no playable streams after loudness protocol fallback: {} · {}",
-                    negotiated.video_verdict,
-                    negotiated.audio_verdict
-                );
+                let placement = place(&session_needs);
+
                 anyhow::ensure!(
                     placement.available,
                     "video transcoding unavailable: no capable external transcoder or enabled all-in-one transcoder"

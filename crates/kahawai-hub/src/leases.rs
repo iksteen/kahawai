@@ -28,22 +28,16 @@ enum LeaseMode {
 struct LeaseInner {
     req_tx: mpsc::Sender<Result<ReadRequest, tonic::Status>>,
     mode: tokio::sync::Mutex<LeaseMode>,
-    streaming: bool,
+    generation: std::sync::atomic::AtomicU64,
 }
 #[derive(Clone)]
 pub struct Lease(Arc<LeaseInner>);
 impl Lease {
     pub fn diagnostics(&self) -> String {
-        let transport = if self.0.streaming {
-            "continuous"
-        } else {
-            "legacy-ranges"
-        };
-        let buffer = match self.0.mode.try_lock().as_deref() {
+        match self.0.mode.try_lock().as_deref() {
             Ok(LeaseMode::Buffered(buffer)) => buffer.diagnostics(),
             _ => "finite range read or not yet activated".into(),
-        };
-        format!("transport={transport} {buffer}")
+        }
     }
 
     pub async fn read_buffered(
@@ -59,35 +53,26 @@ impl Lease {
                 LeaseMode::Direct(receiver) => {
                     let chunks = receiver.take().expect("lease receiver already transferred");
                     let wire = self.0.req_tx.clone();
-                    let streaming = self.0.streaming;
-                    tracing::info!(
-                        streaming,
-                        capacity = HUB_CAPACITY,
-                        "hub source buffer opened"
-                    );
+                    tracing::info!(capacity = HUB_CAPACITY, "hub source buffer opened");
                     let buffer =
                         ReadAhead::new(size, HUB_CAPACITY, move |requests, output| async move {
-                            if streaming {
-                                let send = async {
-                                    let mut requests = requests;
-                                    while let Some(req) = requests.recv().await {
-                                        if wire.send(Ok(req)).await.is_err() {
-                                            break;
-                                        }
+                            let send = async {
+                                let mut requests = requests;
+                                while let Some(req) = requests.recv().await {
+                                    if wire.send(Ok(req)).await.is_err() {
+                                        break;
                                     }
-                                };
-                                let receive = async {
-                                    let mut chunks = chunks;
-                                    while let Some(chunk) = chunks.recv().await {
-                                        if output.send(chunk).await.is_err() {
-                                            break;
-                                        }
+                                }
+                            };
+                            let receive = async {
+                                let mut chunks = chunks;
+                                while let Some(chunk) = chunks.recv().await {
+                                    if output.send(chunk).await.is_err() {
+                                        break;
                                     }
-                                };
-                                tokio::select! { _ = send => {}, _ = receive => {} }
-                            } else {
-                                legacy_stream(wire, chunks, requests, output).await;
-                            }
+                                }
+                            };
+                            tokio::select! { _ = send => {}, _ = receive => {} }
                         });
                     *mode = LeaseMode::Buffered(buffer.clone());
                     buffer
@@ -143,13 +128,18 @@ impl Lease {
             let mut cur = offset;
             while cur < end {
                 let want = (end - cur).min(BLOCK);
+                let generation = lease
+                    .0
+                    .generation
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                    + 1;
                 if lease
                     .0
                     .req_tx
                     .send(Ok(ReadRequest {
                         offset: cur,
                         len: want,
-                        generation: 0,
+                        generation,
                     }))
                     .await
                     .is_err()
@@ -165,6 +155,12 @@ impl Lease {
                     match chunks.recv().await {
                         Some(c) if !c.error.is_empty() => {
                             let _ = tx.send(Err(std::io::Error::other(c.error))).await;
+                            return;
+                        }
+                        Some(c) if c.generation != generation => {
+                            let _ = tx
+                                .send(Err(std::io::Error::other("invalid range generation")))
+                                .await;
                             return;
                         }
                         Some(c) if c.eof => {
@@ -241,72 +237,8 @@ impl Lease {
         Lease(Arc::new(LeaseInner {
             req_tx,
             mode: tokio::sync::Mutex::new(LeaseMode::Direct(Some(chunk_rx))),
-            streaming: true,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }))
-    }
-}
-
-/// Older mediahosts cannot interrupt a send. Drain at most their current
-/// 4 MiB request, remembering the latest seek, then resume at its generation.
-async fn legacy_stream(
-    wire: mpsc::Sender<Result<ReadRequest, tonic::Status>>,
-    mut chunks: mpsc::Receiver<ByteChunk>,
-    mut commands: mpsc::Receiver<ReadRequest>,
-    output: mpsc::Sender<ByteChunk>,
-) {
-    let mut pending = commands.recv().await;
-    while let Some(req) = pending.take() {
-        let mut cur = req.offset;
-        let end = req.offset.saturating_add(req.len);
-        while cur < end {
-            let want = (end - cur).min(BLOCK);
-            if wire
-                .send(Ok(ReadRequest {
-                    offset: cur,
-                    len: want,
-                    generation: 0,
-                }))
-                .await
-                .is_err()
-            {
-                return;
-            }
-            let mut received = 0;
-            loop {
-                let mut chunk = tokio::select! {
-                    biased;
-                    command = commands.recv() => { match command { Some(c) => pending = Some(c), None => return }; continue; }
-                    chunk = chunks.recv() => match chunk { Some(c) => c, None => return },
-                };
-                let eof = chunk.eof;
-                let error = !chunk.error.is_empty();
-                if !eof {
-                    received += chunk.data.len() as u64;
-                }
-                chunk.generation = req.generation;
-                // Intermediate legacy EOFs delimit blocks, not the stream.
-                if pending.is_none() && (!eof || cur + received >= end || received < want) {
-                    tokio::select! {
-                        biased;
-                        command = commands.recv() => match command { Some(c) => pending = Some(c), None => return },
-                        result = output.send(chunk) => if result.is_err() { return; },
-                    }
-                }
-                if error {
-                    return;
-                }
-                if eof {
-                    break;
-                }
-            }
-            if pending.is_some() || received < want {
-                break;
-            }
-            cur += received;
-        }
-        if pending.is_none() {
-            pending = commands.recv().await;
-        }
     }
 }
 
@@ -341,14 +273,14 @@ impl Leases {
 
     /// Called by the ByteChannel service when a host connects with a token.
     /// Returns the wires the service should pump, or None for unknown tokens.
-    pub fn fulfill(&self, token: &str, streaming: bool) -> Option<LeaseWires> {
+    pub fn fulfill(&self, token: &str) -> Option<LeaseWires> {
         let waiter = self.pending.lock().unwrap().remove(token)?;
         let (req_tx, req_rx) = mpsc::channel(4);
         let (chunk_tx, chunk_rx) = mpsc::channel::<ByteChunk>(8);
         let lease = Lease(Arc::new(LeaseInner {
             req_tx,
             mode: tokio::sync::Mutex::new(LeaseMode::Direct(Some(chunk_rx))),
-            streaming,
+            generation: std::sync::atomic::AtomicU64::new(0),
         }));
         waiter.send(lease).ok()?;
         Some((ReceiverStream::new(req_rx), chunk_tx))
@@ -366,6 +298,51 @@ mod tests {
         fn drop(&mut self) {
             self.0.fetch_sub(1, Ordering::SeqCst);
         }
+    }
+
+    #[tokio::test]
+    async fn finite_requests_use_increasing_generations_across_ranges() {
+        use tokio_stream::StreamExt;
+        let (req_tx, mut requests) = mpsc::channel(2);
+        let (chunks, rx) = mpsc::channel(2);
+        let lease = Lease(Arc::new(LeaseInner {
+            req_tx,
+            mode: tokio::sync::Mutex::new(LeaseMode::Direct(Some(rx))),
+            generation: std::sync::atomic::AtomicU64::new(0),
+        }));
+        let server = tokio::spawn(async move {
+            for generation in 1..=3 {
+                let req = requests.recv().await.unwrap().unwrap();
+                assert_eq!(req.generation, generation);
+                chunks
+                    .send(ByteChunk {
+                        generation,
+                        offset: req.offset,
+                        data: vec![generation as u8],
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+                chunks
+                    .send(ByteChunk {
+                        generation,
+                        offset: req.offset + 1,
+                        eof: true,
+                        ..Default::default()
+                    })
+                    .await
+                    .unwrap();
+            }
+        });
+        for generation in 1..=3 {
+            let mut stream = lease.read_range(10, 1);
+            assert_eq!(
+                stream.next().await.unwrap().unwrap().as_ref(),
+                &[generation as u8]
+            );
+            assert!(stream.next().await.is_none());
+        }
+        server.await.unwrap();
     }
 
     #[tokio::test]
@@ -413,78 +390,6 @@ mod tests {
 mod streaming_tests {
     use super::*;
     use tokio::time::timeout;
-    fn expected(offset: u64, n: usize) -> Vec<u8> {
-        (offset..offset + n as u64)
-            .map(|v| (v % 251) as u8)
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn legacy_host_drains_only_current_block_before_serving_new_generation() {
-        let size = 40 * 1024 * 1024;
-        let (wire, mut requests) = mpsc::channel::<Result<ReadRequest, tonic::Status>>(2);
-        let (tx, chunks) = mpsc::channel(2);
-        let old_host = tokio::spawn(async move {
-            while let Some(Ok(req)) = requests.recv().await {
-                assert_eq!(req.generation, 0);
-                assert!(req.len <= BLOCK);
-                let mut offset = req.offset;
-                let end = req.offset.saturating_add(req.len).min(size);
-                while offset < end {
-                    let len = (end - offset).min(source_stream::CHUNK as u64) as usize;
-                    if tx
-                        .send(ByteChunk {
-                            offset,
-                            data: expected(offset, len),
-                            ..Default::default()
-                        })
-                        .await
-                        .is_err()
-                    {
-                        return;
-                    }
-                    offset += len as u64;
-                }
-                if tx
-                    .send(ByteChunk {
-                        offset,
-                        eof: true,
-                        ..Default::default()
-                    })
-                    .await
-                    .is_err()
-                {
-                    return;
-                }
-            }
-        });
-        let lease = Lease(Arc::new(LeaseInner {
-            req_tx: wire,
-            mode: tokio::sync::Mutex::new(LeaseMode::Direct(Some(chunks))),
-            streaming: false,
-        }));
-        assert_eq!(
-            lease.read_buffered(0, 1, size).await.unwrap(),
-            expected(0, 1)
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-        for offset in [30 * 1024 * 1024 + 17, 33, size - 5] {
-            let data = timeout(
-                Duration::from_secs(3),
-                lease.read_buffered(offset, 4096, size),
-            )
-            .await
-            .expect("legacy seek stalled")
-            .unwrap();
-            assert_eq!(data, expected(offset, (size - offset).min(4096) as usize));
-        }
-        drop(lease);
-        timeout(Duration::from_secs(1), old_host)
-            .await
-            .unwrap()
-            .unwrap();
-    }
-
     #[tokio::test]
     async fn local_lease_seeks_after_full_buffer_and_surfaces_truncation() {
         let dir = tempfile::tempdir().unwrap();

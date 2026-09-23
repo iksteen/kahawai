@@ -13,9 +13,11 @@ case "${1:-check}" in
     pull)
         export KAHAWAI_MEDIA_TEST_STRICT=1
         # Exact pull requests, distant demux offsets, bounded transport,
-        # legacy peers, real mTLS remux/transcode, and the supervised worker.
+        # protocol-5 descriptors, real mTLS remux/transcode, and the supervised worker.
         cargo test -p kahawai-media --lib remux:: -- --test-threads=1 --nocapture
-        cargo test -p kahawai-transport --lib read_ahead::
+        cargo test -p kahawai-transport --lib
+        cargo test -p kahawai-playback --test job_codecs
+        cargo test -p kahawai-hub --test link_wire --test transcoder_wire
         cargo test -p kahawai-transcoder --lib stream_rate
         cargo test -p kahawai-transcoder --lib source_
         cargo test -p kahawai-hub --lib source_

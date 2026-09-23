@@ -145,7 +145,7 @@ impl TranscoderLink for TranscoderLinkService {
         // Sender first, then "present" — the same reason as the mediahost link:
         // the renewal settlement below is DB work, and a box announced as
         // present without a way to reach it is a placement target that fails.
-        registry.register_tc_link(&module_id, hello.protocol_minor, tx.clone());
+        registry.register_tc_link(&module_id, tx.clone());
         registry.connected(
             &module_id,
             &peer.module_type,
@@ -346,24 +346,7 @@ impl TranscoderLink for TranscoderLinkService {
                                 });
                             }
                         }
-                        tc_to_hub::Msg::SourceRead(r) => {
-                            let sessions = sessions.clone();
-                            let registry = registry.clone();
-                            let module_id = module_id.clone();
-                            tokio::spawn(async move {
-                                sessions
-                                    .source_read(
-                                        &registry,
-                                        &module_id,
-                                        &r.session_id,
-                                        r.offset,
-                                        r.len,
-                                        r.req,
-                                        r.part,
-                                    )
-                                    .await;
-                            });
-                        }
+
                         tc_to_hub::Msg::ArtifactData(d) => sessions.artifact_chunk(d),
                         tc_to_hub::Msg::Hello(_) | tc_to_hub::Msg::Heartbeat(_) => {}
                     },

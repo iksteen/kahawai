@@ -184,7 +184,6 @@ pub async fn serve_lease_scheduled(
     // seconds for a byte channel whose failure never reached it.
     tx.send(ByteChunk {
         lease_token,
-        continuous_reads: true,
         error: opened
             .as_ref()
             .err()

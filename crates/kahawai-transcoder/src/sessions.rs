@@ -1,8 +1,8 @@
 //! Dispatched session execution (§6, TC-3..5): each session runs on the
 //! same supervised executor the hub uses locally
 //! (`kahawai_playback::executor`), fed over its Unix socket by a byte
-//! source with bounded read-ahead on a separate byte connection. Protocol-4.5
-//! and older hubs retain finite reads over their legacy control link.
+//! source with bounded read-ahead on a dedicated byte connection and
+//! mandatory per-part source grants.
 //! Artifacts (playlist/segments) are read from the run directory and
 //! streamed back on request; the run's diagnostics bundle goes back at
 //! session end and whenever the hub asks (OPS-10).
@@ -16,16 +16,14 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kahawai_playback::executor::{BoxFuture, ByteSource, Death, Executor, Run};
-use kahawai_playback::job::Job;
 use kahawai_proto::v1::{
     ArtifactData, PaceReport, PaceSample, SessionError, SessionFact, SessionReady, StartSession,
     TcToHub, tc_to_hub,
 };
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
 
 const ARTIFACT_CHUNK: usize = 256 * 1024;
 
@@ -38,11 +36,6 @@ const LINK_MIN_READ: usize = 1024 * 1024;
 /// single read races against whatever else shares the wire; the rate
 /// should drift toward the sustained truth rather than chase spikes.
 const LINK_ALPHA: f64 = 0.2;
-
-/// How long one source read may wait on the hub before the worker is
-/// told the bytes are not coming. If the hub dropped the read (lease
-/// gone, session torn down) the worker must error out, not hang.
-const READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
 /// Sample continuous arrivals only. After consumer backpressure, discard
 /// queued arrivals until a receive actually waits, then use its completion
@@ -76,13 +69,7 @@ impl StreamRateSample {
 }
 
 /// The link as a byte plane: shared by every part of every session.
-struct LinkReads {
-    link: mpsc::Sender<TcToHub>,
-    /// In-flight source reads keyed by request id — NEVER by session:
-    /// seek-restarts reuse the session id, and a stale response from the
-    /// previous worker must not satisfy the new worker's read.
-    pending: Mutex<HashMap<u64, oneshot::Sender<Vec<u8>>>>,
-    next_req: AtomicU64,
+struct LinkRate {
     /// Bytes/sec the source plane sustains, EWMA over LARGE reads only
     /// (see `LINK_MIN_READ`). None until one is seen — a box that has
     /// only ever served small reads has no measured bandwidth, which is
@@ -90,7 +77,7 @@ struct LinkReads {
     link_rate: Mutex<Option<f64>>,
 }
 
-impl LinkReads {
+impl LinkRate {
     /// Fold one completed source read into the link-rate EWMA. Small
     /// reads are ignored (see `LINK_MIN_READ`).
     fn fold_link_rate(&self, bytes: usize, elapsed: std::time::Duration) {
@@ -106,84 +93,13 @@ impl LinkReads {
     }
 }
 
-/// One part of one session, read through the hub.
-struct LinkByteSource {
-    reads: Arc<LinkReads>,
-    session_id: String,
-    part: u32,
-    size: u64,
-}
-
-impl ByteSource for LinkByteSource {
-    fn size(&self) -> u64 {
-        self.size
-    }
-
-    fn read(&self, offset: u64, len: u64) -> BoxFuture<'_, std::io::Result<Vec<u8>>> {
-        Box::pin(async move {
-            let req_id = self.reads.next_req.fetch_add(1, Ordering::Relaxed);
-            let (tx, rx) = oneshot::channel();
-            self.reads.pending.lock().unwrap().insert(req_id, tx);
-            struct Pending<'a>(&'a LinkReads, u64);
-            impl Drop for Pending<'_> {
-                fn drop(&mut self) {
-                    self.0.pending.lock().unwrap().remove(&self.1);
-                }
-            }
-            let _pending = Pending(&self.reads, req_id);
-            let sent = self
-                .reads
-                .link
-                .send(TcToHub {
-                    msg: Some(tc_to_hub::Msg::SourceRead(kahawai_proto::v1::SourceRead {
-                        session_id: self.session_id.clone(),
-                        offset,
-                        len,
-                        req: req_id,
-                        part: self.part,
-                    })),
-                })
-                .await;
-            if sent.is_err() {
-                self.reads.pending.lock().unwrap().remove(&req_id);
-                return Err(std::io::Error::other("link closed"));
-            }
-            let started = std::time::Instant::now();
-            match tokio::time::timeout(READ_TIMEOUT, rx).await {
-                Ok(Ok(data)) => {
-                    // Timed at the LEASE round trip, not the local write:
-                    // this is what the source plane sustains for this box
-                    // (HUB-36).
-                    self.reads.fold_link_rate(data.len(), started.elapsed());
-                    Ok(data)
-                }
-                Ok(Err(_)) | Err(_) => {
-                    self.reads.pending.lock().unwrap().remove(&req_id);
-                    Err(std::io::Error::other(format!(
-                        "source read {req_id} unanswered"
-                    )))
-                }
-            }
-        })
-    }
-}
-
 struct BufferedSource {
     buffer: kahawai_transport::read_ahead::ReadAhead,
     size: u64,
-    continuous: bool,
 }
 impl ByteSource for BufferedSource {
     fn diagnostics(&self) -> String {
-        format!(
-            "transport={} {}",
-            if self.continuous {
-                "continuous"
-            } else {
-                "legacy-ranges"
-            },
-            self.buffer.diagnostics()
-        )
+        self.buffer.diagnostics()
     }
     fn size(&self) -> u64 {
         self.size
@@ -219,7 +135,7 @@ async fn stream_source(
     token: String,
     requests: mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
     chunks: mpsc::Sender<kahawai_proto::v1::ByteChunk>,
-    rates: Arc<LinkReads>,
+    rates: Arc<LinkRate>,
 ) -> anyhow::Result<()> {
     stream_source_with(
         || kahawai_transport::tls::grpc_channel_with(address, tls.clone()),
@@ -236,7 +152,7 @@ async fn stream_source_with<F, Fut>(
     token: String,
     mut requests: mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
     chunks: mpsc::Sender<kahawai_proto::v1::ByteChunk>,
-    rates: Arc<LinkReads>,
+    rates: Arc<LinkRate>,
 ) -> anyhow::Result<()>
 where
     F: FnMut() -> Fut,
@@ -299,7 +215,7 @@ async fn source_attempt(
     token: &str,
     requests: &mut mpsc::Receiver<kahawai_proto::v1::ReadRequest>,
     chunks: &mpsc::Sender<kahawai_proto::v1::ByteChunk>,
-    rates: &LinkReads,
+    rates: &LinkRate,
     resume: &Mutex<SourceResume>,
 ) -> anyhow::Result<()> {
     use kahawai_proto::v1::{SourceCommand, transcoder_link_client::TranscoderLinkClient};
@@ -423,7 +339,7 @@ pub struct Runner {
     executor: Executor,
     source_endpoint: Mutex<Option<(String, Arc<rustls::ClientConfig>)>>,
     link: mpsc::Sender<TcToHub>,
-    reads: Arc<LinkReads>,
+    reads: Arc<LinkRate>,
     sessions: Mutex<HashMap<String, Session>>,
     generations: Mutex<HashMap<String, Generations>>,
     /// Start admission. A start registers in `sessions` only once its
@@ -458,11 +374,9 @@ impl Runner {
             // and the executor sweeps it.
             executor: Executor::new(scratch_root, worker_exe),
             source_endpoint: Mutex::new(None),
-            link: link.clone(),
-            reads: Arc::new(LinkReads {
-                link,
-                pending: Mutex::new(HashMap::new()),
-                next_req: AtomicU64::new(1),
+
+            link,
+            reads: Arc::new(LinkRate {
                 link_rate: Mutex::new(None),
             }),
             sessions: Mutex::new(HashMap::new()),
@@ -504,7 +418,7 @@ impl Runner {
 
     async fn start_inner(self: &Arc<Self>, msg: StartSession) {
         let session_id = msg.session_id.clone();
-        let job = match Job::from_start_session(&msg) {
+        let job = match kahawai_playback::job::Job::from_start_session(&msg) {
             Ok(job) => job,
             Err(e) => {
                 let _ = self
@@ -514,17 +428,7 @@ impl Runner {
                 return;
             }
         };
-        if !msg.source_tokens.is_empty() && msg.source_tokens.len() != job.part_sizes.len() {
-            let _ = self
-                .link
-                .send(session_error(
-                    &session_id,
-                    "source token count does not match parts".into(),
-                    String::new(),
-                ))
-                .await;
-            return;
-        }
+
         // Replace any previous run first (seek-restart reuses the id),
         // then take the generation that outlives that end.
         self.end(&session_id).await;
@@ -535,55 +439,40 @@ impl Runner {
             g.latest
         };
         let endpoint = self.source_endpoint.lock().unwrap().clone();
-        let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(job.part_sizes.len());
-        for (part, size) in job.part_sizes.iter().enumerate() {
-            let size = *size;
-            let token = msg.source_tokens.get(part).cloned();
-            let continuous = token.is_some();
-            let endpoint = endpoint.clone();
-            let legacy = LinkByteSource {
-                reads: self.reads.clone(),
-                session_id: session_id.clone(),
-                part: part as u32,
-                size,
-            };
-            let rates = self.reads.clone();
+        let Some((address, tls)) = endpoint else {
+            let _ = self
+                .link
+                .send(session_error(
+                    &session_id,
+                    "missing source endpoint".into(),
+                    String::new(),
+                ))
+                .await;
+            return;
+        };
+        let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(msg.sources.len());
+        for descriptor in msg.sources {
+            let (address, tls, rates) = (address.clone(), tls.clone(), self.reads.clone());
+            let size = descriptor.size;
             let buffer = kahawai_transport::read_ahead::ReadAhead::new(
                 size,
                 kahawai_transport::read_ahead::TRANSCODER_CAPACITY,
                 move |requests, chunks| async move {
-                    match (token, endpoint) {
-                        (Some(token), Some((address, tls))) => {
-                            if let Err(error) =
-                                stream_source(&address, tls, token, requests, chunks, rates).await
-                            {
-                                tracing::warn!(error = %error, "transcoder source channel failed");
-                            }
-                        }
-                        (None, _) => {
-                            kahawai_transport::source_stream::serve_batched(
-                                requests,
-                                chunks,
-                                size,
-                                2 * 1024 * 1024,
-                                |offset, len| {
-                                    let legacy = &legacy;
-                                    async move { Ok(legacy.read(offset, len as u64).await?) }
-                                },
-                            )
-                            .await;
-                        }
-                        _ => tracing::error!(
-                            "source token supplied without a byte connection endpoint"
-                        ),
+                    if let Err(error) = stream_source(
+                        &address,
+                        tls,
+                        descriptor.source_token,
+                        requests,
+                        chunks,
+                        rates,
+                    )
+                    .await
+                    {
+                        tracing::warn!(error = %error, "transcoder source channel failed");
                     }
                 },
             );
-            sources.push(Arc::new(BufferedSource {
-                buffer,
-                size,
-                continuous,
-            }));
+            sources.push(Arc::new(BufferedSource { buffer, size }));
         }
         let started = match self.executor.start(&session_id, job, sources).await {
             Ok(started) => started,
@@ -705,15 +594,6 @@ impl Runner {
             samples,
             link_bytes_per_sec: rate.unwrap_or(0.0) as u64,
         })
-    }
-
-    /// Hub answered a source read. Stale responses (request id no
-    /// longer pending — e.g. from a worker a seek-restart replaced) are
-    /// dropped on the floor.
-    pub fn source_data(&self, req: u64, data: Vec<u8>) {
-        if let Some(tx) = self.reads.pending.lock().unwrap().remove(&req) {
-            let _ = tx.send(data);
-        }
     }
 
     /// Hub wants an artifact: stream it back in chunks.
@@ -890,6 +770,7 @@ fn session_error(session_id: &str, error: String, worker_log: String) -> TcToHub
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
 
     #[tokio::test]
     async fn source_reconnect_resumes_exactly_after_delivered_bytes() {
@@ -967,7 +848,7 @@ mod tests {
                 .add_service(TranscoderLinkServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );
-        let (rates, _control) = reads();
+        let rates = reads();
         let buffer = kahawai_transport::read_ahead::ReadAhead::new(
             16384,
             kahawai_transport::source_stream::CHUNK,
@@ -1009,7 +890,7 @@ mod tests {
         let calls = AtomicU64::new(0);
         let (_requests, rx) = mpsc::channel(2);
         let (tx, _chunks) = mpsc::channel(2);
-        let (rates, _control) = reads();
+        let rates = reads();
         let error = stream_source_with(
             || {
                 calls.fetch_add(1, Ordering::SeqCst);
@@ -1047,77 +928,22 @@ mod tests {
         assert_eq!(resume.0.unwrap().len, 870);
     }
 
-    fn reads() -> (Arc<LinkReads>, mpsc::Receiver<TcToHub>) {
-        let (tx, rx) = mpsc::channel(4);
+    fn reads() -> Arc<LinkRate> {
+        Arc::new(LinkRate {
+            link_rate: Mutex::new(None),
+        })
+    }
+
+    fn source_endpoint() -> (String, Arc<rustls::ClientConfig>) {
+        let _ = rustls::crypto::ring::default_provider().install_default();
         (
-            Arc::new(LinkReads {
-                link: tx,
-                pending: Mutex::new(HashMap::new()),
-                next_req: AtomicU64::new(1),
-                link_rate: Mutex::new(None),
-            }),
-            rx,
+            "https://127.0.0.1:1".into(),
+            Arc::new(
+                rustls::ClientConfig::builder()
+                    .with_root_certificates(rustls::RootCertStore::empty())
+                    .with_no_client_auth(),
+            ),
         )
-    }
-
-    #[tokio::test]
-    async fn a_read_the_hub_drops_fails_the_worker_instead_of_hanging() {
-        // The hub tore the session down (lease gone) and will never answer
-        // this request: the read must come back as an error so the pipeline
-        // errors out rather than waiting for ever.
-        let (reads, mut rx) = reads();
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 0,
-            size: 100,
-        };
-        let read = tokio::spawn(async move { source.read(0, 16).await });
-        let sent = rx.recv().await.unwrap();
-        let Some(tc_to_hub::Msg::SourceRead(req)) = sent.msg else {
-            panic!("expected a SourceRead");
-        };
-        // Dropping the pending sender is what a torn-down session looks
-        // like from here: nobody will ever call `source_data` for it.
-        reads.pending.lock().unwrap().remove(&req.req);
-        assert!(read.await.unwrap().is_err());
-    }
-
-    #[tokio::test]
-    async fn a_closed_link_fails_the_read_and_releases_its_slot() {
-        let (reads, rx) = reads();
-        drop(rx);
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 0,
-            size: 100,
-        };
-        assert!(source.read(0, 16).await.is_err());
-        assert!(
-            reads.pending.lock().unwrap().is_empty(),
-            "the pending slot is released"
-        );
-    }
-
-    #[tokio::test]
-    async fn an_answered_read_returns_the_hubs_bytes() {
-        let (reads, mut rx) = reads();
-        let source = LinkByteSource {
-            reads: reads.clone(),
-            session_id: "s".into(),
-            part: 2,
-            size: 100,
-        };
-        let read = tokio::spawn(async move { source.read(10, 4).await });
-        let sent = rx.recv().await.unwrap();
-        let Some(tc_to_hub::Msg::SourceRead(req)) = sent.msg else {
-            panic!("expected a SourceRead");
-        };
-        assert_eq!((req.offset, req.len, req.part), (10, 4, 2));
-        let tx = reads.pending.lock().unwrap().remove(&req.req).unwrap();
-        tx.send(vec![1, 2, 3, 4]).unwrap();
-        assert_eq!(read.await.unwrap().unwrap(), vec![1, 2, 3, 4]);
     }
 
     /// A stand-in for the `remux-worker` child that never produces a
@@ -1165,7 +991,11 @@ mod tests {
     fn stalled_session() -> StartSession {
         StartSession {
             session_id: "s".into(),
-            size: 1,
+            sources: vec![kahawai_proto::v1::SourceDescriptor {
+                size: 1,
+                source_token: "test-source".into(),
+            }],
+            target_duration_secs: 6,
             video: "copy".into(),
             audio: "copy".into(),
             ..Default::default()
@@ -1175,6 +1005,8 @@ mod tests {
     async fn stalled_start(dir: &std::path::Path) -> (Arc<Runner>, mpsc::Receiver<TcToHub>, u32) {
         let (tx, rx) = mpsc::channel(8);
         let runner = Runner::new(dir.join("sessions"), Some(stalled_worker(dir)), tx);
+        let endpoint = source_endpoint();
+        runner.set_source_endpoint(endpoint.0, endpoint.1);
         runner.start(stalled_session());
         let pid = worker_pid(&dir.join("sessions")).await;
         assert!(alive(pid));
@@ -1236,6 +1068,8 @@ mod tests {
             tx,
         );
         runner.end_all().await;
+        let endpoint = source_endpoint();
+        runner.set_source_endpoint(endpoint.0, endpoint.1);
         runner.start(stalled_session());
         tokio::time::sleep(std::time::Duration::from_millis(500)).await;
         assert!(runner.starting.lock().unwrap().pending.is_empty());
@@ -1252,11 +1086,7 @@ mod tests {
 
     #[test]
     fn small_reads_do_not_move_the_link_rate() {
-        let (tx, _rx) = mpsc::channel(1);
-        let reads = LinkReads {
-            link: tx,
-            pending: Mutex::new(HashMap::new()),
-            next_req: AtomicU64::new(1),
+        let reads = LinkRate {
             link_rate: Mutex::new(None),
         };
         reads.fold_link_rate(1024, std::time::Duration::from_millis(1));

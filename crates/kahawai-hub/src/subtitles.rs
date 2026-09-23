@@ -69,11 +69,10 @@ enum ImageSetsState {
     /// Nothing arrived inside the wait, but nothing said it never will:
     /// background walks queue behind whatever else that mediahost is doing,
     /// and a large prewarm backlog can outlast any wait a caller is willing
-    /// to sit through. Distinct from [Self::Unavailable] because the work is
+    /// to sit through. The work is
     /// still coming — recording it as a failure would disable this track's
     /// OCR for the rest of the hub run over a queue delay.
     NotYet,
-    Unavailable,
 }
 
 #[cfg(feature = "ocr")]
@@ -730,9 +729,7 @@ impl Subtitles {
             .await
         {
             ImageSetsState::Ready(path) => Some(path),
-            ImageSetsState::RetryOnReconnect
-            | ImageSetsState::NotYet
-            | ImageSetsState::Unavailable => None,
+            ImageSetsState::RetryOnReconnect | ImageSetsState::NotYet => None,
         }
     }
 
@@ -810,9 +807,7 @@ impl Subtitles {
         let Some(link) = registry.host_link(module_id) else {
             return ImageSetsState::RetryOnReconnect;
         };
-        if !link.supports_revisioned_subtitles() {
-            return ImageSetsState::Unavailable;
-        }
+
         let link_generation = link.generation();
         if link.send(msg).await.is_err() {
             return ImageSetsState::RetryOnReconnect;
@@ -900,9 +895,7 @@ impl Subtitles {
         revision: &str,
     ) -> Option<Extracted> {
         let link = registry.host_link(module_id)?;
-        if !link.supports_revisioned_subtitles() {
-            return None;
-        }
+
         let msg = kahawai_proto::v1::HubToHost {
             msg: Some(kahawai_proto::v1::hub_to_host::Msg::ExtractSubs(
                 kahawai_proto::v1::ExtractSubs {
@@ -1227,7 +1220,7 @@ mod ocr_memory_tests {
             kahawai_mediadb::Store::in_memory().await.unwrap(),
         );
         let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("mh", old_tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("mh", old_tx, 0);
         registry.connected("mh", "mediahost", "storage", "fp", "test");
         let subs = super::Subtitles::new(tempfile::tempdir().unwrap().keep());
         let wait = subs.image_sets_state(
@@ -1248,7 +1241,7 @@ mod ocr_memory_tests {
             state = &mut wait => panic!("wait ended before link replacement: {}", matches!(state, super::ImageSetsState::RetryOnReconnect)),
         }
         let (new_tx, _new_rx) = tokio::sync::mpsc::channel(1);
-        registry.register_link("mh", new_tx, kahawai_proto::PROTOCOL_MINOR, 0);
+        registry.register_link("mh", new_tx, 0);
         registry.connected("mh", "mediahost", "storage", "fp", "test");
 
         assert!(matches!(

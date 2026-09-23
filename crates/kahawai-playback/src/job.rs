@@ -15,17 +15,9 @@
 //! runway. The round-trip tests in `tests/job_codecs.rs` are what keep the
 //! two directions of each codec agreeing now.
 //!
-//! Wire conventions worth knowing, because they are not the obvious ones:
-//!
-//! * Scalar loudness gains are `optional` on the wire and their PRESENCE is
-//!   authoritative — an old hub's absent field must not read as unity gain.
-//!   A present-but-unmeasured gain is sent as NaN so the worker's
-//!   distinction between "absent" and "exactly 0 dB" survives.
-//! * Burn indexes are 1-based on the wire, 0 = burn nothing; argv and the
-//!   plan are 0-based.
-//! * Bitrate, height and channel ceilings are 0 = unset on the wire.
-//! * `target_duration_secs` is 0 = unknown on the wire; an old hub sends
-//!   nothing and the transcoder falls back to the historical runway.
+//! Protocol 5 binds each dispatched size to a nonempty source token and
+//! requires a positive target duration. Optional gains preserve absence;
+//! burn indexes are 1-based on the wire, and ceilings use zero for unset.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -64,8 +56,8 @@ impl Payload {
 pub struct Job {
     pub plan: RemuxPlan,
     /// Part sizes in timeline order. `[0]` is the positional size of the
-    /// worker argv and `StartSession.size`; the rest are `--part` and
-    /// `tail_sizes`. Never empty.
+    /// worker argv; the rest use `--part`. Wire sizes are paired with grants
+    /// in `StartSession.sources`. Never empty.
     pub part_sizes: Vec<u64>,
     /// Offset within the FIRST part; later parts play whole.
     pub start_ms: u64,
@@ -76,7 +68,7 @@ pub struct Job {
     pub burn_ass: Option<Payload>,
     /// What the playlist will declare as `EXT-X-TARGETDURATION`. Feeds the
     /// readiness runway (see [`crate::playlist::runway_secs`]). `None` =
-    /// unknown, which is what an old hub over the wire looks like.
+    /// unspecified for a worker invocation; mandatory for dispatch.
     pub target_duration_secs: Option<u32>,
 }
 
@@ -265,8 +257,24 @@ impl Job {
     }
 
     /// The wire spelling, hub → transcoder. Reads file-held payloads.
-    pub fn to_start_session(&self, session_id: &str) -> Result<StartSession> {
+    pub fn to_start_session(
+        &self,
+        session_id: &str,
+        sources: &[kahawai_proto::v1::SourceDescriptor],
+    ) -> Result<StartSession> {
         anyhow::ensure!(!self.part_sizes.is_empty(), "a job needs at least one part");
+        validate_sources(sources)?;
+        anyhow::ensure!(
+            sources
+                .iter()
+                .map(|s| s.size)
+                .eq(self.part_sizes.iter().copied()),
+            "source sizes do not match parts"
+        );
+        anyhow::ensure!(
+            self.target_duration_secs.is_some_and(|n| n > 0),
+            "dispatch requires a target duration"
+        );
         let plan = &self.plan;
         let payload = |p: &Option<Payload>| -> Result<Vec<u8>> {
             match p {
@@ -276,24 +284,19 @@ impl Job {
         };
         Ok(StartSession {
             session_id: session_id.to_string(),
-            source_tokens: Vec::new(),
-            size: self.size(),
+            sources: sources.to_vec(),
             video: mode_arg(plan.video).into(),
             audio: mode_arg(plan.audio).into(),
             audio_track: plan.audio_track as u32,
             video_track: plan.video_track as u32,
             start_ms: self.start_ms,
             sink: self.sink.clone().unwrap_or_default(),
-            tail_sizes: self.tail_sizes().to_vec(),
             video_kbps: plan.video_kbps.unwrap_or(0),
             max_height: plan.max_height.unwrap_or(0),
             max_channels: plan.max_channels.unwrap_or(0),
-            // Presence is authoritative in the protocol-4 baseline. The
-            // sentinels keep argv's distinction between absent and an
-            // exact 0 dB value.
-            stereo_gain_db: Some(plan.stereo_gain_db.unwrap_or(f64::NAN)),
-            native_gain_db: Some(plan.native_gain_db.unwrap_or(f64::NAN)),
-            loudness_source_channels: Some(plan.loudness_source_channels.unwrap_or(0)),
+            stereo_gain_db: plan.stereo_gain_db,
+            native_gain_db: plan.native_gain_db,
+            loudness_source_channels: plan.loudness_source_channels,
             loudness_gains: self
                 .exact_gains()
                 .into_iter()
@@ -319,6 +322,8 @@ impl Job {
 
     /// The transcoder side of [`Self::to_start_session`].
     pub fn from_start_session(msg: &StartSession) -> Result<Job> {
+        validate_sources(&msg.sources)?;
+        anyhow::ensure!(msg.target_duration_secs > 0, "missing target duration");
         let positive = |v: u32| (v > 0).then_some(v);
         let exact: Vec<AudioLayoutGain> = msg
             .loudness_gains
@@ -349,8 +354,7 @@ impl Job {
             audio_codec: AudioTarget::from_str(&msg.audio_codec),
             segment_format: SegmentFormat::from_str(&msg.container),
         };
-        let mut part_sizes = vec![msg.size];
-        part_sizes.extend_from_slice(&msg.tail_sizes);
+        let part_sizes = msg.sources.iter().map(|s| s.size).collect();
         Ok(Job {
             plan,
             part_sizes,
@@ -378,4 +382,13 @@ fn layout_gains(
         *slot = Some(gain);
     }
     Ok(slots)
+}
+
+fn validate_sources(sources: &[kahawai_proto::v1::SourceDescriptor]) -> Result<()> {
+    anyhow::ensure!(!sources.is_empty(), "a dispatch needs at least one source");
+    anyhow::ensure!(
+        sources.iter().all(|s| !s.source_token.is_empty()),
+        "empty source grant"
+    );
+    Ok(())
 }

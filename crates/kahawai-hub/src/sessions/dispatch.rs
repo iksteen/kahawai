@@ -107,11 +107,8 @@ impl Sessions {
                 .then_some(kahawai_playback::job::Payload::Bytes(burn_ass_file)),
             target_duration_secs: Some(target_duration_secs),
         };
-        let mut message = job.to_start_session(session_id)?;
+        let mut descriptors = Vec::with_capacity(parts.len());
         self.revoke_source_grants(session_id);
-        if registry
-            .transcoder_protocol_features(transcoder)
-            .is_some_and(|f| f.supports(kahawai_proto::ProtocolFeature::ContinuousSourceReads))
         {
             let mut grants = self.source_grants.lock().unwrap();
             for (lease, size) in &parts {
@@ -128,7 +125,10 @@ impl Sessions {
                         alive,
                     },
                 );
-                message.source_tokens.push(token);
+                descriptors.push(kahawai_proto::v1::SourceDescriptor {
+                    size: *size,
+                    source_token: token,
+                });
             }
         }
         struct PendingGrants<'a> {
@@ -148,9 +148,10 @@ impl Sessions {
         }
         let mut pending_grants = PendingGrants {
             grants: &self.source_grants,
-            tokens: message.source_tokens.clone(),
+            tokens: descriptors.iter().map(|s| s.source_token.clone()).collect(),
             armed: true,
         };
+        let message = job.to_start_session(session_id, &descriptors)?;
         let start = kahawai_proto::v1::HubToTc {
             msg: Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(message)),
         };
@@ -167,10 +168,7 @@ impl Sessions {
             sessions.tc_leases.lock().unwrap().remove(session_id);
             sessions.pending_ready.lock().unwrap().remove(session_id);
         };
-        if let Err(e) = registry
-            .send_to_tc_requiring(transcoder, start, loudness_protocol_feature(&plan))
-            .await
-        {
+        if let Err(e) = registry.send_to_tc(transcoder, start).await {
             cleanup(self);
             return Err(e);
         }
@@ -214,69 +212,6 @@ impl Sessions {
             true
         } else {
             false
-        }
-    }
-
-    /// Link-facing: serve one source read for a dispatched session.
-    #[allow(clippy::too_many_arguments)] // wire-shaped plumbing
-    pub async fn source_read(
-        &self,
-        registry: &Registry,
-        transcoder: &str,
-        session_id: &str,
-        offset: u64,
-        len: u64,
-        req: u64,
-        part: u32,
-    ) {
-        let held = self.tc_leases.lock().unwrap().get(session_id).cloned();
-        let Some((lease, size)) = held.and_then(|(parts, _)| parts.get(part as usize).cloned())
-        else {
-            tracing::debug!(
-                session = session_id,
-                part,
-                "source read for unknown session/part"
-            );
-            return;
-        };
-        let len = len.min(kahawai_media::worker::MAX_READ);
-        let want = if offset >= size {
-            0
-        } else {
-            len.min(size - offset)
-        };
-        let mut buf = Vec::with_capacity(want as usize);
-        if want > 0 {
-            let mut stream = lease.read_range(offset, want).into_inner();
-            while (buf.len() as u64) < want {
-                match stream.recv().await {
-                    Some(Ok(bytes)) => buf.extend_from_slice(&bytes),
-                    Some(Err(e)) => {
-                        tracing::warn!(session = session_id, error = %e, "lease read failed");
-                        break;
-                    }
-                    None => break,
-                }
-            }
-            buf.truncate(want as usize);
-        }
-        let msg = kahawai_proto::v1::HubToTc {
-            msg: Some(kahawai_proto::v1::hub_to_tc::Msg::SourceData(
-                kahawai_proto::v1::SourceData {
-                    session_id: session_id.to_string(),
-                    offset,
-                    data: buf,
-                    req,
-                    part,
-                },
-            )),
-        };
-        if let Err(e) = registry.send_to_tc(transcoder, msg).await {
-            tracing::debug!(
-                session = session_id,
-                error = format!("{e:#}"),
-                "source data undeliverable"
-            );
         }
     }
 

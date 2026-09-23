@@ -284,7 +284,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
                 },
             ],
             max_sessions: 2,
-            decode_caps: vec![], // empty = assume capable (OPS-7)
+            decode_caps: vec!["video/x-h264".into(), "audio/x-flac".into()],
             tonemap: false,
             tonemap_speed_1080: None,
             tonemap_speed_2160: None,
@@ -530,7 +530,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
                 },
             ],
             max_sessions: 2,
-            decode_caps: vec![],
+            decode_caps: vec!["video/x-h264".into(), "audio/x-flac".into()],
             tonemap: false,
             tonemap_speed_1080: None,
             tonemap_speed_2160: None,

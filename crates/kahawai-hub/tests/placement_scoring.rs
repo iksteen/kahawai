@@ -37,7 +37,6 @@ fn need(class: &str) -> PlacementNeed {
         audio_caps: vec![],
         needs_tonemap: false,
         needs_ass_burn: false,
-        required_protocol_feature: None,
         video_codec: "h264".into(),
         audio_codec: String::new(),
         work_class: Some(class.into()),
@@ -70,31 +69,26 @@ async fn registry_with_local_video_executor(
 
 /// Connect a transcoder well enough to be a placement candidate.
 fn connect(reg: &Registry, id: &str, c: CapabilityReport) {
-    connect_minor(reg, id, kahawai_proto::PROTOCOL_MINOR, c);
-}
-
-fn connect_minor(reg: &Registry, id: &str, protocol_minor: u32, c: CapabilityReport) {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     std::mem::forget(rx); // keep the link "up" for the test's lifetime
     reg.connected(id, "transcoder", id, "fp", "test");
-    reg.register_tc_link(id, protocol_minor, tx);
+    reg.register_tc_link(id, tx);
     reg.set_transcoder_caps(id, &c);
 }
 
 #[tokio::test]
-async fn dispatch_pairs_the_required_protocol_with_the_same_live_sender() {
+async fn dispatch_uses_the_current_live_sender() {
     let (_d, reg) = registry_with_local_video_executor(false).await;
     let (old_tx, mut old_rx) = tokio::sync::mpsc::channel(2);
-    reg.register_tc_link("box", 0, old_tx);
-    let required = Some(kahawai_proto::ProtocolFeature::ExactAudioLoudnessGains);
-    reg.send_to_tc_requiring("box", kahawai_proto::v1::HubToTc::default(), required)
+    reg.register_tc_link("box", old_tx);
+    reg.send_to_tc("box", kahawai_proto::v1::HubToTc::default())
         .await
         .unwrap();
     assert!(old_rx.recv().await.unwrap().is_ok());
 
     let (new_tx, mut new_rx) = tokio::sync::mpsc::channel(2);
-    reg.register_tc_link("box", 0, new_tx);
-    reg.send_to_tc_requiring("box", kahawai_proto::v1::HubToTc::default(), required)
+    reg.register_tc_link("box", new_tx);
+    reg.send_to_tc("box", kahawai_proto::v1::HubToTc::default())
         .await
         .unwrap();
     assert!(new_rx.recv().await.unwrap().is_ok());
