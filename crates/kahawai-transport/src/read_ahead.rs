@@ -3,7 +3,11 @@
 //! remote reposition/read. Audio/video alternation must not cancel the other
 //! stream or release its unread bytes. Independent byte channels prevent a full
 //! speculative window from blocking delivery to the demanded window.
-//! Within each window, a demand releases only blocks before its starting block.
+//! BiReadAhead reuses resident bytes before assigning a producer. Two recent
+//! demand positions guide release behind playback independently of the physical
+//! supplier; nearby cursors can share one producer without pruning each other.
+//! Hints never pin allocations: a miss can reclaim least-recently-read blocks.
+//! A standalone ReadAhead releases blocks before its own read's start.
 //! Full allocations (including consumed prefixes) count against capacity. A miss
 //! reserves admission space, including when it reaches the prefetch boundary.
 //! Thus large reads progress without needing space from the other window.
@@ -188,6 +192,16 @@ impl ReadAhead {
     }
 
     pub async fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        self.read_with_retention(offset, len, offset, false).await
+    }
+
+    async fn read_with_retention(
+        &self,
+        offset: u64,
+        len: u64,
+        retain_from: u64,
+        retain: bool,
+    ) -> io::Result<Vec<u8>> {
         let _serial = self.shared.serial.lock().await;
         let len = len.min(self.size.saturating_sub(offset));
         let mut out = Vec::new();
@@ -195,7 +209,7 @@ impl ReadAhead {
             let mut state = self.shared.state.lock().unwrap();
             let mut removed = 0;
             state.blocks.retain(|block| {
-                let before = block.offset + block.data.len() as u64 <= offset;
+                let before = block.offset + block.data.len() as u64 <= retain_from;
                 if before {
                     removed += block.data.len();
                 }
@@ -243,11 +257,15 @@ impl ReadAhead {
                     if state.bytes != before {
                         self.shared.changed.notify_waiters();
                     }
-                    // Small forward skips can wait for the already streaming
-                    // chunk. Restarting here wastes in-flight bytes; admission
+                    // Bounded forward skips can wait for the active stream.
+                    // Restarting here wastes in-flight bytes; admission
                     // above ensures skipped bytes cannot fill and pin the window.
-                    let approaching =
-                        pos >= state.next && pos - state.next < super::source_stream::CHUNK as u64;
+                    let horizon = if retain {
+                        self.capacity
+                    } else {
+                        super::source_stream::CHUNK
+                    };
+                    let approaching = pos >= state.next && pos - state.next < horizon as u64;
                     if state.generation == 0 || !approaching || state.eof {
                         state.generation += 1;
                         state.discarded += state.bytes as u64;
@@ -302,6 +320,8 @@ struct Selection {
     clock: u64,
     used: [u64; 2],
     cursor: [u64; 2],
+    heads: [Option<u64>; 2],
+    head_used: [u64; 2],
 }
 impl BiReadAhead {
     pub fn new(windows: [ReadAhead; 2]) -> Self {
@@ -324,28 +344,71 @@ impl BiReadAhead {
         if len == 0 || offset >= self.windows[0].size {
             return Ok(Vec::new());
         }
-        // Prefer a resident range or a nearby forward continuation. When both windows
-        // overlap, follow the closest demand cursor (the two streams may advance
-        // at very different rates). Otherwise replace the least recently used
-        // window; an index read or genuine seek never destroys both streams.
+        // Logical demand positions are independent of physical suppliers. Track
+        // the nearest position within one transport chunk; larger jumps replace
+        // the least recently used position instead of dragging a cursor forward
+        // and prematurely releasing bytes needed by a trailing reader.
+        // This is a retention hint, not a track identity or a pinned allocation:
+        // misses can always reclaim space if either hint becomes stale.
+        let head = (0..2)
+            .filter_map(|i| select.heads[i].map(|pos| (i, pos)))
+            .filter(|&(_, pos)| pos.abs_diff(offset) < super::source_stream::CHUNK as u64)
+            .min_by_key(|&(_, pos)| pos.abs_diff(offset))
+            .map(|(i, _)| i)
+            .unwrap_or_else(|| {
+                if select.head_used[0] <= select.head_used[1] {
+                    0
+                } else {
+                    1
+                }
+            });
+        select.clock += 1;
+        select.heads[head] = Some(offset);
+        select.head_used[head] = select.clock;
+        let retain_from = select
+            .heads
+            .iter()
+            .flatten()
+            .copied()
+            .filter(|&pos| pos <= offset && offset - pos < self.windows[0].capacity as u64)
+            .min()
+            .unwrap_or(offset)
+            // Positions within a chunk are deliberately coalesced above. Keep
+            // that much history too, including across an allocation boundary.
+            .saturating_sub(super::source_stream::CHUNK as u64);
+        // A resident byte wins over a forward continuation, regardless of which
+        // cursor previously used it. Retention below makes that sharing safe:
+        // reading ahead must not prune a trailing cursor's blocks. Nearby cursors
+        // can therefore share one producer instead of fetching the same advancing
+        // region twice. Distant regions still reserve independent windows.
         let hit = (0..2)
-            .filter(|&i| {
+            .filter_map(|i| {
                 let state = self.windows[i].shared.state.lock().unwrap();
-                state.generation != 0
-                    && ((!state.eof
-                        && offset >= state.next
-                        && offset - state.next < self.windows[i].capacity as u64)
-                        || state
-                            .blocks
-                            .iter()
-                            .any(|b| b.offset <= offset && offset - b.offset < b.data.len() as u64))
+                let resident = state
+                    .blocks
+                    .iter()
+                    .any(|b| b.offset <= offset && offset - b.offset < b.data.len() as u64);
+                let approaching = state.generation != 0
+                    && !state.eof
+                    && offset >= state.next
+                    && offset - state.next < self.windows[i].capacity as u64;
+                (resident || approaching).then_some((i, resident))
             })
-            .min_by_key(|&i| {
+            .min_by_key(|&(i, resident)| {
                 (
-                    select.cursor[i].abs_diff(offset),
+                    !resident,
+                    // If streams have converged, stick with the most recently
+                    // used resident supplier. Cursor affinity here would keep
+                    // both producers traversing the same bytes indefinitely.
+                    if resident {
+                        0
+                    } else {
+                        select.cursor[i].abs_diff(offset)
+                    },
                     std::cmp::Reverse(select.used[i]),
                 )
-            });
+            })
+            .map(|(i, _)| i);
         let window = hit.unwrap_or_else(|| {
             if select.used[0] <= select.used[1] {
                 0
@@ -357,7 +420,9 @@ impl BiReadAhead {
         select.used[window] = select.clock;
         select.cursor[window] = offset;
         tracing::trace!(window, offset, len, "bi-generational demand");
-        self.windows[window].read(offset, len).await
+        self.windows[window]
+            .read_with_retention(offset, len, retain_from, true)
+            .await
     }
 }
 
@@ -606,6 +671,129 @@ mod tests {
         for window in &buffer.windows {
             assert_eq!(window.shared.state.lock().unwrap().generation, 1);
         }
+    }
+
+    #[tokio::test]
+    async fn nearby_cursors_share_fetches_without_pruning_each_others_bytes() {
+        let intervals = Arc::new(Mutex::new(Vec::new()));
+        let size = 64 * CHUNK as u64;
+        let windows = std::array::from_fn(|_| {
+            let intervals = intervals.clone();
+            ReadAhead::new(size, 8 * CHUNK, move |rx, tx| async move {
+                serve(rx, tx, size, |offset, len| {
+                    intervals.lock().unwrap().push((offset, len));
+                    async move { Ok(data(offset, len)) }
+                })
+                .await;
+            })
+        });
+        let buffer = BiReadAhead::new(windows);
+        // The leading demand arrives before prefetch necessarily reaches it.
+        // Both cursors move much farther than the entire retention allowance.
+        for i in 0..48 {
+            for offset in [i * CHUNK as u64, (i + 3) * CHUNK as u64] {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), buffer.read(offset, 4096))
+                        .await
+                        .expect("nearby cursor stalled")
+                        .unwrap(),
+                    data(offset, 4096)
+                );
+            }
+        }
+        let mut intervals = intervals.lock().unwrap().clone();
+        intervals.sort_unstable();
+        assert!(
+            intervals.len() >= 51,
+            "fixture did not advance through the file"
+        );
+        for pair in intervals.windows(2) {
+            assert!(
+                pair[0].0 + pair[0].1 as u64 <= pair[1].0,
+                "duplicate upstream file reads: {pair:?}"
+            );
+        }
+        assert_eq!(buffer.windows[0].shared.state.lock().unwrap().generation, 1);
+        assert_eq!(buffer.windows[1].shared.state.lock().unwrap().generation, 0);
+        assert!(
+            buffer
+                .windows
+                .iter()
+                .all(|w| w.shared.state.lock().unwrap().peak <= w.capacity)
+        );
+    }
+
+    #[tokio::test]
+    async fn shared_cursor_hint_preserves_reads_across_block_boundaries() {
+        let (a, _) = source(4 * CHUNK);
+        let (b, _) = source(4 * CHUNK);
+        let buffer = BiReadAhead::new([a, b]);
+        buffer.read(0, 32).await.unwrap();
+        for i in 1..20 {
+            let boundary = i * CHUNK as u64;
+            for offset in [boundary - 4096, boundary + 32, boundary - 4096] {
+                assert_eq!(buffer.read(offset, 4096).await.unwrap(), data(offset, 4096));
+            }
+        }
+        assert_eq!(buffer.windows[0].shared.state.lock().unwrap().generation, 1);
+        assert_eq!(buffer.windows[1].shared.state.lock().unwrap().generation, 0);
+    }
+
+    #[tokio::test]
+    async fn converging_producers_stop_fetching_the_same_advancing_region() {
+        let size = 128 * CHUNK as u64;
+        let counts: [Arc<AtomicUsize>; 2] = std::array::from_fn(|_| Arc::new(AtomicUsize::new(0)));
+        let windows = std::array::from_fn(|i| {
+            let count = counts[i].clone();
+            ReadAhead::new(size, 8 * CHUNK, move |rx, tx| async move {
+                serve(rx, tx, size, |offset, len| {
+                    count.fetch_add(1, Ordering::SeqCst);
+                    async move { Ok(data(offset, len)) }
+                })
+                .await;
+            })
+        });
+        let buffer = BiReadAhead::new(windows);
+        buffer.read(0, 32).await.unwrap();
+        buffer.read(32 * CHUNK as u64, 32).await.unwrap();
+        // A formerly distant cursor catches up, then stays three chunks behind.
+        // Run far past both original windows and any queued speculative data.
+        let mut settled = [0; 2];
+        for i in 29..100 {
+            if i == 48 {
+                settled = std::array::from_fn(|j| counts[j].load(Ordering::SeqCst));
+            }
+            for offset in [i * CHUNK as u64, (i + 3) * CHUNK as u64] {
+                assert_eq!(
+                    tokio::time::timeout(Duration::from_secs(2), buffer.read(offset, 4096))
+                        .await
+                        .expect("converging cursor stalled")
+                        .unwrap(),
+                    data(offset, 4096)
+                );
+            }
+        }
+        let further_reads: Vec<_> = counts
+            .iter()
+            .enumerate()
+            .map(|(i, n)| n.load(Ordering::SeqCst) - settled[i])
+            .collect();
+        // After convergence, only bounded in-flight data can remain on the
+        // retiring producer. It must not shadow the final fifty-two chunks.
+        assert!(
+            *further_reads.iter().min().unwrap() <= 6,
+            "both producers kept advancing: {further_reads:?}"
+        );
+        assert!(
+            further_reads.iter().sum::<usize>() <= 70,
+            "sustained duplicate fetches: {further_reads:?}"
+        );
+        assert!(
+            buffer
+                .windows
+                .iter()
+                .all(|w| w.shared.state.lock().unwrap().peak <= w.capacity)
+        );
     }
 
     #[tokio::test]

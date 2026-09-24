@@ -20,6 +20,26 @@ use tokio::sync::mpsc;
 use tokio_rustls::TlsAcceptor;
 use tokio_stream::wrappers::ReceiverStream;
 
+// RFC 9113 §5.2.1: "Flow control is specific to a connection."
+// https://www.rfc-editor.org/rfc/rfc9113.html#section-5.2.1
+// Both connection and stream credit can block DATA. Alternating consumers on
+// independent byte connections exposed a throughput collapse with Hyper's
+// default equal 1 MiB windows. 4 MiB / 256 KiB improved the measured workloads
+// (docs/kahawai-bi-generational-comparison.md). Stream credit limits additional
+// flow-controlled data to one chunk beyond what the receiver has consumed.
+// Credit is separate from retained-source capacity and does not allocate it
+// eagerly. Keep adaptive sizing off so stalled consumers have a fixed bound.
+const CONNECTION_WINDOW: u32 = 4 * 1024 * 1024;
+const STREAM_WINDOW: u32 = 256 * 1024;
+
+/// Satellite listener receive policy, also used by real-wire test fixtures.
+pub fn grpc_server() -> tonic::transport::Server {
+    tonic::transport::Server::builder()
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .initial_stream_window_size(STREAM_WINDOW)
+        .http2_adaptive_window(Some(false))
+}
+
 /// Install the ring crypto provider exactly once, before any rustls config is
 /// built. Safe to call from every entry point.
 pub fn init_crypto() {
@@ -121,6 +141,9 @@ pub async fn grpc_channel_with(
     // Placeholder URI — the connector dials the real address and does the
     // TLS itself, so this stays `http` (h2 prior knowledge over our stream).
     let channel = tonic::transport::Endpoint::try_from("http://kahawai.invalid")?
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .initial_stream_window_size(STREAM_WINDOW)
+        .http2_adaptive_window(false)
         .connect_with_connector(connector)
         .await
         .context("connecting to hub")?;

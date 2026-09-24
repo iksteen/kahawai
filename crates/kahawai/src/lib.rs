@@ -777,7 +777,7 @@ async fn run_hub_inner(
         "hub up"
     );
 
-    tonic::transport::Server::builder()
+    kahawai_transport::tls::grpc_server()
         .add_service(svc.into_server())
         .add_service(
             kahawai_hub::renewal_service::RenewalService::new(

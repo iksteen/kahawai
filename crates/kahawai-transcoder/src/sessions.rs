@@ -834,7 +834,7 @@ mod tests {
         let address = format!("http://{}", listener.local_addr().unwrap());
         let service = Flaky(attempts.clone(), offsets.clone());
         let server = tokio::spawn(
-            tonic::transport::Server::builder()
+            kahawai_transport::tls::grpc_server()
                 .add_service(TranscoderLinkServer::new(service))
                 .serve_with_incoming(TcpListenerStream::new(listener)),
         );

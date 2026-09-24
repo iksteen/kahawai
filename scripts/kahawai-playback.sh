@@ -12,7 +12,7 @@ case "${1:-check}" in
         ;;
     pull)
         export KAHAWAI_MEDIA_TEST_STRICT=1
-        # Exact pull requests, distant demux offsets, bounded transport,
+        # Exact pull requests, deduplicated nearby/converging cursors, distant offsets, bounded transport,
         # protocol-6 dual-grant descriptors, real mTLS remux/transcode, and the supervised worker.
         cargo test -p kahawai-media --lib remux:: -- --test-threads=1 --nocapture
         cargo test -p kahawai-transport --lib

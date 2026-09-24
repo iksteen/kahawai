@@ -98,7 +98,7 @@ async fn direct_play_ranges_end_to_end() {
         )),
     );
     tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        kahawai_transport::tls::grpc_server()
             .add_service(link_svc.into_server())
             .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))
             .await

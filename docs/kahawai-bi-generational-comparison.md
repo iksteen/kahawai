@@ -151,3 +151,58 @@ transport penalty reproduced by direct range reads.
 
 These were temporary diagnostic builds. Shared connection credit is not a
 substitute for proving isolation when more leases or sessions are active.
+
+## Flow control and shared retention
+
+The follow-up uses independent connections with explicit 4 MiB connection /
+256 KiB stream receive credit on the satellite listener and TLS clients. The
+retained-source allowances remain 32 MiB at the hub and 2 MiB at a transcoder.
+Resident bytes take precedence over assigning another producer. Separate recent
+demand-position hints allow release behind both cursors while a nearby pair
+shares one stream; demand admission can reclaim space even if a hint goes stale.
+When two producers converge, selection favors the latest resident supplier so
+one stops advancing instead of shadowing the other.
+
+Simply retaining every block until a miss reduced duplication but measured only
+5.37× production: the receiver stayed full and admitted prefetch in bursts.
+Releasing behind the active positions restored continuous refill. The revised
+AVI run produced 900.020 seconds in 18.417 seconds (48.87×), started playback in
+1.97 seconds, and completed two browser minutes without underruns or worker
+errors, holding about 61 seconds of client buffer. This improves the observed
+4–7× two-window results but does not establish parity with the historical 67.23×
+push measurement.
+
+NAS positional-read tracing recorded 1,829 reads totalling 478,800,296 bytes,
+covering 473,557,256 unique bytes: **1.10% duplicate file-read bytes**, compared with the
+earlier 49.5% measurement over a similar unique-byte footprint. Startup probes,
+seeks, eviction and already queued speculative data can still cause retransfers;
+this is not a guarantee of globally unique reads.
+
+The transport regressions verify exact data while nearby cursors advance beyond
+six retention capacities with no overlapping upstream reads, formerly distant
+producers converge without sustained duplicate fetching, and reads straddling a
+block boundary remain resident. Existing distant-region, full-buffer admission,
+seek replacement and lifetime checks remain part of `scripts/kahawai-playback.sh pull`.
+
+The separated-track MP4 check produced 900.025 seconds in 11.218 seconds
+(80.23×), started in 2.17 seconds, and completed two browser minutes with no
+underruns or worker errors and about 66 seconds of client buffer. Both source
+windows continued independently. The earlier independent-window run measured
+88.16×; these observations establish continued successful playback, not a
+throughput improvement for this workload.
+
+With the final receive-credit policy, the direct alternating-range test transferred
+256 MiB in 10.681 seconds (23.97 MiB/s), without GStreamer or read-ahead in the
+path. Both responses were HTTP 206 and their combined length was checked. The
+original-credit repeats measured 3.43 and 4.66 MiB/s. These runs retain the same
+network/cache/background-load limitations described above.
+
+The original local AIO and NAS mediahost binaries were restored after these
+checks and verified by SHA-256; both hubs again reported the NAS healthy and no
+test sessions remained. The Mac mini executable was unchanged. These results do
+not imply fleet rollout.
+
+Final validation passed: the full workspace suite serially with
+`KAHAWAI_MEDIA_TEST_STRICT=1`, `cargo clippy --workspace --all-targets`, release
+builds for AIO and mediahost, and `cargo fmt --all -- --check`. Real-wire fixtures
+use the same receive-credit constructor as the production listener.

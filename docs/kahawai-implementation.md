@@ -129,23 +129,40 @@ owns two mediahost connections and two file leases; a remote transcoder also
 owns two source connections. This replaces the mediahost's shared byte-plane
 connection, so finite leases also pay for their own connection/TLS setup.
 Demand hits cost a copy; misses cost remote repositioning
-and delivery latency. Overlapping windows can fetch the same bytes twice; each
+and delivery latency. Nearby cursors share resident bytes and an active producer; each
 individual stream has half the previous single-window look-ahead. Two channels let alternating audio/video regions progress
 without cancelling each other's generation, and prevent a backpressured window
 from blocking the other window's demanded bytes.
 
-A read chooses a window containing its starting byte or approaching it within
-one window-capacity of its current frontier. Small forward skips of less than
-one transport chunk wait for the already active stream; larger unbuffered
-skips reposition that same window. If both qualify, the nearest last-demand cursor wins; if neither
-qualifies, the least recently demanded window is repositioned. Header/index
-reads and genuine seeks therefore replace at most one window. Each window
-releases blocks entirely before its own demand's starting offset, retaining the
-starting block's prefix for repeated and overlapping reads. On a miss it reserves
-one eighth of its capacity (at least one 256 KiB chunk) for incoming bytes. Reads
-larger than capacity can reclaim already copied blocks. A reposition clears that
-window's old blocks, never the other window. Generation checks reject stale
-in-flight data independently on each channel.
+A read first chooses a window containing its starting byte; only on a miss does
+it choose an approaching producer within one window-capacity of its frontier.
+Resident suppliers take precedence over cursor affinity. When both hold the byte,
+the most recently used supplier wins, allowing formerly separate streams to
+converge instead of continuously fetching overlapping regions. An approaching
+producer streams across the bounded forward gap; this can read up to a window's
+worth of skipped bytes, trading that traffic for avoiding a fresh remote seek
+and retaining the trailing cursor's bytes. If neither window qualifies, the least
+recently demanded window is repositioned. Header/index reads and genuine seeks
+therefore replace at most one window.
+
+Retention tracks two recent demand positions separately from the physical
+suppliers. Reads within one transport chunk update the nearest position; a larger
+jump replaces the least recently used hint. Before each read, a window releases
+blocks behind both nearby hints, retaining an extra chunk of history because
+nearby positions are coalesced. This lets prefetch refill continuously without
+advancing one reader discarding the other reader's bytes. Far-away hints cannot
+hold back a window: only positions within its capacity of the demand contribute.
+These are byte-position heuristics, not demux track identities.
+
+Hints never pin allocations. Hits move whole blocks to the retention queue's
+newest end; a miss releases least-recently-read blocks until one eighth of the
+window's capacity (at least one 256 KiB chunk) is available. Stale hints and reads
+larger than capacity therefore cannot prevent admission. A reposition clears
+that window's old blocks, never the other window. Generation checks reject stale
+in-flight data independently on each channel. Deduplication avoids sustained
+overlapping producers when their working sets fit one window; it does not promise
+zero retransfers across seeks, eviction, or the bounded speculative data already
+fetched before two producers converge.
 
 Prefetch stops when its window is full. Reservations make demand progress
 independent of space in the other window; no shared receive queue can pin a
@@ -157,6 +174,15 @@ exercises both generations under pressure, seek replacement, grant revocation,
 reconnects, and the real dispatched pipeline.
 The [real-file comparison](kahawai-bi-generational-comparison.md) records the
 alternating-region regression, the separated-track check, and the measurement limits.
+
+The satellite listener and TLS gRPC clients explicitly use 4 MiB connection and
+256 KiB stream receive credit, with adaptive resizing disabled. These are
+HTTP/2 allowances, separate from retained bytes and bounded application queues;
+they are not eagerly allocated buffers. The smaller stream allowance limits
+speculative transport backlog, while the larger connection allowance avoids the
+measured alternating-consumer penalty of equal connection/stream credit.
+Independent byte connections still provide isolation; tuning credit does not
+make a shared connection safe for an arbitrary number of stalled leases.
 
 A mediahost continuously serves a range toward EOF, interrupted by a newer
 generation. Command intake remains live during disk admission or a blocked

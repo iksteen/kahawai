@@ -76,8 +76,11 @@ How something works and why it was built that way belong in
       delivered offset with peer-bound single-reader grants; malformed commands
       return explicit errors. Overlapping demux reads reuse retained block prefixes
       without restarting the byte stream, including repeated reads ending at block
-      boundaries. Reads release blocks before their starting offset, with pressure
-      reclamation allowing requests larger than capacity to progress.
+      boundaries. Nearby demand positions share resident bytes and one producer;
+      separate retention hints release bytes behind both positions, with pressure
+      reclamation preventing stale hints from blocking demand. TLS gRPC receivers
+      use explicit 4 MiB connection / 256 KiB stream credit; byte connections stay
+      independent. Position and convergence regressions count upstream reads.
       Finite and buffered sources have separate construction;
       run-owned grants revoke on teardown or cancelled startup. Protocol-4 peers
       are rejected, and minor feature gates are removed. Check with

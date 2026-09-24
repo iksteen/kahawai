@@ -152,7 +152,7 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
     );
     let tc_svc = TranscoderLinkService::new(registry.clone(), sessions.clone());
     tokio::spawn(async move {
-        tonic::transport::Server::builder()
+        kahawai_transport::tls::grpc_server()
             .add_service(mh_svc.into_server())
             .add_service(tc_svc.into_server())
             .serve_with_incoming(kahawai_transport::tls::tls_incoming(listener, tls))

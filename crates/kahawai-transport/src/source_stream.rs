@@ -63,6 +63,7 @@ impl FileReader {
                 }
                 filled += n;
             }
+            tracing::trace!(offset, len, "source positional file read");
             Ok::<_, std::io::Error>(data)
         })
         .await??)
