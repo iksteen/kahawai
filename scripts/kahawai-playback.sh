@@ -22,6 +22,7 @@ case "${1:-check}" in
         cargo test -p kahawai-transcoder --lib source_
         cargo test -p kahawai-hub --lib source_
         cargo test -p kahawai-hub --lib streaming_tests
+        cargo test -p kahawai-hub --lib cancellation_tests
         cargo test -p kahawai-hub --test remux_play --test transcode_dispatch
         cargo build --bin kahawai
         cargo run --quiet -p kahawai-playback --example playback_check -- --worker-exe target/debug/kahawai

@@ -168,7 +168,11 @@ impl Sessions {
                 let (this2, registry2, session2) =
                     (this.clone(), registry.clone(), session.clone());
                 let outcome = match tokio::spawn(async move {
-                    this2.execute_seek(&registry2, &session2, todo).await
+                    until_session_ends(
+                        session2.seek_ended.subscribe(),
+                        this2.execute_seek(&registry2, &session2, todo),
+                    )
+                    .await
                 })
                 .await
                 {
@@ -545,5 +549,65 @@ impl Sessions {
             }
             Mode::Direct { .. } => bail!("direct sessions seek with range requests"),
         }
+    }
+}
+
+/// Disconnecting the HTTP request must not cancel an accepted seek, but ending
+/// the session must. Dropping the restart future drops any not-yet-published
+/// local Run (which kills its worker); teardown collects a published run and
+/// sends EndSession to a remote executor after the seek releases its lock.
+async fn until_session_ends<T>(
+    mut ended: tokio::sync::watch::Receiver<bool>,
+    restart: impl std::future::Future<Output = Result<T>>,
+) -> Result<T> {
+    tokio::select! {
+        biased;
+        _ = ended.wait_for(|ended| *ended) => bail!("session ended during seek"),
+        result = restart => result,
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn ended_session_never_polls_a_queued_restart() {
+        let (ended, _) = tokio::sync::watch::channel(false);
+        ended.send_replace(true);
+        let result = until_session_ends(ended.subscribe(), async {
+            panic!("a queued seek must not start after session deletion");
+            #[allow(unreachable_code)]
+            Ok(())
+        })
+        .await;
+        assert!(result.unwrap_err().to_string().contains("session ended"));
+    }
+
+    #[tokio::test]
+    async fn deletion_drops_in_flight_restart_without_reaching_fallback() {
+        let (ended, rx) = tokio::sync::watch::channel(false);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (owned, mut released) = tokio::sync::oneshot::channel::<()>();
+        let restart = tokio::spawn(until_session_ends(rx, async {
+            let _owned = owned;
+            started.send(()).unwrap();
+            std::future::pending::<()>().await;
+            panic!("cancelled readiness must not fall through to fallback");
+            #[allow(unreachable_code)]
+            Ok(())
+        }));
+        ready.await.unwrap();
+        assert!(matches!(
+            released.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+        ended.send_replace(true);
+        let result = tokio::time::timeout(Duration::from_secs(1), restart)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(result.is_err());
+        assert!(released.await.is_err(), "restart still owns its resources");
     }
 }

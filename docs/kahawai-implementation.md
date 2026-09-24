@@ -1142,6 +1142,13 @@ the OCR engine; `tests/boundaries.rs` reads its manifest and
 * `seek` — part indexing, host dependence of a multi-part session, and
   seek-intent coalescing.
 
+An accepted hub seek runs independently of its HTTP request, so a disconnected
+client cannot strand a partially replaced pipeline. Session deletion is different:
+it signals cancellation to the detached seek and takes the seek lock before
+collecting the run or sending the final remote `EndSession`. Cancellation drops
+an unpublished local run, stopping its worker, and prevents readiness failure
+from starting a fallback after the session has ended.
+
 `scripts/kahawai-playback.sh check` runs the crate's tests and a real
 pipeline through the executor; `worker` does the same through the spawned
 `remux-worker` child of a freshly built `kahawai` binary.
