@@ -1,13 +1,12 @@
-//! Bounded, disposable transport read-ahead, not a persistent media cache.
-//! Demand hits cost a memory copy; misses cost a remote seek/read. Retain
-//! disjoint ranges for demuxers alternating audio/video offsets. Speculation
-//! stops at capacity. Retain blocks across forward and backward reads; only a
-//! demand miss reclaims space, evicting the least recently used blocks first.
-//! This lets alternating audio/video reads share the budget without treating
-//! the later stream's cursor as proof the earlier stream has consumed its data.
-//! Capacity counts full allocations, including consumed prefixes. Demand reserves
-//! admission space even at the prefetch boundary, so a full buffer cannot prevent
-//! progress. Reads larger than capacity may evict their already copied prefix.
+//! Two independently backpressured source generations, each with a reserved
+//! half of the per-source memory budget. A hit costs a copy; a miss costs a
+//! remote reposition/read. Audio/video alternation must not cancel the other
+//! stream or release its unread bytes. Independent byte channels prevent a full
+//! speculative window from blocking delivery to the demanded window.
+//! Within each window, a demand releases only blocks before its starting block.
+//! Full allocations (including consumed prefixes) count against capacity. A miss
+//! reserves admission space, including when it reaches the prefetch boundary.
+//! Thus large reads progress without needing space from the other window.
 use kahawai_proto::v1::{ByteChunk, ReadRequest};
 use std::{
     collections::VecDeque,
@@ -192,6 +191,21 @@ impl ReadAhead {
         let _serial = self.shared.serial.lock().await;
         let len = len.min(self.size.saturating_sub(offset));
         let mut out = Vec::new();
+        if len != 0 {
+            let mut state = self.shared.state.lock().unwrap();
+            let mut removed = 0;
+            state.blocks.retain(|block| {
+                let before = block.offset + block.data.len() as u64 <= offset;
+                if before {
+                    removed += block.data.len();
+                }
+                !before
+            });
+            state.bytes -= removed;
+            if removed != 0 {
+                self.shared.changed.notify_waiters();
+            }
+        }
         let started = std::time::Instant::now();
         while (out.len() as u64) < len {
             let pos = offset + out.len() as u64;
@@ -229,8 +243,16 @@ impl ReadAhead {
                     if state.bytes != before {
                         self.shared.changed.notify_waiters();
                     }
-                    if state.generation == 0 || pos != state.next || state.eof {
+                    // Small forward skips can wait for the already streaming
+                    // chunk. Restarting here wastes in-flight bytes; admission
+                    // above ensures skipped bytes cannot fill and pin the window.
+                    let approaching =
+                        pos >= state.next && pos - state.next < super::source_stream::CHUNK as u64;
+                    if state.generation == 0 || !approaching || state.eof {
                         state.generation += 1;
+                        state.discarded += state.bytes as u64;
+                        state.blocks.clear();
+                        state.bytes = 0;
                         state.next = pos;
                         state.eof = false;
                         state.misses += 1;
@@ -266,6 +288,76 @@ impl ReadAhead {
             "source demand answered"
         );
         Ok(out)
+    }
+}
+
+/// Two independently owned wires; neither can consume the other's reservation.
+#[derive(Clone)]
+pub struct BiReadAhead {
+    windows: [ReadAhead; 2],
+    selection: Arc<tokio::sync::Mutex<Selection>>,
+}
+#[derive(Default)]
+struct Selection {
+    clock: u64,
+    used: [u64; 2],
+    cursor: [u64; 2],
+}
+impl BiReadAhead {
+    pub fn new(windows: [ReadAhead; 2]) -> Self {
+        assert_eq!(windows[0].size, windows[1].size);
+        assert_eq!(windows[0].capacity, windows[1].capacity);
+        Self {
+            windows,
+            selection: Arc::new(tokio::sync::Mutex::new(Selection::default())),
+        }
+    }
+    pub fn diagnostics(&self) -> String {
+        format!(
+            "window 0: {}\nwindow 1: {}",
+            self.windows[0].diagnostics(),
+            self.windows[1].diagnostics()
+        )
+    }
+    pub async fn read(&self, offset: u64, len: u64) -> io::Result<Vec<u8>> {
+        let mut select = self.selection.lock().await;
+        if len == 0 || offset >= self.windows[0].size {
+            return Ok(Vec::new());
+        }
+        // Prefer a resident range or a nearby forward continuation. When both windows
+        // overlap, follow the closest demand cursor (the two streams may advance
+        // at very different rates). Otherwise replace the least recently used
+        // window; an index read or genuine seek never destroys both streams.
+        let hit = (0..2)
+            .filter(|&i| {
+                let state = self.windows[i].shared.state.lock().unwrap();
+                state.generation != 0
+                    && ((!state.eof
+                        && offset >= state.next
+                        && offset - state.next < self.windows[i].capacity as u64)
+                        || state
+                            .blocks
+                            .iter()
+                            .any(|b| b.offset <= offset && offset - b.offset < b.data.len() as u64))
+            })
+            .min_by_key(|&i| {
+                (
+                    select.cursor[i].abs_diff(offset),
+                    std::cmp::Reverse(select.used[i]),
+                )
+            });
+        let window = hit.unwrap_or_else(|| {
+            if select.used[0] <= select.used[1] {
+                0
+            } else {
+                1
+            }
+        });
+        select.clock += 1;
+        select.used[window] = select.clock;
+        select.cursor[window] = offset;
+        tracing::trace!(window, offset, len, "bi-generational demand");
+        self.windows[window].read(offset, len).await
     }
 }
 
@@ -379,42 +471,11 @@ mod tests {
             );
             assert_eq!(buffer.shared.state.lock().unwrap().generation, generation);
         }
-        // A forward read does not destroy the earlier region's retained bytes.
+        // Within a window, forward demand releases earlier blocks.
         bounded(&buffer, CHUNK as u64, CHUNK as u64).await;
         let state = buffer.shared.state.lock().unwrap();
-        assert!(state.blocks.iter().any(|b| b.offset == 0));
+        assert!(!state.blocks.iter().any(|b| b.offset == 0));
         assert!(state.blocks.iter().any(|b| b.offset == CHUNK as u64));
-    }
-
-    #[tokio::test]
-    async fn alternating_regions_survive_pressure_and_demand_keeps_progressing() {
-        let capacity = 4 * CHUNK;
-        let (buffer, _) = source(capacity);
-        bounded(&buffer, 0, 1).await;
-        tokio::time::timeout(Duration::from_secs(2), async {
-            while buffer.shared.state.lock().unwrap().bytes != capacity {
-                tokio::task::yield_now().await;
-            }
-        })
-        .await
-        .unwrap();
-        let generation = buffer.shared.state.lock().unwrap().generation;
-        // Touch both regions, then force admission at the full prefetch boundary.
-        for offset in [0, 2 * CHUNK, 4 * CHUNK, 0, 2 * CHUNK] {
-            assert_eq!(
-                bounded(&buffer, offset as u64, 32).await,
-                data(offset as u64, 32)
-            );
-            assert_eq!(buffer.shared.state.lock().unwrap().generation, generation);
-        }
-        // Continue beyond the initial window: retention must not starve demand.
-        for offset in (5 * CHUNK..32 * CHUNK).step_by(CHUNK) {
-            assert_eq!(
-                bounded(&buffer, offset as u64, 32).await,
-                data(offset as u64, 32)
-            );
-        }
-        assert!(buffer.shared.state.lock().unwrap().peak <= capacity);
     }
 
     #[tokio::test]
@@ -473,6 +534,80 @@ mod tests {
         }
         assert!(buffer.shared.state.lock().unwrap().peak <= CHUNK);
     }
+    #[tokio::test]
+    async fn two_generations_advance_without_cancelling_or_starving_each_other() {
+        let (a, _) = source(2 * CHUNK);
+        let (b, _) = source(2 * CHUNK);
+        let buffer = BiReadAhead::new([a, b]);
+        for i in 0..8 {
+            for offset in [i * CHUNK as u64, (16 + i) * CHUNK as u64] {
+                let bytes =
+                    tokio::time::timeout(Duration::from_secs(2), buffer.read(offset, CHUNK as u64))
+                        .await
+                        .expect("one full window starved the other")
+                        .unwrap();
+                assert_eq!(bytes, data(offset, CHUNK));
+            }
+        }
+        for window in &buffer.windows {
+            let state = window.shared.state.lock().unwrap();
+            assert_eq!(
+                state.generation, 1,
+                "alternation restarted an active stream"
+            );
+            assert!(state.peak <= 2 * CHUNK);
+        }
+        // A third region replaces one window, not both.
+        assert_eq!(
+            buffer.read(30 * CHUNK as u64, 19).await.unwrap(),
+            data(30 * CHUNK as u64, 19)
+        );
+        assert_eq!(
+            buffer.read(23 * CHUNK as u64, 19).await.unwrap(),
+            data(23 * CHUNK as u64, 19)
+        );
+        assert_eq!(buffer.windows[1].shared.state.lock().unwrap().generation, 1);
+    }
+
+    #[tokio::test]
+    async fn consecutive_forward_skip_keeps_its_window_and_the_other_stream() {
+        let (a, _) = source(2 * CHUNK);
+        let (b, _) = source(2 * CHUNK);
+        let buffer = BiReadAhead::new([a, b]);
+        buffer.read(0, 32).await.unwrap();
+        buffer.read(16 * CHUNK as u64, 32).await.unwrap();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while buffer
+                .windows
+                .iter()
+                .any(|w| w.shared.state.lock().unwrap().bytes != 2 * CHUNK)
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        // Audio makes two consecutive reads, the second just beyond its current
+        // prefetch frontier. Replacing the LRU window here cancels VIDEO, swaps
+        // the streams, and makes the next video demand cancel audio in turn.
+        buffer.read(64, 32).await.unwrap();
+        let target = 2 * CHUNK as u64 + 17;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), buffer.read(target, 32))
+                .await
+                .unwrap()
+                .unwrap(),
+            data(target, 32)
+        );
+        assert_eq!(
+            buffer.read(16 * CHUNK as u64 + 64, 32).await.unwrap(),
+            data(16 * CHUNK as u64 + 64, 32)
+        );
+        for window in &buffer.windows {
+            assert_eq!(window.shared.state.lock().unwrap().generation, 1);
+        }
+    }
+
     #[tokio::test]
     async fn error_is_not_eof_and_drop_releases_transport() {
         struct Witness(Arc<AtomicUsize>);

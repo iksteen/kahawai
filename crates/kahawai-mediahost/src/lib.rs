@@ -995,7 +995,6 @@ async fn link_once_v4(
         owner: scheduler_owner.clone(),
     };
     let channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls.clone()).await?;
-    let byte_channel = kahawai_transport::tls::grpc_channel_with(&hub.address, tls).await?;
     let mut client = MediahostLinkClient::new(channel)
         .max_decoding_message_size(64 * 1024 * 1024)
         .max_encoding_message_size(64 * 1024 * 1024);
@@ -1156,13 +1155,15 @@ async fn link_once_v4(
                         .context("hub overran the subtitle work queue")?;
                 }
                 Some(HubToHost { msg: Some(hub_to_host::Msg::OpenRead(request)) }) => {
-                    let channel = byte_channel.clone();
+                    let address = hub.address.clone();
+                    let tls = tls.clone();
                     let scheduler = runtime.scheduler.clone();
                     let owner = Some(format!("hub:{}", hub.id));
                     let collections = selected.clone();
                     tokio::spawn(async move {
                         if let Err(error) = serve::serve_request_scheduled(
-                            channel,
+                            &address,
+                            tls,
                             request,
                             collections,
                             scheduler,
@@ -2237,11 +2238,6 @@ async fn link_once(
     state_dir: &Path,
 ) -> Result<()> {
     let channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls.clone()).await?;
-    // The byte plane gets its OWN connection: lease streams pushing (or
-    // stalling on) megabytes must never exhaust the control link's h2
-    // connection window — that froze heartbeats for 40 s at a time and
-    // the hub declared the link dead mid-scan.
-    let byte_channel = kahawai_transport::tls::grpc_channel_with(hub_addr, tls).await?;
     // Mirror the hub's raised limit: worklists and manifests can pass
     // tonic's 4 MB default on large collections.
     let mut client = MediahostLinkClient::new(channel.clone())
@@ -2312,7 +2308,8 @@ async fn link_once(
                 match msg {
                     Ok(Some(m)) => {
                         if let Some(req) = engine.dispatch(m)? {
-                            let ch = byte_channel.clone();
+                            let address = hub_addr.to_owned();
+                            let tls = tls.clone();
                             // A background lease is served like any other and
                             // does not make this box busy: the hub's own sweeps
                             // must not shut the gate on the work only this box
@@ -2335,7 +2332,8 @@ async fn link_once(
                             let collections = collections.to_vec();
                             tokio::spawn(async move {
                                 let result = serve::serve_request_scheduled(
-                                    ch,
+                                    &address,
+                                    tls,
                                     req,
                                     collections,
                                     scheduler,

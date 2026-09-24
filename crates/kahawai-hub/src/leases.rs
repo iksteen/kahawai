@@ -1,8 +1,8 @@
 //! Fresh file transports become either finite leases or sized pipeline sources.
-//! Pipeline clones share a 16 MiB buffer and one wire; the choice is immutable.
+//! Pipeline clones share two 16 MiB windows and independent wires.
 use anyhow::{Context, Result, bail};
 use kahawai_proto::v1::{ByteChunk, ReadRequest};
-use kahawai_transport::read_ahead::{HUB_CAPACITY, ReadAhead};
+use kahawai_transport::read_ahead::{BiReadAhead, HUB_CAPACITY, ReadAhead};
 use kahawai_transport::source_stream::{self, FileReader};
 use rand_core::{OsRng, RngCore};
 use std::collections::HashMap;
@@ -37,11 +37,11 @@ struct LeaseInner {
 /// Finite reads, serialized on one transport and drained when abandoned.
 #[derive(Clone)]
 pub struct Lease(Arc<LeaseInner>);
-/// Sized pipeline source. All owners share one continuously filled buffer.
+/// Sized pipeline source. All owners share two continuously filled windows.
 #[derive(Clone)]
 pub(crate) struct PipelineSource {
     size: u64,
-    buffer: ReadAhead,
+    buffer: BiReadAhead,
 }
 impl PipelineSource {
     pub fn diagnostics(&self) -> String {
@@ -76,26 +76,35 @@ impl LeaseTransport {
             }),
         }))
     }
-    pub fn buffered(self, size: u64) -> PipelineSource {
-        let buffer = ReadAhead::new(size, HUB_CAPACITY, move |mut requests, output| async move {
-            let send = async {
-                while let Some(req) = requests.recv().await {
-                    if self.req_tx.send(Ok(req)).await.is_err() {
-                        break;
-                    }
-                }
-            };
-            let receive = async {
-                let mut chunks = self.chunks;
-                while let Some(chunk) = chunks.recv().await {
-                    if output.send(chunk).await.is_err() {
-                        break;
-                    }
-                }
-            };
-            tokio::select! { _ = send => {}, _ = receive => {} }
+    pub fn buffered(transports: [Self; 2], size: u64) -> PipelineSource {
+        let windows = transports.map(|transport| {
+            ReadAhead::new(
+                size,
+                HUB_CAPACITY / 2,
+                move |mut requests, output| async move {
+                    let send = async {
+                        while let Some(req) = requests.recv().await {
+                            if transport.req_tx.send(Ok(req)).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    let receive = async {
+                        let mut chunks = transport.chunks;
+                        while let Some(chunk) = chunks.recv().await {
+                            if output.send(chunk).await.is_err() {
+                                break;
+                            }
+                        }
+                    };
+                    tokio::select! { _ = send => {}, _ = receive => {} }
+                },
+            )
         });
-        PipelineSource { size, buffer }
+        PipelineSource {
+            size,
+            buffer: BiReadAhead::new(windows),
+        }
     }
 }
 impl Lease {
@@ -391,7 +400,13 @@ mod streaming_tests {
         let file = std::fs::File::create(&path).unwrap();
         let size = 3 * HUB_CAPACITY as u64;
         file.set_len(size).unwrap();
-        let lease = LeaseTransport::local_guarded(path, None, None).buffered(size);
+        let lease = LeaseTransport::buffered(
+            [
+                LeaseTransport::local_guarded(path.clone(), None, None),
+                LeaseTransport::local_guarded(path, None, None),
+            ],
+            size,
+        );
         assert_eq!(lease.read(0, 1).await.unwrap(), [0]);
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(

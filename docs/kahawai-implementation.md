@@ -120,28 +120,43 @@ Three gRPC services, all initiated module→hub (AR-3) over mTLS (the satellite'
 
 **Byte plane.** For a networked mediahost, bulk media bytes ride a separate gRPC connection: tonic byte-chunk streams over mTLS, with a one-time token minted on the control stream binding the channel to a specific read lease. The hard-won invariant (AR-12): **the byte plane MUST be a separate HTTP/2 connection from the control link**. HTTP/2 flow control is per-connection as well as per-stream: in early implementation, a single stalled lease stream (client paused, pipeline backpressured) exhausted the shared connection-level window and froze heartbeats for 40 s at a time, producing false disconnects and spurious failovers. Separate connections make a stalled lease stall only itself. The in-process mediahost takes neither connection: path resolution and file reads stay local as described in §2.
 
-**Pull and read-ahead (protocol 5.0).** Pipeline appsrc uses `RandomAccess`, byte
-format and a known size, and answers each demand exactly (short only at EOF).
-Its single feeder has no speculative ring; the hub holds at most 32 MiB of
-read-ahead per activated part and a remote transcoder holds another 2 MiB.
-These temporary buffers trade bounded RAM/speculative I/O for memory-speed
-hits; a miss costs a source seek and fresh bytes. Forward reads do not release
-earlier blocks: poorly interleaved audio/video can alternate between two
-advancing file regions. Releasing everything before the later read repeatedly
-forced the earlier region to be fetched again even when the gap fit in RAM.
-The 32 MiB hub budget spends another 16 MiB per activated part on headroom for
-that pattern; retention, rather than capacity alone, avoids the refetch latency.
-On a miss, one eighth of capacity is made available by dropping the least
-recently used retained blocks. Demand hits move their blocks to the back of
-the eviction queue; incoming prefetch is appended there too. Retained blocks
-count their full allocation, and already-returned prefixes remain readable.
-A demand at the current prefetch boundary makes room for an incoming chunk
-without restarting the upstream stream; buffered skips remain hits. Reclamation
-can release even the starting block so reads larger than capacity can progress.
-Speculative reading stops at capacity. Bounded 256 KiB transport chunks and
-outstanding demand responses are additional memory, not included in the
-read-ahead allowance. This is bounded retention, not a guarantee that either
-of two regions survives arbitrary demand or prefetch pressure.
+**Pull and bi-generational read-ahead (protocol 6.0).** Pipeline appsrc uses
+`RandomAccess`, byte format and a known size, and answers each demand exactly
+(short only at EOF). Each activated source owns two independent byte channels
+with a reserved half-budget each: 2 × 16 MiB at the hub, 2 × 1 MiB at a remote
+transcoder. The total allowance remains 32 MiB / 2 MiB. Each activated part now
+owns two mediahost connections and two file leases; a remote transcoder also
+owns two source connections. This replaces the mediahost's shared byte-plane
+connection, so finite leases also pay for their own connection/TLS setup.
+Demand hits cost a copy; misses cost remote repositioning
+and delivery latency. Overlapping windows can fetch the same bytes twice; each
+individual stream has half the previous single-window look-ahead. Two channels let alternating audio/video regions progress
+without cancelling each other's generation, and prevent a backpressured window
+from blocking the other window's demanded bytes.
+
+A read chooses a window containing its starting byte or approaching it within
+one window-capacity of its current frontier. Small forward skips of less than
+one transport chunk wait for the already active stream; larger unbuffered
+skips reposition that same window. If both qualify, the nearest last-demand cursor wins; if neither
+qualifies, the least recently demanded window is repositioned. Header/index
+reads and genuine seeks therefore replace at most one window. Each window
+releases blocks entirely before its own demand's starting offset, retaining the
+starting block's prefix for repeated and overlapping reads. On a miss it reserves
+one eighth of its capacity (at least one 256 KiB chunk) for incoming bytes. Reads
+larger than capacity can reclaim already copied blocks. A reposition clears that
+window's old blocks, never the other window. Generation checks reject stale
+in-flight data independently on each channel.
+
+Prefetch stops when its window is full. Reservations make demand progress
+independent of space in the other window; no shared receive queue can pin a
+needed chunk behind the other stream's speculative data. This does not guarantee
+hits for arbitrary access patterns with more than two regions. Full retained
+allocations count against the budget; bounded transport queues and outstanding
+demand responses are additional memory. `scripts/kahawai-playback.sh pull`
+exercises both generations under pressure, seek replacement, grant revocation,
+reconnects, and the real dispatched pipeline.
+The [real-file comparison](kahawai-bi-generational-comparison.md) records the
+alternating-region regression, the separated-track check, and the measurement limits.
 
 A mediahost continuously serves a range toward EOF, interrupted by a newer
 generation. Command intake remains live during disk admission or a blocked
@@ -156,14 +171,14 @@ wait 200 ms, have a 10 s outage budget and bound connect/bind waits at 2 s each,
 within the existing 30 s demand deadline. Authorization and protocol errors are
 terminal, not retried. Ending or replacing a run revokes active channels and
 future rebinds. Malformed commands produce explicit status and peer diagnostics
-without exposing bearer tokens. Protocol 5 rejects all protocol-4 peers; there
+without exposing bearer tokens. Protocol 6 rejects peers on other major versions; there
 are no minor feature gates or control-link byte reads. Regular HTTP ranges
 remain finite and use the same nonzero, increasing generation contract.
 
-A fresh mediahost transport is consumed once into either a finite `Lease` or a
-sized `PipelineSource`; there is no runtime mode switch. The latter is the
+A fresh mediahost transport is consumed once into a finite `Lease`; a pair of
+fresh transports constructs a sized `PipelineSource`; there is no runtime mode switch. The latter is the
 shared adapter for worker playback and `BlockingSource` analysis. `Job` holds
-processing options only; `Dispatch` adds mandatory ordered `{size, source_token}`
+processing options only; `Dispatch` adds mandatory ordered `{size, source_token, secondary_source_token}`
 descriptors, while worker invocation pairs each socket with its size. The hub's
 per-run grant owner revokes exactly its own tokens on drop, including failed or
 cancelled starts. Successful starts transfer that owner into the dispatched run;
@@ -308,7 +323,7 @@ Two ordering rules the wiring has to respect, both of which fail silently. The r
 
 **Where the display sets come from.** The index walk that yields them is disk-speed locally and round-trip-bound over the byte plane — measured at ~4 KB/s hub→mediahost→NAS, so a walk costing milliseconds on the host does not finish inside a session start at all. It therefore runs on the MEDIAHOST (`ExtractImageSubs` → `subindex::extract_image_track` → `ImageSubtitles`), which reads its own disk; the hub caches the raw blocks per (module, collection, path, track) and hands the file to whichever worker runs the encode — by path for a local worker, in `StartSession.burn_sets` for a dispatched one, which can no more walk the source index than the hub can. Extraction is **on demand at session start**, not at scan: it costs milliseconds per file, while pre-walking all ~1200 image-sub files would cost roughly 12 GB of cache (OPS-6 never evicts) for content that only a non-compositing client ever needs. Text subtitles already have both shapes — urgent on demand plus the `subtitle_jobs` prewarm queue — so pre-warming image sets on the same idle tier is the upgrade if first-play latency ever matters. A burn is only promised once the sets exist: if they do not arrive, negotiation re-plans with the tier withdrawn rather than encoding video that burns nothing, and the walk itself runs under a read budget so a session always starts.
 
-**Three faults that only the real fleet exposed**, each of which the dev box hid: image tracks may carry Matroska per-track compression (this library's PGS is zlib), so payloads must be inflated before any decoder sees them — the text path had the same latent gap and now shares the fix; `overlaycomposition` only blends when downstream does *not* claim to support overlay metadata, and the VA encoder claims it and then drops it, so burn-in worked on NVENC and silently did nothing on silence — we now blend explicitly via `gst_video_overlay_composition_blend`, which needs nothing of the encoder; and a burned frame's own timestamp does not say where in the FILE it is, so the blend reads its position from the frame's SEGMENT instead (the same conversion the seek gate uses for `start.pos`). The seek gate rolls the whole chain to PAUSED with data from the top of the file before the flushing seek can happen, so the blender sees pre-seek frames stamped ~0 and post-seek frames stamped at the snapped keyframe on the same pad — a difference that reads as "timestamps are absolute on one box and rebased on another" and was diagnosed that way for a while. Deciding a time base once, from the first frame, therefore latched onto a preroll and put every subtitle a resume offset out of place: a 1 h resume into The Truman Show looked up 2 h and burned nothing at all, while playback from zero was frame-exact and looked like proof the code was right.
+**Three faults that only the real fleet exposed**, each of which the dev box hid: image tracks may carry Matroska per-track compression (this library's PGS is zlib), so payloads must be inflated before any decoder sees them — the text path had the same latent gap and now shares the fix; `overlaycomposition` only blends when downstream does *not* claim to support overlay metadata, and the VA encoder claims it and then drops it, so burn-in worked on NVENC and silently did nothing on silence — we now blend explicitly via `gst_video_overlay_composition_blend`, which needs nothing of the encoder; and a burned frame's own timestamp does not say where in the FILE it is, so the blend reads its position from the frame's SEGMENT instead (the same conversion the seek gate uses for `start.pos`). The seek gate rolls the whole chain to PAUSED with data from the top of the file before the flushing seek can happen, so the blender sees pre-seek frames stamped ~0 and post-seek frames stamped at the snapped keyframe on the same pad — a difference that reads as "timestamps are absolute on one box and rebased on another" and was diagnosed that way for a while. Deciding a time base once, from the first frame, therefore latched onto a preroll and put every subtitle a resume offset out of place: a 1 h resume looked up 2 h and burned nothing at all, while playback from zero was frame-exact and looked like proof the code was right.
 
 **Decoder rank calibration (OPS-9).** GStreamer ranks decide which decoder autoplugs, and a rank is a vendor's claim about its own element, not a measurement of this box. Two ways that goes wrong, and presence checks see neither. The first is a hardware decoder that is present, advertises the codec, works, and is catastrophically slow: on the J5005, measured through `doctor --calibrate`, `vah265dec` decodes the reference clip at **8 fps against `avdec_h265`'s 145**, and `vah264dec` at **9 against 341** — a 16x and a 38x inversion of what the ranks assert. The second is a decoder that is fast and sees less of the stream, of which `dtsdec` is the instance: libdca decodes only the lossy DTS core, so a scan autoplugging it files a DTS-HD MA 7.1 track as 5.1 (312 titles in this library did exactly that). Only the first class is measurable — the second is a fixed known-bad list, because timing finds nothing wrong with being quickly incorrect. The measurement names the candidate element EXPLICITLY rather than autoplugging, since the point is to time the element GStreamer would have chosen against the one it would not; it reuses the TC-1 benchmark harness (`bench.rs`) but needed a new asset, because those clips are h264 and the pathology is h265 — `ref-1080p.h265` is the same 24 frames re-encoded, so a decoder's two numbers describe the same pictures. Candidates are filtered to hardware elements by name prefix (`va`, `nv`, `v4l2`, `vt`, `qsv`, …), a heuristic with a stated ceiling: without it the check times software siblings against each other and reports the loser as a pathology. Because it is timed it is opt-in — `startup_checks` shares the same check list and a boot must not spend seconds decoding to warn nobody is reading. Codecs without a checked-in reference bitstream are simply not timed (OPS-9a); the tool says what it measured rather than warning an operator about work we have not done. Remediation is the half that makes the check worth having: `doctor --fix` writes the demotions into the box's own config through `toml_edit`, format-preserving, additive and idempotent, into both `[transcoder]` and `[mediahost]` because a decoder that decodes the wrong thing also files the wrong thing. It never removes an entry a human put there — the measurement is one box at one moment, and the asymmetry is stark: a spurious demotion costs some speed, a removed one silently files hundreds of files wrong again. The requirement exists because the DTS check already warned, in exactly the words that describe the bug, on a box nobody was reading the output of.
 
@@ -547,14 +562,14 @@ State machine per session: `Negotiated → Provisioning → Streaming → (Seeki
 
 **Measured audio loudness normalisation (HUB-38).** A scalar native LUFS/true-peak pair cannot predict a downmix: output energy contains cross-channel correlation terms, post-matrix true peak depends on sample phase, and EBU relative gating must be rerun over the converted blocks. The owning mediahost therefore decodes each non-music stream once and tees it into bounded `audioconvert` + `ebur128` histogram branches for the untouched decoded layout and every smaller canonical layout playback may emit (7.1 variants, 5.1, stereo, mono). Measurements are keyed by exact `(channels, channel-mask)`, revision-guarded on the hub, target −18 LUFS, and cap measured true peak at −1 dBTP. Playback waits for the worker's actual post-conversion caps and selects only the matching static gain; it never derives one layout from another.
 
-The global preference has three states: the empty/default value applies gain only when negotiation already encodes audio, `off` suppresses it, and `force` asks negotiation to replace measured direct/copied audio with an encode. Force is admitted only for a single-part source, an exact measured output layout, a compatible audio encoder, and an unchanged video mode. The hub preflights its local AAC/Opus layout before replacing direct/copy; an unsupported layout retains the ordinary plan rather than paying for a no-op transcode. Protocol 5 includes exact per-layout loudness maps on every executor: a worker
+The global preference has three states: the empty/default value applies gain only when negotiation already encodes audio, `off` suppresses it, and `force` asks negotiation to replace measured direct/copied audio with an encode. Force is admitted only for a single-part source, an exact measured output layout, a compatible audio encoder, and an unchanged video mode. The hub preflights its local AAC/Opus layout before replacing direct/copy; an unsupported layout retains the ordinary plan rather than paying for a no-op transcode. Protocol 6 includes exact per-layout loudness maps on every executor: a worker
 may fold a nominal 7.1 source to 5.1, so source channel count cannot prove which
 scalar will apply. There is no protocol-specific replanning or gain suppression.
 Force still requires a usable measurement and codec/layout support; missing
 measurements retain the ordinary plan. Explicit `mode=direct` remains original
 bytes.
 
-Protocol 5 has one baseline with no minor feature thresholds. Placement uses
+Protocol 6 has one baseline with no minor feature thresholds. Placement uses
 reported hardware capabilities, load and measured throughput. Empty decoder
 inventories are not assumed capable. Scalar wire fields use protobuf presence:
 absent means unmeasured and an explicit zero remains an exact 0 dB gain.

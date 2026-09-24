@@ -94,7 +94,7 @@ impl LinkRate {
 }
 
 struct BufferedSource {
-    buffer: kahawai_transport::read_ahead::ReadAhead,
+    buffer: kahawai_transport::read_ahead::BiReadAhead,
     size: u64,
 }
 impl ByteSource for BufferedSource {
@@ -445,26 +445,23 @@ impl Runner {
         let SourceEndpoint { address, tls } = &self.source_endpoint;
         let mut sources: Vec<Arc<dyn ByteSource>> = Vec::with_capacity(dispatch.sources.len());
         for descriptor in dispatch.sources {
-            let (address, tls, rates) = (address.clone(), tls.clone(), self.reads.clone());
             let size = descriptor.size;
-            let buffer = kahawai_transport::read_ahead::ReadAhead::new(
-                size,
-                kahawai_transport::read_ahead::TRANSCODER_CAPACITY,
-                move |requests, chunks| async move {
-                    if let Err(error) = stream_source(
-                        &address,
-                        tls,
-                        descriptor.source_token,
-                        requests,
-                        chunks,
-                        rates,
+            let windows =
+                [descriptor.source_token, descriptor.secondary_source_token].map(|token| {
+                    let (address, tls, rates) = (address.clone(), tls.clone(), self.reads.clone());
+                    kahawai_transport::read_ahead::ReadAhead::new(
+                        size,
+                        kahawai_transport::read_ahead::TRANSCODER_CAPACITY / 2,
+                        move |requests, chunks| async move {
+                            if let Err(error) =
+                                stream_source(&address, tls, token, requests, chunks, rates).await
+                            {
+                                tracing::warn!(error = %error, "transcoder source channel failed");
+                            }
+                        },
                     )
-                    .await
-                    {
-                        tracing::warn!(error = %error, "transcoder source channel failed");
-                    }
-                },
-            );
+                });
+            let buffer = kahawai_transport::read_ahead::BiReadAhead::new(windows);
             sources.push(Arc::new(BufferedSource { buffer, size }));
         }
         let started = match self.executor.start(&session_id, job, sources).await {
@@ -987,6 +984,7 @@ mod tests {
             sources: vec![kahawai_proto::v1::SourceDescriptor {
                 size: 1,
                 source_token: "test-source".into(),
+                secondary_source_token: "second-test-source".into(),
             }],
             target_duration_secs: 6,
             video: "copy".into(),

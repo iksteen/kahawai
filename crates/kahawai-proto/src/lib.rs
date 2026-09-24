@@ -6,8 +6,8 @@ pub mod v1 {
     tonic::include_proto!("kahawai.v1");
 }
 
-/// Protocol 5 requires the current source and work contracts on every peer.
-pub const PROTOCOL_MAJOR: u32 = 5;
+/// Protocol 6 requires two independent source grants per dispatched part.
+pub const PROTOCOL_MAJOR: u32 = 6;
 pub const PROTOCOL_MINOR: u32 = 0; // Informational only; no minor negotiation.
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
@@ -36,8 +36,8 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_five_baseline() {
-        assert_eq!((PROTOCOL_MAJOR, PROTOCOL_MINOR), (5, 0));
+    fn protocol_six_baseline() {
+        assert_eq!((PROTOCOL_MAJOR, PROTOCOL_MINOR), (6, 0));
     }
 
     #[test]

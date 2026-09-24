@@ -22,9 +22,10 @@ docker exec -it <container-name> kahawai hub init-admin
 
 Neither first-admin path exists after setup succeeds.
 
-## Protocol 5 fleet cutover
+## Protocol 6 fleet cutover
 
-Protocol 5 peers reject protocol 4. Stage every binary before activating the
+Protocol 6 requires two independent source grants per dispatched part and rejects
+other protocol majors. Stage every binary before activating the
 fleet; both hubs (Linux AIO and Mac AIO) and every NAS/Mac satellite must switch
 in the same maintenance window. Temporary version refusals during that window
 are expected; there is no minor-version compatibility mode.

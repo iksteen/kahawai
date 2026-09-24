@@ -147,7 +147,7 @@ Deployment topology, cross-compilation and the NAS/macOS satellites:
   Placement ranking is `playback/placement.rs`; the registry only holds the
   locks and takes the reservation.
 - **Byte plane** — `crates/kahawai-transport/src/read_ahead.rs` defines the
-  bounded range buffer, demand admission and allocation accounting;
+  two independently backpressured windows, demand admission and allocation accounting;
   `source_stream.rs` beside it defines interruptible generations and positional
   disk reads. Hub `leases.rs` constructs finite leases or sized buffered sources
   from fresh transports; `playback/job.rs` separates jobs, dispatch descriptors

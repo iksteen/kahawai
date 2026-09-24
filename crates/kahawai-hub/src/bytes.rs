@@ -161,8 +161,8 @@ impl ByteSources {
         reader: Reader,
         size: u64,
     ) -> Result<PipelineSource> {
-        Ok(self
-            .open_transport(
+        let open = || {
+            self.open_transport(
                 registry,
                 module_id,
                 collection_id,
@@ -170,8 +170,9 @@ impl ByteSources {
                 path_rel,
                 reader,
             )
-            .await?
-            .buffered(size))
+        };
+        let (a, b) = tokio::try_join!(open(), open())?;
+        Ok(LeaseTransport::buffered([a, b], size))
     }
 
     /// Open a read lease on an arbitrary path within a collection (also

@@ -72,8 +72,10 @@ impl Dispatch {
 fn validate_sources(sources: &[SourceDescriptor]) -> Result<()> {
     anyhow::ensure!(!sources.is_empty(), "a dispatch needs at least one source");
     anyhow::ensure!(
-        sources.iter().all(|s| !s.source_token.is_empty()),
-        "empty source grant"
+        sources.iter().all(|s| !s.source_token.is_empty()
+            && !s.secondary_source_token.is_empty()
+            && s.source_token != s.secondary_source_token),
+        "each source needs two distinct nonempty grants"
     );
     Ok(())
 }

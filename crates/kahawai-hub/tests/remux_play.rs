@@ -107,7 +107,7 @@ async fn remux_to_hls_end_to_end() {
         ca_pem: ca.ca_cert_pem().to_string(),
     };
     let client_tls = kahawai_transport::mtls::mtls_client_config(&id).unwrap();
-    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls)
+    let channel = kahawai_transport::tls::grpc_channel_with(&hub_addr, client_tls.clone())
         .await
         .unwrap();
     let mut client = pb::mediahost_link_client::MediahostLinkClient::new(channel.clone());
@@ -151,17 +151,26 @@ async fn remux_to_hls_end_to_end() {
         }],
     )
     .await;
-    let serve_channel = channel.clone();
+    let serve_address = hub_addr.clone();
+    let scheduler = kahawai_mediahost::scheduler::Scheduler::new(&[], &Default::default()).unwrap();
     tokio::spawn(async move {
         while let Ok(Some(m)) = inbound.message().await {
             if let Some(pb::hub_to_host::Msg::OpenRead(req)) = m.msg {
-                let path = kahawai_mediahost::serve::resolve_path(&collections, &req);
-                let ch = serve_channel.clone();
-                tokio::spawn(kahawai_mediahost::serve::serve_lease(
-                    ch,
-                    req.lease_token,
-                    path,
-                ));
+                let address = serve_address.clone();
+                let tls = client_tls.clone();
+                let collections = collections.clone();
+                let scheduler = scheduler.clone();
+                tokio::spawn(async move {
+                    kahawai_mediahost::serve::serve_request_scheduled(
+                        &address,
+                        tls,
+                        req,
+                        collections,
+                        scheduler,
+                        None,
+                    )
+                    .await
+                });
             }
         }
     });

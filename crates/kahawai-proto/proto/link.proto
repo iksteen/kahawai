@@ -889,10 +889,11 @@ message ViewerPosition {
   uint64 position_ms = 2;
 }
 
-// One ordered source binding. Every dispatched part has its own grant.
+// One ordered source binding. Each part has two separately bound stream grants.
 message SourceDescriptor {
   uint64 size = 1;
   string source_token = 2;
+  string secondary_source_token = 3;
 }
 
 message StartSession {

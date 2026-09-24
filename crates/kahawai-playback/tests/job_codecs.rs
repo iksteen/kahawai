@@ -366,6 +366,12 @@ fn dispatch_requires_sources_tokens_and_target_duration() {
     message.sources[1].source_token.clear();
     assert!(Dispatch::from_start_session(&message).is_err());
     message.sources = descriptors();
+    message.sources[1].secondary_source_token.clear();
+    assert!(Dispatch::from_start_session(&message).is_err());
+    message.sources = descriptors();
+    message.sources[1].secondary_source_token = message.sources[1].source_token.clone();
+    assert!(Dispatch::from_start_session(&message).is_err());
+    message.sources = descriptors();
     message.target_duration_secs = 0;
     assert!(Dispatch::from_start_session(&message).is_err());
     let mut job = full_job();
@@ -427,10 +433,12 @@ fn descriptors() -> Vec<SourceDescriptor> {
         SourceDescriptor {
             size: 100,
             source_token: "part-a".into(),
+            secondary_source_token: "second-a".into(),
         },
         SourceDescriptor {
             size: 200,
             source_token: "part-b".into(),
+            secondary_source_token: "second-b".into(),
         },
     ]
 }

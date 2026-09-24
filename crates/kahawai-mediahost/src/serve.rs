@@ -109,12 +109,16 @@ pub async fn serve_lease(
 /// Canonicalization can itself block on a network mount, so it must not happen
 /// in the control-link task before the scheduler sees the operation.
 pub async fn serve_request_scheduled(
-    channel: tonic::transport::Channel,
+    address: &str,
+    tls: std::sync::Arc<rustls::ClientConfig>,
     request: OpenRead,
     collections: Vec<CollectionConfig>,
     scheduler: Scheduler,
     owner: Option<String>,
 ) -> Result<()> {
+    // Each lease owns a connection: a full speculative window must not exhaust
+    // the shared HTTP/2 connection window and starve another lease's demand.
+    let channel = kahawai_transport::tls::grpc_channel_with(address, tls).await?;
     let source = request
         .source
         .as_ref()

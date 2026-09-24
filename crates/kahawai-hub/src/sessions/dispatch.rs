@@ -289,21 +289,25 @@ impl GrantOwner {
         {
             let mut grants = owner.registry.lock().unwrap();
             for source in parts {
-                let token = crate::leases::new_lease_token();
-                let (alive, _) = tokio::sync::watch::channel(());
-                grants.insert(
-                    token.clone(),
-                    SourceGrant {
-                        peer: peer.into(),
-                        source: source.clone(),
-                        claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                        alive,
-                    },
-                );
-                owner.tokens.push(token.clone());
+                let tokens: [String; 2] = std::array::from_fn(|_| crate::leases::new_lease_token());
+                for token in &tokens {
+                    let (alive, _) = tokio::sync::watch::channel(());
+                    grants.insert(
+                        token.clone(),
+                        SourceGrant {
+                            peer: peer.into(),
+                            source: source.clone(),
+                            claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                            alive,
+                        },
+                    );
+                    owner.tokens.push(token.clone());
+                }
+                let [source_token, secondary_source_token] = tokens;
                 descriptors.push(kahawai_proto::v1::SourceDescriptor {
                     size: source.size(),
-                    source_token: token,
+                    source_token,
+                    secondary_source_token,
                 });
             }
         }
@@ -369,8 +373,13 @@ mod source_token_tests {
         let path = dir.path().join("source");
         std::fs::write(&path, b"example").unwrap();
         let sessions = Sessions::new(dir.path().join("runs"));
-        let source: Arc<dyn ByteSource> =
-            Arc::new(crate::leases::LeaseTransport::local_guarded(path, None, None).buffered(7));
+        let source: Arc<dyn ByteSource> = Arc::new(crate::leases::LeaseTransport::buffered(
+            [
+                crate::leases::LeaseTransport::local_guarded(path.clone(), None, None),
+                crate::leases::LeaseTransport::local_guarded(path, None, None),
+            ],
+            7,
+        ));
         let (pending, old) = GrantOwner::new(
             sessions.source_grants.clone(),
             "tc",
@@ -378,6 +387,19 @@ mod source_token_tests {
         );
         let (replacement, new) = GrantOwner::new(sessions.source_grants.clone(), "tc", &[source]);
         let (_, mut live, claim) = sessions.claim_source(&old[0].source_token, "tc").unwrap();
+        let (_, mut second_live, second_claim) = sessions
+            .claim_source(&old[0].secondary_source_token, "tc")
+            .unwrap();
+        assert!(
+            sessions
+                .claim_source(&old[0].secondary_source_token, "other-tc")
+                .is_err()
+        );
+        assert!(
+            sessions
+                .claim_source(&old[0].secondary_source_token, "tc")
+                .is_err()
+        );
         let (entered, ready) = tokio::sync::oneshot::channel();
         let start = tokio::spawn(async move {
             let _pending = pending;
@@ -388,8 +410,14 @@ mod source_token_tests {
         start.abort();
         assert!(start.await.unwrap_err().is_cancelled());
         assert!(live.changed().await.is_err());
-        drop(claim);
+        assert!(second_live.changed().await.is_err());
+        drop((claim, second_claim));
         assert!(sessions.claim_source(&old[0].source_token, "tc").is_err());
+        assert!(
+            sessions
+                .claim_source(&old[0].secondary_source_token, "tc")
+                .is_err()
+        );
         let (source, mut live, claim) = sessions.claim_source(&new[0].source_token, "tc").unwrap();
         assert_eq!(source.read(0, 7).await.unwrap(), b"example");
         drop(replacement);
@@ -409,9 +437,13 @@ mod source_token_tests {
             "old-token".into(),
             SourceGrant {
                 peer: "assigned-tc".into(),
-                source: Arc::new(
-                    crate::leases::LeaseTransport::local_guarded(path, None, None).buffered(7),
-                ),
+                source: Arc::new(crate::leases::LeaseTransport::buffered(
+                    [
+                        crate::leases::LeaseTransport::local_guarded(path.clone(), None, None),
+                        crate::leases::LeaseTransport::local_guarded(path, None, None),
+                    ],
+                    7,
+                )),
                 claimed: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 alive,
             },
