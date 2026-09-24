@@ -99,3 +99,55 @@ Protocol 6 requires coordinated hub/mediahost/transcoder activation; see
 [kahawai-deployment.md](kahawai-deployment.md#protocol-6-fleet-cutover). The
 comparison temporarily upgraded the test hub and mediahost, then restored their
 original protocol-5 binaries. This report does not imply fleet deployment.
+
+## Follow-up: isolate byte delivery from demuxing
+
+Instrumenting the remote file reader during a one-minute run recorded 639
+reads. Admission, blocking-thread scheduling and file I/O together took 0.293
+seconds; median file I/O was 216 microseconds. Sending chunks spent 124.6
+seconds blocked across the two concurrent streams. Thus file I/O and scheduler
+admission did not explain that run's stalls waiting for source bytes.
+
+Direct sessions then served ranges without GStreamer or `ReadAhead`. Two
+consumers draining independently transferred 512 MiB at 30.9 MiB/s combined.
+Alternating one 256 KiB read from each response transferred 256 MiB at only
+3.43 MiB/s. This reproduces a delivery penalty without demux track selection.
+
+Diagnostic builds varied HTTP/2 connection ownership and receive credit while
+keeping the retained source budget unchanged:
+
+| Alternating 256 MiB transfer | Aggregate throughput |
+|---|---:|
+| Independent connections, default credit | 3.43 MiB/s |
+| Shared connection, 4 MiB connection / 1 MiB stream credit | 20.61 MiB/s |
+| Independent connections, 4 MiB connection / 1 MiB stream credit | 19.40 MiB/s |
+| Return to independent connections and default credit | 4.66 MiB/s |
+
+The pinned Hyper implementation defaults to 1 MiB at both levels. These are
+transport flow-control allowances, distinct from the 32 MiB read-ahead budget.
+The larger connection window alone improved the simple alternating benchmark;
+connection sharing cannot be credited with that entire improvement. In real
+playback, the shared-connection experiment measured 27.60× production, while
+the larger-credit independent-connection experiment measured 7.76×. Reducing
+the stream window to 256 KiB while retaining 4 MiB connection credit and
+independent connections measured 15.00×. The precise
+transport feedback causing this workload sensitivity remains unproven; these
+results do not establish a production tuning policy.
+
+A separate cost is duplicate prefetch. During the shared-connection playback
+experiment, recorded file-read intervals totalled 935,193,000 bytes but covered
+only 472,508,680 unique bytes: 49.5% of the read traffic duplicated earlier
+ranges. The two continuously advancing windows largely traversed the same file
+region. Stable generations therefore do not imply efficient byte delivery.
+The old push run did not record comparable interval counters, so this is not
+an exact attribution of the entire remaining throughput difference.
+
+Appsrc cannot supply demux track identity with these reads: its callbacks carry
+`need-data(length)` and `seek-data(offset)`. The demuxer knows which output track
+it is serving, but the upstream pull request carries an offset and length on
+its common sink pad. See the [appsrc signal API](https://gstreamer.freedesktop.org/documentation/app/appsrc.html#need-data).
+A track label would not itself eliminate overlapping byte transfers or the
+transport penalty reproduced by direct range reads.
+
+These were temporary diagnostic builds. Shared connection credit is not a
+substitute for proving isolation when more leases or sessions are active.
