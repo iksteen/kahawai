@@ -40,6 +40,7 @@ impl FileReader {
         })
     }
     pub async fn read(&self, offset: u64, len: usize) -> Result<Vec<u8>> {
+        let started = std::time::Instant::now();
         let io_permit = self.io_slot.clone().acquire_owned().await?;
         let len = (self.size.saturating_sub(offset)).min(len as u64) as usize;
         let permit = match &self.admission {
@@ -47,7 +48,9 @@ impl FileReader {
             None => None,
         };
         let file = self.file.clone();
-        Ok(tokio::task::spawn_blocking(move || {
+        let admitted_us = started.elapsed().as_micros();
+        let (data, disk_us) = tokio::task::spawn_blocking(move || {
+            let disk_started = std::time::Instant::now();
             use std::os::unix::fs::FileExt;
             let _io_permit = io_permit;
             let _permit = permit;
@@ -63,10 +66,18 @@ impl FileReader {
                 }
                 filled += n;
             }
-            tracing::trace!(offset, len, "source positional file read");
-            Ok::<_, std::io::Error>(data)
+            Ok::<_, std::io::Error>((data, disk_started.elapsed().as_micros()))
         })
-        .await??)
+        .await??;
+        tracing::trace!(
+            offset,
+            len,
+            admitted_us,
+            disk_us,
+            total_us = started.elapsed().as_micros(),
+            "source positional file read"
+        );
+        Ok(data)
     }
 }
 
@@ -118,6 +129,7 @@ pub async fn serve<F, Fut>(
                     }
                 };
                 for part in data.chunks(CHUNK) {
+                    let sending = std::time::Instant::now();
                     let n = part.len();
                     if chunks
                         .send(ByteChunk {
@@ -131,6 +143,13 @@ pub async fn serve<F, Fut>(
                     {
                         return;
                     }
+                    tracing::trace!(
+                        generation = req.generation,
+                        offset,
+                        len = n,
+                        wait_us = sending.elapsed().as_micros(),
+                        "source channel send"
+                    );
                     offset += n as u64;
                 }
             }
