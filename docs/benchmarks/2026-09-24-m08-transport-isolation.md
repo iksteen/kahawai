@@ -74,9 +74,10 @@ A header-only packet capture on the local Ethernet interface measured:
 The timestamp comparison uses changes within one connection, so it does not
 require synchronized host clocks. It is evidence of delayed delivery below the
 application. It does **not** identify a particular switch, bridge, NIC or kernel
-mechanism without further measurements. The physical path between the two wired
-interfaces remains to be established. Fixing or bypassing that path should be
-tested with this small reproducer before further changes to source buffering.
+mechanism without further measurements. The maintainer subsequently confirmed
+that this path crosses a wireless mesh backhaul. A
+[wired NAS-to-Mac control](2026-09-25-wired-tcp-control.md) did not reproduce the
+collapse; it changes both the path and the receiving computer.
 
 ## Session-lifetime fix
 
