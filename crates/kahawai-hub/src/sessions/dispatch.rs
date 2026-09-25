@@ -120,30 +120,26 @@ impl Sessions {
             .lock()
             .unwrap()
             .insert(session_id.to_string(), ready_tx);
-        let cleanup = |sessions: &Self| {
-            sessions.tc_leases.lock().unwrap().remove(session_id);
-            sessions.pending_ready.lock().unwrap().remove(session_id);
+        let mut pending = PendingStart {
+            sessions: self,
+            id: session_id,
+            keep_leases: false,
         };
-        if let Err(e) = registry
+        registry
             .send_to_tc_requiring(transcoder, start, loudness_protocol_feature(&plan))
-            .await
-        {
-            cleanup(self);
-            return Err(e);
-        }
+            .await?;
         match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
             Ok(Ok(Ok(facts))) => {
+                pending.keep_leases = true;
                 // No increment here: the slot has been held since the
                 // pick. Counting again would double it.
                 tracing::info!(session = session_id, transcoder, "session dispatched");
                 Ok(facts)
             }
             Ok(Ok(Err(e))) => {
-                cleanup(self);
                 bail!("transcoder rejected session: {e}");
             }
             Ok(Err(_)) | Err(_) => {
-                cleanup(self);
                 let _ = registry
                     .send_to_tc(
                         transcoder,
@@ -301,5 +297,90 @@ impl Sessions {
                 }
             }
         }
+    }
+}
+
+/// Cancellation drops startup registrations just like an explicit failure.
+/// Once readiness succeeds, the session owns its leases until teardown.
+struct PendingStart<'a> {
+    sessions: &'a Sessions,
+    id: &'a str,
+    keep_leases: bool,
+}
+
+impl Drop for PendingStart<'_> {
+    fn drop(&mut self) {
+        self.sessions.pending_ready.lock().unwrap().remove(self.id);
+        if !self.keep_leases {
+            self.sessions.tc_leases.lock().unwrap().remove(self.id);
+        }
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    async fn dispatch_registration(succeed: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = Registry::new(
+            crate::db::open_in_memory().await.unwrap(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        );
+        let (tx, mut rx) = tokio::sync::mpsc::channel(1);
+        registry.register_tc_link("tc", kahawai_proto::PROTOCOL_MINOR, tx);
+        let sessions = Sessions::new(dir.path().join("sessions"));
+        let source = dir.path().join("source");
+        std::fs::write(&source, b"data").unwrap();
+        let plan = kahawai_media::remux::RemuxPlan {
+            video: kahawai_media::remux::StreamMode::Copy,
+            ..Default::default()
+        };
+        let mut start = Box::pin(sessions.start_transcode(
+            &registry,
+            "tc",
+            "run",
+            plan,
+            2,
+            vec![(Lease::local(source), 4)],
+            0,
+            0,
+            "",
+            vec![],
+            vec![],
+        ));
+        tokio::select! {
+            biased;
+            _ = &mut start => panic!("start completed without readiness"),
+            message = rx.recv() => assert!(matches!(
+                message.unwrap().unwrap().msg,
+                Some(kahawai_proto::v1::hub_to_tc::Msg::StartSession(_))
+            )),
+        }
+        assert!(sessions.pending_ready.lock().unwrap().contains_key("run"));
+        assert!(sessions.tc_leases.lock().unwrap().contains_key("run"));
+        if succeed {
+            assert!(sessions.transcode_verdict("run", Ok(vec![])));
+            start.await.unwrap();
+        } else {
+            drop(start);
+        }
+        assert!(sessions.pending_ready.lock().unwrap().is_empty());
+        assert_eq!(
+            sessions.tc_leases.lock().unwrap().contains_key("run"),
+            succeed
+        );
+        assert!(!sessions.transcode_verdict("run", Ok(vec![])));
+    }
+
+    #[tokio::test]
+    async fn cancelled_dispatch_releases_readiness_and_source_leases() {
+        dispatch_registration(false).await;
+    }
+
+    #[tokio::test]
+    async fn successful_dispatch_keeps_sources_for_the_session() {
+        dispatch_registration(true).await;
     }
 }

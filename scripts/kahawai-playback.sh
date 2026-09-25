@@ -13,6 +13,9 @@ case "${1:-check}" in
         # The deadline test spends thirty seconds of wall clock on purpose.
         cargo test -p kahawai-playback --test executor -- --ignored
         ;;
+    cancel)
+        cargo test -p kahawai-hub --lib cancellation_tests
+        ;;
     worker)
         # The child-process path every real session takes: the worker is the
         # kahawai binary's hidden subcommand, so build it first.
@@ -33,7 +36,7 @@ case "${1:-check}" in
         echo "kahawai-transcoderd stays lean"
         ;;
     *)
-        echo "usage: kahawai-playback.sh [check|slow|worker|lean]" >&2
+        echo "usage: kahawai-playback.sh [check|slow|cancel|worker|lean]" >&2
         exit 2
         ;;
 esac

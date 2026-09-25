@@ -1030,6 +1030,15 @@ the OCR engine; `tests/boundaries.rs` reads its manifest and
 * `seek` — part indexing, host dependence of a multi-part session, and
   seek-intent coalescing.
 
+An accepted seek survives an HTTP disconnect, but session deletion cancels its
+detached restart, including readiness waits and fallback. Teardown signals the
+seek task and waits for its lock before collecting the final run, so a deleted
+session cannot start a replacement worker later. Cancelled lease-open operations
+remove their pending tokens; cancelled remote startup removes its readiness
+waiter and releases its source leases. A successful remote startup retains its
+leases until session teardown. `scripts/kahawai-playback.sh cancel` checks these
+lifecycle rules independently of source scheduling.
+
 `scripts/kahawai-playback.sh check` runs the crate's tests and a real
 pipeline through the executor; `worker` does the same through the spawned
 `remux-worker` child of a freshly built `kahawai` binary.
