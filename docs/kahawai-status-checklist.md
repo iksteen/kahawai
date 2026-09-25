@@ -71,6 +71,10 @@ How something works and why it was built that way belong in
 - [x] AR-12 Control/byte plane isolation: separate connections, no shared
       flow-control window (the frozen-heartbeat lesson, codified)
 
+Out-of-band layout diagnostics: `scripts/kahawai-interleave.py` ranks sustained
+audio/video byte separation for manual playback testing; see
+`docs/kahawai-interleave-scan.md`. It does not predict stalls.
+
 ## Security & enrollment (SEC)
 
 - [x] SEC-1 Hub-internal CA, generated on first start
