@@ -1,5 +1,8 @@
 # Wired TCP control
 
+Follow-up: the [wired Mac playback comparison](2026-09-25-mac-push-pull.md)
+tests the previously problematic sources on both push and pull revisions.
+
 The [transport-isolation reproducer](2026-09-24-m08-transport-isolation.md)
 completed without a delivery collapse from the NAS to the Mac mini on
 2026-09-25. This is a synthetic transport test, not a playback benchmark.

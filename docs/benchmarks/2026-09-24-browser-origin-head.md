@@ -1,5 +1,10 @@
 # Browser playback comparison: origin/master versus pull-source HEAD
 
+Follow-up: the [wired Mac/NAS comparison](2026-09-25-mac-push-pull.md)
+retests the problematic cases on the same two revisions, with the browser and
+AIO on the Mac mini. Its results limit attributing the stalls below to source
+scheduling alone.
+
 Measured 2026-09-24. Baseline `48fa253217a865569d85a64c477053281b3c37f4`; candidate `59b4ebd1ae57029da18696ef4a2f1438e8978022`. All arrows below are **baseline → candidate**. Sample identifiers are intentionally anonymous.
 
 ## Findings
