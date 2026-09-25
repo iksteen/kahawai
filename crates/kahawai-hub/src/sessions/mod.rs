@@ -263,6 +263,9 @@ pub struct Session {
     /// winner's result, and an HTTP-cancelled request can no longer
     /// abort a restart midway (the executor task is detached).
     seek_done: tokio::sync::watch::Sender<(u64, Result<u64, String>)>,
+    /// Session removal cancels detached seeks, including readiness and fallback.
+    /// Teardown then takes seek_lock before collecting the final run.
+    seek_ended: tokio::sync::watch::Sender<bool>,
     touched: Mutex<std::time::Instant>,
     /// Progress holds a read guard through its watch-state write; teardown
     /// waits for it before ending the session, so the last progress write
@@ -601,6 +604,7 @@ impl Sessions {
             };
             (session, active.is_empty())
         };
+        session.seek_ended.send_replace(true);
         if idle {
             self.idle.send_replace(true);
         }
@@ -610,6 +614,10 @@ impl Sessions {
         let mut ending = session.ending.write().await;
         *ending = true;
         drop(ending);
+        // A seek may own the old run or be waiting for its replacement. Cancel
+        // it first, then wait for ownership to settle before taking the run.
+        // Holding this lock also orders remote StartSession before EndSession.
+        let _seek = session.seek_lock.lock().await;
         {
             let mut kept = self.known_sessions.lock().unwrap();
             // Bounded like the bundles themselves: a header is only

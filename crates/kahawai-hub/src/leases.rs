@@ -312,15 +312,21 @@ impl Leases {
     ) -> Result<Lease> {
         let (tx, rx) = oneshot::channel();
         self.pending.lock().unwrap().insert(token.to_string(), tx);
-        let cleanup = || self.pending.lock().unwrap().remove(token);
+        struct Pending<'a>(&'a Leases, &'a str);
+        impl Drop for Pending<'_> {
+            fn drop(&mut self) {
+                self.0.pending.lock().unwrap().remove(self.1);
+            }
+        }
+        // Also release the token when the caller cancels during announcement
+        // or while waiting for the byte channel.
+        let _pending = Pending(self, token);
         if let Err(e) = announce.await {
-            cleanup();
             return Err(e).context("announcing OpenRead");
         }
         match tokio::time::timeout(Duration::from_secs(10), rx).await {
             Ok(Ok(lease)) => Ok(lease),
             Ok(Err(_)) | Err(_) => {
-                cleanup();
                 bail!("mediahost did not open the byte channel in time");
             }
         }
@@ -392,5 +398,34 @@ mod tests {
         assert_eq!(active.load(Ordering::SeqCst), 0);
         assert!(entered.load(Ordering::SeqCst) >= 12);
         drop(lease);
+    }
+}
+
+#[cfg(test)]
+mod cancellation_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn cancelled_open_releases_token_during_announce_and_channel_wait() {
+        for during_announce in [true, false] {
+            let leases = Leases::default();
+            let (entered, started) = oneshot::channel();
+            let mut open = Box::pin(leases.establish("cancelled", async {
+                entered.send(()).unwrap();
+                if during_announce {
+                    std::future::pending::<()>().await;
+                }
+                Ok(())
+            }));
+            tokio::select! {
+                biased;
+                _ = &mut open => panic!("open completed without a byte channel"),
+                _ = started => {}
+            }
+            assert!(leases.pending.lock().unwrap().contains_key("cancelled"));
+            drop(open);
+            assert!(leases.pending.lock().unwrap().is_empty());
+            assert!(leases.fulfill("cancelled").is_none());
+        }
     }
 }

@@ -588,6 +588,7 @@ impl Sessions {
             pending_seek: Mutex::new(None),
             seek_gen: std::sync::atomic::AtomicU64::new(0),
             seek_done: tokio::sync::watch::channel((0, Ok(0))).0,
+            seek_ended: tokio::sync::watch::channel(false).0,
             plan: Mutex::new(session_plan),
             needs: Mutex::new(session_needs),
             pace_class: session_class,
