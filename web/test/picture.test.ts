@@ -1038,6 +1038,19 @@ describe('choosing a track', () => {
     await flushPromises()
   }
 
+  test('playback updates leave a tentative audio choice alone', async () => {
+    const { wrapper, element } = await switching()
+    const picker = wrapper.find('[aria-label="Audio track"]').element as HTMLSelectElement
+    const optionWrite = vi.spyOn(picker.options[0]!, 'setAttribute')
+    picker.value = '1'
+    at(element, 20)
+    await flushPromises()
+    expect(picker.value).toBe('1')
+    expect(optionWrite).not.toHaveBeenCalled()
+    await pick(wrapper, '1')
+    expect(api.putPref).toHaveBeenCalledWith({ scope: 'heat', key: 'audio', value: 'jpn' })
+  })
+
   test('remembers the language for the series, once it is playing', async () => {
     // Two additive layers (HUB-33): the SERIES remembers the language, which
     // is portable across episodes whose mux order differs.
@@ -1238,7 +1251,7 @@ describe('a restart keeps the choice the viewer made', () => {
     // The session restarts on the carried video track; a selector left at
     // zero would hand track 0 to the NEXT restart — the same silent revert,
     // on the other axis.
-    const { wrapper } = await watching({
+    const { wrapper, element } = await watching({
       item: film({
         sources: [
           {
@@ -1256,6 +1269,10 @@ describe('a restart keeps the choice the viewer made', () => {
     })
     const select = wrapper.find('[aria-label="Video track"]')
     expect((select.element as HTMLSelectElement).value).toBe('1')
+    ;(select.element as HTMLSelectElement).value = '0'
+    at(element, 20)
+    await flushPromises()
+    expect((select.element as HTMLSelectElement).value).toBe('0')
   })
 
   test('a carried key the list no longer has falls back to the wishlist', async () => {
@@ -1325,6 +1342,28 @@ describe('choosing subtitles', () => {
     await wrapper.find('[aria-label="Subtitles"]').setValue(value)
     await flushPromises()
   }
+
+  test('playback updates leave an open subtitle picker alone', async () => {
+    const { wrapper, element } = await withSubs([listing(), listing({ id: 8, language: 'nld' })])
+    await choose(wrapper, '7')
+    const picker = wrapper.find('[aria-label="Subtitles"]').element as HTMLSelectElement
+    // Native menus can move their tentative selection before committing change.
+    picker.value = '8'
+    const write = vi.spyOn(picker, 'value', 'set')
+    const optionWrite = vi.spyOn(picker.options[1]!, 'setAttribute')
+    element.currentTime = 20
+    element.dispatchEvent(new Event('timeupdate'))
+    await flushPromises()
+    expect(write).not.toHaveBeenCalled()
+    expect(optionWrite).not.toHaveBeenCalled()
+    await choose(wrapper, '8')
+    expect(picker.value).toBe('8')
+    expect(api.putPref).toHaveBeenCalledWith({
+      scope: 'source:heat-copy:1',
+      key: 'subs.track',
+      value: '8',
+    })
+  })
 
   test('is remembered in two layers: the series’ language, this item’s row', async () => {
     // The exact id is the only spelling that can name a downloaded or OCR

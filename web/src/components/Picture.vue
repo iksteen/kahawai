@@ -86,6 +86,7 @@ import { seLabel } from '../domain/label.ts'
 import { sentence } from '../domain/refusal.ts'
 import { subtitleRoute } from '../domain/subtitle-route.ts'
 import { useSubtitleRenderers } from '../composables/subtitles.ts'
+import NativeSelect from './NativeSelect.vue'
 
 const props = defineProps<{
   item: ItemDetail
@@ -270,6 +271,27 @@ const phase = computed(() =>
 const blocked = computed(() => phase.value === 'standby' || phase.value === 'gone')
 /// The pipeline is not the viewer's to steer right now.
 const frozen = computed(() => blocked.value || phase.value === 'restarting')
+
+const videoOptions = computed(() =>
+  trk.value.videoList.map((v, value) => ({
+    value,
+    label: `${v.codec} ${v.width}×${v.height}`,
+  })),
+)
+const audioOptions = computed(() =>
+  trk.value.audioList.map((a, value) => ({
+    value,
+    label: `${a.language ?? '?'} · ${a.codec} ${a.channels}ch`,
+  })),
+)
+const subtitleOptions = computed(() => [
+  { value: '', label: 'Subtitles off' },
+  ...trk.value.subs.map((s) => ({
+    value: String(s.id),
+    label: subtitleLabel(s),
+    disabled: s.delivery === 'none',
+  })),
+])
 
 const selected = computed(() => trk.value.subs.find((s) => String(s.id) === trk.value.subKey))
 const route = computed(() =>
@@ -1903,56 +1925,41 @@ const remember = (scope: string, key: string, value: string) =>
         </span>
 
         <span class="ml-auto flex flex-wrap items-center gap-2">
-          <select
+          <NativeSelect
             v-if="isHls && trk.videoList.length > 1"
             class="tsel"
             title="Video track"
             aria-label="Video track"
             :value="trk.video"
+            :options="videoOptions"
             :disabled="frozen"
             @change="switchTracks(trk.audio, Number(($event.target as HTMLSelectElement).value))"
-          >
-            <option v-for="(v, at) in trk.videoList" :key="at" :value="at">
-              {{ v.codec }} {{ v.width }}×{{ v.height }}
-            </option>
-          </select>
-          <select
+          />
+          <NativeSelect
             v-if="isHls && trk.audioList.length > 1"
             class="tsel"
             title="Audio track"
             aria-label="Audio track"
             :value="trk.audio"
+            :options="audioOptions"
             :disabled="frozen"
             @change="switchTracks(Number(($event.target as HTMLSelectElement).value), trk.video)"
-          >
-            <option v-for="(a, at) in trk.audioList" :key="at" :value="at">
-              {{ a.language ?? '?' }} · {{ a.codec }} {{ a.channels }}ch
-            </option>
-          </select>
+          />
           <!-- Disabled during a restart like the two above. This was the one
                control left live, and the only one that can START a restart:
                picking a burn track mid-seek bumps the generation again, so the
                seek already in flight bails and the hub runs two pipeline
                restarts for one intent. -->
-          <select
+          <NativeSelect
             v-if="trk.subs.length"
             class="tsel"
             title="Subtitles"
             aria-label="Subtitles"
             :value="trk.subKey"
+            :options="subtitleOptions"
             :disabled="frozen"
             @change="chooseSubtitle(($event.target as HTMLSelectElement).value)"
-          >
-            <option value="">Subtitles off</option>
-            <option
-              v-for="s in trk.subs"
-              :key="s.id"
-              :value="String(s.id)"
-              :disabled="s.delivery === 'none'"
-            >
-              {{ subtitleLabel(s) }}
-            </option>
-          </select>
+          />
           <button
             class="tpill"
             type="button"
