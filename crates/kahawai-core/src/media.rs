@@ -6,22 +6,6 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
-/// Known legacy discoverer sums; do not divide arbitrary storage depths by three.
-pub fn normalize_video_depth(depth: u32) -> Option<u32> {
-    match depth {
-        24 => Some(8),
-        30 => Some(10),
-        1..=16 => Some(depth),
-        _ => None,
-    }
-}
-
-fn deserialize_video_depth<'de, D: serde::Deserializer<'de>>(
-    d: D,
-) -> Result<Option<u32>, D::Error> {
-    Ok(Option::<u32>::deserialize(d)?.and_then(normalize_video_depth))
-}
-
 fn deserialize_depth_limit<'de, D: serde::Deserializer<'de>>(
     d: D,
 ) -> Result<Option<u32>, D::Error> {
@@ -198,7 +182,7 @@ pub struct VideoStream {
     #[schema(required)]
     pub fps: Option<(u32, u32)>,
     /// Bits per component, not the legacy sum of three component depths.
-    #[serde(default, deserialize_with = "deserialize_video_depth")]
+    #[serde(default)]
     #[schema(required)]
     pub bit_depth: Option<u32>,
     pub interlaced: bool,
@@ -640,23 +624,12 @@ mod root_identity_tests {
 mod bit_depth_tests {
     use super::*;
     #[test]
-    fn legacy_depths_normalize_without_a_rescan() {
-        for (stored, expected) in [(24, 8), (30, 10), (8, 8), (10, 10), (12, 12), (16, 16)] {
+    fn stored_depths_are_not_repaired_on_read() {
+        for depth in [8, 10, 12, 16, 24, 30, 36, 48] {
             let mut json = serde_json::to_value(VideoStream::default()).unwrap();
-            json["bit_depth"] = stored.into();
+            json["bit_depth"] = depth.into();
             let stream: VideoStream = serde_json::from_value(json).unwrap();
-            assert_eq!(stream.bit_depth, Some(expected));
-            assert_eq!(serde_json::to_value(stream).unwrap()["bit_depth"], expected);
-        }
-        for value in [serde_json::Value::Null, 0.into(), 32.into()] {
-            let mut json = serde_json::to_value(VideoStream::default()).unwrap();
-            json["bit_depth"] = value;
-            assert_eq!(
-                serde_json::from_value::<VideoStream>(json)
-                    .unwrap()
-                    .bit_depth,
-                None
-            );
+            assert_eq!(stream.bit_depth, Some(depth));
         }
     }
     #[test]

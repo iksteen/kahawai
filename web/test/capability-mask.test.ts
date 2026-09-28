@@ -136,7 +136,7 @@ describe('bit-depth mask', () => {
     expect(rfc6381({ codec: 'av1', profile: 'main', level: '4.0', bit_depth: 10 })).toBe(
       'video/mp4; codecs="av01.0.08M.10"',
     )
-    expect(rfc6381({ codec: 'vp9', profile: '2', level: '5.0', bit_depth: 30 })).toBe(
+    expect(rfc6381({ codec: 'vp9', profile: '2', level: '5.0', bit_depth: 10 })).toBe(
       'video/webm; codecs="vp09.02.50.10"',
     )
     expect(rfc6381({ codec: 'vp9', profile: '0', level: '5.0', bit_depth: 10 })).toBeUndefined()

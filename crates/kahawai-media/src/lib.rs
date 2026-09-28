@@ -932,7 +932,13 @@ fn discover_video_depth(caps: Option<&gst::CapsRef>, legacy: u32) -> Option<u32>
             return info.depth().iter().copied().filter(|d| *d > 0).max();
         }
     }
-    kahawai_core::media::normalize_video_depth(legacy)
+    match legacy {
+        24 => Some(8),
+        30 => Some(10),
+        36 => Some(12),
+        1..=16 => Some(legacy),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -951,6 +957,8 @@ mod bit_depth_discovery_tests {
             .build();
         assert_eq!(discover_video_depth(Some(&caps), 48), Some(10));
         assert_eq!(discover_video_depth(None, 30), Some(10));
+        assert_eq!(discover_video_depth(None, 36), Some(12));
+        assert_eq!(discover_video_depth(None, 48), None);
         assert_eq!(discover_video_depth(None, 24), Some(8));
         assert_eq!(discover_video_depth(None, 0), None);
         assert_eq!(discover_video_depth(None, 32), None);

@@ -43,6 +43,12 @@
 //! keeps its old value: presence is settled per root by `reconcile_root`
 //! without writing, and `finish_scan` consults the column only for roots the
 //! scan neither walked nor found unavailable.
+//! `catalog_files.reprobe_required` is a durable request to refresh an unchanged
+//! file. The depth migration flags ambiguous legacy measurements; only a successful
+//! full probe clears it. Failed refreshes retain the file and flag for retry.
+//! The one-time migration updates scanner JSON and versioned protobuf records
+//! atomically, preserving byte identity and all derived facts.
+//!
 //! `catalog_files.music_tag_generation` is local probe bookkeeping, not a
 //! source revision. A newer tag mapper re-probes only stale music rows and
 //! leaves byte-derived records attached to the unchanged source. Advancing it
@@ -110,6 +116,7 @@ pub struct KnownFile {
     pub mtime_unix: i64,
     pub streams_json: String,
     pub music_tag_generation: i64,
+    pub reprobe_required: bool,
 }
 
 #[derive(sqlx::FromRow)]
@@ -172,6 +179,7 @@ impl Catalog {
             })
         })
         .await?;
+        Self::migrate_video_depth(&db).await?;
         sqlx::query("UPDATE catalog_jobs SET state='pending' WHERE state='running'")
             .execute(&db)
             .await?;
@@ -401,12 +409,99 @@ impl Catalog {
         Ok((generation, scanning != 0))
     }
 
+    /// The migration and replay records commit together, before any satellite
+    /// link can advertise versions. Derived facts still describe the same bytes.
+    async fn migrate_video_depth(db: &Database) -> Result<()> {
+        let mut tx = db.begin().await?;
+        let pending: Option<String> = sqlx::query_scalar(
+            "SELECT value FROM catalog_meta WHERE key='video_component_depth_migration'",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if pending.as_deref() != Some("pending") {
+            tx.commit().await?;
+            return Ok(());
+        }
+        let rows = sqlx::query(
+            "SELECT collection_id,root_token,path_rel,streams_json FROM catalog_files WHERE error=''",
+        ).fetch_all(&mut *tx).await?;
+        // The record primary key is (collection, kind, key). Collect the small
+        // fact keys once: a per-file lookup with kind != 'file' would scan a
+        // collection repeatedly. Payloads need no decoding or replacement.
+        let mut facts: HashMap<(String, Vec<u8>), Vec<String>> = HashMap::new();
+        for row in sqlx::query(
+            "SELECT collection_id,record_key,kind FROM catalog_records WHERE kind!='file' AND deleted=0",
+        ).fetch_all(&mut *tx).await? {
+            facts.entry((row.get("collection_id"), row.get("record_key")))
+                .or_default().push(row.get("kind"));
+        }
+        let mut converted = 0;
+        let mut flagged = 0;
+        for row in rows {
+            let json: String = row.get("streams_json");
+            let mut media: serde_json::Value = serde_json::from_str(&json)?;
+            let before = media.clone();
+            let reprobe = kahawai_core::video_depth_migration::migrate(&mut media);
+            if before == media {
+                continue;
+            }
+            let collection: String = row.get("collection_id");
+            let root: String = row.get("root_token");
+            let path: String = row.get("path_rel");
+            let key = source_key(&root, &path);
+            let payload: Vec<u8> = sqlx::query_scalar(
+                "SELECT payload FROM catalog_records WHERE collection_id=? AND kind='file' AND record_key=? AND deleted=0",
+            ).bind(&collection).bind(&key).fetch_one(&mut *tx).await?;
+            let mut upsert = kahawai_proto::v1::FileUpsert::decode(payload.as_slice())?;
+            anyhow::ensure!(
+                upsert.files.len() == 1,
+                "invalid file record during depth migration"
+            );
+            let json = serde_json::to_string(&media)?;
+            upsert.files[0].streams_json = json.clone();
+            let version = Self::next_version(&mut tx, &collection).await?;
+            sqlx::query("UPDATE catalog_files SET streams_json=?,reprobe_required=?,version=? WHERE collection_id=? AND root_token=? AND path_rel=?")
+                .bind(json).bind(reprobe).bind(version as i64)
+                .bind(&collection).bind(&root).bind(&path).execute(&mut *tx).await?;
+            Self::put_record(
+                &mut tx,
+                &collection,
+                "file",
+                &key,
+                version,
+                upsert.encode_to_vec(),
+                false,
+            )
+            .await?;
+            // Replay retained facts after the replacement base record, just
+            // as an ordinary metadata-only update does.
+            if let Some(kinds) = facts.remove(&(collection.clone(), key.clone())) {
+                for kind in kinds {
+                    let fact_version = Self::next_version(&mut tx, &collection).await?;
+                    sqlx::query("UPDATE catalog_records SET version=? WHERE collection_id=? AND kind=? AND record_key=?")
+                        .bind(fact_version as i64).bind(&collection).bind(kind).bind(&key)
+                        .execute(&mut *tx).await?;
+                }
+            }
+            converted += 1;
+            flagged += usize::from(reprobe);
+        }
+        sqlx::query(
+            "UPDATE catalog_meta SET value='complete' WHERE key='video_component_depth_migration'",
+        )
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        tracing::info!(converted, flagged, "migrated stored video component depths");
+        Ok(())
+    }
+
     pub async fn known_files(
         &self,
         collection: &str,
     ) -> Result<HashMap<(String, String), KnownFile>> {
         let rows = sqlx::query(
-            "SELECT root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,music_tag_generation
+            "SELECT root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,music_tag_generation,reprobe_required
                FROM catalog_files WHERE collection_id=? AND error=''",
         )
         .bind(collection)
@@ -425,6 +520,7 @@ impl Catalog {
                         mtime_unix: row.get("mtime_unix"),
                         streams_json: row.get("streams_json"),
                         music_tag_generation: row.get("music_tag_generation"),
+                        reprobe_required: row.get("reprobe_required"),
                     },
                 )
             })
@@ -598,7 +694,7 @@ impl Catalog {
         file: &FileRecord,
         generation: i64,
     ) -> Result<Option<u64>> {
-        self.upsert_file_with_music_tag_generation(collection, file, generation, 0)
+        self.upsert_file_inner(collection, file, generation, 0, false)
             .await
     }
 
@@ -608,6 +704,18 @@ impl Catalog {
         file: &FileRecord,
         generation: i64,
         music_tag_generation: i64,
+    ) -> Result<Option<u64>> {
+        self.upsert_file_inner(collection, file, generation, music_tag_generation, true)
+            .await
+    }
+
+    async fn upsert_file_inner(
+        &self,
+        collection: &str,
+        file: &FileRecord,
+        generation: i64,
+        music_tag_generation: i64,
+        probed: bool,
     ) -> Result<Option<u64>> {
         let source = file
             .source
@@ -639,7 +747,8 @@ impl Catalog {
         if unchanged {
             sqlx::query(
                 "UPDATE catalog_files
-                    SET seen_generation=?,music_tag_generation=?
+                    SET seen_generation=?,music_tag_generation=?,
+                        reprobe_required=CASE WHEN ? THEN 0 ELSE reprobe_required END
                   WHERE collection_id=? AND root_token=? AND path_rel=?",
             )
             .bind(generation)
@@ -650,6 +759,7 @@ impl Catalog {
                         .map_or(0, |stored| stored.music_tag_generation),
                 ),
             )
+            .bind(probed)
             .bind(collection)
             .bind(&source.root_token)
             .bind(&source.path_rel)
@@ -678,7 +788,8 @@ impl Catalog {
                oshash=excluded.oshash,streams_json=excluded.streams_json,
                seen_generation=excluded.seen_generation,version=excluded.version,error='',
                music_tag_generation=MAX(catalog_files.music_tag_generation,
-                                        excluded.music_tag_generation)",
+                                        excluded.music_tag_generation),
+               reprobe_required=CASE WHEN ? THEN 0 ELSE catalog_files.reprobe_required END",
         )
         .bind(collection)
         .bind(&source.root_token)
@@ -692,6 +803,7 @@ impl Catalog {
         .bind(generation)
         .bind(version as i64)
         .bind(music_tag_generation)
+        .bind(probed)
         .execute(&mut *tx)
         .await?;
         let payload = kahawai_proto::v1::FileUpsert {
@@ -1960,6 +2072,132 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    #[tokio::test]
+    async fn depth_migration_republishes_metadata_and_retains_reprobe_requests() {
+        use sqlx::Connection as _;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = collection(root.path());
+        let mut old = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(state.path().join("catalog.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let migrations = sqlx::migrate!("./migrations");
+        sqlx::migrate::Migrator::with_migrations(
+            migrations
+                .iter()
+                .filter(|m| m.version < 7)
+                .cloned()
+                .collect(),
+        )
+        .run_direct(None, &mut old, false)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO catalog_collections(id,media_type,epoch,current_version) VALUES('movies','movies','epoch',2)")
+            .execute(&mut old).await.unwrap();
+        let source = SourcePath {
+            root_token: kahawai_core::media::root_token(root.path()),
+            path_rel: "Movie.mkv".into(),
+        };
+        let key = source_key(&source.root_token, &source.path_rel);
+        let mut file = FileRecord { source: Some(source.clone()), size: 123, mtime_unix: 456, head_xxh3: 1, tail_xxh3: 2, oshash: 3,
+            streams_json: serde_json::json!({"video":[{"bit_depth":24},{"bit_depth":30},{"bit_depth":36},{"bit_depth":48},{"bit_depth":16}],"future":42}).to_string() };
+        sqlx::query("INSERT INTO catalog_files(collection_id,root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,seen_generation,version) VALUES('movies',?,?,123,456,1,2,3,?,0,1)")
+            .bind(&source.root_token).bind(&source.path_rel).bind(&file.streams_json).execute(&mut old).await.unwrap();
+        let payload = kahawai_proto::v1::FileUpsert {
+            collection_id: "movies".into(),
+            files: vec![file.clone()],
+        }
+        .encode_to_vec();
+        Catalog::put_record(&mut old, "movies", "file", &key, 1, payload, false)
+            .await
+            .unwrap();
+        Catalog::put_record(
+            &mut old,
+            "movies",
+            "file_attachments",
+            &key,
+            2,
+            vec![1, 2, 3],
+            false,
+        )
+        .await
+        .unwrap();
+        old.close().await.unwrap();
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        let known = catalog.known_files("movies").await.unwrap();
+        let entry = &known[&(source.root_token.clone(), source.path_rel.clone())];
+        assert!(entry.reprobe_required);
+        assert_eq!(
+            (
+                entry.size,
+                entry.mtime_unix,
+                entry.head_xxh3,
+                entry.tail_xxh3,
+                entry.oshash
+            ),
+            (123, 456, 1, 2, 3)
+        );
+        let json: serde_json::Value = serde_json::from_str(&entry.streams_json).unwrap();
+        assert_eq!(
+            json,
+            serde_json::json!({"video":[{"bit_depth":8},{"bit_depth":10},{"bit_depth":12},{"bit_depth":null},{"bit_depth":null}],"future":42})
+        );
+        let delta = catalog.delta("movies", 2, false).await.unwrap();
+        assert_eq!(delta.records.len(), 2);
+        let record = &delta.records[0];
+        assert_eq!(record.kind, "file");
+        let replicated = kahawai_proto::v1::FileUpsert::decode(record.payload.as_slice()).unwrap();
+        assert_eq!(replicated.files[0].streams_json, entry.streams_json);
+        assert_eq!(delta.records[1].kind, "file_attachments");
+        assert_eq!(delta.records[1].payload, vec![1, 2, 3]);
+        assert!(delta.records[1].version > record.version);
+        file.streams_json = entry.streams_json.clone();
+        catalog.upsert_file("movies", &file, 1).await.unwrap();
+        assert!(
+            catalog.known_files("movies").await.unwrap()
+                [&(source.root_token.clone(), source.path_rel.clone())]
+                .reprobe_required,
+            "metadata-only updates cannot acknowledge a probe"
+        );
+        catalog.db.close().await;
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        assert!(
+            catalog
+                .delta("movies", delta.records[1].version, false)
+                .await
+                .unwrap()
+                .records
+                .is_empty(),
+            "migration must not run again"
+        );
+        assert!(
+            catalog.known_files("movies").await.unwrap()
+                [&(source.root_token.clone(), source.path_rel.clone())]
+                .reprobe_required
+        );
+        // A successful probe may legitimately return unknown again. It still
+        // acknowledges the request, without publishing identical metadata.
+        assert!(
+            catalog
+                .upsert_file_with_music_tag_generation("movies", &file, 2, 0)
+                .await
+                .unwrap()
+                .is_none()
+        );
+        assert!(
+            !catalog.known_files("movies").await.unwrap()[&(source.root_token, source.path_rel)]
+                .reprobe_required
+        );
     }
 
     #[tokio::test]

@@ -448,9 +448,20 @@ fn negotiate(source: &SourceStreams, cap: &CapabilityProfile, policy: &Policy)
 
 **Video bit depth.** `VideoStream.bit_depth` means bits per component. New
 probes prefer the parser's luma/chroma depths and then raw-format component
-precision; discoverer's known legacy sums 24/30 normalize to 8/10 during typed
-reads. No catalogue rewrite or library rescan is needed. A profile's maximum
-precision and an HDR flag are not measurements of the source's bit depth.
+precision. A one-time mediahost migration converts stored totals 24/30/36 to
+8/10/12. Ambiguous 16 and other anomalous numeric depths become unknown pending
+a fresh probe; existing unknown depths are left alone. The mediahost persists
+`catalog_files.reprobe_required`, forcing discovery on the next normal scan
+even when size and mtime match. Only a successful probe clears it; a failed
+metadata refresh retains the source and retries on a later scan.
+Migration updates versioned replication records along with the scanner
+catalogue, preserving hashes and derived facts. Normal replication carries
+these newer records to each hub, including hubs that reconnect later. The hub
+has no depth migration or special snapshot request: the mediahost owns the
+correction. Ordinary reads and negotiation consume component depths without
+conversion. Incoming aggregate depths are rejected with a mediahost upgrade
+diagnostic. A profile's maximum precision and an HDR flag are not measurements
+of the source's bit depth.
 Paletted formats use the expanded colour precision: Microsoft RLE4/RLE8 and
 raw RGB8P report 8 bits, not the index width, packed palette-entry width, or
 discoverer's aggregate. A bare stored 16 is not enough to identify palette

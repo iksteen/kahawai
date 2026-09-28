@@ -268,6 +268,12 @@ impl Store {
                 validate_source(value.source.as_ref(), token, path)?;
                 let media: kahawai_core::media::MediaInfo =
                     serde_json::from_str(&value.streams_json)?;
+                ensure!(
+                    media.video.iter().all(|video| video
+                        .bit_depth
+                        .is_none_or(|depth| (1..=16).contains(&depth))),
+                    "mediahost reported a non-component video depth; upgrade the mediahost and migrate its catalogue"
+                );
                 let old = sqlx::query("SELECT * FROM files WHERE id=?")
                     .bind(&file)
                     .fetch_one(&mut *tx)

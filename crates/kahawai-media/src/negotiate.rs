@@ -372,11 +372,8 @@ fn cap_admits(
     cap: &kahawai_core::media::VideoCap,
     v: &kahawai_core::media::VideoStream,
 ) -> bool {
-    if let (Some(have), Some(max)) = (
-        v.bit_depth
-            .and_then(kahawai_core::media::normalize_video_depth),
-        cap.max_bit_depth,
-    ) && have > max
+    if let (Some(have), Some(max)) = (v.bit_depth, cap.max_bit_depth)
+        && have > max
     {
         return false;
     }
@@ -1164,11 +1161,7 @@ fn negotiate_for_executors_impl(
         .collect();
 
     if let Some(v) = v
-        && let (Some(depth), Some(limit)) = (
-            v.bit_depth
-                .and_then(kahawai_core::media::normalize_video_depth),
-            codec_depth_limit(profile, &v.codec),
-        )
+        && let (Some(depth), Some(limit)) = (v.bit_depth, codec_depth_limit(profile, &v.codec))
         && depth > limit
     {
         video_verdict.push_str(&format!(
@@ -1279,7 +1272,7 @@ mod tests {
         for cap in &mut profile.video {
             cap.max_bit_depth = Some(8);
         }
-        for depth in [Some(8), Some(24), Some(10), Some(30), None] {
+        for depth in [Some(8), Some(10), None] {
             let mut video = vs("hevc");
             video.bit_depth = depth;
             let info = media("mp4", Some(video), Some(au("aac", 2)));
@@ -1296,7 +1289,7 @@ mod tests {
                 None,
                 &fleet(),
             );
-            if matches!(depth, Some(10 | 30)) {
+            if matches!(depth, Some(10)) {
                 assert!(!plan.direct);
                 assert_eq!(plan.plan.video, StreamMode::Encode);
                 assert_eq!(plan.plan.max_bit_depth, Some(8));

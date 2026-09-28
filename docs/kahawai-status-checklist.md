@@ -113,7 +113,9 @@ audio/video byte separation for manual playback testing; see
       row at the old generation for retry.
       Other legacy technical rows use bounded local exact-source scheduler
       worklists; results and terminal failures are source-owned and
-      catalogue-revision-guarded
+      catalogue-revision-guarded.
+      Stored aggregate video depths migrate once to component precision; ambiguous
+      measurements receive persistent mediahost re-probe flags.
 - [x] MH-4 Sidecars + artwork + attachment declaration: embedded fonts are
       declared (name/mime/byte range, payload never read) in the file record
       at scan via a sparse EBML walk; missing records are retried by one local
