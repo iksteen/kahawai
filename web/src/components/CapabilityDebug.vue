@@ -12,6 +12,21 @@ import Btn from './Btn.vue'
 import type { CapabilityMask } from '../domain/capability-mask.ts'
 import { buildProfile, loadMask, probedProfile, saveMask } from '../api/capabilities.ts'
 import { maskSummary } from '../domain/capability-mask.ts'
+import NativeSelect from './NativeSelect.vue'
+
+const durationOptions = [2, 4, 6, 10].map((value) => ({ value, label: `${value}s` }))
+const depthOptions = [
+  { value: 0, label: 'probed' },
+  ...[8, 10, 12].map((value) => ({ value, label: `${value}-bit` })),
+]
+const heightOptions = [
+  { value: 0, label: 'none' },
+  ...[2160, 1080, 720, 480].map((value) => ({ value, label: String(value) })),
+]
+const channelOptions = [
+  { value: 0, label: 'unlimited' },
+  ...[6, 2, 1].map((value) => ({ value, label: String(value) })),
+]
 
 const props = defineProps<{
   /// Restart playback with the new mask. Absent on the item page, where there
@@ -174,7 +189,7 @@ const FLAGS: Flag[] = ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render']
         </label>
         <label v-if="target().mode === 'short'">
           max
-          <select
+          <NativeSelect
             :value="shortSecs()"
             @change="
               update({
@@ -185,9 +200,8 @@ const FLAGS: Flag[] = ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render']
                 },
               })
             "
-          >
-            <option v-for="n in [2, 4, 6, 10]" :key="n" :value="n">{{ n }}s</option>
-          </select>
+            :options="durationOptions"
+          />
         </label>
       </span>
     </div>
@@ -197,37 +211,31 @@ const FLAGS: Flag[] = ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render']
       <span class="opts">
         <label>
           bit depth
-          <select
+          <NativeSelect
             :value="mask.max_bit_depth ?? 0"
             @change="
               setCeiling('max_bit_depth', Number(($event.target as HTMLSelectElement).value))
             "
-          >
-            <option :value="0">probed</option>
-            <option v-for="n in [8, 10, 12]" :key="n" :value="n">{{ n }}-bit</option>
-          </select>
+            :options="depthOptions"
+          />
         </label>
         <label>
           height
-          <select
+          <NativeSelect
             :value="mask.max_height ?? 0"
             @change="setCeiling('max_height', Number(($event.target as HTMLSelectElement).value))"
-          >
-            <option :value="0">none</option>
-            <option v-for="n in [2160, 1080, 720, 480]" :key="n" :value="n">{{ n }}</option>
-          </select>
+            :options="heightOptions"
+          />
         </label>
         <label>
           channels
-          <select
+          <NativeSelect
             :value="mask.max_audio_channels ?? 0"
             @change="
               setCeiling('max_audio_channels', Number(($event.target as HTMLSelectElement).value))
             "
-          >
-            <option :value="0">unlimited</option>
-            <option v-for="n in [6, 2, 1]" :key="n" :value="n">{{ n }}</option>
-          </select>
+            :options="channelOptions"
+          />
         </label>
       </span>
     </div>
