@@ -210,7 +210,7 @@ pub(crate) async fn scan_local_collection(
             .await??;
             let mut baselines = Vec::new();
             for (root_local, path, rel, action) in verdicts {
-                let music_tags_stale = match action {
+                let metadata_stale = match action {
                     ScanAction::Unchanged => {
                         skipped += 1;
                         continue;
@@ -229,7 +229,7 @@ pub(crate) async fn scan_local_collection(
                         catalog.upsert_file(&cfg.name, &record, generation).await?;
                         continue;
                     }
-                    ScanAction::Probe { music_tags_stale } => music_tags_stale,
+                    ScanAction::Probe { metadata_stale } => metadata_stale,
                 };
                 let (root2, path2) = (root_local.clone(), path.clone());
                 match scan_blocking(&permit, move |_permit| inspect(&root2, &path2)).await? {
@@ -261,15 +261,15 @@ pub(crate) async fn scan_local_collection(
                     }
                     Err(error) => {
                         failed += 1;
-                        if music_tags_stale {
-                            // A mapper upgrade failed against bytes whose
+                        if metadata_stale {
+                            // A requested metadata refresh failed against bytes whose
                             // stat, identity and sidecars are unchanged. The
                             // old probe remains usable; keep it visible and
                             // leave its generation stale so a later scan tries
                             // again instead of turning an optional metadata
                             // refresh into media loss.
                             tracing::warn!(path = %path.display(), error = format!("{error:#}"),
-                                "music metadata refresh failed; retaining previous source");
+                                "metadata refresh failed; retaining previous source");
                             continue;
                         }
                         tracing::warn!(path = %path.display(), error = format!("{error:#}"),
@@ -324,7 +324,7 @@ enum ScanAction {
     Unchanged,
     Baseline(String),
     Sidecars(FileRecord),
-    Probe { music_tags_stale: bool },
+    Probe { metadata_stale: bool },
 }
 
 fn classify_file(
@@ -335,7 +335,7 @@ fn classify_file(
     music: bool,
 ) -> ScanAction {
     let probe = ScanAction::Probe {
-        music_tags_stale: false,
+        metadata_stale: false,
     };
     let Some(old) = old else { return probe };
     if deep
@@ -351,9 +351,11 @@ fn classify_file(
     {
         return probe;
     }
-    if music && old.music_tag_generation < kahawai_media::MUSIC_TAG_GENERATION {
+    if old.reprobe_required
+        || (music && old.music_tag_generation < kahawai_media::MUSIC_TAG_GENERATION)
+    {
         return ScanAction::Probe {
-            music_tags_stale: true,
+            metadata_stale: true,
         };
     }
     let Ok(mut info) = serde_json::from_str::<kahawai_core::media::MediaInfo>(&old.streams_json)
@@ -1395,6 +1397,99 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn flagged_depth_reprobes_unchanged_media_and_retries_failure() {
+        use gstreamer::prelude::*;
+        use sqlx::Connection as _;
+        kahawai_media::init().unwrap();
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let cfg = CollectionConfig {
+            name: "movies".into(),
+            media_type: "movies".into(),
+            roots: vec![root.path().into()],
+        };
+        let catalog = crate::catalog::Catalog::open(state.path(), std::slice::from_ref(&cfg))
+            .await
+            .unwrap();
+        let failed = seed_scan_file(&catalog, root.path(), "Unprobeable.mp4").await;
+        let path = root.path().join("Fixture.avi");
+        let pipeline = gstreamer::parse::launch(&format!(
+            "videotestsrc num-buffers=5 ! video/x-raw,width=32,height=32,framerate=5/1 ! jpegenc ! avimux ! filesink location={}", path.display()
+        )).unwrap().downcast::<gstreamer::Pipeline>().unwrap();
+        pipeline.set_state(gstreamer::State::Playing).unwrap();
+        let message = pipeline
+            .bus()
+            .unwrap()
+            .timed_pop_filtered(
+                gstreamer::ClockTime::from_seconds(10),
+                &[gstreamer::MessageType::Eos, gstreamer::MessageType::Error],
+            )
+            .expect("fixture generation timed out");
+        pipeline.set_state(gstreamer::State::Null).unwrap();
+        assert!(
+            matches!(message.view(), gstreamer::MessageView::Eos(_)),
+            "{message:?}"
+        );
+        let (size, mtime_unix, head_xxh3, tail_xxh3, oshash, mut info) =
+            inspect(root.path(), &path).unwrap();
+        assert_eq!(info.video[0].bit_depth, Some(8));
+        info.video[0].bit_depth = None;
+        let source = kahawai_proto::v1::SourcePath {
+            root_token: kahawai_core::media::root_token(root.path()),
+            path_rel: "Fixture.avi".into(),
+        };
+        let file = FileRecord {
+            source: Some(source.clone()),
+            size,
+            mtime_unix,
+            head_xxh3,
+            tail_xxh3,
+            oshash,
+            streams_json: serde_json::to_string(&info).unwrap(),
+        };
+        catalog.upsert_file("movies", &file, 1).await.unwrap();
+        // Seed the same durable requests the one-time migration writes.
+        let mut connection = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new().filename(state.path().join("catalog.db")),
+        )
+        .await
+        .unwrap();
+        sqlx::query("UPDATE catalog_files SET reprobe_required=1")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        connection.close().await.unwrap();
+        let counters = ScanCounters::new();
+        run_local_scan(&cfg, &catalog, &counters, false).await;
+        let counts = counters.counts("movies");
+        assert_eq!((counts.scanned, counts.failed, counts.skipped), (1, 1, 0));
+        let known = catalog.known_files("movies").await.unwrap();
+        let success = &known[&(source.root_token.clone(), source.path_rel.clone())];
+        assert!(!success.reprobe_required);
+        assert_eq!(
+            (success.head_xxh3, success.tail_xxh3, success.oshash),
+            (head_xxh3, tail_xxh3, oshash)
+        );
+        let measured: kahawai_core::media::MediaInfo =
+            serde_json::from_str(&success.streams_json).unwrap();
+        assert_eq!(measured.video[0].bit_depth, Some(8));
+        let failed_source = failed.source.unwrap();
+        let retained = &known[&(
+            failed_source.root_token.clone(),
+            failed_source.path_rel.clone(),
+        )];
+        assert!(retained.reprobe_required);
+        assert_eq!(retained.streams_json, failed.streams_json);
+        run_local_scan(&cfg, &catalog, &counters, false).await;
+        let counts = counters.counts("movies");
+        assert_eq!(
+            (counts.scanned, counts.failed, counts.skipped),
+            (0, 1, 1),
+            "retry only the failed request"
+        );
+    }
+
     #[test]
     fn changed_media_and_corrupt_stored_probes_require_discovery() {
         let root = tempfile::tempdir().unwrap();
@@ -1414,6 +1509,7 @@ mod tests {
             oshash: 3,
             streams_json: "{}".into(),
             music_tag_generation: 0,
+            reprobe_required: false,
         };
         assert!(matches!(
             classify_file(root.path(), &path, Some(&old), false, false),

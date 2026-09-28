@@ -5,6 +5,7 @@ pub mod pki;
 pub mod power;
 pub mod private;
 pub mod segments;
+pub mod video_depth_migration;
 
 /// This binary's build stamp — "<short-hash>[+dirty] <commit-date>",
 /// stamped at compile time (see build.rs). Carried in the AR-7 Hello and

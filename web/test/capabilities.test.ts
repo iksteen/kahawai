@@ -163,7 +163,7 @@ describe('bit-depth negotiation', () => {
     browser({ says: true })
     saveMask({ max_bit_depth: 8 })
     const p = buildProfile(null, [
-      { codec: 'hevc', profile: 'main-10', level: '5.1', bit_depth: 30 },
+      { codec: 'hevc', profile: 'main-10', level: '5.1', bit_depth: 10 },
       { codec: 'av1', profile: 'main', level: '4.0', bit_depth: 10 },
     ])
     expect(p.video!.length).toBeGreaterThan(4)

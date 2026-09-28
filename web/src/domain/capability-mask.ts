@@ -115,9 +115,8 @@ export type AnnouncedVideo = {
   bit_depth?: number | null
 }
 
-// Old hubs may still expose discoverer's aggregate depths during rollout.
 export function probeDepth(video: AnnouncedVideo): number {
-  const depth = video.bit_depth === 24 ? 8 : video.bit_depth === 30 ? 10 : video.bit_depth
+  const depth = video.bit_depth
   if (depth && [8, 10, 12, 16].includes(depth)) return depth
   if (video.profile === 'main-10' || video.profile === 'high-10') return 10
   return 8
