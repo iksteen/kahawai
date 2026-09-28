@@ -1635,7 +1635,7 @@ const remember = (scope: string, key: string, value: string) =>
 
     <div
       v-if="panel === 'info'"
-      class="absolute top-3 right-3 z-8 flex max-w-[46ch] flex-col gap-1 rounded-md bg-bg/90 p-3 font-mono text-[11px]"
+      class="absolute top-3 right-3 z-8 flex max-h-[calc(100%-8rem)] max-w-[46ch] flex-col gap-1 overflow-y-auto overscroll-contain rounded-md bg-bg/90 p-3 font-mono text-[11px]"
     >
       <span>
         <span class="text-dim">session </span>{{ props.item.title }} ·
