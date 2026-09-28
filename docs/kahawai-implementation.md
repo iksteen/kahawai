@@ -451,6 +451,10 @@ probes prefer the parser's luma/chroma depths and then raw-format component
 precision; discoverer's known legacy sums 24/30 normalize to 8/10 during typed
 reads. No catalogue rewrite or library rescan is needed. A profile's maximum
 precision and an HDR flag are not measurements of the source's bit depth.
+Paletted formats use the expanded colour precision: Microsoft RLE4/RLE8 and
+raw RGB8P report 8 bits, not the index width, packed palette-entry width, or
+discoverer's aggregate. A bare stored 16 is not enough to identify palette
+video; those old records need a fresh probe, while genuine 16-bit video stays 16.
 `VideoCap.max_bit_depth` is an optional 8/10/12/16-bit ceiling; omitted values
 preserve old-client behavior, and an unknown source depth does not veto copy.
 A known mismatch encodes only the video, using the normal codec and source

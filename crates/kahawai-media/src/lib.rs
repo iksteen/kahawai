@@ -907,11 +907,28 @@ fn discover_video_depth(caps: Option<&gst::CapsRef>, legacy: u32) -> Option<u32>
         if depths.is_some() {
             return depths;
         }
+        // Microsoft RLE's depth is a palette index width, not component depth:
+        // "each of which contains the color index of a single pixel".
+        // https://learn.microsoft.com/en-us/windows/win32/gdi/bitmap-compression
+        // Both RLE4 and RLE8 expand through an eight-bit-per-channel palette.
+        // Do not apply this to other RLE layouts or arbitrary `depth` fields.
+        if st.name() == "video/x-rle"
+            && st.get::<&str>("layout").ok() == Some("microsoft")
+            && matches!(st.get::<i32>("depth").ok(), Some(4 | 8))
+        {
+            return Some(8);
+        }
         if st.name() == "video/x-raw"
             && let Ok(name) = st.get::<&str>("format")
             && let Ok(format) = name.parse::<gstreamer_video::VideoFormat>()
         {
-            let info = gstreamer_video::VideoFormatInfo::from_format(format);
+            let mut info = gstreamer_video::VideoFormatInfo::from_format(format);
+            // RGB8P describes an index and a packed palette entry (8, 32),
+            // not separate colour channels. Measure its unpacked RGB format.
+            // https://gstreamer.freedesktop.org/documentation/video/video-format.html
+            if info.has_palette() {
+                info = gstreamer_video::VideoFormatInfo::from_format(info.unpack_format());
+            }
             return info.depth().iter().copied().filter(|d| *d > 0).max();
         }
     }
@@ -937,5 +954,30 @@ mod bit_depth_discovery_tests {
         assert_eq!(discover_video_depth(None, 24), Some(8));
         assert_eq!(discover_video_depth(None, 0), None);
         assert_eq!(discover_video_depth(None, 32), None);
+    }
+
+    #[test]
+    fn palette_indices_and_entries_are_not_component_depths() {
+        init().unwrap();
+        for depth in [4i32, 8] {
+            let caps = gst::Caps::builder("video/x-rle")
+                .field("layout", "microsoft")
+                .field("depth", depth)
+                .build();
+            assert_eq!(discover_video_depth(Some(&caps), 16), Some(8));
+        }
+        for (format, expected) in [("RGB8P", 8), ("GRAY16_LE", 16), ("RGBA64_LE", 16)] {
+            let caps = gst::Caps::builder("video/x-raw")
+                .field("format", format)
+                .build();
+            assert_eq!(discover_video_depth(Some(&caps), 16), Some(expected));
+        }
+        let caps = gst::Caps::builder("video/x-rle")
+            .field("layout", "quicktime")
+            .field("depth", 8i32)
+            .build();
+        assert_eq!(discover_video_depth(Some(&caps), 48), None);
+        // An ambiguous bare 16 is not evidence of palette video.
+        assert_eq!(discover_video_depth(None, 16), Some(16));
     }
 }
