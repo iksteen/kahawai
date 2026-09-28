@@ -364,6 +364,24 @@ fn level_num(level: &str) -> Option<u32> {
     Some(major * 10 + minor)
 }
 
+/// Bits per component implied by the profile name alone, for the rare case
+/// where the discoverer's numeric depth doesn't normalize (see
+/// `normalize_video_depth`'s "known legacy discoverer sums" — a Main10 HEVC
+/// file has been seen reporting a legacy sum of 48, outside that table,
+/// because the raw-format preview GStreamer used to answer described 16-bit
+/// per-plane storage rather than the encoded 10-bit precision). The profile
+/// string comes straight from the bitstream's SPS and isn't subject to that
+/// storage-width heuristic, so it stands in as a floor when the numeric
+/// depth is unusable — never overriding a numeric depth that DID normalize.
+fn profile_depth_floor(codec: &str, profile: &str) -> Option<u32> {
+    match (codec, profile) {
+        ("hevc", "main-10") => Some(10),
+        ("h264", "high-10") => Some(10),
+        ("h264", "high-4:2:2" | "high-4:4:4") => Some(12),
+        _ => None,
+    }
+}
+
 /// Does one declared capability admit this stream? Codec name is a
 /// hard gate; profile/level compare only when BOTH sides state one
 /// (unknown-permissive on either side).
@@ -372,11 +390,12 @@ fn cap_admits(
     cap: &kahawai_core::media::VideoCap,
     v: &kahawai_core::media::VideoStream,
 ) -> bool {
-    if let (Some(have), Some(max)) = (
-        v.bit_depth
-            .and_then(kahawai_core::media::normalize_video_depth),
-        cap.max_bit_depth,
-    ) && have > max
+    let have_depth = v
+        .bit_depth
+        .and_then(kahawai_core::media::normalize_video_depth)
+        .or_else(|| v.profile.as_deref().and_then(|p| profile_depth_floor(codec, p)));
+    if let (Some(have), Some(max)) = (have_depth, cap.max_bit_depth)
+        && have > max
     {
         return false;
     }
@@ -1342,6 +1361,45 @@ mod tests {
             video_fits(&profile, &video),
             "old clients retain permissive behavior"
         );
+    }
+
+    /// A OnePlus Pad Pro (MediaTek) source reported this exact combination:
+    /// Main10 HEVC whose discoverer legacy depth sum came back 48, outside
+    /// `normalize_video_depth`'s known table, which used to fall through to
+    /// unknown-permissive and copy 10-bit video to an 8-bit-only client —
+    /// the device's own hardware decoder then rejected the stream mid-play
+    /// with "Unsupported bitdepth 10". The profile name is reliable where
+    /// the numeric depth field is not, and should still gate the copy.
+    #[test]
+    fn unmapped_legacy_depth_falls_back_to_profile_name() {
+        let mut profile = chrome();
+        for cap in &mut profile.video {
+            cap.max_bit_depth = Some(8);
+        }
+        let mut video = vs("hevc");
+        video.bit_depth = Some(48);
+        video.profile = Some("main-10".into());
+        assert!(
+            !video_fits(&profile, &video),
+            "a Main10 profile must not copy to an 8-bit client just because \
+             the legacy depth sum didn't normalize"
+        );
+        let info = media("mp4", Some(video), Some(au("aac", 2)));
+        let plan = negotiate(
+            &profile,
+            &info,
+            0,
+            0,
+            true,
+            None,
+            false,
+            false,
+            &[],
+            None,
+            &fleet(),
+        );
+        assert!(!plan.direct);
+        assert_eq!(plan.plan.video, StreamMode::Encode);
     }
 
     #[test]
