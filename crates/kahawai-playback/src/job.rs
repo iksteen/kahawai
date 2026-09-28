@@ -153,6 +153,7 @@ impl Job {
         for (flag, value) in [
             ("--video-kbps", plan.video_kbps),
             ("--max-height", plan.max_height),
+            ("--max-bit-depth", plan.max_bit_depth),
             ("--max-channels", plan.max_channels),
         ] {
             if let Some(value) = value {
@@ -233,6 +234,7 @@ impl Job {
             video_track: args.video_track,
             video_kbps: args.video_kbps,
             max_height: args.max_height,
+            max_bit_depth: args.max_bit_depth,
             max_channels: args.max_channels,
             stereo_gain_db: args.stereo_gain_db,
             native_gain_db: args.native_gain_db,
@@ -286,6 +288,7 @@ impl Job {
             tail_sizes: self.tail_sizes().to_vec(),
             video_kbps: plan.video_kbps.unwrap_or(0),
             max_height: plan.max_height.unwrap_or(0),
+            max_bit_depth: plan.max_bit_depth.unwrap_or(0),
             max_channels: plan.max_channels.unwrap_or(0),
             // Presence is authoritative in the protocol-4 baseline. The
             // sentinels keep argv's distinction between absent and an
@@ -335,6 +338,7 @@ impl Job {
             video_track: msg.video_track as usize,
             video_kbps: positive(msg.video_kbps),
             max_height: positive(msg.max_height),
+            max_bit_depth: positive(msg.max_bit_depth),
             max_channels: positive(msg.max_channels),
             stereo_gain_db: msg.stereo_gain_db.filter(|gain| gain.is_finite()),
             native_gain_db: msg.native_gain_db.filter(|gain| gain.is_finite()),

@@ -963,6 +963,8 @@ message StartSession {
   // (three target durations, floored at 6.5 s, capped at 30 s). 0 = unknown:
   // a hub too old to say, and the flat 6.5 s floor those hubs always got.
   uint32 target_duration_secs = 26;
+  // Protocol 4.6: enforced output bits per component. 0 = unconstrained.
+  uint32 max_bit_depth = 27;
 }
 
 message EndSession {

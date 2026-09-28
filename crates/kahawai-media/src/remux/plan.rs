@@ -123,6 +123,8 @@ pub struct RemuxPlan {
     /// fixed values: 6000 kbit video, no scaling, no downmix.
     pub video_kbps: Option<u32>,
     pub max_height: Option<u32>,
+    /// Enforced encoded component-depth ceiling; None preserves historical negotiation.
+    pub max_bit_depth: Option<u32>,
     /// HUB-15a: run the GL PQ→SDR tone-map segment in the video encode
     /// chain. Only set when the executing box reported the capability.
     pub tone_map: bool,

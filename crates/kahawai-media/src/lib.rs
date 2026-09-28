@@ -371,7 +371,7 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
                 let fps = s.framerate();
                 (fps.numer() > 0).then(|| (fps.numer() as u32, fps.denom() as u32))
             },
-            bit_depth: (s.depth() > 0).then_some(s.depth()),
+            bit_depth: discover_video_depth(caps.as_deref(), s.depth()),
             interlaced: s.is_interlaced(),
             hdr,
             profile: st_get("profile"),
@@ -887,5 +887,55 @@ mod tests {
             tags.get("album_artist").map(String::as_str),
             Some("Various Artists")
         );
+    }
+}
+
+/// Parser caps state encoded component precision; raw storage padding is not depth.
+/// GStreamer discoverer historically reports `finfo->bits * finfo->n_components`:
+/// https://gitlab.freedesktop.org/gstreamer/gstreamer/-/blob/1.28/subprojects/gst-plugins-base/gst-libs/gst/pbutils/gstdiscoverer.c
+fn discover_video_depth(caps: Option<&gst::CapsRef>, legacy: u32) -> Option<u32> {
+    if let Some(st) = caps.and_then(|c| c.structure(0)) {
+        let depths = ["bit-depth-luma", "bit-depth-chroma"]
+            .into_iter()
+            .filter_map(|key| {
+                st.get::<u32>(key)
+                    .ok()
+                    .or_else(|| st.get::<i32>(key).ok().and_then(|v| v.try_into().ok()))
+                    .filter(|d| (1..=16).contains(d))
+            })
+            .max();
+        if depths.is_some() {
+            return depths;
+        }
+        if st.name() == "video/x-raw"
+            && let Ok(name) = st.get::<&str>("format")
+            && let Ok(format) = name.parse::<gstreamer_video::VideoFormat>()
+        {
+            let info = gstreamer_video::VideoFormatInfo::from_format(format);
+            return info.depth().iter().copied().filter(|d| *d > 0).max();
+        }
+    }
+    kahawai_core::media::normalize_video_depth(legacy)
+}
+
+#[cfg(test)]
+mod bit_depth_discovery_tests {
+    use super::*;
+    #[test]
+    fn component_precision_beats_aggregate_and_storage_width() {
+        init().unwrap();
+        let caps = gst::Caps::builder("video/x-h265")
+            .field("bit-depth-luma", 10u32)
+            .field("bit-depth-chroma", 10u32)
+            .build();
+        assert_eq!(discover_video_depth(Some(&caps), 24), Some(10));
+        let caps = gst::Caps::builder("video/x-raw")
+            .field("format", "P010_10LE")
+            .build();
+        assert_eq!(discover_video_depth(Some(&caps), 48), Some(10));
+        assert_eq!(discover_video_depth(None, 30), Some(10));
+        assert_eq!(discover_video_depth(None, 24), Some(8));
+        assert_eq!(discover_video_depth(None, 0), None);
+        assert_eq!(discover_video_depth(None, 32), None);
     }
 }

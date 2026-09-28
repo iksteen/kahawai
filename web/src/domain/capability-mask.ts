@@ -25,6 +25,7 @@ export type CapabilityMask = {
   audio?: string[]
   containers?: string[]
   /// Ceilings to impose; absent means whatever the probe allowed.
+  max_bit_depth?: number
   max_height?: number
   max_audio_channels?: number
   /// Declaration overrides; absent means the probe's own answer.
@@ -45,6 +46,7 @@ export function maskSummary(mask: CapabilityMask): string[] {
     const dropped = mask[kind]
     if (dropped?.length) out.push(`−${dropped.join(',')}`)
   }
+  if (mask.max_bit_depth) out.push(`≤${mask.max_bit_depth}-bit`)
   if (mask.max_height) out.push(`≤${mask.max_height}p`)
   if (mask.max_audio_channels) out.push(`${mask.max_audio_channels}ch`)
   for (const flag of ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render'] as const) {
@@ -71,6 +73,13 @@ export function applyMask(profile: CapabilityProfile, mask: CapabilityMask): Cap
   if (mask.containers?.length && out.containers) {
     const dropped = mask.containers
     out.containers = out.containers.filter((c) => !dropped.includes(c))
+  }
+  // Ceilings tighten, never loosen, including every source-aware entry.
+  if (out.video && mask.max_bit_depth && [8, 10, 12, 16].includes(mask.max_bit_depth)) {
+    out.video = out.video.map((cap) => ({
+      ...cap,
+      max_bit_depth: Math.min(cap.max_bit_depth ?? mask.max_bit_depth!, mask.max_bit_depth!),
+    }))
   }
   // Ceilings tighten, never loosen.
   if (mask.max_height) out.max_height = Math.min(mask.max_height, out.max_height ?? mask.max_height)
@@ -99,7 +108,20 @@ function h264LevelHex(level: string): string | undefined {
   return Number.isFinite(n) && n > 0 ? n.toString(16).toUpperCase().padStart(2, '0') : undefined
 }
 
-export type AnnouncedVideo = { codec: string; profile?: string | null; level?: string | null }
+export type AnnouncedVideo = {
+  codec: string
+  profile?: string | null
+  level?: string | null
+  bit_depth?: number | null
+}
+
+// Old hubs may still expose discoverer's aggregate depths during rollout.
+export function probeDepth(video: AnnouncedVideo): number {
+  const depth = video.bit_depth === 24 ? 8 : video.bit_depth === 30 ? 10 : video.bit_depth
+  if (depth && [8, 10, 12, 16].includes(depth)) return depth
+  if (video.profile === 'main-10' || video.profile === 'high-10') return 10
+  return 8
+}
 
 /// The exact codec string for an announced stream, or undefined when the
 /// metadata predates the probe extension — in which case the generic family
@@ -111,11 +133,51 @@ export type AnnouncedVideo = { codec: string; profile?: string | null; level?: s
 export function rfc6381(video: AnnouncedVideo): string | undefined {
   if (!video.profile || !video.level) return undefined
   if (video.codec === 'h264') {
+    if (probeDepth(video) > (video.profile === 'high-10' ? 10 : 8)) return undefined
     const profile = H264_PROFILE_HEX[video.profile]
     const level = h264LevelHex(video.level)
     return profile && level ? `video/mp4; codecs="avc1.${profile}${level}"` : undefined
   }
+  // Codec strings carry component depth explicitly for VP9 and AV1.
+  // https://www.webmproject.org/vp9/mp4/#codecs-parameter-string
+  // https://aomediacodec.github.io/av1-isobmff/#codecsparam
+  if (video.codec === 'vp9') {
+    const profile = Number(video.profile)
+    const level = Math.round(Number(video.level) * 10)
+    const depth = probeDepth(video)
+    if (
+      !Number.isInteger(profile) ||
+      profile < 0 ||
+      profile > 3 ||
+      !Number.isFinite(level) ||
+      level <= 0
+    )
+      return undefined
+    if ((profile < 2 && depth !== 8) || (profile >= 2 && ![10, 12].includes(depth)))
+      return undefined
+    return `video/webm; codecs="vp09.${String(profile).padStart(2, '0')}.${String(level).padStart(2, '0')}.${String(depth).padStart(2, '0')}"`
+  }
+  if (video.codec === 'av1') {
+    const profile = { main: 0, high: 1, professional: 2 }[video.profile]
+    const level = Number(video.level)
+    const major = Math.floor(level),
+      minor = Math.round((level - major) * 10)
+    const index = (major - 2) * 4 + minor
+    const depth = probeDepth(video)
+    if (
+      profile === undefined ||
+      !Number.isFinite(index) ||
+      major < 2 ||
+      minor > 3 ||
+      index > 23 ||
+      ![8, 10, 12].includes(depth) ||
+      (depth === 12 && profile !== 2)
+    )
+      return undefined
+    return `video/mp4; codecs="av01.${profile}.${String(index).padStart(2, '0')}M.${String(depth).padStart(2, '0')}"`
+  }
   if (video.codec === 'hevc') {
+    if (probeDepth(video) > (video.profile === 'main-10' ? 10 : 8)) return undefined
     const [major, minor = '0'] = video.level.split('.')
     const n = (Number(major) * 10 + Number(minor)) * 3
     if (!Number.isFinite(n) || n <= 0) return undefined

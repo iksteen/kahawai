@@ -360,3 +360,18 @@ fn ewma_converges_in_about_three_samples_and_no_outlier_dominates() {
     }
     assert!(v < 1.9, "still {v} after three slow runs");
 }
+
+#[test]
+fn bit_depth_enforcement_filters_old_workers_only_for_constrained_work() {
+    let mut fleet = fleet(false);
+    connect_minor(&mut fleet, "old", 5, caps(true, 20.0, 0.0));
+    connect(&mut fleet, "new", caps(true, 2.0, 0.0));
+    let mut need = need("1080|hevc|h264");
+    assert!(rank(&fleet, &need).iter().any(|c| c.id == "old"));
+    need.required_protocol_feature = Some(ProtocolFeature::VideoBitDepth);
+    let ranked = rank(&fleet, &need);
+    assert_eq!(ranked.len(), 1);
+    assert_eq!(ranked[0].id, "new");
+    fleet.boxes.remove("new");
+    assert!(!decide(&fleet, &need).available);
+}

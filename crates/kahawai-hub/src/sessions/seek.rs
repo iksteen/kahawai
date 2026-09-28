@@ -355,7 +355,7 @@ impl Sessions {
                 force_measurement.clone(),
             )
             .await?;
-            if loudness_protocol_feature(&plan)
+            if plan_protocol_feature(&plan)
                 .is_some_and(|feature| !executor_protocol.supports(feature))
             {
                 // A track switch cannot move the session to a newer worker.
@@ -374,12 +374,17 @@ impl Sessions {
                     )
                     .await?;
                 }
-                if loudness_protocol_feature(&plan)
+                if plan_protocol_feature(&plan)
                     .is_some_and(|feature| !executor_protocol.supports(feature))
                 {
                     apply_audio_loudness_measurement(&mut plan, LoudnessPreference::Off, None);
                 }
             }
+            anyhow::ensure!(
+                plan_protocol_feature(&plan)
+                    .is_none_or(|feature| executor_protocol.supports(feature)),
+                "selected track requires a transcoder that enforces the client's bit-depth limit (protocol 4.6)"
+            );
             let verdict = replanned_verdict(&plan, &sp.video_verdict, &sp.audio_verdict)?;
             let mut subs = sp.subtitles;
             fill_verdict_track_ids(registry, &session.parts, &mut subs).await;

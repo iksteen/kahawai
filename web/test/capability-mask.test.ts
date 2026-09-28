@@ -117,3 +117,28 @@ describe('asking about one exact stream', () => {
     expect(rfc6381({ codec: 'vp9', profile: 'profile-0', level: '4.1' })).toBeUndefined()
   })
 })
+
+describe('bit-depth mask', () => {
+  test('tightens every entry without changing the original probe', () => {
+    const p = {
+      video: [
+        { codec: 'hevc', max_bit_depth: 10 },
+        { codec: 'h264', max_bit_depth: 8 },
+      ],
+      target_duration: { mode: 'ignore' as const },
+    }
+    expect(applyMask(p, { max_bit_depth: 12 }).video).toEqual(p.video)
+    expect(applyMask(p, { max_bit_depth: 8 }).video?.map((v) => v.max_bit_depth)).toEqual([8, 8])
+    expect(p.video[0]!.max_bit_depth).toBe(10)
+    expect(maskSummary({ max_bit_depth: 8 })).toContain('≤8-bit')
+  })
+  test('codec strings keep AV1 and VP9 component precision', () => {
+    expect(rfc6381({ codec: 'av1', profile: 'main', level: '4.0', bit_depth: 10 })).toBe(
+      'video/mp4; codecs="av01.0.08M.10"',
+    )
+    expect(rfc6381({ codec: 'vp9', profile: '2', level: '5.0', bit_depth: 30 })).toBe(
+      'video/webm; codecs="vp09.02.50.10"',
+    )
+    expect(rfc6381({ codec: 'vp9', profile: '0', level: '5.0', bit_depth: 10 })).toBeUndefined()
+  })
+})

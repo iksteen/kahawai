@@ -497,6 +497,7 @@ pub(super) fn route_stream(
                     plan.video_codec,
                     plan.video_kbps,
                     plan.max_height,
+                    plan.max_bit_depth,
                     source_dimensions,
                     plan.tone_map,
                     plan.deinterlace,

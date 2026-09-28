@@ -87,6 +87,16 @@ pub(super) fn replanned_verdict(
     Ok((video_verdict.to_owned(), audio_verdict.to_owned()))
 }
 
+pub(super) fn plan_protocol_feature(
+    plan: &kahawai_media::remux::RemuxPlan,
+) -> Option<kahawai_proto::ProtocolFeature> {
+    if plan.video == kahawai_media::remux::StreamMode::Encode && plan.max_bit_depth.is_some() {
+        Some(kahawai_proto::ProtocolFeature::VideoBitDepth)
+    } else {
+        loudness_protocol_feature(plan)
+    }
+}
+
 pub(super) fn loudness_protocol_feature(
     plan: &kahawai_media::remux::RemuxPlan,
 ) -> Option<kahawai_proto::ProtocolFeature> {
@@ -125,7 +135,7 @@ pub(super) fn placement_need(
         // Audio-only sessions stay local (`Registry::place`), while a session
         // already bound to a full transcoder remains remote even if a track
         // switch changes video to copy. Preserve the feature for failover.
-        required_protocol_feature: loudness_protocol_feature(plan),
+        required_protocol_feature: plan_protocol_feature(plan),
         video_codec: if plan.video == StreamMode::Encode {
             plan.video_codec.as_str().to_string()
         } else {
@@ -510,11 +520,25 @@ impl<'a> Negotiation<'a> {
                 force,
             )
         };
-        let normal = negotiate(false);
-        if !force_audio_encode {
-            return normal;
+        let selected = negotiate(force_audio_encode);
+        if selected.plan.video == kahawai_media::remux::StreamMode::Encode
+            && selected.plan.max_bit_depth.is_some()
+            && !facts
+                .full_protocol
+                .supports(kahawai_proto::ProtocolFeature::VideoBitDepth)
+        {
+            // Only constrained encodes require a newer executor. Re-probe before
+            // choosing the target so an old fast worker cannot hide a suitable
+            // newer worker with a different codec inventory. With no eligible
+            // worker the empty inventory yields Unplayable, never an unsafe copy.
+            let exact = self.probe(
+                info,
+                facts.burn_capable,
+                Some(kahawai_proto::ProtocolFeature::VideoBitDepth),
+            );
+            return self.plan_with_force(parts, info, &exact, force_audio_encode);
         }
-        negotiate(true)
+        selected
     }
 
     pub(super) fn plans_with_probe(

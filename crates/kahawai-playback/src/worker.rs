@@ -35,6 +35,8 @@ pub struct WorkerArgs {
     #[arg(long)]
     pub max_height: Option<u32>,
     #[arg(long)]
+    pub max_bit_depth: Option<u32>,
+    #[arg(long)]
     pub max_channels: Option<u32>,
     // Supervisors pass the value as a separate argv token; attenuation
     // therefore starts with `-` and must remain a value, not a new flag.

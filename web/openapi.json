@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "85f94ac73370f3397ef01a28cfc160809dec56c3222465bfd2218d7300a9a45e",
+  "x-kahawai-source-sha256": "12144403ceaefa9ba1a9d575ab35f207d30f9a5bdde93fc344b0cb532e55ccaf",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -9669,6 +9669,7 @@
               "null"
             ],
             "format": "int32",
+            "description": "Bits per component (for example 8 or 10), normalized from legacy discoverer sums.",
             "minimum": 0
           },
           "bitrate_kbps": {
@@ -13056,6 +13057,15 @@
           "codec": {
             "type": "string",
             "description": "Normalized codec name (\"h264\", \"hevc\", \"vp9\", \"av1\")."
+          },
+          "max_bit_depth": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Maximum decoded bits per component (8, 10, 12 or 16). Omitted = unrestricted.",
+            "minimum": 0
           },
           "max_level": {
             "type": [

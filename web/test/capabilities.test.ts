@@ -39,7 +39,12 @@ afterEach(() => {
 describe('what the browser says it can play', () => {
   test('is asked of MediaSource first, and of the video element after', () => {
     browser({ says: true })
-    expect(probedProfile().video?.map((v) => v.codec)).toEqual(['h264', 'hevc', 'vp9', 'av1'])
+    expect([...new Set(probedProfile().video?.map((v) => v.codec))]).toEqual([
+      'h264',
+      'hevc',
+      'vp9',
+      'av1',
+    ])
   })
 
   test('a browser with MediaSource but no isTypeSupported does not throw', () => {
@@ -55,7 +60,7 @@ describe('what the browser says it can play', () => {
     // not probe" means.
     browser({ says: false })
     const probed = probedProfile()
-    expect(probed.video).toEqual([{ codec: 'h264' }])
+    expect(probed.video).toEqual([{ codec: 'h264', max_bit_depth: 8 }])
     expect(probed.audio).toEqual(['aac', 'mp3'])
     expect(probed.containers).toEqual(['mp4'])
   })
@@ -90,16 +95,21 @@ describe('the profile that is sent', () => {
   test('and asks the exact question for a stream that said what it is', () => {
     browser({ says: true })
     const profile = buildProfile(null, [{ codec: 'h264', profile: 'high', level: '4.1' }])
-    expect(profile.video).toContainEqual({ codec: 'h264', max_profile: 'high', max_level: '4.1' })
+    expect(profile.video).toContainEqual({
+      codec: 'h264',
+      max_profile: 'high',
+      max_level: '4.1',
+      max_bit_depth: 8,
+    })
     // Alongside the family floor, not instead of it: the hub admits a stream
     // when any cap for its codec does.
-    expect(profile.video).toContainEqual({ codec: 'h264' })
+    expect(profile.video).toContainEqual({ codec: 'h264', max_profile: 'high', max_bit_depth: 8 })
   })
 
   test('a stream the browser cannot play precisely is not claimed', () => {
     browser({ says: false })
     const profile = buildProfile(null, [{ codec: 'h264', profile: 'high', level: '4.1' }])
-    expect(profile.video).toEqual([{ codec: 'h264' }])
+    expect(profile.video).toEqual([{ codec: 'h264', max_bit_depth: 8 }])
   })
 })
 
@@ -138,5 +148,29 @@ describe('the PiP intent', () => {
     const profile = buildProfile(null)
     expect(profile.ass_render).not.toBe(false)
     expect(profile.graphics_overlay).not.toBe(false)
+  })
+})
+
+describe('bit-depth negotiation', () => {
+  test('Main-only HEVC remains available when Main 10 fails', () => {
+    browser({ says: false })
+    vi.stubGlobal('MediaSource', { isTypeSupported: (mime: string) => mime.includes('hvc1.1.') })
+    expect(probedProfile().video).toEqual([
+      { codec: 'hevc', max_profile: 'main', max_bit_depth: 8 },
+    ])
+  })
+  test('source refinements cannot bypass an eight-bit mask', () => {
+    browser({ says: true })
+    saveMask({ max_bit_depth: 8 })
+    const p = buildProfile(null, [
+      { codec: 'hevc', profile: 'main-10', level: '5.1', bit_depth: 30 },
+      { codec: 'av1', profile: 'main', level: '4.0', bit_depth: 10 },
+    ])
+    expect(p.video!.length).toBeGreaterThan(4)
+    expect(p.video!.every((v) => v.max_bit_depth === 8)).toBe(true)
+  })
+  test('all probe entries have an explicit depth limit', () => {
+    browser({ says: true })
+    expect(probedProfile().video!.every((v) => [8, 10, 12].includes(v.max_bit_depth!))).toBe(true)
   })
 })

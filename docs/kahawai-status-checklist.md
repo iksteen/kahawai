@@ -522,7 +522,12 @@ audio/video byte separation for manual playback testing; see
       responses carry aggregate plan cost separately from pipeline mode, so
       player/admin labels say TRANSCODE when either elementary stream is
       encoded even if an audio-only encode runs in the hub-local HLS pipeline
-- [x] HUB-15 Negotiation matrix: codec/profile/level, resolution/fps
+- [x] HUB-15 Negotiation matrix: codec/profile/level and per-codec bit-depth
+      ceilings (Android decoder-profile and browser codec-string probes;
+      unknown sources remain permissive). Encoded depth is enforced end to end,
+      including protocol-4.6 worker placement and seek/retry paths; legacy
+      24/30-bit discoverer sums read as 8/10 without a catalogue rewrite.
+      Resolution/fps
       ceilings, bandwidth cap (pref + profile), channel downmix,
       subtitle tiers with graphics_overlay/ass_render gating, HDR
       tone-map (15a), OCR (32c), burn-in (32b), encode targets (15b)

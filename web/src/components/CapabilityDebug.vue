@@ -63,7 +63,7 @@ function setFlag(flag: Flag, value: boolean) {
   update(next)
 }
 
-function setCeiling(key: 'max_height' | 'max_audio_channels', value: number) {
+function setCeiling(key: 'max_bit_depth' | 'max_height' | 'max_audio_channels', value: number) {
   const next = { ...mask.value }
   if (value > 0) next[key] = value
   else delete next[key]
@@ -99,7 +99,11 @@ async function copyProfile() {
 }
 
 const rows: { kind: DropKind; label: string; names: () => string[] }[] = [
-  { kind: 'video', label: 'video', names: () => (probed.video ?? []).map((c) => c.codec) },
+  {
+    kind: 'video',
+    label: 'video',
+    names: () => [...new Set((probed.video ?? []).map((c) => c.codec))],
+  },
   { kind: 'audio', label: 'audio', names: () => probed.audio ?? [] },
   { kind: 'containers', label: 'container', names: () => probed.containers ?? [] },
 ]
@@ -191,6 +195,18 @@ const FLAGS: Flag[] = ['hdr', 'ass_render', 'graphics_overlay', 'vtt_render']
     <div class="row">
       <span class="label">ceilings</span>
       <span class="opts">
+        <label>
+          bit depth
+          <select
+            :value="mask.max_bit_depth ?? 0"
+            @change="
+              setCeiling('max_bit_depth', Number(($event.target as HTMLSelectElement).value))
+            "
+          >
+            <option :value="0">probed</option>
+            <option v-for="n in [8, 10, 12]" :key="n" :value="n">{{ n }}-bit</option>
+          </select>
+        </label>
         <label>
           height
           <select
