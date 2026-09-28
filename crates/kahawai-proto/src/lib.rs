@@ -10,7 +10,7 @@ pub mod v1 {
 /// durable local catalogue authoritative and deliberately rejects protocol 3
 /// peers, whose hub-owned manifest/worklist contract has the reverse meaning.
 pub const PROTOCOL_MAJOR: u32 = 4;
-pub const PROTOCOL_MINOR: u32 = 5;
+pub const PROTOCOL_MINOR: u32 = 6;
 pub const SEGMENT_COMPARISON_INSUFFICIENT: &str = "fewer than two readable episodes remain";
 
 /// Protocol features that may acquire minor-version gates after the 4.0
@@ -33,6 +33,7 @@ pub enum ProtocolFeature {
     /// follows the hub's playlist declaration. Informational, never a
     /// placement filter — an older transcoder keeps the flat floor.
     ReadinessRunway,
+    VideoBitDepth,
 }
 
 impl ProtocolFeature {
@@ -43,6 +44,7 @@ impl ProtocolFeature {
             Self::RevisionedSubtitles => 3,
             Self::ImageSubsWorklists => 4,
             Self::ReadinessRunway => 5,
+            Self::VideoBitDepth => 6,
             _ => 0,
         }
     }
@@ -92,8 +94,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn protocol_four_five_keeps_inherited_gates_open_and_adds_runway() {
-        assert_eq!(PROTOCOL_MINOR, 5);
+    fn protocol_four_six_keeps_inherited_gates_open_and_adds_bit_depth() {
+        assert_eq!(PROTOCOL_MINOR, 6);
+        assert!(!ProtocolFeatures::new(5).supports(ProtocolFeature::VideoBitDepth));
+        assert!(ProtocolFeatures::current().supports(ProtocolFeature::VideoBitDepth));
         assert!(!ProtocolFeatures::new(4).supports(ProtocolFeature::ReadinessRunway));
         assert!(ProtocolFeatures::current().supports(ProtocolFeature::ReadinessRunway));
         assert!(!ProtocolFeatures::new(3).supports(ProtocolFeature::ImageSubsWorklists));

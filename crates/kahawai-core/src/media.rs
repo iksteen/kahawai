@@ -6,6 +6,34 @@ use std::collections::BTreeMap;
 
 use serde::{Deserialize, Serialize};
 
+/// Known legacy discoverer sums; do not divide arbitrary storage depths by three.
+pub fn normalize_video_depth(depth: u32) -> Option<u32> {
+    match depth {
+        24 => Some(8),
+        30 => Some(10),
+        1..=16 => Some(depth),
+        _ => None,
+    }
+}
+
+fn deserialize_video_depth<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u32>, D::Error> {
+    Ok(Option::<u32>::deserialize(d)?.and_then(normalize_video_depth))
+}
+
+fn deserialize_depth_limit<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<u32>, D::Error> {
+    let depth = Option::<u32>::deserialize(d)?;
+    match depth {
+        None | Some(8 | 10 | 12 | 16) => Ok(depth),
+        _ => Err(serde::de::Error::custom(
+            "max_bit_depth must be 8, 10, 12 or 16 bits per component",
+        )),
+    }
+}
+
 fn is_false(value: &bool) -> bool {
     !*value
 }
@@ -169,6 +197,8 @@ pub struct VideoStream {
     /// Frames per second as (numerator, denominator).
     #[schema(required)]
     pub fps: Option<(u32, u32)>,
+    /// Bits per component, not the legacy sum of three component depths.
+    #[serde(default, deserialize_with = "deserialize_video_depth")]
     #[schema(required)]
     pub bit_depth: Option<u32>,
     pub interlaced: bool,
@@ -402,6 +432,9 @@ fn default_true() -> bool {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct VideoCap {
+    /// Maximum decoded bits per component (8, 10, 12 or 16). Omitted = unrestricted.
+    #[serde(default, deserialize_with = "deserialize_depth_limit")]
+    pub max_bit_depth: Option<u32>,
     /// Normalized codec name ("h264", "hevc", "vp9", "av1").
     pub codec: String,
     /// Highest caps profile the client decodes; None = no ceiling.
@@ -600,5 +633,53 @@ mod root_identity_tests {
             "root-sha256-3RBdn0tNKZrWf3uzPvhpTAjPkGYwOkF2L1ql5BR_8Dc"
         );
         assert_eq!(token.len(), "root-sha256-".len() + 43);
+    }
+}
+
+#[cfg(test)]
+mod bit_depth_tests {
+    use super::*;
+    #[test]
+    fn legacy_depths_normalize_without_a_rescan() {
+        for (stored, expected) in [(24, 8), (30, 10), (8, 8), (10, 10), (12, 12), (16, 16)] {
+            let mut json = serde_json::to_value(VideoStream::default()).unwrap();
+            json["bit_depth"] = stored.into();
+            let stream: VideoStream = serde_json::from_value(json).unwrap();
+            assert_eq!(stream.bit_depth, Some(expected));
+            assert_eq!(serde_json::to_value(stream).unwrap()["bit_depth"], expected);
+        }
+        for value in [serde_json::Value::Null, 0.into(), 32.into()] {
+            let mut json = serde_json::to_value(VideoStream::default()).unwrap();
+            json["bit_depth"] = value;
+            assert_eq!(
+                serde_json::from_value::<VideoStream>(json)
+                    .unwrap()
+                    .bit_depth,
+                None
+            );
+        }
+    }
+    #[test]
+    fn capability_depth_is_explicit_and_not_a_component_sum() {
+        for depth in [8, 10, 12, 16] {
+            let cap: VideoCap =
+                serde_json::from_value(serde_json::json!({"codec":"hevc", "max_bit_depth": depth}))
+                    .unwrap();
+            assert_eq!(cap.max_bit_depth, Some(depth));
+        }
+        for depth in [0, 7, 24, 30] {
+            assert!(
+                serde_json::from_value::<VideoCap>(
+                    serde_json::json!({"codec":"hevc", "max_bit_depth":depth})
+                )
+                .is_err()
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<VideoCap>(r#"{"codec":"hevc"}"#)
+                .unwrap()
+                .max_bit_depth,
+            None
+        );
     }
 }

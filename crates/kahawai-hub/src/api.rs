@@ -3833,6 +3833,7 @@ struct ClientVideoStream {
     height: u32,
     #[schema(required)]
     fps: Option<(u32, u32)>,
+    /// Bits per component (for example 8 or 10), normalized from legacy discoverer sums.
     #[schema(required)]
     bit_depth: Option<u32>,
     interlaced: bool,

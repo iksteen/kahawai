@@ -16,6 +16,10 @@ case "${1:-check}" in
     cancel)
         cargo test -p kahawai-hub --lib cancellation_tests
         ;;
+    bit-depth)
+        source scripts/kahawai-gst-env.sh
+        KAHAWAI_REQUIRE_MEDIA_TESTS=1 cargo test -p kahawai-media bit_depth_live_encode_and_deep_seek -- --ignored --nocapture
+        ;;
     worker)
         # The child-process path every real session takes: the worker is the
         # kahawai binary's hidden subcommand, so build it first.
@@ -36,7 +40,7 @@ case "${1:-check}" in
         echo "kahawai-transcoderd stays lean"
         ;;
     *)
-        echo "usage: kahawai-playback.sh [check|slow|cancel|worker|lean]" >&2
+        echo "usage: kahawai-playback.sh [check|slow|cancel|bit-depth|worker|lean]" >&2
         exit 2
         ;;
 esac

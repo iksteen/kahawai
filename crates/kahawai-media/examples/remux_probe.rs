@@ -28,6 +28,7 @@ fn main() -> anyhow::Result<()> {
         audio_track,
         video_track: 0,
         video_kbps: None,
+        max_bit_depth: None,
         max_height: None,
         tone_map: false,
         deinterlace: false,

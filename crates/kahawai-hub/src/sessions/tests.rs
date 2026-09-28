@@ -489,3 +489,85 @@ async fn forced_video_encode_uses_protocol_four_baseline_layout_gains() {
     );
     assert_ne!(baseline.plan.audio, stereo_normal.plan.audio);
 }
+
+#[tokio::test]
+async fn bit_depth_reprobes_target_inventory_on_a_capable_worker() {
+    use kahawai_core::media::{CapabilityProfile, MediaInfo, VideoCap, VideoStream};
+    use kahawai_proto::v1::{CapabilityReport, EncoderCap};
+    kahawai_media::init().unwrap();
+    if !kahawai_media::testutil::require_elements(&["isofmp4mux"]) {
+        return;
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let registry = crate::registry::Registry::new(
+        crate::db::open(dir.path()).await.unwrap(),
+        Default::default(),
+        kahawai_mediadb::Store::in_memory().await.unwrap(),
+    )
+    .with_local_video_executor(false);
+    let mut receivers = Vec::new();
+    let mut newer = None;
+    for (id, minor, codec, hardware) in [("old", 5, "h264", true), ("new", 6, "hevc", false)] {
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        receivers.push(rx);
+        if id == "new" {
+            newer = Some(tx.clone());
+        }
+        registry.connected(id, "transcoder", id, "fp", "test");
+        registry.register_tc_link(id, minor, tx);
+        registry.set_transcoder_caps(
+            id,
+            &CapabilityReport {
+                encoders: vec![EncoderCap {
+                    codec: codec.into(),
+                    element: if hardware { "nvh264enc" } else { "x265enc" }.into(),
+                    hardware,
+                    speed_1080: Some(5.0),
+                    speed_2160: Some(1.0),
+                }],
+                decode_caps: vec!["video/x-h265".into()],
+                ..Default::default()
+            },
+        );
+    }
+    let profile = CapabilityProfile {
+        video: ["h264", "hevc"]
+            .into_iter()
+            .map(|codec| VideoCap {
+                codec: codec.into(),
+                max_bit_depth: Some(8),
+                ..Default::default()
+            })
+            .collect(),
+        ..Default::default()
+    };
+    let sessions = Sessions::new(dir.path().join("sessions"));
+    let negotiation = Negotiation::preferences(&sessions, &registry, "user", Some(profile), 0, 0)
+        .await
+        .unwrap();
+    let mut info = MediaInfo {
+        container: Some("matroska".into()),
+        video: vec![VideoStream {
+            codec: "hevc".into(),
+            bit_depth: Some(10),
+            width: 320,
+            height: 180,
+            ..Default::default()
+        }],
+        ..Default::default()
+    };
+    let plan = negotiation.plan_for_protocol(&[], &info, false, None);
+    assert_eq!(plan.plan.video, kahawai_media::remux::StreamMode::Encode);
+    assert_eq!(
+        plan.plan.video_codec,
+        kahawai_media::remux::VideoTarget::Hevc
+    );
+    assert_eq!(plan.plan.max_bit_depth, Some(8));
+    registry.register_tc_link("new", 5, newer.unwrap());
+    let refused = negotiation.plan_for_protocol(&[], &info, false, None);
+    assert_eq!(refused.cost, kahawai_media::negotiate::Cost::Unplayable);
+    info.video[0].bit_depth = Some(8);
+    let copy = negotiation.plan_for_protocol(&[], &info, false, None);
+    assert_eq!(copy.plan.video, kahawai_media::remux::StreamMode::Copy);
+    assert_eq!(super::plan_protocol_feature(&copy.plan), None);
+}

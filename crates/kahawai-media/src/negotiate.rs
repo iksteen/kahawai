@@ -372,6 +372,14 @@ fn cap_admits(
     cap: &kahawai_core::media::VideoCap,
     v: &kahawai_core::media::VideoStream,
 ) -> bool {
+    if let (Some(have), Some(max)) = (
+        v.bit_depth
+            .and_then(kahawai_core::media::normalize_video_depth),
+        cap.max_bit_depth,
+    ) && have > max
+    {
+        return false;
+    }
     if let (Some(have), Some(max)) = (v.profile.as_deref(), cap.max_profile.as_deref())
         && let (Some(h), Some(m)) = (profile_rank(codec, have), profile_rank(codec, max))
         && h > m
@@ -921,6 +929,9 @@ fn negotiate_for_executors_impl(
         audio,
         audio_track,
         video_track,
+        max_bit_depth: (video == StreamMode::Encode)
+            .then(|| codec_depth_limit(profile, video_target.as_str()))
+            .flatten(),
         video_kbps: (video == StreamMode::Encode).then(|| cap.map_or(6000, |c| 6000.min(c))),
         max_height: (video == StreamMode::Encode)
             .then_some(profile.max_height)
@@ -1152,6 +1163,18 @@ fn negotiate_for_executors_impl(
         })
         .collect();
 
+    if let Some(v) = v
+        && let (Some(depth), Some(limit)) = (
+            v.bit_depth
+                .and_then(kahawai_core::media::normalize_video_depth),
+            codec_depth_limit(profile, &v.codec),
+        )
+        && depth > limit
+    {
+        video_verdict.push_str(&format!(
+            " · {depth}-bit source exceeds client's {limit}-bit limit"
+        ));
+    }
     SourcePlan {
         direct,
         plan,
@@ -1174,6 +1197,15 @@ fn negotiate_for_executors_impl(
         audio_verdict,
         subtitles,
     }
+}
+
+/// Multiple entries are alternatives; an unrestricted entry admits any depth.
+fn codec_depth_limit(profile: &CapabilityProfile, codec: &str) -> Option<u32> {
+    let caps: Vec<_> = profile.video.iter().filter(|c| c.codec == codec).collect();
+    if caps.iter().any(|c| c.max_bit_depth.is_none()) {
+        return None;
+    }
+    caps.iter().filter_map(|c| c.max_bit_depth).max()
 }
 
 #[cfg(test)]
@@ -1238,6 +1270,103 @@ mod tests {
             &AssPolicy::default(),
             targets,
         )
+    }
+
+    #[test]
+    fn bit_depth_copy_encode_and_unknown_policy() {
+        crate::init().unwrap();
+        let mut profile = chrome();
+        for cap in &mut profile.video {
+            cap.max_bit_depth = Some(8);
+        }
+        for depth in [Some(8), Some(24), Some(10), Some(30), None] {
+            let mut video = vs("hevc");
+            video.bit_depth = depth;
+            let info = media("mp4", Some(video), Some(au("aac", 2)));
+            let plan = negotiate(
+                &profile,
+                &info,
+                0,
+                0,
+                true,
+                None,
+                false,
+                false,
+                &[],
+                None,
+                &fleet(),
+            );
+            if matches!(depth, Some(10 | 30)) {
+                assert!(!plan.direct);
+                assert_eq!(plan.plan.video, StreamMode::Encode);
+                assert_eq!(plan.plan.max_bit_depth, Some(8));
+                assert!(!plan.plan.tone_map, "10-bit SDR is not HDR");
+                assert!(
+                    plan.video_verdict
+                        .contains("10-bit source exceeds client's 8-bit limit")
+                );
+                let unavailable = negotiate(
+                    &profile,
+                    &info,
+                    0,
+                    0,
+                    true,
+                    None,
+                    false,
+                    false,
+                    &[],
+                    None,
+                    &[],
+                );
+                assert_eq!(unavailable.cost, Cost::Unplayable);
+            } else {
+                assert!(plan.direct, "{depth:?}: {}", plan.video_verdict);
+            }
+        }
+        profile
+            .video
+            .iter_mut()
+            .find(|c| c.codec == "hevc")
+            .unwrap()
+            .max_bit_depth = Some(10);
+        let mut video = vs("hevc");
+        video.bit_depth = Some(10);
+        assert!(video_fits(&profile, &video));
+        video.codec = "h264".into();
+        assert!(
+            !video_fits(&profile, &video),
+            "depth support belongs to its codec"
+        );
+        profile.video[0].max_bit_depth = None;
+        assert!(
+            video_fits(&profile, &video),
+            "old clients retain permissive behavior"
+        );
+    }
+
+    #[test]
+    fn bit_depth_and_profile_must_fit_one_capability() {
+        let mut video = vs("hevc");
+        video.bit_depth = Some(10);
+        video.profile = Some("main-10".into());
+        let profile = CapabilityProfile {
+            video: vec![
+                VideoCap {
+                    codec: "hevc".into(),
+                    max_profile: Some("main".into()),
+                    max_bit_depth: Some(10),
+                    ..Default::default()
+                },
+                VideoCap {
+                    codec: "hevc".into(),
+                    max_profile: Some("main-10".into()),
+                    max_bit_depth: Some(8),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        };
+        assert!(!video_fits(&profile, &video));
     }
 
     fn fleet() -> Vec<String> {
@@ -1766,6 +1895,7 @@ mod tests {
             codec: "h264".into(),
             max_profile: Some("high".into()),
             max_level: None,
+            max_bit_depth: None,
         }];
         let ten_bit = VideoStream {
             profile: Some("high-10".into()),
@@ -2578,6 +2708,7 @@ mod tests {
             codec: "h264".into(),
             max_profile: Some("high".into()),
             max_level: Some("4.1".into()),
+            max_bit_depth: None,
         }];
         let ok = VideoStream {
             profile: Some("high".into()),
@@ -2626,6 +2757,7 @@ mod tests {
             codec: "h264".into(),
             max_profile: Some("high-10".into()),
             max_level: Some("4.1".into()),
+            max_bit_depth: None,
         });
         let over = VideoStream {
             profile: Some("high-10".into()),

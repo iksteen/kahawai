@@ -306,10 +306,21 @@ test.describe.serial('real all-in-one product flows', () => {
     await page.getByRole('button', { name: '← Back' }).click()
 
     await page.evaluate(() =>
-      localStorage.setItem('kahawai.capmask', JSON.stringify({ video: ['hevc'] })),
+      localStorage.setItem('kahawai.capmask', JSON.stringify({ max_bit_depth: 8 })),
     )
     await openFixture('Transcode Fixture')
+    const depthReply = page.waitForResponse(
+      (r) => r.url().endsWith('/api/v1/playback/sessions') && r.request().method() === 'POST',
+    )
     video = await startPlayback('TRANSCODE')
+    const response = await depthReply
+    const profile = response.request().postDataJSON().profile
+    expect(profile.video.every((v: { max_bit_depth: number }) => v.max_bit_depth === 8)).toBe(true)
+    const body = await response.json()
+    expect(body.streams.cost).toBe('video_encode')
+    if (profile.video.some((v: { codec: string }) => v.codec === 'hevc')) {
+      expect(body.streams.video).toContain("10-bit source exceeds client's 8-bit limit")
+    }
     expect(
       await video.evaluate((element) => (element as HTMLVideoElement).currentTime),
     ).toBeGreaterThan(0)

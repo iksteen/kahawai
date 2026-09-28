@@ -13,17 +13,23 @@ import {
   type CapabilityMask,
   maskSummary,
   rfc6381,
+  probeDepth,
 } from '../domain/capability-mask.ts'
 import { pipMask, pipPhase } from '../domain/pip.ts'
 
-/// One representative codec string per family, at generous profile and level
-/// — the hub's verifier judges the SOURCE's profile against what is reported,
-/// so probing the high end is what admits the most copies.
-const VIDEO_PROBES: [string, string][] = [
-  ['h264', 'video/mp4; codecs="avc1.640033"'], // High L5.1
-  ['hevc', 'video/mp4; codecs="hvc1.2.4.L153.B0"'], // Main 10
-  ['vp9', 'video/webm; codecs="vp09.00.50.08"'],
-  ['av1', 'video/mp4; codecs="av01.0.08M.08"'],
+/// Baseline probes carry their verified component precision; none is unlimited.
+// Probe each precision independently: failing Main 10 must not remove Main.
+const VIDEO_PROBES: [string, number, string, string][] = [
+  ['h264', 8, 'high', 'video/mp4; codecs="avc1.640033"'],
+  ['h264', 10, 'high-10', 'video/mp4; codecs="avc1.6E0033"'],
+  ['hevc', 8, 'main', 'video/mp4; codecs="hvc1.1.6.L153.B0"'],
+  ['hevc', 10, 'main-10', 'video/mp4; codecs="hvc1.2.4.L153.B0"'],
+  ['vp9', 8, '0', 'video/webm; codecs="vp09.00.50.08"'],
+  ['vp9', 10, '2', 'video/webm; codecs="vp09.02.50.10"'],
+  ['vp9', 12, '2', 'video/webm; codecs="vp09.02.50.12"'],
+  ['av1', 8, 'main', 'video/mp4; codecs="av01.0.08M.08"'],
+  ['av1', 10, 'main', 'video/mp4; codecs="av01.0.08M.10"'],
+  ['av1', 12, 'professional', 'video/mp4; codecs="av01.2.08M.12"'],
 ]
 const AUDIO_PROBES: [string, string][] = [
   ['aac', 'audio/mp4; codecs="mp4a.40.2"'],
@@ -80,7 +86,9 @@ export function probedProfile(): CapabilityProfile {
   if (cached) return cached
   cached = {
     containers: CONTAINER_PROBES.filter(([, mime]) => supported(mime)).map(([name]) => name),
-    video: VIDEO_PROBES.filter(([, mime]) => supported(mime)).map(([codec]) => ({ codec })),
+    video: VIDEO_PROBES.filter(([, , , mime]) => supported(mime)).map(
+      ([codec, max_bit_depth, max_profile]) => ({ codec, max_bit_depth, max_profile }),
+    ),
     audio: AUDIO_PROBES.filter(([, mime]) => supported(mime)).map(([name]) => name),
     // Browsers downmix natively; a ceiling would force re-encodes.
     max_audio_channels: 0,
@@ -107,7 +115,7 @@ export function probedProfile(): CapabilityProfile {
   // A browser with no probeable video at all should not happen, and must not
   // send an empty list — that would transcode everything. A MASK emptying the
   // list is meaningful, and is applied after this.
-  if (!cached.video?.length) cached.video = [{ codec: 'h264' }]
+  if (!cached.video?.length) cached.video = [{ codec: 'h264', max_bit_depth: 8 }]
   if (!cached.audio?.length) cached.audio = ['aac', 'mp3']
   if (!cached.containers?.length) cached.containers = ['mp4']
   return cached
@@ -118,12 +126,17 @@ function refineForSources(streams: AnnouncedVideo[]): VideoCap[] {
   const out: VideoCap[] = []
   const seen = new Set<string>()
   for (const video of streams) {
-    const key = `${video.codec}/${video.profile}/${video.level}`
+    const key = `${video.codec}/${video.profile}/${video.level}/${video.bit_depth}`
     if (seen.has(key)) continue
     seen.add(key)
     const mime = rfc6381(video)
     if (mime && supported(mime)) {
-      out.push({ codec: video.codec, max_profile: video.profile!, max_level: video.level! })
+      out.push({
+        codec: video.codec,
+        max_profile: video.profile!,
+        max_level: video.level!,
+        max_bit_depth: probeDepth(video),
+      })
     }
   }
   return out

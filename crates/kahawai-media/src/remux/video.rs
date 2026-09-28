@@ -677,6 +677,7 @@ pub(super) fn build_video_encode_chain(
     target: VideoTarget,
     video_kbps: Option<u32>,
     max_height: Option<u32>,
+    max_bit_depth: Option<u32>,
     source_dimensions: Option<(i32, i32)>,
     tone_map: bool,
     deinterlace: bool,
@@ -894,6 +895,9 @@ pub(super) fn build_video_encode_chain(
     // on `video_sink` and never on `text_sink` (application/x-ass).
     chain.extend(ass_el.iter());
     chain.extend(converters[scale_at..].iter());
+    let depth_filter =
+        max_bit_depth.map(|_| gst::ElementFactory::make("capsfilter").build().unwrap());
+    chain.extend(depth_filter.iter());
     chain.push(&enc);
     chain.push(&parse);
     pipe.add(&decode).unwrap();
@@ -924,6 +928,44 @@ pub(super) fn build_video_encode_chain(
         AssBurnLink::offer_text_sink(link, pipe, text);
     }
     let out = parse.static_pad("src").unwrap();
+    if let Some(limit) = max_bit_depth {
+        let weak_pipe = pipe.downgrade();
+        out.add_probe(gst::PadProbeType::EVENT_DOWNSTREAM, move |_, probe| {
+            if let Some(gst::PadProbeData::Event(event)) = &probe.data
+                && let gst::EventView::Caps(event) = event.view()
+            {
+                let depth = crate::discover_video_depth(Some(event.caps()), 0).or_else(|| {
+                    let st = event.caps().structure(0)?;
+                    let profile = st.get::<&str>("profile").ok()?;
+                    ((st.name() == "video/x-h264"
+                        && matches!(
+                            profile,
+                            "baseline" | "constrained-baseline" | "main" | "high"
+                        ))
+                        || (st.name() == "video/x-h265" && profile == "main"))
+                        .then_some(8)
+                });
+                // Missing parser precision is not evidence that the output is safe.
+                if depth.is_none_or(|depth| depth > limit) {
+                    if let Some(pipe) = weak_pipe.upgrade() {
+                        let _ = pipe.post_message(
+                            gst::message::Error::builder(
+                                gst::StreamError::Format,
+                                &format!(
+                                    "encoder output depth {depth:?} violates {limit}-bit contract"
+                                ),
+                            )
+                            .src(&pipe)
+                            .build(),
+                        );
+                    }
+                    return gst::PadProbeReturn::Drop;
+                }
+                tracing::info!(?depth, limit, "encoded bit depth verified");
+            }
+            gst::PadProbeReturn::Ok
+        });
+    }
     guard_pts(&out);
     if let Some(g) = gate {
         open_encoder_on_keyframe(&out);
@@ -933,9 +975,47 @@ pub(super) fn build_video_encode_chain(
         tracing::warn!(error = %e, "video encode chain → muxer link failed");
     }
     let convert_sink = chain[0].static_pad("sink").unwrap();
+    // Tone mapping already produces eight-bit NV12/I420. Do not expand it
+    // back to ten bits merely because the decoder originally supplied ten.
+    let raw_depth_limit = max_bit_depth.map(|limit| {
+        if tonemap.is_empty() {
+            limit
+        } else {
+            limit.min(8)
+        }
+    });
+    let weak_pipe = pipe.downgrade();
     decode.connect_pad_added(move |_, pad| {
         if convert_sink.is_linked() {
             return; // first decoded stream wins
+        }
+        if let (Some(limit), Some(filter)) = (raw_depth_limit, depth_filter.as_ref()) {
+            let caps = pad.current_caps();
+            let source = caps
+                .as_ref()
+                .and_then(|c| gstreamer_video::VideoInfo::from_caps(c).ok());
+            let depth = source
+                .as_ref()
+                .and_then(|v| v.format_info().depth().iter().copied().max())
+                .unwrap_or(8)
+                .min(limit);
+            let source_format = source.as_ref().map(|v| v.format());
+            let accepted = enc.static_pad("sink").unwrap().query_caps(None);
+            if let Some(caps) = depth_encode_caps(&accepted, depth, source_format) {
+                filter.set_property("caps", caps);
+            } else {
+                if let Some(pipe) = weak_pipe.upgrade() {
+                    let _ = pipe.post_message(
+                        gst::message::Error::builder(
+                            gst::StreamError::Format,
+                            &format!("encoder has no raw format within {depth}-bit ceiling"),
+                        )
+                        .src(&pipe)
+                        .build(),
+                    );
+                }
+                return;
+            }
         }
         if let Err(e) = pad.link(&convert_sink) {
             tracing::warn!(error = %e, "decodebin → video encode chain link failed");
@@ -944,4 +1024,52 @@ pub(super) fn build_video_encode_chain(
     if let Err(e) = from.link(&decode.static_pad("sink").unwrap()) {
         tracing::warn!(error = %e, "→ decodebin link failed");
     }
+}
+
+/// Pin one accepted raw format rather than relying on caps-list fixation order.
+/// Component depth (VideoFormatInfo.depth), not bits/storage width, handles P010.
+fn depth_encode_caps(
+    accepted: &gst::CapsRef,
+    ceiling: u32,
+    source: Option<gstreamer_video::VideoFormat>,
+) -> Option<gst::Caps> {
+    use gstreamer_video::VideoFormat;
+    let mut formats: Vec<_> = VideoFormat::iter_raw()
+        .filter(|f| {
+            let depth = gstreamer_video::VideoFormatInfo::from_format(*f)
+                .depth()
+                .iter()
+                .copied()
+                .max()
+                .unwrap_or(0);
+            depth > 0 && depth <= ceiling
+        })
+        .collect();
+    formats.sort_by_key(|f| {
+        let depth = gstreamer_video::VideoFormatInfo::from_format(*f)
+            .depth()
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(0);
+        let preference = if Some(*f) == source {
+            0
+        } else {
+            match f {
+                VideoFormat::Nv12 | VideoFormat::P01010le => 1,
+                VideoFormat::I420 | VideoFormat::I42010le => 2,
+                _ => 3,
+            }
+        };
+        (std::cmp::Reverse(depth), preference)
+    });
+    formats
+        .into_iter()
+        .map(|f| {
+            gst::Caps::builder("video/x-raw")
+                .any_features()
+                .field("format", f.to_str())
+                .build()
+        })
+        .find(|caps| caps.can_intersect(accepted))
 }

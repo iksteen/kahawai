@@ -270,6 +270,7 @@ const COPY_AV: RemuxPlan = RemuxPlan {
     audio_track: 0,
     video_track: 0,
     video_kbps: None,
+    max_bit_depth: None,
     max_height: None,
     max_channels: None,
     stereo_gain_db: None,
@@ -1027,6 +1028,7 @@ fn encode_honors_scale_and_downmix() {
         audio_track: 0,
         video_track: 0,
         video_kbps: Some(500),
+        max_bit_depth: None,
         max_height: Some(120),
         max_channels: Some(1),
         tone_map: false,
@@ -1734,6 +1736,7 @@ fn burn_in_from_env() {
         audio_track: 0,
         video_track: 0,
         video_kbps: Some(8000),
+        max_bit_depth: None,
         max_height: None,
         max_channels: None,
         tone_map: false,
@@ -1817,6 +1820,7 @@ fn channel_ceiling_downmixes_to_the_ceiling_not_mono() {
         audio_track: 0,
         video_track: 0,
         video_kbps: None,
+        max_bit_depth: None,
         max_height: None,
         max_channels: Some(2),
         tone_map: false,
@@ -2103,6 +2107,7 @@ fn unbounded_encode_keeps_the_source_layout_and_decodes() {
         audio_track: 0,
         video_track: 0,
         video_kbps: None,
+        max_bit_depth: None,
         max_height: None,
         max_channels: None, // what the web client sends: no ceiling
         tone_map: false,
@@ -2182,6 +2187,7 @@ fn tonemap_encode_outputs_sdr_tagged_video() {
         audio_track: 0,
         video_track: 0,
         video_kbps: Some(500),
+        max_bit_depth: None,
         max_height: None,
         max_channels: None,
         tone_map: true,
@@ -2353,4 +2359,106 @@ fn video_dts_defects(seg: &std::path::Path) -> (usize, usize) {
         }
     }
     (missing, non_mono)
+}
+
+/// Real 10-bit HEVC source, both encode targets, and a restart at 75%.
+/// Run with scripts/kahawai-playback.sh bit-depth (ffmpeg/libx265 required).
+#[test]
+#[ignore = "real encoder/decode smoke test; run via playback script"]
+fn bit_depth_live_encode_and_deep_seek() {
+    use std::process::Command;
+    crate::init().unwrap();
+    let root = tempfile::tempdir().unwrap();
+    let input = root.path().join("ten-bit.mkv");
+    let generated = Command::new("ffmpeg")
+        .args([
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-f",
+            "lavfi",
+            "-i",
+            "testsrc2=size=320x180:rate=24",
+            "-t",
+            "12",
+            "-pix_fmt",
+            "yuv420p10le",
+            "-c:v",
+            "libx265",
+            "-x265-params",
+            "pools=1:frame-threads=1:keyint=24:log-level=error",
+            "-y",
+        ])
+        .arg(&input)
+        .status()
+        .unwrap();
+    assert!(generated.success());
+    let source_info = crate::discover(&input, Duration::from_secs(30)).unwrap();
+    assert_eq!(source_info.video[0].bit_depth, Some(10));
+    for target in [VideoTarget::H264, VideoTarget::Hevc] {
+        for at in [0, 9000] {
+            let dir = root.path().join(format!("{}-{at}", target.as_str()));
+            std::fs::create_dir(&dir).unwrap();
+            let plan = RemuxPlan {
+                video: StreamMode::Encode,
+                audio: StreamMode::Off,
+                video_codec: target,
+                segment_format: SegmentFormat::Fmp4,
+                max_bit_depth: Some(8),
+                ..Default::default()
+            };
+            let job =
+                start_at(&dir, plan, Box::new(FileSource::open(&input).unwrap()), at).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(60);
+            while !job.finished() && job.failed().is_none() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            assert!(
+                job.failed().is_none(),
+                "{target:?}/{at}: {:?}",
+                job.failed()
+            );
+            assert!(job.finished(), "{target:?}/{at}: timed out");
+            let playlist = dir.join("master.m3u8");
+            assert!(
+                std::fs::read_to_string(&playlist)
+                    .unwrap()
+                    .contains("#EXT-X-ENDLIST")
+            );
+            let output = Command::new("ffprobe")
+                .args([
+                    "-v",
+                    "error",
+                    "-select_streams",
+                    "v:0",
+                    "-show_entries",
+                    "stream=pix_fmt,codec_name",
+                    "-of",
+                    "json",
+                ])
+                .arg(&playlist)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let info: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(
+                info["streams"][0]["pix_fmt"], "yuv420p",
+                "{target:?}/{at}: {info}"
+            );
+            assert_eq!(info["streams"][0]["codec_name"], target.as_str());
+            assert!(
+                Command::new("ffmpeg")
+                    .args(["-hide_banner", "-loglevel", "error", "-xerror", "-i"])
+                    .arg(&playlist)
+                    .args(["-map", "0:v:0", "-f", "null", "-"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
+    }
 }

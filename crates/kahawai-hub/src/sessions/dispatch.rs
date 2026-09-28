@@ -126,7 +126,7 @@ impl Sessions {
             keep_leases: false,
         };
         registry
-            .send_to_tc_requiring(transcoder, start, loudness_protocol_feature(&plan))
+            .send_to_tc_requiring(transcoder, start, plan_protocol_feature(&plan))
             .await?;
         match tokio::time::timeout(Duration::from_secs(40), ready_rx).await {
             Ok(Ok(Ok(facts))) => {
