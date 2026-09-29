@@ -149,6 +149,12 @@ verify() {
         dir="$(dirname "$patch")"
         n="$(basename "$patch" | cut -c1-4)"
         name="$(basename "$patch" .patch | cut -c6-)"
+        # applemedia is not built on Linux; a VideoToolbox encode there
+        # cannot verify this patch. Keep this distinct from a LIVE result.
+        if [[ "$name" = vtenc-* ]] && [ "$(uname -s)" != Darwin ]; then
+            printf '  %s  %-52s N/A (Apple VideoToolbox)\n' "$n" "$name"
+            continue
+        fi
         for repro in "$dir/$n"-*-repro-*.py; do
             [ -e "$repro" ] || continue
             ran=$((ran + 1))

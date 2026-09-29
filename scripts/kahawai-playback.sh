@@ -20,6 +20,11 @@ case "${1:-check}" in
         source scripts/kahawai-gst-env.sh
         KAHAWAI_REQUIRE_MEDIA_TESTS=1 cargo test -p kahawai-media bit_depth_live_encode_and_deep_seek -- --ignored --nocapture
         ;;
+    videotoolbox-bitrate)
+        # Run on macOS with a short, representative video sample.
+        # KAHAWAI_BITRATE_SAMPLE=/path/to/sample.mkv scripts/kahawai-playback.sh videotoolbox-bitrate
+        cargo test -p kahawai-media videotoolbox_live_bitrate -- --ignored --nocapture
+        ;;
     worker)
         # The child-process path every real session takes: the worker is the
         # kahawai binary's hidden subcommand, so build it first.
@@ -40,7 +45,7 @@ case "${1:-check}" in
         echo "kahawai-transcoderd stays lean"
         ;;
     *)
-        echo "usage: kahawai-playback.sh [check|slow|cancel|bit-depth|worker|lean]" >&2
+        echo "usage: kahawai-playback.sh [check|slow|cancel|bit-depth|videotoolbox-bitrate|worker|lean]" >&2
         exit 2
         ;;
 esac

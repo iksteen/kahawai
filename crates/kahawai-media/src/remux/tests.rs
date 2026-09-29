@@ -2462,3 +2462,63 @@ fn bit_depth_live_encode_and_deep_seek() {
         }
     }
 }
+
+/// Check the actual production encode chain, not just a property assignment.
+/// Supply a short sample with scripts/kahawai-playback.sh videotoolbox-bitrate.
+#[test]
+#[ignore = "requires macOS VideoToolbox and KAHAWAI_BITRATE_SAMPLE"]
+fn videotoolbox_live_bitrate() {
+    crate::init().unwrap();
+    let input = std::env::var("KAHAWAI_BITRATE_SAMPLE").expect("provide a short video sample");
+    for (target, encoder) in [
+        (VideoTarget::H264, h264_encoder()),
+        (VideoTarget::Hevc, hevc_encoder()),
+    ] {
+        assert!(
+            encoder.is_some_and(|e| e.starts_with("vtenc_")),
+            "requires VideoToolbox: {encoder:?}"
+        );
+        let dir = tempfile::tempdir().unwrap();
+        let plan = RemuxPlan {
+            video: StreamMode::Encode,
+            audio: StreamMode::Off,
+            video_codec: target,
+            video_kbps: Some(6000),
+            max_bit_depth: Some(8),
+            segment_format: SegmentFormat::Fmp4,
+            ..Default::default()
+        };
+        let job = start(
+            dir.path(),
+            plan,
+            Box::new(FileSource::open(std::path::Path::new(&input)).unwrap()),
+        )
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(60);
+        while !job.finished() && job.failed().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(job.failed().is_none(), "{:?}", job.failed());
+        assert!(job.finished(), "sample must finish within 60 seconds");
+        let playlist = std::fs::read_to_string(dir.path().join("master.m3u8")).unwrap();
+        let seconds: f64 = playlist
+            .lines()
+            .filter_map(|l| l.strip_prefix("#EXTINF:"))
+            .map(|l| l.split(',').next().unwrap().parse::<f64>().unwrap())
+            .sum();
+        let bytes: u64 = playlist
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+            .map(|l| std::fs::metadata(dir.path().join(l)).unwrap().len())
+            .sum();
+        let kbps = bytes as f64 * 8.0 / seconds / 1000.0;
+        eprintln!("{target:?}: {kbps:.0} kbit/s over {seconds:.2}s (target 6000)");
+        assert!(seconds >= 10.0, "sample must contain at least 10 seconds");
+        // Allow startup and fragment overhead, but reject both the observed
+        // ABR collapse and the quality=1 overshoot.
+        assert!(
+            (3900.0..8400.0).contains(&kbps),
+            "{target:?}: {kbps} kbit/s"
+        );
+    }
+}

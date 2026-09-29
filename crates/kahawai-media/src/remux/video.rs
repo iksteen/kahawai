@@ -760,6 +760,8 @@ pub(super) fn build_video_encode_chain(
         encoder = enc_name,
         target = target.as_str(),
         hardware = !SW_VIDEO_ENCODERS.contains(&enc_name),
+        video_kbps = kbps,
+        rate_control = ?enc.find_property("rate-control").map(|_| enc.property_value("rate-control")),
         "video encoder selected"
     );
     // Before the GOP pins, so a log reading the element's properties back

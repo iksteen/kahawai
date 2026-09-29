@@ -192,19 +192,19 @@ pub fn opus_encoder() -> Option<&'static str> {
 }
 
 /// H.264 encoders in preference order: hardware first (VA-API, NVENC,
-/// QSV, VideoToolbox), then software.
+/// QSV, VideoToolbox), then software fallbacks.
 pub const H264_ENCODERS: &[&str] = &[
     "vah264enc",
     "vaapih264enc",
     "nvh264enc",
     "qsvh264enc",
-    "vtenc_h264_hw", // VideoToolbox (Apple Silicon)
+    "vtenc_h264_hw",
     "vtenc_h264",
     "x264enc",
     "openh264enc",
 ];
 
-/// HEVC and AV1 encode targets (HUB-15b), same hardware-first shape.
+/// HEVC and AV1 encode targets (HUB-15b), hardware before software.
 pub const HEVC_ENCODERS: &[&str] = &[
     "vah265enc",
     "vaapih265enc",
