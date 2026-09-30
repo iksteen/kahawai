@@ -301,7 +301,7 @@ run_step() {
     local what="$1"
     shift
     local log
-    log="$(mktemp -t kahawai-gst-step)"
+    log="$(mktemp -t kahawai-gst-step-XXXXXX)" || return 1
     if "$@" >"$log" 2>&1; then
         rm -f "$log"
         return 0
