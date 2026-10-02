@@ -93,6 +93,41 @@ impl CacheEvents {
 }
 
 impl Subtitles {
+    /// Resolve the parent captured by the extraction request. Several media
+    /// files can share a sidecar path, so looking up that path alone can select
+    /// a different parent and reject a valid reply as stale. The revision names
+    /// the parent; its host, collection, root and source path must still agree
+    /// with the link's identity. The caller also validates the complete revision.
+    pub(crate) async fn extraction_source(
+        registry: &Registry,
+        host: &str,
+        collection: &str,
+        source: &kahawai_proto::v1::SourcePath,
+        revision: &str,
+    ) -> Result<Option<SourceFile>> {
+        let Some((id, _)) = revision
+            .strip_prefix("v4-")
+            .and_then(|s| s.rsplit_once('-'))
+        else {
+            return Ok(None);
+        };
+        Ok(registry
+            .catalogue()
+            .subtitle_source_by_id(id)
+            .await?
+            .filter(|file| {
+                file.host == host
+                    && file.remote_id == collection
+                    && file.root_token == source.root_token
+                    && (file.path == source.path_rel
+                        || file
+                            .media
+                            .external_subtitles
+                            .iter()
+                            .any(|sidecar| sidecar.path_rel == source.path_rel))
+            }))
+    }
+
     pub(crate) fn accepts_extraction(file: &SourceFile, path: &str, revision: &str) -> bool {
         catalogue::source_revision(&work::part(file), &file.media, path != file.path) == revision
     }

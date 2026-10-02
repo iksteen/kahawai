@@ -621,7 +621,7 @@ impl Subtitles {
 }
 
 #[cfg(test)]
-pub(super) mod tests {
+pub(crate) mod tests {
     use super::*;
     use kahawai_proto::v1 as p;
     use prost::Message;

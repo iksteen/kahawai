@@ -644,10 +644,14 @@ async fn handle_host_msg(
             let source = message.source.context("missing subtitle source")?;
             // Validate the captured revision as well as size: a late reply
             // must not settle a same-size replacement's extraction work.
-            let file = registry
-                .catalogue()
-                .source_file(module_id, &message.collection_id, &source)
-                .await?;
+            let file = crate::subtitles::Subtitles::extraction_source(
+                registry,
+                module_id,
+                &message.collection_id,
+                &source,
+                &message.source_revision,
+            )
+            .await?;
             let known = file.as_ref().is_some_and(|file| {
                 crate::subtitles::Subtitles::accepts_extraction(
                     file,
@@ -717,13 +721,16 @@ async fn handle_host_msg(
         }
         host_to_hub::Msg::ImageSubtitles(mut message) => {
             let source = message.source.as_ref().context("missing image source")?;
-            // Resolved through the catalogue, so a sidecar's `.idx` path
-            // lands on the media file that lists it instead of being
-            // dropped for not being a file row.
-            let file = registry
-                .catalogue()
-                .source_file(module_id, &message.collection_id, source)
-                .await?;
+            // The captured parent disambiguates sidecars shared by several
+            // physical files; the catalogue also verifies the source binding.
+            let file = crate::subtitles::Subtitles::extraction_source(
+                registry,
+                module_id,
+                &message.collection_id,
+                source,
+                &message.source_revision,
+            )
+            .await?;
             if file.as_ref().is_some_and(|file| {
                 !crate::subtitles::Subtitles::accepts_extraction(
                     file,
@@ -957,6 +964,117 @@ mod forget_link_tests {
 #[cfg(test)]
 mod subtitle_revision_tests {
     use super::*;
+
+    #[tokio::test]
+    async fn shared_sidecar_replies_settle_only_the_captured_parent() {
+        use crate::subtitles::work::tests::{fixture, states};
+        use kahawai_proto::v1 as p;
+
+        let media = serde_json::json!({"external_subtitles": [
+            {"path_rel":"Film.idx","format":"vobsub","track":0},
+            {"path_rel":"Film.idx","format":"vobsub","track":1}
+        ]});
+        let (dir, registry, subs) =
+            fixture(vec![("Film.avi", media.clone()), ("Film.mp4", media)]).await;
+        let registry = Arc::new(registry);
+        let enricher = crate::enrich::Enricher::new(dir.path().to_path_buf());
+        let mut partial = Default::default();
+        registry
+            .catalogue()
+            .claim_subtitle_jobs("sets", "host", &[], 0, 60, 16)
+            .await
+            .unwrap();
+        // Receive the second parent's replies first. A path-only lookup can
+        // resolve either parent, but must never substitute one for the other.
+        for (parent, path) in ["Film.mp4", "Film.avi"].into_iter().enumerate() {
+            let file = registry
+                .catalogue()
+                .source_file("host", "series", &p::SourcePath::new("root", path))
+                .await
+                .unwrap()
+                .unwrap();
+            let part = crate::sessions::PartSource {
+                file_id: crate::sessions::FileId::Catalogue(file.file_id.clone()),
+                module_id: file.host.clone(),
+                collection_id: file.remote_id.clone(),
+                root_token: file.root_token.clone(),
+                path_rel: file.path.clone(),
+                size: file.size,
+                mtime_unix: file.mtime,
+                head_xxh3: file.head_hash as i64,
+                tail_xxh3: file.tail_hash as i64,
+                base_ms: 0,
+                duration_ms: 0,
+            };
+            let revision = crate::subtitles::catalogue::source_revision(&part, &file.media, true);
+            let message = |track| p::ImageSubtitles {
+                collection_id: "series".into(),
+                source: Some(p::SourcePath::new("root", "Film.idx")),
+                source_revision: revision.clone(),
+                sub_index: track,
+                codec: "S_VOBSUB".into(),
+                done: Some(true),
+                ..Default::default()
+            };
+            if parent == 0 {
+                // Knowing a parent ID does not permit another peer or an
+                // unrelated source address to publish or settle its work.
+                for (host, collection, root, path) in [
+                    ("other", "series", "root", "Film.idx"),
+                    ("host", "other", "root", "Film.idx"),
+                    ("host", "series", "other", "Film.idx"),
+                    ("host", "series", "root", "Other.idx"),
+                ] {
+                    assert!(
+                        crate::subtitles::Subtitles::extraction_source(
+                            &registry,
+                            host,
+                            collection,
+                            &p::SourcePath::new(root, path),
+                            &revision,
+                        )
+                        .await
+                        .unwrap()
+                        .is_none()
+                    );
+                }
+                let mut stale = message(0);
+                stale.source_revision.push('0');
+                handle_host_msg(
+                    &registry,
+                    &subs,
+                    &enricher,
+                    &mut partial,
+                    "host",
+                    0,
+                    host_to_hub::Msg::ImageSubtitles(stale),
+                )
+                .await
+                .unwrap();
+                assert_eq!(states(&registry, "sets").await, vec![("running".into(), 2)]);
+            }
+            for track in 0..2 {
+                handle_host_msg(
+                    &registry,
+                    &subs,
+                    &enricher,
+                    &mut partial,
+                    "host",
+                    0,
+                    host_to_hub::Msg::ImageSubtitles(message(track)),
+                )
+                .await
+                .unwrap();
+                let remaining = 2 - parent - usize::from(track == 1);
+                let expected = if remaining == 0 {
+                    vec![]
+                } else {
+                    vec![("running".into(), remaining as i64)]
+                };
+                assert_eq!(states(&registry, "sets").await, expected);
+            }
+        }
+    }
 
     #[test]
     fn interleaved_revisions_never_share_partial_image_sets() {

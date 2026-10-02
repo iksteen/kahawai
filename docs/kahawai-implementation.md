@@ -1014,6 +1014,11 @@ are no retained compatibility endpoints or old catalogue regression fixtures.
 `scripts/kahawai-mediadb.sh check-live` exercises ingestion, administration,
 playback and restart against disposable real processes.
 
+Extraction replies resolve the parent file ID carried in the captured revision,
+then verify the sender, collection, root and source path before validating the
+complete revision. A sidecar shared by multiple physical media files therefore
+settles only the parent whose work was requested.
+
 Subtitle extraction caches use the captured physical revision as well as the
 source path and stream index. Sidecar keys also include the companion revision.
 Protocol 4.3 echoes the requested revision through text and chunked image replies;
