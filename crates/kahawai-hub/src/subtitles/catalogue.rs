@@ -1,13 +1,44 @@
 //! Generated artifacts stay in the subtitle cache. Mediadb supplies physical
 //! revisions and probes; no shadow catalogue or generated-track table is needed.
-//! Keys include the source revision and parent stream (or acquired subtitle ID),
-//! never a library item. OCR is idle work; rasterisation is demanded by the ASS
-//! ladder. Both remain retained: rebuilding is expensive and playback needs them
+//! OCR keys include the byte revision, parent stream, format and language,
+//! never unrelated probe interpretation or a library item. Raster keys retain
+//! probe geometry because it affects rendered output. OCR is idle work;
+//! rasterisation is demanded by the ASS ladder. Both remain retained:
+//! rebuilding is expensive and playback needs them
 //! without repeating extraction/rendering. Atomic publication also records empty
 //! OCR answers. Sessions capture immutable raster paths and OCR text.
 use super::*;
 use crate::{sessions::PartSource, tracks::Track};
 use std::path::Path;
+
+/// Extraction follows physical bytes, never the probe's interpretation of them.
+/// Carry the catalogue ID so cache removal can address recovery without a
+/// reverse index of every track in memory. Sidecars retain scanner freshness.
+pub(crate) fn source_revision(
+    part: &PartSource,
+    info: &kahawai_core::media::MediaInfo,
+    sidecar: bool,
+) -> String {
+    use sha2::Digest;
+    let crate::sessions::FileId::Catalogue(id) = &part.file_id;
+    let identity = serde_json::to_vec(&(
+        &part.module_id,
+        &part.collection_id,
+        &part.root_token,
+        &part.path_rel,
+        part.size,
+        part.mtime_unix,
+        part.head_xxh3,
+        part.tail_xxh3,
+        sidecar,
+        sidecar.then_some(&info.sidecar_revision),
+    ))
+    .expect("source identity serializes");
+    format!(
+        "v4-{id}-{}",
+        data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(identity))
+    )
+}
 
 pub(crate) fn key(
     part: &PartSource,
@@ -37,6 +68,34 @@ pub(crate) fn key(
 // v1 artifacts may have been built from path-only extraction caches. They
 // cannot be promoted safely, even when their outer source revision matches.
 pub(super) fn path(dir: &Path, parent: &Track, kind: &str) -> Result<PathBuf> {
+    if matches!(kind, "ocr.json" | "ocr.failed") {
+        use sha2::Digest;
+        let index = parent.stream_index.unwrap_or(0) as usize;
+        let source_index = if parent.origin == "sidecar" {
+            parent
+                .physical
+                .as_ref()
+                .context("track has no captured source")?
+                .info
+                .external_subtitles
+                .get(index)
+                .context("missing sidecar stream")?
+                .track
+                .unwrap_or(0) as usize
+        } else {
+            index
+        };
+        let identity = serde_json::to_vec(&(
+            parent.source_revision()?,
+            parent.internal_key(),
+            &parent.path_rel,
+            source_index,
+            &parent.format,
+            &parent.language,
+        ))?;
+        let key = data_encoding::HEXLOWER.encode(&sha2::Sha256::digest(identity));
+        return Ok(dir.join(format!("derived-v3-{key}-{kind}")));
+    }
     Ok(dir.join(format!(
         "derived-v2-{}-{kind}",
         parent
@@ -352,6 +411,153 @@ mod tests {
             key(&part, &before, "sidecar:0"),
             key(&part, &after, "sidecar:0")
         );
+        assert_eq!(
+            source_revision(&part, &before, false),
+            source_revision(&part, &after, false)
+        );
+        assert_ne!(
+            source_revision(&part, &before, true),
+            source_revision(&part, &after, true)
+        );
+    }
+
+    #[test]
+    fn ocr_identity_tracks_bytes_stream_and_language_not_video_probe() {
+        let before = parent("pgs");
+        let physical = before.physical.as_ref().unwrap();
+        let part = PartSource {
+            file_id: crate::sessions::FileId::Catalogue("file-a".into()),
+            module_id: physical.module_id.clone(),
+            collection_id: physical.collection_id.clone(),
+            root_token: physical.root_token.clone(),
+            path_rel: physical.path_rel.clone(),
+            size: 10,
+            mtime_unix: 1,
+            head_xxh3: 12,
+            tail_xxh3: 34,
+            base_ms: 0,
+            duration_ms: 1000,
+        };
+        let mut info = physical.info.clone();
+        info.video[0].bit_depth = Some(30);
+        let old = crate::sessions::catalogue::tracks("movie-a", &part, &info).remove(0);
+        info.video[0].bit_depth = Some(10);
+        info.video[0].width = 3840;
+        info.duration_ms = Some(2000);
+        info.tags.insert("title".into(), "corrected".into());
+        let corrected = crate::sessions::catalogue::tracks("other-item", &part, &info).remove(0);
+        let dir = Path::new("cache");
+        let answer = path(dir, &old, "ocr.json").unwrap();
+        assert_eq!(answer, path(dir, &corrected, "ocr.json").unwrap());
+        assert_ne!(
+            old.artifact_key, corrected.artifact_key,
+            "raster identity still depends on geometry"
+        );
+        for changed in [
+            Track {
+                language: Some("nl".into()),
+                ..corrected.clone()
+            },
+            Track {
+                stream_index: Some(1),
+                ..corrected.clone()
+            },
+            Track {
+                format: "vobsub".into(),
+                ..corrected.clone()
+            },
+            crate::sessions::catalogue::tracks(
+                "movie-a",
+                &PartSource {
+                    mtime_unix: 2,
+                    ..part.clone()
+                },
+                &info,
+            )
+            .remove(0),
+        ] {
+            assert_ne!(answer, path(dir, &changed, "ocr.json").unwrap());
+        }
+        info.external_subtitles = vec![kahawai_core::media::SidecarSubtitle {
+            path_rel: "film.idx".into(),
+            format: "vobsub".into(),
+            language: Some("en".into()),
+            track: Some(0),
+        }];
+        let sidecar = crate::sessions::catalogue::tracks("movie-a", &part, &info).remove(1);
+        info.external_subtitles[0].track = Some(1);
+        let changed = crate::sessions::catalogue::tracks("movie-a", &part, &info).remove(1);
+        assert_eq!(
+            sidecar.source_revision().unwrap(),
+            changed.source_revision().unwrap()
+        );
+        assert_ne!(
+            path(dir, &sidecar, "ocr.json").unwrap(),
+            path(dir, &changed, "ocr.json").unwrap()
+        );
+    }
+
+    #[test]
+    fn extraction_identity_ignores_probe_interpretation_but_tracks_physical_changes() {
+        let track = parent("ass");
+        let part = PartSource {
+            file_id: crate::sessions::FileId::Catalogue("source-a".into()),
+            module_id: "host".into(),
+            collection_id: "movies".into(),
+            root_token: "root".into(),
+            path_rel: "film.mkv".into(),
+            size: 10,
+            mtime_unix: 1,
+            head_xxh3: 12,
+            tail_xxh3: 34,
+            base_ms: 0,
+            duration_ms: 1000,
+        };
+        let mut before = track.physical.unwrap().info;
+        before.video = vec![kahawai_core::media::VideoStream {
+            bit_depth: Some(24),
+            ..Default::default()
+        }];
+        let mut after = before.clone();
+        after.video[0].bit_depth = Some(8);
+        after.video[0].width = 1920;
+        after
+            .tags
+            .insert("title".into(), "new interpretation".into());
+        after.duration_ms = Some(2000);
+        for sidecar in [false, true] {
+            assert_eq!(
+                source_revision(&part, &before, sidecar),
+                source_revision(&part, &after, sidecar)
+            );
+        }
+        for changed in [
+            PartSource {
+                size: 11,
+                ..part.clone()
+            },
+            PartSource {
+                mtime_unix: 2,
+                ..part.clone()
+            },
+            PartSource {
+                head_xxh3: 13,
+                ..part.clone()
+            },
+            PartSource {
+                tail_xxh3: 35,
+                ..part.clone()
+            },
+            PartSource {
+                file_id: crate::sessions::FileId::Catalogue("source-b".into()),
+                ..part.clone()
+            },
+        ] {
+            assert_ne!(
+                source_revision(&part, &before, false),
+                source_revision(&changed, &before, false)
+            );
+        }
     }
 
     #[test]
@@ -380,7 +586,12 @@ mod tests {
             cached(dir.path(), &[parent.clone()]).unwrap()[0].id,
             track.id
         );
-        parent.artifact_key = Some("another-source-revision".into());
+        parent
+            .physical
+            .as_mut()
+            .unwrap()
+            .revision
+            .push_str("-replaced");
         assert!(cached(dir.path(), &[parent.clone()]).unwrap().is_empty());
         let empty = path(dir.path(), &parent, "ocr.json").unwrap();
         publish(&empty, br#"{"cues":[],"ass":null}"#).unwrap();

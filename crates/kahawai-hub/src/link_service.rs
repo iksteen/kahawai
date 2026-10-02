@@ -642,18 +642,19 @@ async fn handle_host_msg(
         }
         host_to_hub::Msg::FileSubtitles(message) => {
             let source = message.source.context("missing subtitle source")?;
-            // Both gates below drop the mediahost's work silently, and a drop
-            // is indistinguishable from never having extracted: the sweep
-            // re-offers the same file on its next round, forever. Say so.
-            let known = registry
+            // Validate the captured revision as well as size: a late reply
+            // must not settle a same-size replacement's extraction work.
+            let file = registry
                 .catalogue()
-                .source_exists(
-                    module_id,
-                    &message.collection_id,
-                    &source,
-                    Some(message.size),
-                )
+                .source_file(module_id, &message.collection_id, &source)
                 .await?;
+            let known = file.as_ref().is_some_and(|file| {
+                crate::subtitles::Subtitles::accepts_extraction(
+                    file,
+                    &source.path_rel,
+                    &message.source_revision,
+                ) && (!message.error.is_empty() || file.size == message.size)
+            });
             if !message.error.is_empty() || !known || message.source_revision.is_empty() {
                 tracing::warn!(
                     module_id,
@@ -672,10 +673,8 @@ async fn handle_host_msg(
                 // row with a retry instead of leaving it leased.
                 registry
                     .catalogue()
-                    .fail_subtitle_source(
-                        module_id,
-                        &message.collection_id,
-                        &source,
+                    .fail_subtitle_job(
+                        file.as_ref().expect("known source"),
                         "text",
                         crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
                         &message.error,
@@ -702,7 +701,7 @@ async fn handle_host_msg(
                     keys.push(track.key);
                 }
                 // The keys are what makes a stored entry findable again: the
-                // sweep asks for `e<stream_index>`, and anything else caches
+                // queue asks for `e<stream_index>`, and anything else caches
                 // under a name it will never look for.
                 tracing::info!(
                     module_id,
@@ -711,11 +710,9 @@ async fn handle_host_msg(
                     keys = %keys.join(","),
                     "extracted subtitles stored"
                 );
-                registry
-                    .catalogue()
-                    .finish_subtitle_source(module_id, &message.collection_id, &source, "text")
-                    .await?;
-                subtitles.wake();
+                if let Some(file) = file {
+                    subtitles.text_landed(registry, &file).await?;
+                }
             }
         }
         host_to_hub::Msg::ImageSubtitles(mut message) => {
@@ -727,6 +724,23 @@ async fn handle_host_msg(
                 .catalogue()
                 .source_file(module_id, &message.collection_id, source)
                 .await?;
+            if file.as_ref().is_some_and(|file| {
+                !crate::subtitles::Subtitles::accepts_extraction(
+                    file,
+                    &source.path_rel,
+                    &message.source_revision,
+                )
+            }) {
+                partial.remove(&(
+                    message.collection_id.clone(),
+                    source.root_token.clone(),
+                    source.path_rel.clone(),
+                    message.sub_index,
+                    message.source_revision.clone(),
+                ));
+                tracing::warn!(module_id, revision = %message.source_revision, "stale image subtitle extraction discarded");
+                return Ok(());
+            }
             if !message.error.is_empty() || file.is_none() {
                 partial.remove(&(
                     message.collection_id.clone(),
@@ -735,15 +749,13 @@ async fn handle_host_msg(
                     message.sub_index,
                     message.source_revision.clone(),
                 ));
-                if file.is_some() {
+                if let Some(file) = &file {
                     // The host's verdict on this track releases the file's
                     // `sets` row with a retry instead of leaving it leased.
                     registry
                         .catalogue()
-                        .fail_subtitle_source(
-                            module_id,
-                            &message.collection_id,
-                            source,
+                        .fail_subtitle_job(
+                            file,
                             "sets",
                             crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
                             &message.error,
@@ -768,13 +780,10 @@ async fn handle_host_msg(
                 }
                 Chunk::TooBig(bytes) => {
                     tracing::warn!(bytes, "image subtitle transfer exceeded existing limit");
-                    let source = message.source.as_ref().context("missing image source")?;
                     registry
                         .catalogue()
-                        .fail_subtitle_source(
-                            module_id,
-                            &message.collection_id,
-                            source,
+                        .fail_subtitle_job(
+                            file.as_ref().expect("known source"),
                             "sets",
                             crate::queue::now() + crate::subtitles::work::HOST_ERROR_RETRY_SECS,
                             "display sets exceed the transfer limit",

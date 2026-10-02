@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 if [[ ${1:-} == check ]]; then
   cargo test -p kahawai-mediadb --test subtitle_jobs
   KAHAWAI_SKIP_WEB_BUILD=1 cargo test -p kahawai-hub --test work_api
-  KAHAWAI_SKIP_WEB_BUILD=1 cargo test -p kahawai-hub --lib -- queue:: subtitles::work
+  KAHAWAI_SKIP_WEB_BUILD=1 cargo test -p kahawai-hub --lib -- queue:: subtitles::
   exit
 fi
 : "${KAHAWAI_TOKEN:?Set KAHAWAI_TOKEN to an administrator access token}"

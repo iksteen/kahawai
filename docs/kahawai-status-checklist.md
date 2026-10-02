@@ -711,15 +711,22 @@ audio/video byte separation for manual playback testing; see
       tracks AND VobSub sidecar tracks — the landing gate resolves a
       sidecar's `.idx` to its media file, so sidecar sets are no longer
       dropped. A failed track leaves a marker and is skipped until an
-      administrator rerun. Prewarm is a durable `subtitle_jobs` row per
-      probed file and kind (`text`, `sets`): created by the catalogue
+      administrator rerun. Prewarm keeps durable outstanding `subtitle_jobs`
+      rows (`text`, `sets`): created by the catalogue
       commit, ranked at claim time from live watch state, leased to the
       mediahost holding the bytes as one worklist message per batch
-      (`SubsWorklist`, `ImageSubsWorklist` — protocol 4.4) and settled by
-      its reply. Each hub keeps at most 16 unexpired file leases per kind
+      (`SubsWorklist`, `ImageSubsWorklist` — protocol 4.4) and removed when every required artifact is on disk. Each hub keeps at most 16 unexpired file leases per kind
       per host, across collections, and refills to 16 at 8 or fewer. The
       rest stays pending on the hub; image files may expand to several
-      track requests. No catalogue walk remains on the hub;
+      track requests. Extraction keys follow source bytes independently of
+      probe interpretation. OCR keys include source bytes, subtitle track,
+      format and language, independently of unrelated video probe metadata.
+      One-time verified renames preserve raw caches, OCR answers (including
+      empty results) and failures, including known aggregate-depth variants.
+      OCR transition runs before scheduling even if raw caches already moved.
+      Startup reconciliation and filesystem events recreate missing work;
+      there is no periodic catalogue sweep. Leases and failure backoff survive
+      recovery, and stale/partial replies cannot mark extraction complete;
       enrichment shares the queue driver (`hub/queue.rs`) and is woken by
       catalogue commits instead of polling.
       Deferred: the bandwidth-threshold selection (needs measurement)

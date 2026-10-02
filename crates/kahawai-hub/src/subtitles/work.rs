@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use kahawai_mediadb::{SUBTITLE_KINDS, SourceFile};
 
 use super::Subtitles;
@@ -60,8 +60,9 @@ pub(crate) const HOST_ERROR_RETRY_SECS: i64 = 3600;
 #[cfg(feature = "ocr")]
 const OCR_PACE: Duration = Duration::from_secs(10);
 /// Lost-event insurance; every real change wakes the driver.
-const FALLBACK: Duration = Duration::from_secs(900);
+pub(super) const FALLBACK: Duration = Duration::from_secs(900);
 /// Beside a track's `ocr.json` would be: the error that stopped it.
+#[cfg(feature = "ocr")]
 const FAILED_MARKER: &str = "ocr.failed";
 
 /// The OCR worker's own bookkeeping: nothing durable, because the cache
@@ -75,7 +76,7 @@ pub(crate) struct OcrState {
     tx: std::sync::Mutex<Option<tokio::sync::mpsc::UnboundedSender<SourceFile>>>,
 }
 
-fn part(file: &SourceFile) -> PartSource {
+pub(super) fn part(file: &SourceFile) -> PartSource {
     PartSource {
         file_id: FileId::Catalogue(file.file_id.clone()),
         module_id: file.host.clone(),
@@ -91,7 +92,7 @@ fn part(file: &SourceFile) -> PartSource {
     }
 }
 
-fn tracks(file: &SourceFile) -> Vec<crate::tracks::Track> {
+pub(super) fn tracks(file: &SourceFile) -> Vec<crate::tracks::Track> {
     crate::sessions::catalogue::tracks(
         file.item_id.as_deref().unwrap_or(""),
         &part(file),
@@ -101,7 +102,7 @@ fn tracks(file: &SourceFile) -> Vec<crate::tracks::Track> {
 
 /// Cheap pre-check from the probe alone, before any track is built.
 #[cfg(feature = "ocr")]
-fn has_image_tracks(media: &kahawai_core::media::MediaInfo) -> bool {
+pub(super) fn has_image_tracks(media: &kahawai_core::media::MediaInfo) -> bool {
     media
         .subtitles
         .iter()
@@ -121,7 +122,8 @@ fn connected_mediahosts(registry: &Registry) -> Vec<String> {
         .collect()
 }
 
-/// `derived-v2-<key>-ocr.json` → `derived-v2-<key>-ocr.failed`.
+/// A versioned OCR answer's sibling failure marker shares its identity.
+#[cfg(feature = "ocr")]
 fn marker_name(answer: &std::path::Path) -> String {
     let name = answer.file_name().unwrap_or_default().to_string_lossy();
     match name.strip_suffix("ocr.json") {
@@ -181,15 +183,6 @@ impl Subtitles {
 
     /// Start the prewarm driver, the reconnect listener and the OCR worker.
     pub fn start_work(self: &Arc<Self>, registry: Arc<Registry>, sessions: Arc<Sessions>) {
-        {
-            let subs = self.clone();
-            let registry = registry.clone();
-            queue::spawn("subtitles", self.wake.clone(), FALLBACK, move || {
-                let subs = subs.clone();
-                let registry = registry.clone();
-                async move { subs.step(&registry).await }
-            });
-        }
         // Subscribed before spawning so a reconnect racing startup is not
         // missed; the driver's tick would catch it, an hour late.
         let mut events = registry.subscribe_events();
@@ -229,9 +222,9 @@ impl Subtitles {
             let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<SourceFile>();
             *self.ocr.tx.lock().unwrap() = Some(tx);
             let subs = self.clone();
+            let registry = registry.clone();
             tokio::spawn(async move {
                 let mut idle = sessions.idle_watch();
-                subs.ocr_seed(&registry).await;
                 while let Some(file) = rx.recv().await {
                     subs.ocr.queued.fetch_sub(1, Ordering::Relaxed);
                     // Idle means idle: playback outranks this. A session
@@ -253,6 +246,9 @@ impl Subtitles {
         }
         #[cfg(not(feature = "ocr"))]
         let _ = sessions;
+        // Install recovery only after the OCR inbox exists. Its startup
+        // reconciliation seeds OCR after legacy display sets have moved.
+        self.start_recovery(registry.clone());
     }
 
     async fn release_host(&self, registry: &Registry, module_id: &str) -> u64 {
@@ -328,7 +324,7 @@ impl Subtitles {
                                 }
                             }
                             Items::Sets(items) => {
-                                for mut item in self.sets_items(registry, &tracks).await {
+                                for mut item in self.sets_items(registry, &tracks).await? {
                                     item.rank = rank;
                                     items.push(item);
                                 }
@@ -336,7 +332,7 @@ impl Subtitles {
                         }
                         if batch.len() == before {
                             settled += 1;
-                            store.finish_subtitle_job(&job.file.file_id, kind).await?;
+                            store.reconcile_subtitle_job(&job.file, kind, false).await?;
                         } else {
                             offered += 1;
                         }
@@ -367,7 +363,7 @@ impl Subtitles {
     /// The text worklist item for one file, or `None` when nothing on it
     /// needs the mediahost: no embedded text track, or every one already
     /// cached.
-    fn text_item(
+    pub(super) fn text_item(
         &self,
         tracks: &[crate::tracks::Track],
     ) -> Result<Option<kahawai_proto::v1::SubsWorkItem>> {
@@ -377,9 +373,11 @@ impl Subtitles {
             if track.origin != "embedded" || crate::tracks::is_image_format(&track.format) {
                 continue;
             }
-            let (Some(source), Ok(revision)) = (&track.physical, track.source_revision()) else {
-                continue;
-            };
+            let source = track
+                .physical
+                .as_ref()
+                .context("subtitle has no captured source")?;
+            let revision = track.source_revision()?;
             let cached = self
                 .dir
                 .join(format!(
@@ -414,25 +412,30 @@ impl Subtitles {
 
     /// One worklist item per image track that still needs its display
     /// sets: no OCR answer, no failure marker, no sets on disk.
-    async fn sets_items(
+    pub(super) async fn sets_items(
         &self,
         registry: &Registry,
         tracks: &[crate::tracks::Track],
-    ) -> Vec<kahawai_proto::v1::ImageSubsWorkItem> {
+    ) -> Result<Vec<kahawai_proto::v1::ImageSubsWorkItem>> {
         let mut items = vec![];
         for track in tracks {
-            if !crate::tracks::is_image_format(&track.format) || self.ocr_answered(track) {
+            if !crate::tracks::is_image_format(&track.format) {
                 continue;
             }
-            let Ok((host, collection, root, rel, index, _)) =
-                self.extract_ref(registry, track).await
-            else {
-                continue;
-            };
-            let Ok(revision) = track.source_revision() else {
-                continue;
-            };
-            if self.image_sets_cached(&host, &collection, &root, &rel, index, revision) {
+            let (host, collection, root, rel, index, _) = self.extract_ref(registry, track).await?;
+            let revision = track.source_revision()?;
+            let cached = self.dir.join(format!(
+                "{}.sets",
+                super::cache_key(
+                    &host,
+                    &collection,
+                    &root,
+                    &rel,
+                    &format!("i{index}"),
+                    revision
+                )
+            ));
+            if cached.try_exists()? {
                 continue;
             }
             items.push(kahawai_proto::v1::ImageSubsWorkItem {
@@ -445,10 +448,11 @@ impl Subtitles {
                 rank: 0,
             });
         }
-        items
+        Ok(items)
     }
 
     /// An OCR answer or a failure marker: nothing more to ask for.
+    #[cfg(feature = "ocr")]
     fn ocr_answered(&self, track: &crate::tracks::Track) -> bool {
         let Ok(answer) = super::catalogue::path(&self.dir, track, "ocr.json") else {
             return true;
@@ -463,10 +467,10 @@ impl Subtitles {
     /// Display sets landed for one track of this file: settle the `sets`
     /// row once nothing on the file is missing, and hand the file to OCR.
     pub(crate) async fn sets_landed(&self, registry: &Registry, file: SourceFile) -> Result<()> {
-        if self.sets_items(registry, &tracks(&file)).await.is_empty() {
+        if self.sets_items(registry, &tracks(&file)).await?.is_empty() {
             registry
                 .catalogue()
-                .finish_subtitle_job(&file.file_id, "sets")
+                .reconcile_subtitle_job(&file, "sets", false)
                 .await?;
             self.wake();
         }
@@ -490,51 +494,29 @@ impl Subtitles {
     /// built, so it is a read of `files` and not a stat storm.
     #[cfg(feature = "ocr")]
     async fn ocr_seed(&self, registry: &Registry) {
-        let store = registry.catalogue();
-        let summaries = match store.collection_summaries().await {
-            Ok(s) => s,
-            Err(error) => {
-                tracing::warn!(
-                    error = format!("{error:#}"),
-                    "OCR seed could not read collections"
-                );
-                return;
-            }
-        };
+        let mut after = String::new();
         let mut seeded = 0usize;
-        for summary in summaries {
-            let c = summary.collection;
-            let files = match store.files(&c.id).await {
-                Ok(f) => f,
+        loop {
+            let files = match registry
+                .catalogue()
+                .subtitle_sources_page(&after, 256)
+                .await
+            {
+                Ok(files) => files,
                 Err(error) => {
-                    tracing::warn!(collection = %c.id, error = format!("{error:#}"),
-                        "OCR seed could not read files");
-                    continue;
+                    tracing::warn!(
+                        error = format!("{error:#}"),
+                        "OCR seed could not read sources"
+                    );
+                    return;
                 }
             };
-            for f in files {
-                let (Some(media), Some(size)) = (f.media, f.size) else {
-                    continue;
-                };
-                if !has_image_tracks(&media) {
-                    continue;
-                }
-                let file = SourceFile {
-                    file_id: f.id,
-                    host: c.mediahost_id.clone(),
-                    collection_id: c.id.clone(),
-                    remote_id: c.remote_id.clone(),
-                    media_type: c.media_type,
-                    root_token: f.root_token,
-                    path: f.path,
-                    size,
-                    mtime: f.mtime.unwrap_or(0),
-                    head_hash: f.head_hash.unwrap_or(0),
-                    tail_hash: f.tail_hash.unwrap_or(0),
-                    media,
-                    item_id: f.item_id,
-                };
-                if self.ocr_pending(registry, &file).await {
+            if files.is_empty() {
+                break;
+            }
+            after = files.last().unwrap().file_id.clone();
+            for file in files {
+                if has_image_tracks(&file.media) && self.ocr_pending(registry, &file).await {
                     seeded += 1;
                     self.ocr_enqueue(file);
                 }
@@ -546,7 +528,7 @@ impl Subtitles {
     /// Whether any image track of this file has sets on disk, a model to
     /// read them with, no answer and no failure marker.
     #[cfg(feature = "ocr")]
-    async fn ocr_pending(&self, registry: &Registry, file: &SourceFile) -> bool {
+    pub(super) async fn ocr_pending(&self, registry: &Registry, file: &SourceFile) -> bool {
         for track in tracks(file) {
             if !crate::tracks::is_image_format(&track.format) || self.ocr_answered(&track) {
                 continue;
@@ -639,12 +621,12 @@ impl Subtitles {
 }
 
 #[cfg(test)]
-mod tests {
+pub(super) mod tests {
     use super::*;
     use kahawai_proto::v1 as p;
     use prost::Message;
 
-    async fn fixture(
+    pub(crate) async fn fixture(
         files: Vec<(&str, serde_json::Value)>,
     ) -> (tempfile::TempDir, Registry, Subtitles) {
         let dir = tempfile::tempdir().unwrap();
@@ -705,7 +687,7 @@ mod tests {
         (dir, registry, subs)
     }
 
-    async fn states(registry: &Registry, kind: &str) -> Vec<(String, i64)> {
+    pub(crate) async fn states(registry: &Registry, kind: &str) -> Vec<(String, i64)> {
         let mut v: Vec<_> = registry
             .catalogue()
             .subtitle_jobs_status()
@@ -788,11 +770,7 @@ mod tests {
         );
         assert_eq!(
             states(&registry, "text").await,
-            vec![
-                ("done".into(), 8),
-                ("pending".into(), 16),
-                ("running".into(), 16)
-            ]
+            vec![("pending".into(), 16), ("running".into(), 16)]
         );
         assert_eq!(
             states(&registry, "sets").await,
@@ -842,13 +820,9 @@ mod tests {
         assert_eq!(offered, 16);
         assert_eq!(
             states(&registry, "text").await,
-            vec![
-                ("done".into(), 6),
-                ("pending".into(), 10),
-                ("running".into(), 16)
-            ]
+            vec![("pending".into(), 10), ("running".into(), 16)]
         );
-        assert_eq!(states(&registry, "sets").await, vec![("done".into(), 32)]);
+        assert_eq!(states(&registry, "sets").await, vec![]);
     }
 
     /// A file is named once however many text tracks it carries: the
@@ -907,14 +881,8 @@ mod tests {
         assert_eq!(sets.items.len(), 1);
         assert_eq!(sets.items[0].source.as_ref().unwrap().path_rel, "Image.mkv");
         assert_eq!(sets.items[0].sub_index, 0);
-        assert_eq!(
-            states(&registry, "text").await,
-            vec![("done".into(), 1), ("running".into(), 1)]
-        );
-        assert_eq!(
-            states(&registry, "sets").await,
-            vec![("done".into(), 1), ("running".into(), 1)]
-        );
+        assert_eq!(states(&registry, "text").await, vec![("running".into(), 1)]);
+        assert_eq!(states(&registry, "sets").await, vec![("running".into(), 1)]);
 
         // Nothing claimable while the offers are leased, and the driver
         // knows when that changes.
@@ -975,28 +943,17 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(1), refill)
             .await
             .expect("image completion must wake the window refill");
-        assert_eq!(states(&registry, "text").await, vec![("done".into(), 2)]);
-        assert_eq!(states(&registry, "sets").await, vec![("done".into(), 2)]);
+        assert_eq!(states(&registry, "text").await, vec![]);
+        assert_eq!(states(&registry, "sets").await, vec![]);
 
-        // A rerun re-examines everything, but a fully cached file is never
-        // offered again.
-        for kind in SUBTITLE_KINDS {
-            assert_eq!(
-                registry
-                    .catalogue()
-                    .rerun_subtitle_jobs(kind)
-                    .await
-                    .unwrap(),
-                2
-            );
-        }
-        assert!(matches!(subs.step(&registry).await.unwrap(), Step::Worked));
-        assert!(
-            drain(&mut rx).is_empty(),
-            "everything was cached, so nothing was sent"
-        );
-        assert_eq!(states(&registry, "text").await, vec![("done".into(), 2)]);
-        assert_eq!(states(&registry, "sets").await, vec![("done".into(), 2)]);
+        subs.reconcile_cache(&registry).await.unwrap();
+        assert!(matches!(
+            subs.step(&registry).await.unwrap(),
+            Step::Idle { .. }
+        ));
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(states(&registry, "text").await, vec![]);
+        assert_eq!(states(&registry, "sets").await, vec![]);
     }
 
     #[tokio::test]
@@ -1101,6 +1058,7 @@ mod tests {
         assert!(subs.ocr_pending(&registry, &a).await);
     }
 
+    #[cfg(feature = "ocr")]
     #[test]
     fn a_marker_sits_beside_the_answer_it_replaces() {
         assert_eq!(

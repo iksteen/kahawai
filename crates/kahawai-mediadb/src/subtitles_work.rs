@@ -2,11 +2,10 @@
 //!
 //! `subtitle_jobs` is queue state, not artifact state. The hub's subtitle
 //! cache on disk stays the truth of what has been extracted; a row only
-//! says whether the hub still has to offer the file to its mediahost. Rows
-//! exist for every file with a probe, whether or not it carries subtitle
-//! tracks: deciding that needs the probe decoded, which is the hub's job,
-//! and a row it finishes on first claim costs less than a catalogue walk
-//! to avoid creating it.
+//! says whether the hub still has to offer the file to its mediahost. A
+//! catalogue commit creates candidates for probed files; startup and cache
+//! events recreate missing work. Files with no relevant tracks or complete
+//! artifacts have their candidates removed after a local presence check.
 //!
 //! Two kinds, one mechanism. `text` is the embedded text tracks, walked
 //! out of the container by the mediahost in one pass and settled by its
@@ -18,12 +17,12 @@
 //!
 //! Lifecycle: `pending`/`retry` are claimable once `due_at` passes,
 //! `running` is leased to the mediahost named in `host` and reclaimable
-//! after `lease_until`, `blocked` waits for an administrator, `done` is
-//! settled — by the host's `FileSubtitles` landing, or by the hub finding
-//! nothing to ask for. A byte change on the file (size, mtime or hashes)
+//! after `lease_until`, `blocked` waits for an administrator. Completed work
+//! is removed: disk presence, not a persisted completion flag, answers whether
+//! extraction is needed. A byte change on the file (size, mtime or hashes)
 //! resets the row, because the cache key carries the content revision and
 //! the old artifacts no longer answer for the new bytes; a metadata-only
-//! version bump does not. A host reconnect releases what was offered to it:
+//! version bump leaves existing leases and backoff intact. A host reconnect releases what was offered to it:
 //! its queue died with its process.
 //!
 //! OCR itself is not a kind: it is a function of display sets on disk, and
@@ -55,6 +54,7 @@ fn kind_ok(kind: &str) -> Result<()> {
 #[derive(Debug, Clone)]
 pub struct SourceFile {
     pub file_id: String,
+    pub observed_version: i64,
     pub host: String,
     pub collection_id: String,
     pub remote_id: String,
@@ -91,13 +91,14 @@ pub struct SubtitleWorkStatus {
 /// administrator instead of spending another attempt on the clock.
 pub const BLOCK_AFTER_ATTEMPTS: i64 = 6;
 
-const SOURCE_COLUMNS: &str = "f.id AS file_id,f.path,f.size,f.mtime,f.head_hash,f.tail_hash,f.media_json,
+const SOURCE_COLUMNS: &str = "f.version AS observed_version,f.id AS file_id,f.path,f.size,f.mtime,f.head_hash,f.tail_hash,f.media_json,
     r.token,c.id AS collection_id,c.remote_id,c.mediahost_id,c.media_type,
     (SELECT e.item_id FROM media_parts p JOIN media_entries e ON e.id=p.entry_id WHERE p.file_id=f.id) AS item_id";
 
 fn source_file(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFile> {
     Ok(SourceFile {
         file_id: row.get("file_id"),
+        observed_version: row.get("observed_version"),
         host: row.get("mediahost_id"),
         collection_id: row.get("collection_id"),
         remote_id: row.get("remote_id"),
@@ -114,6 +115,65 @@ fn source_file(row: &sqlx::sqlite::SqliteRow) -> Result<SourceFile> {
 }
 
 impl Store {
+    /// Bounded startup/event-loss reconciliation, never a periodic sweep.
+    pub async fn subtitle_sources_page(&self, after: &str, limit: i64) -> Result<Vec<SourceFile>> {
+        sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {SOURCE_COLUMNS} FROM files f
+             JOIN collection_roots r ON r.id=f.root_id
+             JOIN collections c ON c.id=f.collection_id
+             WHERE f.id>? AND f.media_json IS NOT NULL
+               AND f.size IS NOT NULL ORDER BY f.id LIMIT ?"
+        )))
+        .bind(after)
+        .bind(limit)
+        .fetch_all(self.db.read_pool())
+        .await?
+        .iter()
+        .map(source_file)
+        .collect()
+    }
+
+    pub async fn subtitle_source_by_id(&self, file: &str) -> Result<Option<SourceFile>> {
+        let row = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT {SOURCE_COLUMNS} FROM files f
+             JOIN collection_roots r ON r.id=f.root_id
+             JOIN collections c ON c.id=f.collection_id
+             WHERE f.id=? AND f.media_json IS NOT NULL AND f.size IS NOT NULL"
+        )))
+        .bind(file)
+        .fetch_optional(self.db.read_pool())
+        .await?;
+        row.as_ref().map(source_file).transpose()
+    }
+
+    /// Disk checks use a captured source. A concurrent replacement must not
+    /// create or settle its work using the previous bytes' artifacts. Missing
+    /// artifacts never release another extraction's lease or retry/backoff.
+    pub async fn reconcile_subtitle_job(
+        &self,
+        file: &SourceFile,
+        kind: &str,
+        missing: bool,
+    ) -> Result<()> {
+        kind_ok(kind)?;
+        let predicate = "id=?1 AND version=?3";
+        let query = if missing {
+            format!(
+                "INSERT INTO subtitle_jobs(file_id,kind) SELECT id,?2 FROM files WHERE {predicate} ON CONFLICT(file_id,kind) DO NOTHING"
+            )
+        } else {
+            format!(
+                "DELETE FROM subtitle_jobs WHERE kind=?2 AND file_id IN (SELECT id FROM files WHERE {predicate})"
+            )
+        };
+        sqlx::query(sqlx::AssertSqlSafe(query))
+            .bind(&file.file_id)
+            .bind(kind)
+            .bind(file.observed_version)
+            .execute(&self.db)
+            .await?;
+        Ok(())
+    }
     /// Fill up to `limit` outstanding, unexpired leases of one kind for one
     /// mediahost, most wanted first. Count and claim share the writer transaction
     /// so repeated/concurrent claims cannot drain the backlog past this window.
@@ -225,14 +285,11 @@ impl Store {
     /// answers the same question the queue asked.
     pub async fn finish_subtitle_job(&self, file_id: &str, kind: &str) -> Result<()> {
         kind_ok(kind)?;
-        sqlx::query(
-            "UPDATE subtitle_jobs SET state='done',token=NULL,lease_until=0,due_at=0,error=NULL
-             WHERE file_id=? AND kind=?",
-        )
-        .bind(file_id)
-        .bind(kind)
-        .execute(&self.db)
-        .await?;
+        sqlx::query("DELETE FROM subtitle_jobs WHERE file_id=? AND kind=?")
+            .bind(file_id)
+            .bind(kind)
+            .execute(&self.db)
+            .await?;
         Ok(())
     }
 
@@ -247,8 +304,7 @@ impl Store {
     ) -> Result<bool> {
         kind_ok(kind)?;
         Ok(sqlx::query(
-            "UPDATE subtitle_jobs SET state='done',token=NULL,lease_until=0,due_at=0,error=NULL
-             WHERE kind=?1 AND file_id=(SELECT f.id FROM files f JOIN collections c ON c.id=f.collection_id
+            "DELETE FROM subtitle_jobs WHERE kind=?1 AND file_id=(SELECT f.id FROM files f JOIN collections c ON c.id=f.collection_id
                   JOIN collection_roots r ON r.id=f.root_id
                   WHERE c.mediahost_id=?2 AND c.remote_id=?3 AND r.token=?4
                     AND (f.path=?5 OR EXISTS(SELECT 1 FROM json_each(f.media_json,'$.external_subtitles') e
@@ -280,7 +336,7 @@ impl Store {
         Ok(sqlx::query(
             "UPDATE subtitle_jobs SET state=CASE WHEN attempts>=?6 THEN 'blocked' ELSE 'retry' END,
                     due_at=?7,error=?8,token=NULL,lease_until=0
-             WHERE kind=?1 AND state<>'done' AND file_id=(SELECT f.id FROM files f JOIN collections c ON c.id=f.collection_id
+             WHERE kind=?1 AND file_id=(SELECT f.id FROM files f JOIN collections c ON c.id=f.collection_id
                   JOIN collection_roots r ON r.id=f.root_id
                   WHERE c.mediahost_id=?2 AND c.remote_id=?3 AND r.token=?4 AND f.path=?5)",
         )
@@ -298,6 +354,23 @@ impl Store {
             > 0)
     }
 
+    /// Failure of a captured extraction must not park a replacement file.
+    pub async fn fail_subtitle_job(
+        &self,
+        file: &SourceFile,
+        kind: &str,
+        due_at: i64,
+        error: &str,
+    ) -> Result<()> {
+        kind_ok(kind)?;
+        sqlx::query("UPDATE subtitle_jobs SET state=CASE WHEN attempts>=?3 THEN 'blocked' ELSE 'retry' END,
+            due_at=?4,error=?5,token=NULL,lease_until=0
+            WHERE file_id=?1 AND kind=?2 AND EXISTS(SELECT 1 FROM files WHERE id=?1 AND version=?6)")
+            .bind(&file.file_id).bind(kind).bind(BLOCK_AFTER_ATTEMPTS).bind(due_at).bind(error)
+            .bind(file.observed_version).execute(&self.db).await?;
+        Ok(())
+    }
+
     /// A mediahost came back: its offered work is gone with its old
     /// process. A reconnect is a state change, not a failure, so the
     /// attempt count starts over.
@@ -312,14 +385,13 @@ impl Store {
         .rows_affected())
     }
 
-    /// Administrator rerun: parked, waiting and settled rows go again from
-    /// the top. Also the repair for a cache deleted by hand, since a claim
-    /// re-checks the disk.
+    /// Administrator rerun releases failed work. The hub additionally reconciles
+    /// disk presence to recreate work whose artifacts were removed.
     pub async fn rerun_subtitle_jobs(&self, kind: &str) -> Result<u64> {
         kind_ok(kind)?;
         Ok(sqlx::query(
             "UPDATE subtitle_jobs SET state='pending',due_at=0,attempts=0,token=NULL,lease_until=0,error=NULL
-             WHERE kind=? AND state IN ('blocked','retry','done')",
+             WHERE kind=? AND state IN ('blocked','retry')",
         )
         .bind(kind)
         .execute(&self.db)

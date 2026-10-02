@@ -142,6 +142,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn subtitle_upgrade_removes_completion_and_preserves_outstanding_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mediadb.db");
+        std::fs::File::create(&path).unwrap();
+        let old =
+            Migrator::with_migrations(MIGRATOR.iter().filter(|m| m.version < 9).cloned().collect());
+        let store = connect(&path, old).await.unwrap();
+        let mut tx = store.db.begin().await.unwrap();
+        sqlx::raw_sql("INSERT INTO mediahosts VALUES('host','Fixture');
+            INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch) VALUES('collection','host','films','movies','epoch');
+            INSERT INTO collection_roots(id,collection_id,token,path) VALUES('root','collection','root','/media');")
+            .execute(&mut *tx).await.unwrap();
+        for state in ["done", "running", "retry", "blocked", "pending"] {
+            sqlx::query(
+                "INSERT INTO files(id,collection_id,root_id,path) VALUES(?,'collection','root',?)",
+            )
+            .bind(state)
+            .bind(state)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO subtitle_jobs(file_id,kind,state,attempts,token,lease_until,host,error,due_at) VALUES(?,'text',?,4,'lease',999,'host','failure',123)")
+                .bind(state).bind(state).execute(&mut *tx).await.unwrap();
+        }
+        tx.commit().await.unwrap();
+        store.close().await;
+        for _ in 0..2 {
+            let store = Store::open(&path).await.unwrap();
+            let states: Vec<(String, i64)> = sqlx::query_as(
+                "SELECT state,count(*) FROM subtitle_jobs GROUP BY state ORDER BY state",
+            )
+            .fetch_all(store.db.read_pool())
+            .await
+            .unwrap();
+            assert_eq!(
+                states,
+                vec![
+                    ("blocked".into(), 1),
+                    ("pending".into(), 1),
+                    ("retry".into(), 1),
+                    ("running".into(), 1)
+                ]
+            );
+            let lease: (i64,String,i64,String,i64) = sqlx::query_as("SELECT attempts,token,lease_until,error,due_at FROM subtitle_jobs WHERE state='running'")
+                .fetch_one(store.db.read_pool()).await.unwrap();
+            assert_eq!(lease, (4, "lease".into(), 999, "failure".into(), 123));
+            assert!(
+                sqlx::query("UPDATE subtitle_jobs SET state='done'")
+                    .execute(&store.db)
+                    .await
+                    .is_err()
+            );
+            store.close().await;
+        }
+    }
+
+    #[tokio::test]
     async fn provider_children_upgrade_preserves_records_and_cached_answers() {
         use serde_json::json;
         let dir = tempfile::tempdir().unwrap();

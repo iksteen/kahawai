@@ -279,8 +279,8 @@ pub(crate) fn physical(
         root_token: part.root_token.clone(),
         path_rel: part.path_rel.clone(),
         size: part.size,
-        revision: crate::subtitles::catalogue::key(part, info, "embedded"),
-        sidecar_revision: crate::subtitles::catalogue::key(part, info, "sidecar:"),
+        revision: crate::subtitles::catalogue::source_revision(part, info, false),
+        sidecar_revision: crate::subtitles::catalogue::source_revision(part, info, true),
         info: info.clone(),
     }
 }

@@ -201,6 +201,11 @@ pub fn encode_sets(codec: &str, codec_private: Option<&[u8]>, blocks: &[SetBlock
     out
 }
 
+/// Check a stored extraction before promoting it to a new source identity.
+pub fn validate_sets(data: &[u8]) -> Result<()> {
+    decode_sets(data).map(|_| ())
+}
+
 fn decode_sets(data: &[u8]) -> Result<(String, Option<Vec<u8>>, Vec<SetBlock>)> {
     // zstd frame magic: a compressed sets file (or wire payload) is
     // inflated first; raw KBS1 passes straight through. Sniffing keeps

@@ -183,7 +183,7 @@ async fn every_probed_file_gets_a_row_and_a_claim_ranks_them() {
 }
 
 #[tokio::test]
-async fn a_byte_change_resets_a_settled_row_and_a_version_bump_does_not() {
+async fn completed_work_is_removed_and_catalogue_updates_recheck_presence() {
     let (_dir, store) = store().await;
     films(&store, vec![file_at(1, "Film.mkv", 10, 100)]).await;
     assert!(
@@ -197,7 +197,7 @@ async fn a_byte_change_resets_a_settled_row_and_a_version_bump_does_not() {
             .await
             .unwrap()
     );
-    assert_eq!(states(&store).await, vec![("done".to_string(), 1)]);
+    assert_eq!(states(&store).await, vec![]);
 
     store
         .apply_catalogue(
@@ -212,7 +212,7 @@ async fn a_byte_change_resets_a_settled_row_and_a_version_bump_does_not() {
         )
         .await
         .unwrap();
-    assert_eq!(states(&store).await, vec![("done".to_string(), 1)]);
+    assert_eq!(states(&store).await, vec![("pending".to_string(), 1)]);
 
     store
         .apply_catalogue(
@@ -285,7 +285,7 @@ async fn a_reconnect_or_rerun_releases_rows_and_a_reported_failure_backs_off() {
         .finish_subtitle_job(&job.file.file_id, "text")
         .await
         .unwrap();
-    assert_eq!(states(&store).await, vec![("done".to_string(), 1)]);
+    assert_eq!(states(&store).await, vec![]);
 
     // Removing the file removes its work.
     store
@@ -354,10 +354,7 @@ async fn a_source_resolves_by_media_path_or_by_sidecar_path() {
             .await
             .unwrap()
     );
-    assert_eq!(
-        states_of(&store, "sets").await,
-        vec![("done".to_string(), 1)]
-    );
+    assert_eq!(states_of(&store, "sets").await, vec![]);
     assert_eq!(states(&store).await, vec![("pending".to_string(), 1)]);
 }
 
@@ -466,4 +463,37 @@ async fn dispatch_window_is_shared_across_collections_and_atomic_between_claims(
         16,
         "reconnect does not dump the released backlog"
     );
+}
+
+#[tokio::test]
+async fn captured_source_cannot_finish_or_fail_a_replacement() {
+    let (_dir, store) = store().await;
+    films(&store, vec![file_at(1, "Film.mkv", 10, 100)]).await;
+    let old = store
+        .source_file("host", "films", &p::SourcePath::new("root", "Film.mkv"))
+        .await
+        .unwrap()
+        .unwrap();
+    store
+        .apply_catalogue(
+            "host",
+            &delta(
+                "films",
+                false,
+                true,
+                2,
+                vec![file_at(2, "Film.mkv", 10, 101)],
+            ),
+        )
+        .await
+        .unwrap();
+    store
+        .reconcile_subtitle_job(&old, "text", false)
+        .await
+        .unwrap();
+    store
+        .fail_subtitle_job(&old, "text", 123, "old extraction failed")
+        .await
+        .unwrap();
+    assert_eq!(states(&store).await, vec![("pending".into(), 1)]);
 }

@@ -4,6 +4,7 @@
 //! remain in the durable on-disk cache because rebuilding demuxes the source.
 
 pub(crate) mod catalogue;
+mod recovery;
 pub(crate) mod work;
 
 use std::collections::HashMap;
@@ -104,6 +105,22 @@ fn cache_key(
     key: &str,
     revision: &str,
 ) -> String {
+    if let Some((file, digest)) = revision
+        .strip_prefix("v4-")
+        .and_then(|s| s.rsplit_once('-'))
+        && !file.is_empty()
+        && file
+            .bytes()
+            .all(|c| c.is_ascii_alphanumeric() || c == b'-' || c == b'_')
+        && digest.len() == 64
+        && digest.bytes().all(|c| c.is_ascii_hexdigit())
+        && key.bytes().all(|c| c.is_ascii_alphanumeric())
+    {
+        let address = xxhash_rust::xxh3::xxh3_64(
+            format!("{module_id}\n{collection_id}\n{root_token}\n{path_rel}").as_bytes(),
+        );
+        return format!("extracted-v4/{file}/{digest}/{address:016x}-{key}");
+    }
     format!(
         "v3-{:016x}-{key}",
         xxhash_rust::xxh3::xxh3_64(
@@ -365,6 +382,7 @@ impl Subtitles {
             let ex: Extracted = serde_json::from_slice(&bytes)?;
             return Ok(AssBody::Full(ex.ass.context("subtitle has no ASS form")?));
         }
+        self.cache_miss(registry, &revision).await?;
 
         if let Some(ex) = self
             .request_extraction(
@@ -502,6 +520,7 @@ impl Subtitles {
         if let Ok(bytes) = std::fs::read(&cache_path) {
             return Ok(serde_json::from_slice(&bytes)?);
         }
+        self.cache_miss(registry, &revision).await?;
         let ex: Extracted = if let Some(n) = key.strip_prefix('s') {
             let idx: usize = n.parse().context("bad sidecar key")?;
             let sidecar = info
@@ -583,8 +602,7 @@ impl Subtitles {
         } else {
             bail!("bad subtitle key: {key}");
         };
-        std::fs::create_dir_all(&self.dir)?;
-        std::fs::write(&cache_path, serde_json::to_vec(&ex)?)?;
+        recovery::publish(&cache_path, &serde_json::to_vec(&ex)?)?;
         Ok(ex)
     }
 
@@ -683,7 +701,12 @@ impl Subtitles {
         if revision.is_empty() {
             return Ok(());
         }
-        std::fs::create_dir_all(&self.dir)?;
+        anyhow::ensure!(
+            key.strip_prefix('e')
+                .or_else(|| key.strip_prefix('s'))
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|c| c.is_ascii_digit())),
+            "invalid extracted subtitle track key"
+        );
         let path = self.dir.join(format!(
             "{}.json",
             cache_key(
@@ -695,7 +718,7 @@ impl Subtitles {
                 revision
             )
         ));
-        std::fs::write(&path, serde_json::to_vec(ex)?)?;
+        recovery::publish(&path, &serde_json::to_vec(ex)?)?;
         Ok(())
     }
 
@@ -738,6 +761,7 @@ impl Subtitles {
 
     #[allow(clippy::too_many_arguments)] // exact source/track identity plus wait policy
     /// Whether one image track's display sets are already on disk.
+    #[cfg(feature = "ocr")]
     pub(crate) fn image_sets_cached(
         &self,
         module_id: &str,
@@ -881,10 +905,7 @@ impl Subtitles {
             (!msg.codec_private.is_empty()).then_some(&msg.codec_private[..]),
             &blocks,
         );
-        tokio::fs::create_dir_all(&self.dir).await.ok();
-        let tmp = path.with_extension("sets.tmp");
-        tokio::fs::write(&tmp, &bytes).await?;
-        tokio::fs::rename(&tmp, &path).await?;
+        recovery::publish(&path, &bytes)?;
         Ok(())
     }
 

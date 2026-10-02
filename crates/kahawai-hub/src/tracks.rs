@@ -9,7 +9,7 @@ use serde::Serialize;
 pub struct Track {
     #[serde(skip)]
     pub acquired: Option<std::sync::Arc<kahawai_media::subtitles::Extracted>>,
-    /// Immutable physical revision key for generated catalogue artifacts.
+    /// Probe-dependent processing identity for raster catalogue artifacts.
     #[serde(skip)]
     pub artifact_key: Option<String>,
     #[serde(skip)]

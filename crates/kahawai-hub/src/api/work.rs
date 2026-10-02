@@ -21,6 +21,7 @@ pub struct WorkQueue {
     pub running: i64,
     pub retry: i64,
     pub blocked: i64,
+    /// Text/sets extraction queues contain outstanding work only: always zero.
     pub done: i64,
     /// Unix time the clock next makes a row claimable, when known.
     #[schema(required)]
@@ -217,7 +218,10 @@ pub(super) async fn work_rerun(
         "subtitles" => match body.queue.as_str() {
             kind @ ("text" | "sets") => {
                 store.rerun_subtitle_jobs(kind).await.map_err(internal)?;
-                s.subtitles.wake();
+                s.subtitles
+                    .reconcile_cache(&s.registry)
+                    .await
+                    .map_err(internal)?;
             }
             "ocr" => s.subtitles.ocr_rerun(&s.registry).await,
             _ => {
