@@ -661,6 +661,47 @@ describe('hand-matching from the grid (HUB-8)', () => {
     expect(vi.mocked(listItems).mock.calls.length).toBe(reads + 1)
   })
 
+  test('assigning a card replaces its title and a previously missing poster', async () => {
+    const rows = [item('i0', { title: 'Unmatched film', match_confidence: 'weak' })]
+    vi.mocked(listItems).mockImplementation(async () => ({
+      items: [...rows],
+      total: rows.length,
+      offset: 0,
+      limit: CHUNK,
+    }))
+    vi.mocked(enrichmentIdentities).mockResolvedValue([
+      { id: 'assigned', title: 'Assigned film', year: 2001 },
+    ])
+    vi.mocked(enrichmentCorrect).mockImplementation(async () => {
+      rows[0] = item('assigned', { title: 'Assigned film', year: 2001, match_confidence: 'manual' })
+      return { ok: true }
+    })
+    const { wrapper } = await grid()
+    await wrapper.findComponent(Card).find('img').trigger('error')
+    expect(wrapper.findComponent(Card).find('img').classes()).toContain('invisible')
+    await wrapper.find('[aria-label*="match"]').trigger('click')
+    await flushPromises()
+    await wrapper
+      .findAll('[role="dialog"] button')
+      .find((button) => button.text() === 'Assigned film · 2001')!
+      .trigger('click')
+    await flushPromises()
+
+    expect(enrichmentCorrect).toHaveBeenCalledWith(
+      'i0',
+      expect.objectContaining({
+        action: 'assign',
+        library_item_id: 'assigned',
+      }),
+    )
+    expect(wrapper.find('[role="dialog"]').exists()).toBe(false)
+    const card = wrapper.findComponent(Card)
+    expect(card.text()).toContain('Assigned film')
+    expect(card.text()).not.toContain('Unmatched film')
+    expect(card.find('img').attributes('src')).toContain('/items/assigned/artwork')
+    expect(card.find('img').classes()).not.toContain('invisible')
+  })
+
   test('a match preserves a deep viewport and reloads only its shifted visible rows', async () => {
     laidOut({ viewport: 400 })
     const rows = Array.from({ length: 250 }, (_, n) => item(`i${n}`))

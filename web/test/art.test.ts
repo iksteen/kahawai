@@ -86,6 +86,26 @@ describe('what is drawn over it', () => {
     })
   })
 
+  test('a failed poster does not hide the next item in a reused card', async () => {
+    const art = mount(Art, { props: { item: item(), size: 'card' } })
+    await art.find('img').trigger('error')
+    await art.setProps({ item: item({ id: 'i2' }) })
+    expect(art.find('img').attributes('src')).toContain('/items/i2/artwork')
+    expect(art.find('img').classes()).not.toContain('invisible')
+  })
+
+  test('only a different artwork source resets a failed poster', async () => {
+    const art = mount(Art, { props: { item: item(), size: 'card' } })
+    await art.find('img').trigger('error')
+    await art.setProps({ item: item({ played: true }) })
+    expect(art.find('img').classes()).toContain('invisible')
+    await art.setProps({ item: item({ library_id: 'other-library' }) })
+    expect(art.find('img').classes()).not.toContain('invisible')
+    await art.find('img').trigger('error')
+    await art.setProps({ posterOf: 'show1' })
+    expect(art.find('img').classes()).not.toContain('invisible')
+  })
+
   test('a seen item is marked', () => {
     const art = mount(Art, { props: { item: item({ played: true }), size: 'card' } })
     expect(art.find('[title="seen"]').exists()).toBe(true)

@@ -93,6 +93,14 @@ describe('the artwork', () => {
     expect(img.attributes('src')).toContain('size=card')
   })
 
+  test('changing items clears the previous poster failure', async () => {
+    const wrapper = head()
+    await wrapper.find('img').trigger('error')
+    await wrapper.setProps({ item: item({ id: 'another-film' }) })
+    expect(wrapper.find('img').attributes('src')).toContain('/items/another-film/artwork')
+    expect(wrapper.find('img').classes()).not.toContain('invisible')
+  })
+
   test('and one that will not load is hidden, revealing the swell', () => {
     const wrapper = head()
     expect(wrapper.find('img').classes()).not.toContain('invisible')

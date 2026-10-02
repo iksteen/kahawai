@@ -15,7 +15,7 @@
 ///
 /// Before UI-22 every unpainted image showed the swell, so a slow page looked
 /// like a library with no artwork at all.
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 
 import Icon, { type IconName } from './Icon.vue'
 import { type ArtSize, artworkSrcSet, artworkUrl } from '../api/artwork.ts'
@@ -59,6 +59,12 @@ const broken = ref(false)
 
 const artId = computed(() => props.posterOf ?? props.item.id)
 const artVersion = computed(() => (props.posterOf ? undefined : props.item.art_version))
+// Grid cells are reused when matching reorders the library. A failed poster
+// belongs to its URL, not to the cell that happened to display it.
+const source = computed(() =>
+  artworkUrl(artId.value, artVersion.value, props.size, props.item.library_id),
+)
+watch(source, () => (broken.value = false))
 const done = computed(() => (props.progress ? watchedPct(props.item) : null))
 
 function kindGlyph(kind: string): IconName | null {
@@ -79,7 +85,7 @@ const glyph = computed(() => kindGlyph(props.item.kind))
     <img
       class="art"
       :class="broken && 'invisible'"
-      :src="artworkUrl(artId, artVersion, props.size, props.item.library_id)"
+      :src="source"
       :srcset="
         props.size === 'card' ? artworkSrcSet(artId, artVersion, props.item.library_id) : undefined
       "

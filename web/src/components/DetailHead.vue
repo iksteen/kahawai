@@ -4,7 +4,7 @@
 ///
 /// One shape for all four kinds rather than three near-copies — only the
 /// artwork's proportions differ, and they follow what the artwork IS.
-import { computed, ref } from 'vue'
+import { computed, ref, watch } from 'vue'
 import type { Description } from '../api/generated/model/description.ts'
 
 import { artShape } from '../domain/detail.ts'
@@ -38,6 +38,10 @@ const props = defineProps<{
 
 const shape = computed(() => artShape(props.item.kind))
 const broken = ref(false)
+const source = computed(() =>
+  artworkUrl(props.item.id, props.item.art_version, 'card', props.item.library_id),
+)
+watch(source, () => (broken.value = false))
 const done = computed(() =>
   props.progress === undefined ? watchedPct(props.item) : props.progress,
 )
@@ -54,7 +58,7 @@ const runtime = computed(() => duration(props.item.duration_ms))
         class="block w-full rounded-md object-cover"
         :class="broken && 'invisible'"
         :style="{ aspectRatio: shape.ratio }"
-        :src="artworkUrl(props.item.id, props.item.art_version, 'card', props.item.library_id)"
+        :src="source"
         :srcset="artworkSrcSet(props.item.id, props.item.art_version, props.item.library_id)"
         alt=""
         @error="broken = true"
