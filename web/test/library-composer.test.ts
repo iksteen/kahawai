@@ -1,6 +1,8 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount, type VueWrapper } from '@vue/test-utils'
 import { afterEach, beforeEach, expect, test, vi } from 'vitest'
+import { createMemoryHistory, createRouter } from 'vue-router'
+import { adminRoutes } from '../src/routes/admin.ts'
 import Admin from '../src/views/Admin.vue'
 import * as api from '../src/api/generated/kahawai.ts'
 import type { CatalogueCollection } from '../src/api/generated/model/catalogueCollection.ts'
@@ -65,8 +67,16 @@ afterEach(() => {
   vi.resetAllMocks()
 })
 async function open() {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: adminRoutes,
+  })
+  await router.push('/admin')
+  await router.isReady()
   client = new QueryClient({ defaultOptions: { queries: { retry: false, gcTime: 0 } } })
-  wrapper = mount(Admin, { global: { plugins: [[VueQueryPlugin, { queryClient: client }]] } })
+  wrapper = mount(Admin, {
+    global: { plugins: [router, [VueQueryPlugin, { queryClient: client }]] },
+  })
   await flushPromises()
   await wrapper.get('#tab-libraries').trigger('click')
   await flushPromises()

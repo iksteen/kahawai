@@ -9,6 +9,7 @@ import { createRouter, createWebHistory } from 'vue-router'
 
 import { loadChunk } from './api/chunk.ts'
 import { notify } from './composables/notices.ts'
+import { adminRoutes } from './routes/admin.ts'
 
 const Home = () => import('./views/Home.vue')
 const Library = () => import('./views/Library.vue')
@@ -16,7 +17,6 @@ const Artist = () => import('./views/Artist.vue')
 const Detail = () => import('./views/Detail.vue')
 const Season = () => import('./views/Season.vue')
 const Settings = () => import('./views/Settings.vue')
-const Admin = () => import('./views/Admin.vue')
 
 export const router = createRouter({
   // The hub serves the app under /app/ and falls back to the shell for any
@@ -24,7 +24,7 @@ export const router = createRouter({
   history: createWebHistory('/app/'),
   routes: [
     { path: '/', name: 'libraries', component: Home },
-    { path: '/admin', name: 'admin', component: Admin },
+    ...adminRoutes,
     { path: '/settings', name: 'settings', component: Settings },
     { path: '/library/:library', name: 'library', component: Library },
     { path: '/library/:library/artist/:artist', name: 'artist', component: Artist },

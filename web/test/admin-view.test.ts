@@ -9,9 +9,11 @@
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
 import { afterEach, beforeEach, describe, expect, test, vi } from 'vitest'
+import { createMemoryHistory, createRouter } from 'vue-router'
 
 import { ApiError } from '../src/api/errors.ts'
 import { IN_PROCESS } from '../src/domain/admin.ts'
+import { adminRoutes } from '../src/routes/admin.ts'
 import { POLL_MS } from '../src/composables/admin.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
@@ -87,11 +89,18 @@ const user = (over: Record<string, unknown> = {}) => ({
   ...over,
 })
 
-async function open() {
+async function open(address = '/admin') {
+  const router = createRouter({
+    history: createMemoryHistory(),
+    routes: adminRoutes,
+  })
+  await router.push(address)
+  await router.isReady()
   const wrapper = mount(Admin, {
     attachTo: document.body,
     global: {
       plugins: [
+        router,
         [
           VueQueryPlugin,
           { queryClient: new QueryClient({ defaultOptions: { queries: { retry: false } } }) },
@@ -514,6 +523,28 @@ describe('the two kinds of failure', () => {
 })
 
 describe('the tabs', () => {
+  test('restore the selected section from its address after a fresh mount', async () => {
+    const wrapper = await open('/admin?keep=value#anchor')
+    await tab(wrapper, 'Background work')
+    const address = wrapper.vm.$router.currentRoute.value.fullPath
+    expect(address).toBe('/admin/work?keep=value#anchor')
+    wrapper.unmount()
+    const reloaded = await open(address)
+    expect(reloaded.get('[role="tabpanel"]').attributes('aria-labelledby')).toBe('tab-work')
+    expect(reloaded.get('#tab-work').attributes('aria-selected')).toBe('true')
+    reloaded.unmount()
+  })
+
+  test.each(['/admin/unknown', '/admin/work/sessions'])(
+    'an invalid section address falls back safely: %s',
+    async (address) => {
+      const wrapper = await open(address)
+      expect(wrapper.vm.$router.currentRoute.value.path).toBe('/admin/satellites')
+      expect(wrapper.get('[role="tabpanel"]').attributes('aria-labelledby')).toBe('tab-satellites')
+      wrapper.unmount()
+    },
+  )
+
   test('are tabs, and the arrow keys move between them', async () => {
     // A COLUMN of tabs, so Down and Up. `aria-orientation` is a promise about
     // which keys work, and Left/Right on a column is the wrong one.

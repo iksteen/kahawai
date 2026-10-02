@@ -12,7 +12,8 @@
 /// else on the page explains: that deleting a satellite is a certificate
 /// revocation at the TLS layer, and that a grant chip writes the whole set
 /// rather than a change to it.
-import { computed, nextTick, ref, useTemplateRef } from 'vue'
+import { computed, nextTick, useTemplateRef, watch } from 'vue'
+import { useRoute, useRouter } from 'vue-router'
 
 import AdminLibraries from './admin/Libraries.vue'
 import AdminProviders from './admin/Providers.vue'
@@ -63,10 +64,18 @@ const SECTIONS = [
 
 type SectionId = (typeof SECTIONS)[number]['id']
 
-const tab = ref<SectionId>('satellites')
+const route = useRoute()
+const router = useRouter()
+// The router validates the section; the bare /admin address opens Satellites.
+const tab = computed(() => (route.params.section || 'satellites') as SectionId)
 const here = computed(() => SECTIONS.find((s) => s.id === tab.value)!)
 
 const admin = useAdmin(computed(() => tab.value === 'sessions'))
+watch(tab, () => {
+  // A refusal belongs to the section where the action happened, including
+  // when navigation changes the section without a click on this tablist.
+  admin.actionError.value = ''
+})
 
 /// HUB-11. The poll is the safety net; this is what makes a scan's progress and
 /// a satellite asking to be let in arrive when they happen rather than up to
@@ -92,10 +101,12 @@ const badge = (id: SectionId) =>
 const tabs = useTemplateRef<HTMLButtonElement[]>('tabs')
 
 async function go(id: SectionId) {
-  tab.value = id
-  // A refusal is an answer to something the operator did on the screen they
-  // were on. Carried onto another tab it reads as that tab's news.
-  admin.actionError.value = ''
+  await router.replace({
+    name: 'admin',
+    params: { section: id },
+    query: route.query,
+    hash: route.hash,
+  })
   await nextTick()
   // By id, not by index: Vue does not promise a `v-for` ref array is in source
   // order, and focusing the wrong tab is a silent, occasional bug.
