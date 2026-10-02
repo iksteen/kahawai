@@ -1061,6 +1061,8 @@ not describe this branch's current runtime.
       virtual poster and artist grids with representative-copy match confidence,
       sorting/search, scoped artwork and metadata
       detail, physical source lists, runtime/chapters, reload/back navigation and browser checks.
+      Browser Back/Forward and hierarchical back buttons restore browse depth after
+      virtual grids reserve their height; movie and music browse entries retain their sort.
       Artist cards request catalogue portraits directly; the unused artist `art_version`
       field is removed from the API and UI.
       Artist image URLs encode names as path components, including slashes in AC/DC.

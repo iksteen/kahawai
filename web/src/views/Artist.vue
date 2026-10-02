@@ -11,13 +11,15 @@ import PagedGrid from '../components/PagedGrid.vue'
 import { useArtistAlbums } from '../composables/music.ts'
 import { useSearchQuery } from '../composables/search.ts'
 import { useScreenName } from '../composables/title.ts'
+import { backTo, useBrowseSort } from '../composables/scroll.ts'
 
 const route = useRoute()
 const router = useRouter()
 const library = computed(() => String(route.params.library ?? ''))
 const key = computed(() => String(route.params.artist ?? ''))
 const query = useSearchQuery()
-const sort = ref('year')
+const sort = useBrowseSort('albumSort', 'year')
+const scrollReady = ref(false)
 const albums = useArtistAlbums(library, key, query, sort)
 
 watch([library, key, query, sort], () => window.scrollTo({ top: 0 }))
@@ -39,19 +41,25 @@ function openAlbum(id: string) {
 <template>
   <Failed
     v-if="albums.failure.value && !albums.artist.value"
+    :data-scroll-page="route.fullPath"
+    data-scroll-ready="true"
     what="Could not load this artist."
     :message="albums.failure.value"
     away="Back to library"
     @retry="albums.retry"
-    @away="router.push({ name: 'library', params: { library } })"
+    @away="backTo(router, { name: 'library', params: { library } })"
   />
 
-  <main v-else>
+  <main
+    v-else
+    :data-scroll-page="route.fullPath"
+    :data-scroll-ready="scrollReady || !!albums.failure.value"
+  >
     <Btn
       ghost
       small
       class="mb-[18px]"
-      @click="router.push({ name: 'library', params: { library } })"
+      @click="backTo(router, { name: 'library', params: { library } })"
     >
       ← Library
     </Btn>
@@ -86,7 +94,13 @@ function openAlbum(id: string) {
     <p v-if="albums.total.value === 0" class="text-dim">
       {{ query ? `Nothing matches “${query}”.` : 'This artist has no albums.' }}
     </p>
-    <PagedGrid class="album-grid" :total="albums.total.value" min-width="150px" @need="albums.need">
+    <PagedGrid
+      class="album-grid"
+      :total="albums.total.value"
+      min-width="150px"
+      @need="albums.need"
+      @ready="scrollReady = $event"
+    >
       <template #default="{ at }">
         <Card
           :item="albums.loaded.value.get(at)"

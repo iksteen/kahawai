@@ -33,3 +33,12 @@ test('asks for later chunks as their reserved rows approach the viewport', async
   await flushPromises()
   expect(needs().some(([chunks]) => chunks.includes(1))).toBe(true)
 })
+
+test('reports readiness after measurement and also for an empty result', async () => {
+  const wrapper = mount(PagedGrid, { props: { total: null, minWidth: '120px' } })
+  await flushPromises()
+  expect(wrapper.emitted('ready')).toEqual([[false]])
+  await wrapper.setProps({ total: 0 })
+  expect(wrapper.emitted('ready')).toEqual([[false], [true]])
+  wrapper.unmount()
+})

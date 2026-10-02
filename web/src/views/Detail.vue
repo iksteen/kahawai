@@ -56,6 +56,7 @@ import { seasonSegment } from '../domain/routes.ts'
 import { useScreenName } from '../composables/title.ts'
 import { whoAmI } from '../api/session.ts'
 import { playbackItemQuery, useChildren, useItem, useWatched } from '../composables/item.ts'
+import { backTo } from '../composables/scroll.ts'
 import { usePrefs } from '../composables/prefs.ts'
 import { useQueue } from '../composables/queue.ts'
 
@@ -192,16 +193,16 @@ const up = computed(() => {
 })
 function goUp() {
   if ('artist' in up.value && up.value.artist) {
-    void router.push({
+    backTo(router, {
       name: 'artist',
       params: { library: library.value, artist: up.value.artist },
     })
     return
   }
   if (up.value.id) {
-    void router.push({ name: 'detail', params: { library: library.value, id: up.value.id } })
+    backTo(router, { name: 'detail', params: { library: library.value, id: up.value.id } })
   } else {
-    void router.push({ name: 'library', params: { library: library.value } })
+    backTo(router, { name: 'library', params: { library: library.value } })
   }
 }
 
@@ -441,7 +442,7 @@ function markSeason(season: number | null, played: boolean) {
     :message="sentence(query.error.value)"
     away="Back to library"
     @retry="query.refetch()"
-    @away="router.push({ name: 'library', params: { library } })"
+    @away="backTo(router, { name: 'library', params: { library } })"
   />
 
   <main v-else-if="item">

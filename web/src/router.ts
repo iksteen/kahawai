@@ -10,6 +10,9 @@ import { createRouter, createWebHistory } from 'vue-router'
 import { loadChunk } from './api/chunk.ts'
 import { notify } from './composables/notices.ts'
 import { adminRoutes } from './routes/admin.ts'
+import { browseScroll } from './composables/scroll.ts'
+
+const scroll = browseScroll()
 
 const Home = () => import('./views/Home.vue')
 const Library = () => import('./views/Library.vue')
@@ -68,18 +71,23 @@ export const router = createRouter({
     // exact traffic this line exists for.
     { path: '/:pathMatch(.*)*', redirect: '/' },
   ],
-  scrollBehavior(_to, _from, savedPosition) {
+  async scrollBehavior(to, _from, savedPosition) {
     // A push is a new screen and the browser does not move for one. The
     // library grid reserves the whole library's height — tens of thousands of
     // pixels — so opening an item from row 150 kept `scrollY` and clamped it
     // to the short page's maximum: you landed at the BOTTOM of the item, on
     // the sources list, with the title and Play button off-screen above.
     //
-    // Back and forward restore where they were, which is `savedPosition` and
-    // is what a person expects from those two buttons alone.
+    // Returning to a browse grid must wait until its reserved height exists;
+    // scrolling earlier clamps the saved depth to the empty page's height.
+    if (savedPosition && (to.name === 'library' || to.name === 'artist')) {
+      if (!(await scroll.ready(to.fullPath))) return false
+    }
     return savedPosition ?? { top: 0 }
   },
 })
+
+router.beforeEach(() => scroll.cancel())
 
 /// A chunk that could not be fetched, after `loadChunk` has already spent its
 /// one reload on it. The router leaves the address where it was and renders

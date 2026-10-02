@@ -38,6 +38,7 @@ import { useArtists } from '../composables/music.ts'
 import { useScreenName } from '../composables/title.ts'
 import { useSearchBox, useSearchQuery } from '../composables/search.ts'
 import { whoAmI } from '../api/session.ts'
+import { useBrowseSort } from '../composables/scroll.ts'
 
 const route = useRoute()
 const router = useRouter()
@@ -45,8 +46,8 @@ const router = useRouter()
 const library = computed(() => String(route.params.library ?? ''))
 /// The header's box filters this library in place — see `useSearch`.
 const query = useSearchQuery()
-const sort = ref('title')
-const artistSort = ref('name')
+const sort = useBrowseSort('itemSort', 'title')
+const artistSort = useBrowseSort('artistSort', 'name')
 
 /// Resolve the media type before choosing the browse shape. Music starts at
 /// artists; every other library retains the virtual item grid.
@@ -98,6 +99,17 @@ const metric = ref<Metric | null>(null)
 const rows = ref({ start: 0, end: 0 })
 const wrap = ref<HTMLElement | null>(null)
 const grid = ref<HTMLElement | null>(null)
+const artistsReady = ref(false)
+const scrollReady = computed(() => {
+  if (!details.data.value && !details.isError.value) return false
+  const itemsReady =
+    !!failure.value || (total.value !== null && (total.value === 0 || metric.value !== null))
+  if (!music.value) return itemsReady
+  return (
+    (artists.total.value === 0 || artistsReady.value || !!artists.failure.value) &&
+    (!query.value || itemsReady)
+  )
+})
 
 function measure() {
   const el = grid.value
@@ -253,7 +265,7 @@ function retryPage() {
 </script>
 
 <template>
-  <main>
+  <main :data-scroll-page="route.fullPath" :data-scroll-ready="scrollReady">
     <!-- The wordmark opens the jump menu now, so home needs saying
          somewhere. -->
     <Btn ghost small class="mb-[18px]" @click="router.push({ name: 'libraries' })">← Home</Btn>
@@ -335,7 +347,12 @@ function retryPage() {
 
     <section v-if="music && (artists.total.value ?? 0) > 0" class="artist-grid">
       <h2 v-if="query" class="mb-3 text-[17px] font-[650]">Artists</h2>
-      <PagedGrid :total="artists.total.value" min-width="150px" @need="artists.need">
+      <PagedGrid
+        :total="artists.total.value"
+        min-width="150px"
+        @need="artists.need"
+        @ready="artistsReady = $event"
+      >
         <template #default="{ at }">
           <ArtistCard
             :artist="artists.loaded.value.get(at)"

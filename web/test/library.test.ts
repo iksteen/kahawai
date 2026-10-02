@@ -310,7 +310,33 @@ describe('an empty library', () => {
   })
 })
 
+test('an empty music library is ready to restore without a grid to measure', async () => {
+  vi.mocked(listArtists).mockResolvedValue({ artists: [], total: 0, limit: 100, offset: 0 })
+  const { wrapper } = await grid('/library/music')
+  expect(wrapper.find('main').attributes('data-scroll-ready')).toBe('true')
+  wrapper.unmount()
+})
+
 describe('sorting', () => {
+  test('returning to a browse history entry retains its sort order', async () => {
+    const { router, wrapper } = await grid()
+    await wrapper.find('select').setValue('-added')
+    await flushPromises()
+    expect(router.options.history.state.itemSort).toBe('-added')
+    const owner = mount({ template: '<div />' }, { global: { plugins: [router] } })
+    wrapper.unmount()
+    await router.push('/library/films/item/i0')
+    router.back()
+    await flushPromises()
+    vi.mocked(listItems).mockClear()
+    const returned = mount(Library, { global: { plugins: [router, queryPlugin()] } })
+    await flushPromises()
+    expect((returned.find('select').element as HTMLSelectElement).value).toBe('-added')
+    expect(listItems).toHaveBeenCalledWith(expect.objectContaining({ sort: '-added' }))
+    returned.unmount()
+    owner.unmount()
+  })
+
   test('asks the hub again, in the new order', async () => {
     const { wrapper } = await grid()
     vi.mocked(listItems).mockClear()

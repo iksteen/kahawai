@@ -19,12 +19,17 @@ const props = defineProps<{
   total: number | null
   minWidth: string
 }>()
-const emit = defineEmits<{ need: [chunks: number[]] }>()
+const emit = defineEmits<{ need: [chunks: number[]]; ready: [ready: boolean] }>()
 
 const metric = ref<Metric | null>(null)
 const rows = ref({ start: 0, end: 0 })
 const wrap = ref<HTMLElement | null>(null)
 const grid = ref<HTMLElement | null>(null)
+watch(
+  () => props.total !== null && (props.total === 0 || metric.value !== null),
+  (ready) => emit('ready', ready),
+  { immediate: true, flush: 'post' },
+)
 
 function measure() {
   const el = grid.value
