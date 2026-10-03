@@ -1,14 +1,14 @@
 <script setup lang="ts">
-/// Artwork, with the kahawai swell on the box behind it — so a poster that is
-/// slow shows the swell rather than a white flash, and one that never arrives
+/// Artwork, with the Kahawai mark on the box behind it — so a poster that is
+/// slow shows the mark rather than a white flash, and one that never arrives
 /// simply keeps it.
 ///
 /// UI-22 is three states and they are drawn differently on purpose:
 ///
 /// - **not arrived yet** — the `<img>`'s own opaque background, half-strength
-///   slate, covering the swell. The browser paints it until the content lands,
+///   slate, covering the mark. The browser paints it until the content lands,
 ///   so this one costs nothing.
-/// - **there is no poster** — the swell at full strength, revealed by hiding
+/// - **there is no poster** — the mark at full strength, revealed by hiding
 ///   the image on `error`.
 /// - **the row itself has not arrived** — the caller's ghost, which is a
 ///   different component again.
@@ -126,7 +126,7 @@ const glyph = computed(() => kindGlyph(props.item.kind))
   /* A poster unless the view says otherwise. The shelf sets this per library:
      a sleeve is square and a poster is two by three. */
   aspect-ratio: var(--card-ratio, 2 / 3);
-  /* Opaque, so it covers the swell while the picture is in flight — the same
+  /* Opaque, so it covers the mark while the picture is in flight — the same
      blank as a card that has not arrived at all, because it says the same
      thing. */
   background: color-mix(in srgb, var(--color-line), var(--color-surface));

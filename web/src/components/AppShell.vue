@@ -8,6 +8,7 @@
 import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
+import Brand from './Brand.vue'
 import Icon, { type IconName } from './Icon.vue'
 import MenuItem from './MenuItem.vue'
 import MenuPopover from './MenuPopover.vue'
@@ -206,14 +207,14 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
     <header class="flex flex-wrap items-center justify-between gap-3 pt-5 pb-6.5">
       <div class="relative">
         <button
-          class="flex cursor-pointer items-center text-xl font-[650] tracking-[0.04em]"
+          class="flex cursor-pointer items-center"
           title="Jump to…"
           type="button"
           :aria-expanded="navOpen"
           aria-haspopup="menu"
           @click="openNav"
         >
-          <span>kahawai<span class="text-teal">~</span></span>
+          <Brand class="h-7 w-auto" />
           <!-- Hidden: `aria-expanded` already says which way it points, and a
                glyph inside the button becomes part of its name — so the name
                would change on every toggle and be read out again. -->

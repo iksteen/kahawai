@@ -7,6 +7,7 @@
 /// was typed and a screen reader had nothing to announce for the field at all.
 import { computed, nextTick, onMounted, ref, useId } from 'vue'
 
+import Brand from '../components/Brand.vue'
 import Btn from '../components/Btn.vue'
 import { MIN_PASSWORD, passwordLongEnough } from '../domain/auth.ts'
 import { browserLogin } from '../api/session.ts'
@@ -94,10 +95,10 @@ async function submit() {
          overflows the padding it is centred in, and the first screen everybody
          meets is the wrong one to have a horizontal scrollbar. -->
     <div
-      class="animate-rise flex w-[min(340px,100%)] flex-col gap-3 rounded-lg border border-line bg-surface px-7 pt-8 pb-7"
+      class="animate-rise flex w-[min(340px,100%)] min-w-0 flex-col gap-3 rounded-lg border border-line bg-surface px-7 pt-8 pb-7"
     >
-      <h1 class="text-[28px] font-[650] tracking-[0.04em]">
-        kahawai<span class="text-teal">~</span>
+      <h1>
+        <Brand class="h-auto w-[200px] max-w-full" />
       </h1>
 
       <!-- Setup is reachable only from the hub's own local control plane, so
