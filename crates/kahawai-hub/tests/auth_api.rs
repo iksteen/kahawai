@@ -568,7 +568,7 @@ async fn auth_harness() -> (
 }
 
 #[tokio::test]
-async fn built_in_transcoder_cannot_be_deleted_or_drained_through_admin_api() {
+async fn built_in_transcoder_requires_a_full_executor_and_cannot_be_deleted() {
     let (_dir, _db, _auth, api, root) = auth_harness().await;
     let id = Registry::LOCAL_TRANSCODER;
     let deleted = api
@@ -591,6 +591,79 @@ async fn built_in_transcoder_cannot_be_deleted_or_drained_through_admin_api() {
         .await
         .unwrap();
     assert_eq!(disabled.status(), StatusCode::CONFLICT);
+}
+
+#[tokio::test]
+async fn built_in_transcoder_admin_toggle_preserves_its_identity_and_delete_protection() {
+    let (_dir, db, auth, _api, root) = auth_harness().await;
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            Default::default(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(true),
+    );
+    let api = test_router(
+        registry.clone(),
+        auth,
+        Arc::new(kahawai_hub::sessions::Sessions::new(
+            tempfile::tempdir().unwrap().keep(),
+        )),
+    );
+    let id = Registry::LOCAL_TRANSCODER;
+    for disabled in [true, false] {
+        let response = api
+            .clone()
+            .oneshot(post_authed(
+                &format!("/admin/v1/satellites/{id}/disabled"),
+                &root.access_token,
+                serde_json::json!({"disabled": disabled}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert_eq!(registry.local_video_executor_enabled(), !disabled);
+        let response = api
+            .clone()
+            .oneshot(get_authed("/admin/v1/satellites", &root.access_token))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let row = body["satellites"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|row| row["module_id"] == id)
+            .unwrap();
+        assert_eq!(row["disabled"], disabled);
+        assert_eq!(row["connected"], true);
+        let value: String = sqlx::query_scalar(
+            "SELECT value FROM settings WHERE key = 'local_transcoder_disabled'",
+        )
+        .fetch_one(&db)
+        .await
+        .unwrap();
+        assert_eq!(value, disabled.to_string());
+        let deleted = api
+            .clone()
+            .oneshot(
+                Request::delete(format!("/admin/v1/satellites/{id}"))
+                    .header("authorization", format!("Bearer {}", root.access_token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(deleted.status(), StatusCode::CONFLICT);
+    }
+    let enrolled: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM satellites WHERE module_id = ?")
+        .bind(id)
+        .fetch_one(&db)
+        .await
+        .unwrap();
+    assert_eq!(enrolled, 0);
 }
 
 #[tokio::test]

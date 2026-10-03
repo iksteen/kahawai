@@ -2,6 +2,9 @@
 //! placement and settings. Durable operational state belongs to the hub DB;
 //! collections, physical source facts and replay cursors belong to mediadb.
 //! Link generations prevent late replies from replacing a newer connection.
+//! `settings.local_transcoder_disabled` stores the admin drain for the virtual
+//! AIO video executor. It stops new local video work, independently of the
+//! structural startup setting; remux and audio-only execution remain local.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -176,7 +179,8 @@ pub struct Registry {
     /// Cleared on disconnect for the same reason.
     tc_link_rate: Mutex<HashMap<String, u64>>,
     /// Admin-disabled satellites: placement skips them; active sessions
-    /// finish. Persisted in `satellites.disabled` and read back at startup by
+    /// finish. Persisted in `satellites.disabled` (the virtual local transcoder
+    /// uses `settings.local_transcoder_disabled`) and read back at startup by
     /// `load_allowlist`, so a drain survives a hub restart — the note that once
     /// stood here calling it a throwaway in-memory toggle is what made clearing
     /// it inside `unregister_link` look free. Only `set_disabled` and
@@ -373,6 +377,16 @@ impl Registry {
 
     pub fn local_video_executor_enabled(&self) -> bool {
         self.local_video_executor_enabled
+            && !self
+                .disabled
+                .lock()
+                .unwrap()
+                .contains(Self::LOCAL_TRANSCODER)
+    }
+
+    /// Structural capability, retained by existing video sessions when drained.
+    pub fn local_video_executor_present(&self) -> bool {
+        self.local_video_executor_enabled
     }
 
     /// Push an event hint to /api/v1/events subscribers (HUB-11).
@@ -440,6 +454,8 @@ impl Registry {
     /// placement pace key (`local`). Never enrolled or given a control link.
     pub const LOCAL_TRANSCODER: &str = "local-transcoder";
 
+    const LOCAL_TRANSCODER_DISABLED: &str = "local_transcoder_disabled";
+
     pub async fn ensure_local_satellite(&self, module_id: &str, name: &str) -> Result<()> {
         sqlx::query(
             "INSERT INTO satellites (module_id, module_type, name, cert_fingerprint)
@@ -471,7 +487,19 @@ impl Registry {
         .fetch_all(&self.db)
         .await?;
         let n = rows.len();
+        let local_disabled = self
+            .get_setting(Self::LOCAL_TRANSCODER_DISABLED)
+            .await?
+            .map(|value| value.parse::<bool>())
+            .transpose()
+            .context("reading built-in transcoder drain")?
+            .unwrap_or(false);
         let mut disabled = self.disabled.lock().unwrap();
+        if local_disabled {
+            disabled.insert(Self::LOCAL_TRANSCODER.into());
+        } else {
+            disabled.remove(Self::LOCAL_TRANSCODER);
+        }
         for row in rows {
             self.allowed
                 .insert(&row.get::<String, _>("cert_fingerprint"));
@@ -1300,15 +1328,20 @@ impl Registry {
     /// Admin toggle: a disabled satellite is skipped by placement.
     /// Persisted — a drained box must not rejoin because the hub bounced.
     pub async fn set_disabled(&self, module_id: &str, disabled: bool) -> Result<()> {
-        anyhow::ensure!(
-            module_id != Self::LOCAL_TRANSCODER,
-            "the built-in transcoder is configured on the hub, not drained as a satellite"
-        );
-        sqlx::query("UPDATE satellites SET disabled = ? WHERE module_id = ?")
-            .bind(disabled as i64)
-            .bind(module_id)
-            .execute(&self.db)
-            .await?;
+        if module_id == Self::LOCAL_TRANSCODER {
+            anyhow::ensure!(
+                self.local_video_executor_present(),
+                "no built-in video transcoder on this hub"
+            );
+            self.set_setting(Self::LOCAL_TRANSCODER_DISABLED, &disabled.to_string())
+                .await?;
+        } else {
+            sqlx::query("UPDATE satellites SET disabled = ? WHERE module_id = ?")
+                .bind(disabled as i64)
+                .bind(module_id)
+                .execute(&self.db)
+                .await?;
+        }
         let mut set = self.disabled.lock().unwrap();
         if disabled {
             set.insert(module_id.to_string());
@@ -1362,7 +1395,8 @@ impl Registry {
             boxes,
             pace,
             local_bench,
-            local_video_executor_enabled: self.local_video_executor_enabled,
+            local_video_executor_enabled: self.local_video_executor_enabled
+                && !disabled.contains(Self::LOCAL_TRANSCODER),
         };
         f(&fleet, &mut load)
     }
@@ -1423,7 +1457,7 @@ impl Registry {
     }
 
     /// Enrolled satellites merged with live state, plus the AIO transcoder's
-    /// virtual, read-only row. It is never part of enrollment or dispatch.
+    /// virtual row. It can be drained, but is never enrolled or dispatched to.
     pub async fn satellites_overview(&self) -> Result<Vec<SatelliteOverview>> {
         let rows = sqlx::query(
             "SELECT module_id, module_type, name, cert_fingerprint, enrolled_at
@@ -1492,7 +1526,11 @@ impl Registry {
                 connected: true,
                 build: Some(kahawai_core::build_stamp().into()),
                 capabilities,
-                disabled: false,
+                disabled: self
+                    .disabled
+                    .lock()
+                    .unwrap()
+                    .contains(Self::LOCAL_TRANSCODER),
                 pace: observed,
                 link_bytes_per_sec: None,
             });

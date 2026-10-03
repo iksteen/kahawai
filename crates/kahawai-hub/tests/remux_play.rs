@@ -64,11 +64,19 @@ async fn remux_to_hls_end_to_end() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(
-        db.clone(),
-        allowed.clone(),
-        kahawai_mediadb::Store::in_memory().await.unwrap(),
-    ));
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            allowed.clone(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(true),
+    );
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, true)
+        .await
+        .unwrap();
+    assert!(!registry.local_video_executor_enabled());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -340,6 +348,100 @@ async fn remux_to_hls_end_to_end() {
     // The playlist of an ended session is 404: hls.js reads the status off
     // the failed load and the player restarts.
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // Start actual local video work, then drain it. The existing session can
+    // still seek and produce bytes, while a new video session is refused.
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, false)
+        .await
+        .unwrap();
+    let element = kahawai_media::remux::h264_encoder().unwrap();
+    let mut bench = kahawai_media::bench::BenchResults::default();
+    bench.encoders.insert(
+        element.into(),
+        kahawai_media::bench::Speeds {
+            s1080: Some(2.0),
+            s2160: Some(1.0),
+        },
+    );
+    registry.set_local_bench(bench);
+    sqlx::query("INSERT INTO user_prefs (user_id, scope, key, value) SELECT id, '', 'bandwidth_kbps', '1' FROM users")
+        .execute(&db).await.unwrap();
+    let start_video = || {
+        Request::post("/api/v1/playback/sessions")
+            .header("authorization", bearer.clone())
+            .header("content-type", "application/json")
+            .body(Body::from(
+                serde_json::json!({
+                    "library_id": library_id, "item_id": item_id, "mode": "remux",
+                })
+                .to_string(),
+            ))
+            .unwrap()
+    };
+    let response = api.clone().oneshot(start_video()).await.unwrap();
+    assert_eq!(response.status(), StatusCode::CREATED);
+    let encoded: serde_json::Value = serde_json::from_slice(&body_bytes(response).await).unwrap();
+    assert_eq!(encoded["streams"]["cost"], "video_encode");
+    let encoded_id = encoded["session_id"].as_str().unwrap();
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, true)
+        .await
+        .unwrap();
+    let blocked = api.clone().oneshot(start_video()).await.unwrap();
+    assert_eq!(
+        blocked.status(),
+        StatusCode::CONFLICT,
+        "new local video work must be refused while drained"
+    );
+    let response = api
+        .clone()
+        .oneshot(
+            Request::post(format!("/api/v1/playback/sessions/{encoded_id}/seek"))
+                .header("authorization", bearer.clone())
+                .header("content-type", "application/json")
+                .body(Body::from("{\"position_ms\":2000}"))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "an existing video session retains its executor"
+    );
+    let segment = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = api
+                .clone()
+                .oneshot(get(format!(
+                    "/api/v1/playback/sessions/{encoded_id}/segment00000.ts"
+                )))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                let bytes = body_bytes(response).await;
+                if !bytes.is_empty() {
+                    return bytes;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("existing local video session produced no segment after draining and seeking");
+    assert!(segment.len() > 1_000);
+    assert_eq!(segment[0], 0x47);
+    let response = api
+        .oneshot(
+            Request::delete(format!("/api/v1/playback/sessions/{encoded_id}"))
+                .header("authorization", bearer)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
 }
 
 /// Router with default admin plumbing for tests that don't exercise it.

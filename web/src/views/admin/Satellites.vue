@@ -54,7 +54,6 @@ const drained = (satellite: SatelliteOverview) =>
   setting.value.get(satellite.module_id) ?? satellite.disabled
 
 async function drain(satellite: SatelliteOverview) {
-  if (builtIn(satellite)) return
   const want = !drained(satellite)
   setting.value = new Map(setting.value).set(satellite.module_id, want)
   // Held on success until the re-read has landed — dropping it at once flicks
@@ -229,12 +228,16 @@ function some(satellite: SatelliteOverview) {
                flag, a row that said "Enable" for ever — and a host still
                serving every byte it was asked for. -->
           <Btn
-            v-if="satellite.module_type === 'transcoder' && !builtIn(satellite)"
+            v-if="satellite.module_type === 'transcoder'"
             ghost
             small
             class="ml-auto"
             :title="
-              drained(satellite) ? 'Disabled — no work is sent here' : 'Stop sending work here'
+              builtIn(satellite)
+                ? 'Video transcodes only; remuxing and audio transcoding stay local'
+                : drained(satellite)
+                  ? 'Disabled — no work is sent here'
+                  : 'Stop sending work here'
             "
             @click="drain(satellite)"
           >
@@ -306,6 +309,10 @@ function some(satellite: SatelliteOverview) {
 
         <p v-if="builtIn(satellite) && !satellite.capabilities" class="mt-1 text-[11px] text-dim">
           Benchmarks pending.
+        </p>
+        <p v-if="builtIn(satellite)" class="mt-1 text-[11px] text-dim">
+          Disabling stops new video transcodes. Remuxing and audio transcoding stay local; current
+          sessions continue.
         </p>
         <div v-if="!builtIn(satellite)" class="mt-1 truncate font-mono text-[11px] text-dimmer">
           {{ satellite.cert_fingerprint }}

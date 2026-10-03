@@ -32,7 +32,6 @@ async fn local_transcoder_is_visible_without_enrollment_and_cannot_be_removed() 
     assert!(local.link_bytes_per_sec.is_none());
     assert!(registry.is_in_process(&local.module_id).await.unwrap());
     assert!(registry.delete_satellite(&local.module_id).await.is_err());
-    assert!(registry.set_disabled(&local.module_id, true).await.is_err());
     let enrolled: Vec<String> = sqlx::query_scalar("SELECT module_id FROM satellites")
         .fetch_all(&db)
         .await
@@ -41,6 +40,99 @@ async fn local_transcoder_is_visible_without_enrollment_and_cannot_be_removed() 
     // Returning to a plain hub does not leave a stale transcoder behind.
     let plain = Registry::new(db, Default::default(), catalogue);
     assert_eq!(plain.satellites_overview().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn disabling_local_video_preserves_lightweight_placement_and_survives_restart() {
+    use kahawai_hub::registry::PlacementNeed;
+
+    let dir = tempfile::tempdir().unwrap();
+    let db = kahawai_hub::db::open(dir.path()).await.unwrap();
+    let catalogue = kahawai_mediadb::Store::in_memory().await.unwrap();
+    let registry = Registry::new(db.clone(), Default::default(), catalogue.clone())
+        .with_local_video_executor(true);
+    let video = PlacementNeed {
+        encode_video: true,
+        video_codec: "h264".into(),
+        ..Default::default()
+    };
+    assert!(registry.place(&video).available);
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, true)
+        .await
+        .unwrap();
+    assert!(registry.local_video_executor_present());
+    assert!(!registry.local_video_executor_enabled());
+    assert!(!registry.place(&video).available);
+    for need in [
+        PlacementNeed::default(),
+        PlacementNeed {
+            encode_audio: true,
+            ..Default::default()
+        },
+    ] {
+        let placement = registry.place(&need);
+        assert!(placement.available);
+        assert!(
+            placement.target.is_none(),
+            "remux and audio-only work must stay local"
+        );
+    }
+    let local = registry.satellites_overview().await.unwrap().pop().unwrap();
+    assert!(local.connected && local.disabled);
+    assert!(registry.delete_satellite(&local.module_id).await.is_err());
+    assert!(
+        registry
+            .satellites_overview()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .disabled
+    );
+
+    // Re-open the on-disk database and use the real startup loader.
+    let restored = Registry::new(
+        kahawai_hub::db::open(dir.path()).await.unwrap(),
+        Default::default(),
+        catalogue.clone(),
+    )
+    .with_local_video_executor(true);
+    restored.load_allowlist().await.unwrap();
+    assert!(!restored.local_video_executor_enabled());
+    restored
+        .set_disabled(Registry::LOCAL_TRANSCODER, false)
+        .await
+        .unwrap();
+    assert!(restored.local_video_executor_enabled());
+    assert!(restored.place(&video).available);
+    assert!(
+        !restored
+            .satellites_overview()
+            .await
+            .unwrap()
+            .pop()
+            .unwrap()
+            .disabled
+    );
+    let restored_again = Registry::new(
+        kahawai_hub::db::open(dir.path()).await.unwrap(),
+        Default::default(),
+        catalogue.clone(),
+    )
+    .with_local_video_executor(true);
+    restored_again.load_allowlist().await.unwrap();
+    assert!(restored_again.local_video_executor_enabled());
+
+    // Startup config is structural; admin cannot enable an executor it omitted.
+    let plain = Registry::new(db, Default::default(), catalogue);
+    assert!(
+        plain
+            .set_disabled(Registry::LOCAL_TRANSCODER, false)
+            .await
+            .is_err()
+    );
+    assert!(!plain.local_video_executor_enabled());
 }
 
 #[tokio::test]
@@ -73,6 +165,16 @@ async fn local_measurements_are_projected_and_quarantined_encoders_are_excluded(
     assert_eq!(caps.encoders[0].element, *element);
     assert_eq!(caps.encoders[0].speed_1080, Some(6.0));
     assert_eq!(caps.encoders[0].speed_2160, Some(2.0));
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, true)
+        .await
+        .unwrap();
+    let disabled = registry.satellites_overview().await.unwrap().pop().unwrap();
+    assert!(disabled.disabled);
+    assert_eq!(
+        disabled.capabilities.unwrap().encoders[0].speed_1080,
+        Some(6.0)
+    );
     bench.crashes.insert((*element).into(), 1);
     registry.set_local_bench(bench);
     let row = registry.satellites_overview().await.unwrap().pop().unwrap();

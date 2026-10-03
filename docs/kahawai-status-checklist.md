@@ -835,7 +835,7 @@ audio/video byte separation for manual playback testing; see
       real.
 - [x] HUB-36 Pace-aware video placement, on measured capability. Full
       external/AIO transcoders benchmark video encoders and GL tone-map;
-      plain hub does neither. Admin's fleet includes a read-only built-in
+      plain hub does neither. Admin's fleet includes an undeletable built-in
       transcoder entry with the AIO's benchmarks and observed session pace,
       without enrollment.
       Only successful current-fingerprint benchmarks
@@ -853,8 +853,11 @@ audio/video byte separation for manual playback testing; see
 
 - [x] TC-1 Capability probe reported on registration
 - [x] TC-2 Capability + inverse-load placement; admin enable/disable for
-      enrolled transcoders. The AIO full local video executor is instead a
-      structural `[all_in_one] transcoder` setting (default true): false
+      enrolled and AIO built-in transcoders. The built-in toggle is persisted
+      in hub settings, stops new local video work and retains local remux/audio
+      execution; existing video sessions continue. The AIO full local video
+      executor has a structural `[all_in_one] transcoder` setting (default true):
+      false
       suppresses its video-encoder dry-runs, benchmark and video placement
       while external transcoders remain schedulable. Plain hub still performs
       remux and audio-only transcode and never enters video placement

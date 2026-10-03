@@ -129,11 +129,19 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
     )
     .unwrap();
     let db = kahawai_hub::db::open_in_memory().await.unwrap();
-    let registry = Arc::new(Registry::new(
-        db.clone(),
-        allowed.clone(),
-        kahawai_mediadb::Store::in_memory().await.unwrap(),
-    ));
+    let registry = Arc::new(
+        Registry::new(
+            db.clone(),
+            allowed.clone(),
+            kahawai_mediadb::Store::in_memory().await.unwrap(),
+        )
+        .with_local_video_executor(true),
+    );
+    registry
+        .set_disabled(Registry::LOCAL_TRANSCODER, true)
+        .await
+        .unwrap();
+    assert!(!registry.local_video_executor_enabled());
     let sessions = Arc::new(kahawai_hub::sessions::Sessions::new(
         tempfile::tempdir().unwrap().keep(),
     ));
@@ -375,6 +383,31 @@ async fn keeps_audio_encode_local_and_dispatches_video_encode() {
     assert_eq!(local["streams"]["cost"], "audio_encode");
     assert_eq!(local["streams"]["audio"], "flac → aac (transcoded)");
     let local_id = local["session_id"].as_str().unwrap();
+    let segment = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let response = api
+                .clone()
+                .oneshot(get(format!(
+                    "/api/v1/playback/sessions/{local_id}/segment00000.ts"
+                )))
+                .await
+                .unwrap();
+            if response.status() == StatusCode::OK {
+                let bytes = body_bytes(response).await;
+                if !bytes.is_empty() {
+                    return bytes;
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
+    .await
+    .expect("local audio encode produced no segment while video was disabled");
+    assert!(segment.len() > 10_000);
+    assert_eq!(
+        segment[0], 0x47,
+        "local audio encode must produce actual TS bytes"
+    );
     let resp = api
         .clone()
         .oneshot(

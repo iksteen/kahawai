@@ -172,7 +172,7 @@ afterEach(() => {
 })
 
 describe('the fleet', () => {
-  test('shows built-in encoder measurements without Delete or Disable controls', async () => {
+  test('shows built-in measurements and allows draining without offering Delete', async () => {
     vi.mocked(api.adminSatellites).mockResolvedValue({
       satellites: [
         box({
@@ -192,7 +192,13 @@ describe('the fleet', () => {
     expect(wrapper.text()).toContain('Built-in transcoder')
     expect(wrapper.text()).toContain('h264 6.0× / 2.0×')
     expect(wrapper.text()).toContain('1080|av1|h264 3.2×')
-    expect(wrapper.findAll('button').some((b) => /Delete|Disable/.test(b.text()))).toBe(false)
+    expect(wrapper.findAll('button').some((b) => /Delete/.test(b.text()))).toBe(false)
+    expect(wrapper.text()).toContain('Remuxing and audio transcoding stay local')
+    vi.mocked(api.adminSetDisabled).mockResolvedValue(undefined as never)
+    await press(wrapper, 'Disable')
+    expect(api.adminSetDisabled).toHaveBeenCalledWith('local-transcoder', { disabled: true })
+    await press(wrapper, 'Disabled — enable')
+    expect(api.adminSetDisabled).toHaveBeenLastCalledWith('local-transcoder', { disabled: false })
     expect(wrapper.text()).not.toContain(IN_PROCESS)
   })
 

@@ -219,6 +219,11 @@ impl Sessions {
         } = todo;
         let mut plan =
             (*session.plan.lock().unwrap()).context("session has no restartable pipeline")?;
+        // Draining blocks new video placements, not an existing video session's
+        // track switches. A copy/audio session cannot gain video work while drained.
+        let local_video_executor = registry.local_video_executor_enabled()
+            || (registry.local_video_executor_present()
+                && plan.video == kahawai_media::remux::StreamMode::Encode);
         session.touch();
         let want_audio = audio_track.map(|t| t as usize).unwrap_or(plan.audio_track);
         let want_video = video_track.map(|t| t as usize).unwrap_or(plan.video_track);
@@ -234,9 +239,7 @@ impl Sessions {
                     let tc = transcoder.lock().unwrap().clone();
                     registry.transcoder_reports_tonemap(&tc)
                 }
-                _ if registry.local_video_executor_enabled() => {
-                    kahawai_media::remux::tonemap_available()
-                }
+                _ if local_video_executor => kahawai_media::remux::tonemap_available(),
                 _ => false,
             };
             // Mirrors the start path (connected counts: the mediahost
@@ -260,7 +263,7 @@ impl Sessions {
                     (video, audio.clone(), audio)
                 }
                 _ => {
-                    let video = if registry.local_video_executor_enabled() {
+                    let video = if local_video_executor {
                         local_video_encoder_names(registry)
                     } else {
                         Vec::new()
@@ -332,9 +335,7 @@ impl Sessions {
                                 let tc = transcoder.lock().unwrap().clone();
                                 registry.transcoder_reports_ass_burn(&tc)
                             }
-                            _ if registry.local_video_executor_enabled() => {
-                                kahawai_media::remux::ass_burn_available()
-                            }
+                            _ if local_video_executor => kahawai_media::remux::ass_burn_available(),
                             _ => false,
                         },
                         ..session.ass.clone()

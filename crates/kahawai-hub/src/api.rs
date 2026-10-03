@@ -2241,7 +2241,7 @@ struct SetDisabled {
         (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
         (status = 401, body = ApiErrorBody),
         (status = 403, body = ApiErrorBody),
-        (status = 409, description = "In-process modules cannot be drained as satellites", body = ApiErrorBody),
+        (status = 409, description = "The in-process mediahost cannot be drained, or the hub has no built-in video transcoder", body = ApiErrorBody),
         (status = 500, body = ApiErrorBody),
         (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
         (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
@@ -2253,10 +2253,17 @@ async fn admin_set_disabled(
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
-    if state.registry.is_in_process(&id).await.map_err(internal)? {
+    if id == crate::registry::Registry::LOCAL_TRANSCODER {
+        if !state.registry.local_video_executor_present() {
+            return Err(ApiError::new(
+                ErrorCode::Conflict,
+                "this hub has no built-in video transcoder",
+            ));
+        }
+    } else if state.registry.is_in_process(&id).await.map_err(internal)? {
         return Err(ApiError::new(
             ErrorCode::Conflict,
-            "in-process modules are configured on the hub, not drained as satellites",
+            "the in-process mediahost cannot be drained",
         ));
     }
     state

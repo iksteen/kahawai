@@ -89,10 +89,13 @@ ordering and backpressure identical between deployment modes.
 
 `[all_in_one] transcoder = false` makes the full local video executor
 structurally unavailable before startup video-encoder dry-runs, capability
-benchmarking and placement. It deliberately does not create a synthetic
-satellite: the admin satellite toggle is a live drain for an enrolled remote
-worker, whereas this setting describes what the AIO machine may run across
-restarts. Hub-local remux and audio-only transcode workers remain available
+benchmarking and placement. When configured, the executor appears in admin as
+a virtual built-in transcoder, without enrollment, a certificate or a control
+link. Its Disable toggle persists a video drain in hub settings: new sessions
+cannot negotiate or place local video work, while existing video sessions
+retain their executor for seeks and track switches. The row keeps its measured
+capabilities and can be re-enabled, but cannot be deleted. Hub-local remux and
+audio-only transcode workers remain available
 (AR-10), and external transcoders continue to enroll and receive video encode
 work. Plain `hub` has this same lightweight worker boundary unconditionally:
 it never probes video encoders or competes for video placement.

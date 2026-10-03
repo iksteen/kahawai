@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "ebc1f98bb57aaecf7b7886e9e8601c3c374145fe97cfd12507f2caa63856b629",
+  "x-kahawai-source-sha256": "495164a3258043edb410356486f72ac0402b25ba13448e1517a2d464a4f51516",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -3008,7 +3008,7 @@
             }
           },
           "409": {
-            "description": "In-process modules cannot be drained as satellites",
+            "description": "The in-process mediahost cannot be drained, or the hub has no built-in video transcoder",
             "headers": {
               "X-Request-Id": {
                 "schema": {
