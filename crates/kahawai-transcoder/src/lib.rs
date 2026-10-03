@@ -70,9 +70,11 @@ fn bench_cache(state_dir: &Path) -> std::path::PathBuf {
     state_dir.join("benchmarks.json")
 }
 
-/// TC-1 capability probe: only benchmark-proven work is advertised. A cache
-/// miss connects with no encoders, then the background children publish each
-/// capability after the current fingerprint has measured it successfully.
+/// TC-1 capability probe: every encoder must pass its startup dry run. Video
+/// encoders additionally need a successful current-fingerprint benchmark;
+/// background children fill missing measurements. AAC/Opus are advertised
+/// immediately: the resolution-based benchmarks measure only video, so they
+/// cannot qualify an audio encoder.
 fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityReport> {
     let bench = kahawai_media::bench::load(&bench_cache(state_dir)).unwrap_or_default();
     let available = kahawai_media::remux::encoder_capabilities();
@@ -82,6 +84,9 @@ fn probe_capabilities(max_sessions: u32, state_dir: &Path) -> Result<CapabilityR
     let encoders: Vec<EncoderCap> = available
         .into_iter()
         .filter(|(codec, element, _)| {
+            if matches!(*codec, "aac" | "opus") {
+                return true; // Already dry-run-verified by encoder_capabilities().
+            }
             let ready = bench.encoder_ready(element);
             if !ready {
                 tracing::warn!(
@@ -405,10 +410,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn serving_capabilities_require_successful_current_benchmarks() {
+    fn video_capabilities_require_successful_current_benchmarks() {
         let available = kahawai_media::remux::encoder_capabilities();
-        let Some((codec, element, _)) = available.first().copied() else {
-            eprintln!("skip: no verified encoder on this test host");
+        let Some((codec, element, _)) = available
+            .iter()
+            .find(|(codec, _, _)| matches!(*codec, "h264" | "hevc" | "av1"))
+            .copied()
+        else {
+            eprintln!("skip: no verified video encoder on this test host");
             return;
         };
         let dir = tempfile::tempdir().unwrap();
@@ -431,12 +440,14 @@ mod tests {
         kahawai_media::bench::store(&cache, &measured);
 
         let report = probe_capabilities(1, dir.path()).unwrap();
-        assert_eq!(report.encoders.len(), 1);
+        let video: Vec<_> = report
+            .encoders
+            .iter()
+            .filter(|encoder| matches!(encoder.codec.as_str(), "h264" | "hevc" | "av1"))
+            .collect();
+        assert_eq!(video.len(), 1);
         assert_eq!(
-            (
-                report.encoders[0].codec.as_str(),
-                report.encoders[0].element.as_str()
-            ),
+            (video[0].codec.as_str(), video[0].element.as_str()),
             (codec, element)
         );
 
@@ -457,5 +468,32 @@ mod tests {
         // reports the GL elements as available.
         kahawai_media::bench::record_crash(&cache, &kahawai_media::bench::BenchmarkJob::ToneMap);
         assert!(!probe_capabilities(1, dir.path()).unwrap().tonemap);
+    }
+
+    #[test]
+    fn verified_audio_is_advertised_without_video_benchmarks() {
+        let available = kahawai_media::remux::encoder_capabilities();
+        let audio: Vec<_> = available
+            .iter()
+            .filter(|(codec, _, _)| matches!(*codec, "aac" | "opus"))
+            .collect();
+        if audio.is_empty() {
+            eprintln!("skip: no verified audio encoder on this test host");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!bench_cache(dir.path()).exists());
+
+        let report = probe_capabilities(2, dir.path()).unwrap();
+        assert_eq!(report.max_sessions, 2);
+        assert!(!report.tonemap, "unmeasured tone-map remained advertised");
+        assert_eq!(report.encoders.len(), audio.len());
+        for (encoder, (codec, element, hardware)) in report.encoders.iter().zip(audio) {
+            assert_eq!(encoder.codec, *codec);
+            assert_eq!(encoder.element, *element);
+            assert_eq!(encoder.hardware, *hardware);
+            assert_eq!(encoder.speed_1080, None);
+            assert_eq!(encoder.speed_2160, None);
+        }
     }
 }

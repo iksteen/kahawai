@@ -843,8 +843,10 @@ audio/video byte separation for manual playback testing; see
       plain hub does neither. Admin's fleet includes an undeletable built-in
       transcoder entry with the AIO's benchmarks and observed session pace,
       without enrollment.
-      Only successful current-fingerprint benchmarks
-      become serving capabilities; a crashed child durably quarantines its
+      Video encoders and tone-map become serving capabilities only after
+      successful current-fingerprint benchmarks. AAC/Opus are advertised after
+      their startup dry runs; the resolution-based benchmarks do not measure
+      audio. A crashed child durably quarantines its
       capability until explicit successful remeasurement or fingerprint
       invalidation. Workers meter the un-throttled phase of real sessions into
       a persisted per-(box, work class) EWMA; placement ranks on it and states
