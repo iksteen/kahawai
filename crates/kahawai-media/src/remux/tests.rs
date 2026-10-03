@@ -2187,7 +2187,7 @@ fn tonemap_encode_outputs_sdr_tagged_video() {
         audio_track: 0,
         video_track: 0,
         video_kbps: Some(500),
-        max_bit_depth: None,
+        max_bit_depth: Some(8),
         max_height: None,
         max_channels: None,
         tone_map: true,
@@ -2218,6 +2218,11 @@ fn tonemap_encode_outputs_sdr_tagged_video() {
         .find(|p| p.extension().is_some_and(|x| x == "ts"))
         .expect("no segment produced");
     let seg_info = crate::discover(&seg, Duration::from_secs(30)).unwrap();
+    assert_eq!(
+        seg_info.video[0].bit_depth,
+        Some(8),
+        "depth ceiling must agree with tone-map output"
+    );
     assert_eq!(
         seg_info.video[0].hdr, None,
         "output still tagged HDR — the colorimetry relabel failed"

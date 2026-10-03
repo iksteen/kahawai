@@ -535,7 +535,12 @@ audio/video byte separation for manual playback testing; see
       tone-map (15a), OCR (32c), burn-in (32b), encode targets (15b)
 - [x] HUB-15a HDR→SDR tone-mapping tier: GL shader (BT.2390 EETF,
       scene-adaptive peak probe, libplacebo-matched display mapping),
-      TC-1 `tonemap` report, doctor row, placement preference, verdict
+      TC-1 `tonemap` report, doctor row, placement preference, verdict.
+      Fixed eight-bit output selected from the encoder: NV12 for NVIDIA,
+      VA and VideoToolbox; I420 for software targets requiring it.
+      macOS uses offscreen CGL contexts without a desktop session; probes,
+      benchmarks and workers share setup. Requested mapping fails loudly
+      if unavailable; the encoded depth ceiling is still verified.
 - [x] HUB-15b Multiple encode targets: ubiquity ladders h264 → hevc →
       av1 / aac → opus, picked per session from client profile ∩ the
       placed box's dry-run-verified encoder set (codec is a HARD

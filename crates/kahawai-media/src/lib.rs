@@ -7,6 +7,7 @@ pub mod burnin;
 pub mod doctor;
 pub mod facts;
 pub mod fmp4sink;
+mod gl;
 pub mod imagesubs;
 pub mod loudness;
 pub mod negotiate;

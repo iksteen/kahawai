@@ -333,62 +333,46 @@ pub(super) fn open_encoder_on_keyframe(pad: &gst::Pad) {
     );
 }
 
-/// The GL tone-map segment: upload → RGBA → PQ→SDR shader → back to
-/// system memory, then capssetter rewrites the colorimetry tag to
-/// bt709 so the encoder's VUI tells the player the truth (the shader
-/// changed the pixels; nothing else knows to change the label).
-/// The one output format to pin for `encoder`: the first of
-/// [`TONEMAP_OUT_FORMATS`] its sink pad actually accepts.
-///
-/// A LIST is not a preference order. Offering `{NV12, I420}` to
-/// `vah264enc` — which takes NV12 and not I420 — resolves to I420 and
-/// the pipeline dies with not-negotiated. Measured on the J5005:
-///
-/// ```text
-///   {NV12,I420}   not-negotiated
-///   NV12          OK
-///   I420          FAILED
-/// ```
-///
-/// So the pin has to name the format the DOWNSTREAM ENCODER takes,
-/// which means knowing which encoder that is. Falls back to the whole
-/// list when the element cannot be probed — no worse than before, and
-/// the only case where a list is honest.
+/// One fixed eight-bit output format for tone mapping. A list does not
+/// express preference: GL can fixate I420 while a depth filter pins NV12,
+/// with no
+/// converter between them on VA/VideoToolbox paths. NVIDIA's tone-map
+/// output must stay NV12; I420 is the fallback for software encoders
+/// whose templates reject NV12. The encoder-free benchmark uses NV12.
 pub(crate) fn tonemap_out_caps(encoder: &str) -> gst::Caps {
-    let accepted: Vec<&str> = gst::ElementFactory::find(encoder)
-        .map(|f| {
-            let sinks: Vec<gst::Caps> = f
-                .static_pad_templates()
-                .into_iter()
-                .filter(|t| t.direction() == gst::PadDirection::Sink)
-                .map(|t| t.caps())
-                .collect();
-            TONEMAP_OUT_FORMATS
-                .iter()
-                .copied()
-                .filter(|fmt| {
-                    // Feature-agnostic: hardware templates publish under
-                    // memory:VAMemory/GLMemory/CUDAMemory, and it is the
-                    // FORMAT agreement being tested, not the memory space.
-                    let mut want = gst::Caps::builder("video/x-raw")
-                        .field("format", *fmt)
-                        .build();
-                    want.get_mut()
-                        .unwrap()
-                        .set_features(0, Some(gst::CapsFeatures::new_any()));
-                    sinks.iter().any(|c| !c.intersect(&want).is_empty())
-                })
-                .collect()
-        })
-        .unwrap_or_default();
-    let formats = if accepted.is_empty() {
-        TONEMAP_OUT_FORMATS.to_vec()
-    } else {
-        accepted
+    if encoder.is_empty() {
+        return gst::Caps::builder("video/x-raw")
+            .field("format", "NV12")
+            .build();
+    }
+    let Some(factory) = gst::ElementFactory::find(encoder) else {
+        return gst::Caps::new_empty();
     };
-    gst::Caps::builder("video/x-raw")
-        .field("format", gst::List::new(formats))
-        .build()
+    let sinks: Vec<_> = factory
+        .static_pad_templates()
+        .into_iter()
+        .filter(|t| t.direction() == gst::PadDirection::Sink)
+        .map(|t| t.caps())
+        .collect();
+    let formats: &[&str] = if encoder.starts_with("nv") {
+        &["NV12"]
+    } else {
+        &TONEMAP_OUT_FORMATS
+    };
+    formats
+        .iter()
+        .find_map(|format| {
+            let want = gst::Caps::builder("video/x-raw")
+                .any_features()
+                .field("format", *format)
+                .build();
+            sinks.iter().any(|caps| caps.can_intersect(&want)).then(|| {
+                gst::Caps::builder("video/x-raw")
+                    .field("format", *format)
+                    .build()
+            })
+        })
+        .unwrap_or_else(gst::Caps::new_empty)
 }
 
 pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
@@ -410,23 +394,9 @@ pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
         .unwrap();
     let from_rgba = gst::ElementFactory::make("glcolorconvert").build().unwrap();
     let download = gst::ElementFactory::make("gldownload").build().unwrap();
-    // Pinned HERE, GPU-side: without it glcolorconvert stays RGBA and a
-    // VA encoder with no converter between (the non-CUDA path has none
-    // after this segment) refuses system-memory RGBA — observed as
-    // not-negotiated on the J5005.
-    //
-    // A LIST, not NV12 alone. "Every encoder we place takes NV12" was
-    // written for the hardware ones and is false for openh264enc, whose
-    // sink template is I420 and nothing else: pinning NV12 left the
-    // segment's trailing capssetter unlinkable to it, and because the
-    // chain is linked from a pad-added callback the `unwrap` on that
-    // link became a non-unwinding panic — SIGABRT, no session error, on
-    // every HDR title a software-encoder box was asked to tone-map
-    // (field report 2026-08-01; the user's workaround was forcing HDR on
-    // in the browser, which skips this segment entirely). NV12 stays
-    // first so hardware still negotiates it; I420 is what makes the
-    // software path exist at all.
-    let nv12 = gst::ElementFactory::make("capsfilter")
+    // The relabel below does not convert pixels; constrain GL's output
+    // here. This fixed eight-bit pin also enforces the depth ceiling.
+    let output_format = gst::ElementFactory::make("capsfilter")
         .property("caps", tonemap_out_caps(encoder))
         .build()
         .unwrap();
@@ -441,7 +411,14 @@ pub(crate) fn tonemap_segment(encoder: &str) -> Vec<gst::Element> {
         .unwrap();
     attach_peak_probe(&upload, &shader);
     vec![
-        upload, to_rgba, rgba, shader, from_rgba, download, nv12, relabel,
+        upload,
+        to_rgba,
+        rgba,
+        shader,
+        from_rgba,
+        download,
+        output_format,
+        relabel,
     ]
 }
 
@@ -831,13 +808,19 @@ pub(super) fn build_video_encode_chain(
     // segment's output pin comes from this encoder, so that is the only
     // question with an answer (AR-13a).
     let tonemap: Vec<gst::Element> = if tone_map && encoder.is_some_and(tonemap_into) {
+        tracing::info!(encoder = enc_name, raw_caps = %tonemap_out_caps(enc_name), "tone-map output selected");
         tonemap_segment(encoder.unwrap_or_default())
     } else {
         if tone_map {
-            tracing::warn!(
-                encoder = encoder.unwrap_or("-"),
-                "tone-map requested but the GL segment cannot feed this encoder — encoding as-is"
+            let _ = pipe.post_message(
+                gst::message::Error::builder(
+                    gst::StreamError::Format,
+                    &format!("tone-map requested but unavailable for {enc_name}"),
+                )
+                .src(pipe)
+                .build(),
             );
+            return;
         }
         vec![]
     };
@@ -897,8 +880,12 @@ pub(super) fn build_video_encode_chain(
     // on `video_sink` and never on `text_sink` (application/x-ass).
     chain.extend(ass_el.iter());
     chain.extend(converters[scale_at..].iter());
+    // The tone-map segment already pins one eight-bit format. A second
+    // depth pin adds no restriction and, after CUDA upload, must not force
+    // system memory. Keep the depth filter only for the unmapped path.
+    let raw_depth_limit = max_bit_depth.filter(|_| tonemap.is_empty());
     let depth_filter =
-        max_bit_depth.map(|_| gst::ElementFactory::make("capsfilter").build().unwrap());
+        raw_depth_limit.map(|_| gst::ElementFactory::make("capsfilter").build().unwrap());
     chain.extend(depth_filter.iter());
     chain.push(&enc);
     chain.push(&parse);
@@ -977,15 +964,6 @@ pub(super) fn build_video_encode_chain(
         tracing::warn!(error = %e, "video encode chain → muxer link failed");
     }
     let convert_sink = chain[0].static_pad("sink").unwrap();
-    // Tone mapping already produces eight-bit NV12/I420. Do not expand it
-    // back to ten bits merely because the decoder originally supplied ten.
-    let raw_depth_limit = max_bit_depth.map(|limit| {
-        if tonemap.is_empty() {
-            limit
-        } else {
-            limit.min(8)
-        }
-    });
     let weak_pipe = pipe.downgrade();
     decode.connect_pad_added(move |_, pad| {
         if convert_sink.is_linked() {

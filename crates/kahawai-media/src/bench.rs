@@ -877,6 +877,15 @@ fn count_through_capped(
 /// memory (decode → videoconvert → glupload).
 fn run_counting(chain: &[gst::Element], w: i32, h: i32, format: &str) -> Option<f32> {
     let pipe = gst::Pipeline::new();
+    if chain.iter().any(|element| {
+        element
+            .factory()
+            .is_some_and(|factory| factory.name() == "glshader")
+    }) && let Err(error) = crate::gl::configure_pipeline(&pipe)
+    {
+        tracing::warn!(%error, "tone-map benchmark graphics initialization failed");
+        return None;
+    }
     // Every format here is 4:2:0 (1.5 bytes/pixel); 10-bit doubles it.
     // A wrong size only means a differently-shaped noise frame, which
     // the encoder is equally happy to compress.

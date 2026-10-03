@@ -49,8 +49,10 @@ MAC_CONFIG="$HOME/.config/kahawai/kahawai.toml"
 # auto-allowed by Local Network privacy (TN3179 — the self-signed
 # identity can NOT hold that grant; only Apple-issued ones are
 # signature-tracked, everything else keys on the per-build LC_UUID) and
-# start at boot without a login session. VideoToolbox hw encode and the
-# GL tone-map segment both verified under the daemon (2026-07-31).
+# start at boot without a login session. VideoToolbox hw encode is
+# headless-safe; the GL tone-map segment uses explicit offscreen CGL
+# contexts (no desktop session or AppKit event loop required). See
+# kahawai-tonemap-check.py.
 # Sudo happens here, once; deploys just pkill and KeepAlive respawns.
 # The patched GStreamer is a keg-only Homebrew formula, built from
 # HomebrewFormula/kahawai-gstreamer.rb — see that file for why the

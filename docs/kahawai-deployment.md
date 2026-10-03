@@ -416,7 +416,11 @@ rebuild, rename and re-sign — belt. The braces, live since 2026-07-31:
 the transcoder is a launchd **daemon** (system domain, `UserName` the
 deploy user), which is auto-allowed by design and starts at boot with
 no login session. VideoToolbox hw encode and the GL tone-map segment
-both dry-run-verified under the daemon; `kahawai-mac.sh setup` installs
+use the same dry runs in workers and daemons. Tone mapping creates an
+offline CGL share context and an explicit offscreen GL thread/window,
+so it requires neither a desktop login nor an AppKit event loop.
+`scripts/kahawai-tonemap-check.py` verifies the real worker, depth ceiling
+and SDR output against a short PQ clip. `kahawai-mac.sh setup` installs
 it (the one sudo step), and deploys stay sudo-free — they kill the
 process and `KeepAlive` respawns it. The self-signed identity stays:
 it keeps the signature itself stable, which macOS wants for everything

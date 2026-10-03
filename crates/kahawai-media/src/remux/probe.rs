@@ -736,6 +736,10 @@ pub(super) fn probe_tonemap_into(encoder: &str) -> bool {
         return false;
     }
     let pipe = gst::Pipeline::new();
+    if let Err(error) = crate::gl::configure_pipeline(&pipe) {
+        tracing::warn!(%error, "tone-map graphics initialization failed");
+        return false;
+    }
     let Ok(src) = gst::ElementFactory::make("videotestsrc")
         .property("num-buffers", 5i32)
         .build()

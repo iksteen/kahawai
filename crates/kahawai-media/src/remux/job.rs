@@ -187,6 +187,9 @@ pub fn start_parts(
         .then(|| Arc::new(Mutex::new(AssBurnLink::default())));
 
     let pipeline = gst::Pipeline::new();
+    if plan.tone_map {
+        crate::gl::configure_pipeline(&pipeline).context("initialize tone-map graphics context")?;
+    }
     if let (Some(path), Some(link)) = (burn_ass_file, &ass_link)
         && let Some(source) = load_ass_file(path)
     {
@@ -773,26 +776,13 @@ mod concat_spike {
                 "{name} accepts none of what the tone-map segment would pin \
                  ({pinned:?}). Its sink caps: {sink:?}"
             );
-            // And every format in the pin must suit it, since the one
-            // negotiation picks is not ours to choose.
-            let Some(list) = pinned
+            let format = pinned
                 .structure(0)
-                .and_then(|st| st.get::<gst::List>("format").ok())
-            else {
-                panic!("{name}: pinned caps carry no format list");
-            };
-            for fmt in list.iter() {
-                let fmt = fmt.get::<String>().unwrap();
-                let mut one = gst::Caps::builder("video/x-raw")
-                    .field("format", &fmt)
-                    .build();
-                one.get_mut()
-                    .unwrap()
-                    .set_features(0, Some(gst::CapsFeatures::new_any()));
-                assert!(
-                    sink.iter().any(|c| !c.intersect(&one).is_empty()),
-                    "{name} would be offered {fmt}, which it does not accept"
-                );
+                .unwrap()
+                .get::<String>("format")
+                .expect("tone mapping must pin one format, not a list");
+            if name.starts_with("nv") {
+                assert_eq!(format, "NV12", "NVIDIA tone mapping requires NV12");
             }
             checked += 1;
         }
@@ -841,11 +831,12 @@ mod concat_spike {
                 continue;
             }
             let pinned = tonemap_out_caps(enc);
-            let list = pinned
+            let format = pinned
                 .structure(0)
-                .and_then(|st| st.get::<gst::List>("format").ok())
-                .expect("pinned caps carry a format list");
-            assert!(!list.is_empty(), "{enc}: nothing pinned");
+                .unwrap()
+                .get::<String>("format")
+                .expect("verified target must pin one raw format");
+            assert!(["NV12", "I420"].contains(&format.as_str()));
         }
     }
 
