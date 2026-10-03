@@ -2196,7 +2196,7 @@ async fn admin_delete_satellite(
     if state.registry.is_in_process(&id).await.map_err(internal)? {
         return Err(ApiError::new(
             ErrorCode::Conflict,
-            "the in-process mediahost cannot be deleted: it is the hub itself",
+            "in-process modules cannot be deleted: they are part of the hub itself",
         ));
     }
     let ended = state.sessions.end_for_module(&id).await;
@@ -2241,6 +2241,7 @@ struct SetDisabled {
         (status = 400, description = "The request body is not the JSON this route takes", body = ApiErrorBody),
         (status = 401, body = ApiErrorBody),
         (status = 403, body = ApiErrorBody),
+        (status = 409, description = "In-process modules cannot be drained as satellites", body = ApiErrorBody),
         (status = 500, body = ApiErrorBody),
         (status = 415, description = "The body needs Content-Type: application/json", body = ApiErrorBody),
         (status = 413, description = "The body is past the hub's buffer limit", body = ApiErrorBody),
@@ -2252,6 +2253,12 @@ async fn admin_set_disabled(
     ApiPath(id): ApiPath<String>,
     ApiJson(body): ApiJson<SetDisabled>,
 ) -> Result<StatusCode, ApiError> {
+    if state.registry.is_in_process(&id).await.map_err(internal)? {
+        return Err(ApiError::new(
+            ErrorCode::Conflict,
+            "in-process modules are configured on the hub, not drained as satellites",
+        ));
+    }
     state
         .registry
         .set_disabled(&id, body.disabled)

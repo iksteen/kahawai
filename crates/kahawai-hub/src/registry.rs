@@ -154,7 +154,7 @@ pub struct Registry {
     /// HUB-36: what AIO's optional full local transcoder measured about
     /// itself. Plain hub never fills this: its local worker is limited to
     /// remux and audio-only transcode, neither of which needs video pace.
-    local_bench: Mutex<Option<kahawai_media::bench::BenchResults>>,
+    local_bench: Mutex<Option<LocalBench>>,
     /// Structural startup choice for FULL local video execution. The hub's
     /// lightweight remux/audio worker is always available; only AIO may add
     /// video encode, tone-map and subtitle burn-in here.
@@ -249,6 +249,13 @@ impl From<&TranscoderCapabilities> for BoxCaps {
             tonemap_speed_2160: c.tonemap_speed_2160,
         }
     }
+}
+
+/// One published local benchmark and its admin capability projection. Probes
+/// run when measurements are published, never on admin/health requests.
+struct LocalBench {
+    measured: kahawai_media::bench::BenchResults,
+    capabilities: TranscoderCapabilities,
 }
 
 #[derive(Debug, Clone, Serialize, ToSchema)]
@@ -428,6 +435,10 @@ impl Registry {
     /// there is no TLS identity to pin, admit or revoke. Anything that
     /// means "enrolled satellite" must test for this first.
     pub const IN_PROCESS: &str = "in-process";
+
+    /// Virtual admin identity, distinct from the local mediahost and the
+    /// placement pace key (`local`). Never enrolled or given a control link.
+    pub const LOCAL_TRANSCODER: &str = "local-transcoder";
 
     pub async fn ensure_local_satellite(&self, module_id: &str, name: &str) -> Result<()> {
         sqlx::query(
@@ -1037,12 +1048,46 @@ impl Registry {
 
     /// HUB-36: publish what AIO's full local transcoder measured.
     pub fn set_local_bench(&self, b: kahawai_media::bench::BenchResults) {
-        *self.local_bench.lock().unwrap() = Some(b);
+        let capabilities = {
+            let tonemap = b.tonemap_ready() && kahawai_media::remux::tonemap_available();
+            let tm = b.tonemap.unwrap_or_default();
+            TranscoderCapabilities {
+                encoders: kahawai_media::remux::encoder_capabilities()
+                    .into_iter()
+                    .filter(|(_, element, _)| b.encoder_ready(element))
+                    .map(|(codec, element, hardware)| {
+                        let speeds = b.encoders[element];
+                        EncoderCapability {
+                            codec: codec.into(),
+                            element: element.into(),
+                            hardware,
+                            speed_1080: speeds.s1080,
+                            speed_2160: speeds.s2160,
+                        }
+                    })
+                    .collect(),
+                // Local execution has no satellite slot limit.
+                max_sessions: 0,
+                decode_caps: kahawai_media::remux::decoder_caps_names(),
+                tonemap,
+                ass_burn: kahawai_media::remux::ass_burn_available(),
+                tonemap_speed_1080: tonemap.then_some(tm.s1080).flatten(),
+                tonemap_speed_2160: tonemap.then_some(tm.s2160).flatten(),
+            }
+        };
+        *self.local_bench.lock().unwrap() = Some(LocalBench {
+            measured: b,
+            capabilities,
+        });
     }
 
     /// AIO's local video speeds, if its benchmark has landed.
     pub fn local_bench(&self) -> Option<kahawai_media::bench::BenchResults> {
-        self.local_bench.lock().unwrap().clone()
+        self.local_bench
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|local| local.measured.clone())
     }
 
     /// HUB-36: a transcoder's measured speed for one codec at a source
@@ -1255,6 +1300,10 @@ impl Registry {
     /// Admin toggle: a disabled satellite is skipped by placement.
     /// Persisted — a drained box must not rejoin because the hub bounced.
     pub async fn set_disabled(&self, module_id: &str, disabled: bool) -> Result<()> {
+        anyhow::ensure!(
+            module_id != Self::LOCAL_TRANSCODER,
+            "the built-in transcoder is configured on the hub, not drained as a satellite"
+        );
         sqlx::query("UPDATE satellites SET disabled = ? WHERE module_id = ?")
             .bind(disabled as i64)
             .bind(module_id)
@@ -1287,7 +1336,12 @@ impl Registry {
         let disabled = self.disabled.lock().unwrap();
         let pace = self.tc_pace.lock().unwrap().clone();
         let link_rate = self.tc_link_rate.lock().unwrap();
-        let local_bench = self.local_bench.lock().unwrap().clone();
+        let local_bench = self
+            .local_bench
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|local| local.measured.clone());
         let boxes = caps
             .iter()
             .filter_map(|(id, c)| {
@@ -1354,10 +1408,12 @@ impl Registry {
         })
     }
 
-    /// Enrolled satellites (DB) merged with live connection state.
-    /// Is this the hub's own in-process mediahost (AR-5)? Callers that
+    /// Is this an in-process hub module (AR-5)? Callers that
     /// mean "an enrolled satellite" ask this before acting.
     pub async fn is_in_process(&self, module_id: &str) -> Result<bool> {
+        if module_id == Self::LOCAL_TRANSCODER {
+            return Ok(true);
+        }
         let fp: Option<String> =
             sqlx::query_scalar("SELECT cert_fingerprint FROM satellites WHERE module_id = ?")
                 .bind(module_id)
@@ -1366,6 +1422,8 @@ impl Registry {
         Ok(fp.as_deref() == Some(Self::IN_PROCESS))
     }
 
+    /// Enrolled satellites merged with live state, plus the AIO transcoder's
+    /// virtual, read-only row. It is never part of enrollment or dispatch.
     pub async fn satellites_overview(&self) -> Result<Vec<SatelliteOverview>> {
         let rows = sqlx::query(
             "SELECT module_id, module_type, name, cert_fingerprint, enrolled_at
@@ -1380,7 +1438,7 @@ impl Registry {
         // rather than in hash order.
         let pace = self.tc_pace.lock().unwrap().clone();
         let link_rates = self.tc_link_rate.lock().unwrap().clone();
-        Ok(rows
+        let mut satellites: Vec<_> = rows
             .iter()
             .map(|r| {
                 let id: String = r.get("module_id");
@@ -1408,7 +1466,38 @@ impl Registry {
                     link_bytes_per_sec: link_rates.get(&id).copied(),
                 }
             })
-            .collect())
+            .collect();
+        if self.local_video_executor_enabled {
+            let capabilities = self
+                .local_bench
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|local| local.capabilities.clone());
+            let mut observed: Vec<_> = pace
+                .iter()
+                .filter(|((module, _), _)| module == kahawai_playback::placement::LOCAL)
+                .map(|((_, class), multiple)| SatellitePace {
+                    class: class.clone(),
+                    multiple: *multiple,
+                })
+                .collect();
+            observed.sort_by(|a, b| a.class.cmp(&b.class));
+            satellites.push(SatelliteOverview {
+                module_id: Self::LOCAL_TRANSCODER.into(),
+                module_type: "transcoder".into(),
+                name: "Built-in transcoder".into(),
+                cert_fingerprint: Self::IN_PROCESS.into(),
+                enrolled_at: 0,
+                connected: true,
+                build: Some(kahawai_core::build_stamp().into()),
+                capabilities,
+                disabled: false,
+                pace: observed,
+                link_bytes_per_sec: None,
+            });
+        }
+        Ok(satellites)
     }
 
     /// Remove a satellite's mediadb catalogue, then revoke enrollment and its
@@ -1420,6 +1509,10 @@ impl Registry {
     /// composition layer can retire work owned by the deleted connection.
     /// Transient disconnects never come here.
     pub async fn delete_satellite(&self, module_id: &str) -> Result<DeletedSatellite> {
+        anyhow::ensure!(
+            module_id != Self::LOCAL_TRANSCODER,
+            "the built-in transcoder cannot be deleted: it is the hub itself"
+        );
         let gate = self.catalog_apply_lock(module_id);
         let _guard = gate.lock().await;
         let fingerprint: String =

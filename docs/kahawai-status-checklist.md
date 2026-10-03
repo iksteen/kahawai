@@ -835,7 +835,10 @@ audio/video byte separation for manual playback testing; see
       real.
 - [x] HUB-36 Pace-aware video placement, on measured capability. Full
       external/AIO transcoders benchmark video encoders and GL tone-map;
-      plain hub does neither. Only successful current-fingerprint benchmarks
+      plain hub does neither. Admin's fleet includes a read-only built-in
+      transcoder entry with the AIO's benchmarks and observed session pace,
+      without enrollment.
+      Only successful current-fingerprint benchmarks
       become serving capabilities; a crashed child durably quarantines its
       capability until explicit successful remeasurement or fingerprint
       invalidation. Workers meter the un-throttled phase of real sessions into

@@ -15,7 +15,7 @@ import {
   adminDeleteSatellite,
   adminSetDisabled,
 } from '../../api/generated/kahawai.ts'
-import { measuredPair, multiple } from '../../domain/admin.ts'
+import { builtIn, measuredPair, multiple } from '../../domain/admin.ts'
 import { notify } from '../../composables/notices.ts'
 
 const props = defineProps<{
@@ -54,6 +54,7 @@ const drained = (satellite: SatelliteOverview) =>
   setting.value.get(satellite.module_id) ?? satellite.disabled
 
 async function drain(satellite: SatelliteOverview) {
+  if (builtIn(satellite)) return
   const want = !drained(satellite)
   setting.value = new Map(setting.value).set(satellite.module_id, want)
   // Held on success until the re-read has landed — dropping it at once flicks
@@ -87,6 +88,7 @@ watch(
 /// returned to the top of the document and a screen reader is told nothing at
 /// all. Relabelling in place keeps focus and announces the new name.
 async function remove(satellite: SatelliteOverview) {
+  if (builtIn(satellite)) return
   if (!(await props.act(() => adminDeleteSatellite(satellite.module_id)))) return
   notify(
     `Deleted ${satellite.name}: certificate revoked, collections removed. Existing watch history is retained.`,
@@ -183,7 +185,7 @@ function some(satellite: SatelliteOverview) {
       id="enrolled"
       class="mt-[22px] mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase"
     >
-      Enrolled
+      Fleet
     </h2>
     <p v-if="props.broken.includes('satellites')" class="text-warn">
       The fleet could not be read, so this is not saying there is nothing enrolled.
@@ -198,11 +200,16 @@ function some(satellite: SatelliteOverview) {
         <div class="flex flex-wrap items-center gap-3">
           <span
             class="font-[650]"
-            :title="`${satellite.module_id}\ncert ${satellite.cert_fingerprint}`"
+            :title="
+              builtIn(satellite)
+                ? 'Runs inside the hub'
+                : `${satellite.module_id}\ncert ${satellite.cert_fingerprint}`
+            "
           >
             {{ satellite.name }}
           </span>
           <span class="font-mono text-[12px] text-dim">{{ satellite.module_type }}</span>
+          <span v-if="builtIn(satellite)" class="font-mono text-[11px] text-dim">built-in</span>
           <span
             class="rounded px-1.5 py-0.5 font-mono text-[11px]"
             :class="satellite.connected ? 'text-teal' : 'text-warn'"
@@ -222,7 +229,7 @@ function some(satellite: SatelliteOverview) {
                flag, a row that said "Enable" for ever — and a host still
                serving every byte it was asked for. -->
           <Btn
-            v-if="satellite.module_type === 'transcoder'"
+            v-if="satellite.module_type === 'transcoder' && !builtIn(satellite)"
             ghost
             small
             class="ml-auto"
@@ -236,6 +243,7 @@ function some(satellite: SatelliteOverview) {
           <!-- Filled in the warning colour once it is armed, so the second
                press does not look like the first. -->
           <Armed
+            v-if="!builtIn(satellite)"
             label="Delete"
             armed-label="Really delete + revoke?"
             :name="`Delete ${satellite.name}`"
@@ -296,7 +304,10 @@ function some(satellite: SatelliteOverview) {
           </span>
         </div>
 
-        <div class="mt-1 truncate font-mono text-[11px] text-dimmer">
+        <p v-if="builtIn(satellite) && !satellite.capabilities" class="mt-1 text-[11px] text-dim">
+          Benchmarks pending.
+        </p>
+        <div v-if="!builtIn(satellite)" class="mt-1 truncate font-mono text-[11px] text-dimmer">
           {{ satellite.cert_fingerprint }}
         </div>
       </li>

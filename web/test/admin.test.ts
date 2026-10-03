@@ -22,8 +22,12 @@ describe('the satellites an operator can act on', () => {
     // It has no certificate to show, nothing to enable or disable, and
     // nothing to revoke — and the Delete it was offered would wipe the index
     // of everything it serves, which on an all-in-one is the whole library.
-    const fleet = [{ cert_fingerprint: IN_PROCESS }, { cert_fingerprint: 'ab12' }]
-    expect(enrolled(fleet)).toEqual([{ cert_fingerprint: 'ab12' }])
+    const fleet = [
+      { cert_fingerprint: IN_PROCESS, module_type: 'mediahost' },
+      { cert_fingerprint: 'ab12', module_type: 'mediahost' },
+      { cert_fingerprint: IN_PROCESS, module_type: 'transcoder' },
+    ]
+    expect(enrolled(fleet)).toEqual(fleet.slice(1))
   })
 
   test('and an empty fleet is empty rather than missing', () => {

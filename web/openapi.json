@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "9c653fb0da3bf84de01183c34772964fb9d916f7b156bd7b638e0a7fe9b927ce",
+  "x-kahawai-source-sha256": "ebc1f98bb57aaecf7b7886e9e8601c3c374145fe97cfd12507f2caa63856b629",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -2991,6 +2991,24 @@
             }
           },
           "403": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "In-process modules cannot be drained as satellites",
             "headers": {
               "X-Request-Id": {
                 "schema": {

@@ -7,7 +7,12 @@
 /// a private detail — the hub mirrors this constant.
 export const IN_PROCESS = 'in-process'
 
-/// The satellites an operator can act on.
+/// Whether this module is part of the hub, without an enrolled identity.
+export function builtIn(satellite: { cert_fingerprint: string }): boolean {
+  return satellite.cert_fingerprint === IN_PROCESS
+}
+
+/// Fleet entries shown in admin, including the built-in transcoder.
 ///
 /// The hub's own in-process mediahost is not an enrolled satellite: it has no
 /// certificate to show, nothing to enable or disable, and nothing to revoke.
@@ -15,8 +20,10 @@ export const IN_PROCESS = 'in-process'
 /// serves — the whole library, on an all-in-one deployment. Its COLLECTIONS
 /// still appear in the composer, which reads the collections table and never
 /// this list.
-export function enrolled<T extends { cert_fingerprint: string }>(satellites: T[]): T[] {
-  return satellites.filter((s) => s.cert_fingerprint !== IN_PROCESS)
+export function enrolled<T extends { cert_fingerprint: string; module_type: string }>(
+  satellites: T[],
+): T[] {
+  return satellites.filter((s) => !builtIn(s) || s.module_type === 'transcoder')
 }
 
 /// A measured multiple, or nothing when it was never measured. Zero is "not

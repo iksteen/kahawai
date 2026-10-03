@@ -566,6 +566,33 @@ async fn auth_harness() -> (
     );
     (dir, db, auth, api, setup)
 }
+
+#[tokio::test]
+async fn built_in_transcoder_cannot_be_deleted_or_drained_through_admin_api() {
+    let (_dir, _db, _auth, api, root) = auth_harness().await;
+    let id = Registry::LOCAL_TRANSCODER;
+    let deleted = api
+        .clone()
+        .oneshot(
+            Request::delete(format!("/admin/v1/satellites/{id}"))
+                .header("authorization", format!("Bearer {}", root.access_token))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(deleted.status(), StatusCode::CONFLICT);
+    let disabled = api
+        .oneshot(post_authed(
+            &format!("/admin/v1/satellites/{id}/disabled"),
+            &root.access_token,
+            serde_json::json!({"disabled": true}),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(disabled.status(), StatusCode::CONFLICT);
+}
+
 #[tokio::test]
 async fn explicit_auth_modes_split_bearers_from_browser_cookies() {
     let (_dir, _db, _auth, api, _root) = auth_harness().await;

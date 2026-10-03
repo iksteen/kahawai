@@ -172,6 +172,39 @@ afterEach(() => {
 })
 
 describe('the fleet', () => {
+  test('shows built-in encoder measurements without Delete or Disable controls', async () => {
+    vi.mocked(api.adminSatellites).mockResolvedValue({
+      satellites: [
+        box({
+          module_id: 'local-transcoder',
+          name: 'Built-in transcoder',
+          cert_fingerprint: IN_PROCESS,
+          capabilities: {
+            encoders: [
+              { codec: 'h264', element: 'x264enc', hardware: false, speed_1080: 6, speed_2160: 2 },
+            ],
+          },
+          pace: [{ class: '1080|av1|h264', multiple: 3.2 }],
+        }),
+      ],
+    } as never)
+    const wrapper = await open()
+    expect(wrapper.text()).toContain('Built-in transcoder')
+    expect(wrapper.text()).toContain('h264 6.0× / 2.0×')
+    expect(wrapper.text()).toContain('1080|av1|h264 3.2×')
+    expect(wrapper.findAll('button').some((b) => /Delete|Disable/.test(b.text()))).toBe(false)
+    expect(wrapper.text()).not.toContain(IN_PROCESS)
+  })
+
+  test('shows a built-in transcoder before benchmarks have landed', async () => {
+    vi.mocked(api.adminSatellites).mockResolvedValue({
+      satellites: [box({ name: 'Built-in transcoder', cert_fingerprint: IN_PROCESS })],
+    } as never)
+    const wrapper = await open()
+    expect(wrapper.text()).toContain('Built-in transcoder')
+    expect(wrapper.text()).toContain('Benchmarks pending.')
+  })
+
   test('lists what is enrolled, and never the hub’s own mediahost', async () => {
     // It has no certificate to revoke, and the Delete it was offered would wipe
     // the index of everything it serves.
