@@ -2047,6 +2047,185 @@ fn preserved_multichannel_encode_uses_native_loudness_gain() {
     );
 }
 
+/// Side-surround 5.1 must not become stereo just because native AAC-in-TS
+/// fails. Exercise both encoder families independently, preserving native
+/// positions whenever the actual source-aware round trip accepts them.
+#[test]
+fn side_surround_five_one_stays_six_channels() {
+    crate::init().unwrap();
+    let mut tested = 0;
+    for encoder in ["avenc_aac", "fdkaacenc"] {
+        if gst::ElementFactory::find(encoder).is_none() {
+            continue;
+        }
+        tested += 1;
+        let native_works = aac_accepts(encoder, (6, 0xc0f), 6, Some(0xc0f));
+        let selected = aac_input_layout(encoder, 6, 0xc0f, None)
+            .expect("no encodable layout for side-surround 5.1");
+        assert_eq!(
+            selected,
+            (6, Some(if native_works { 0xc0f } else { 0x3f })),
+            "{encoder}: native first, then the six-channel surround conversion"
+        );
+        assert!(aac_accepts(encoder, (6, 0xc0f), selected.0, selected.1));
+        for ceiling in [1, 2] {
+            assert_eq!(
+                aac_input_layout(encoder, 6, 0xc0f, Some(ceiling))
+                    .unwrap()
+                    .0,
+                ceiling,
+                "{encoder}: client ceiling ignored"
+            );
+        }
+        let (channels, mask) = aac_input_layout(encoder, 8, 0xc3f, None).unwrap();
+        assert!(channels >= 6, "{encoder}: 7.1 collapsed to {channels}");
+        assert!(mask.is_none_or(|mask| mask & 0xc3f == mask));
+    }
+    crate::testutil::require(tested > 0, "libav or FDK AAC encoder");
+}
+
+#[test]
+fn side_surround_audio_tail_round_trips_with_matching_gain() {
+    crate::init().unwrap();
+    if !crate::testutil::require_elements(&["avenc_ac3", "avdec_ac3", "avenc_aac", "avdec_aac"]) {
+        return;
+    }
+    for (ceiling, converted_gain) in [
+        (None, true),
+        (None, false),
+        (Some(2), true),
+        (Some(1), true),
+    ] {
+        // Real AC3 decoding, followed by the production tail, not only the
+        // synthetic qualification probe. Decode the result AFTER MPEG-TS.
+        let selected = aac_input_layout("avenc_aac", 6, 0xc0f, ceiling).unwrap();
+        assert_eq!(selected.0, ceiling.unwrap_or(6));
+        let pipe = gst::parse::launch(&format!(
+            "audiotestsrc num-buffers=200 volume=0.02 ! audioconvert \
+         ! audio/x-raw,rate=48000,channels=6,channel-mask=(bitmask)0xc0f \
+         ! avenc_ac3 ! ac3parse ! avdec_ac3 name=decoded \
+         mpegtsmux name=m ! tsdemux ! aacparse ! avdec_aac \
+             ! audio/x-raw,channels={} ! audioconvert \
+             ! audio/x-raw,format=S16LE,layout=interleaved ! fakesink name=probesink",
+            selected.0,
+        ))
+        .unwrap()
+        .downcast::<gst::Pipeline>()
+        .unwrap();
+        let gain_db = match selected {
+            (6, Some(0xc0f)) => Some(-12.0),
+            (6, Some(0x3f)) => converted_gain.then_some(4.0),
+            (2, _) => Some(6.0),
+            (1, _) => Some(2.0),
+            _ => panic!("unexpected layout: {selected:?}"),
+        };
+        let mut exact = [None; crate::loudness::MAX_LAYOUT_GAINS];
+        exact[0] = Some(crate::loudness::AudioLayoutGain {
+            layout: crate::loudness::AudioLayout::new(6, 0xc0f),
+            gain_db: -12.0,
+        });
+        exact[1] = converted_gain.then_some(crate::loudness::AudioLayoutGain {
+            layout: crate::loudness::AudioLayout::new(6, 0x3f),
+            gain_db: 4.0,
+        });
+        exact[2] = Some(crate::loudness::AudioLayoutGain {
+            layout: crate::loudness::AudioLayout::new(2, 0x3),
+            gain_db: 6.0,
+        });
+        exact[3] = Some(crate::loudness::AudioLayoutGain {
+            layout: crate::loudness::AudioLayout::new(1, 0x4),
+            gain_db: 2.0,
+        });
+        let dir = tempfile::tempdir().unwrap();
+        build_audio_tail(
+            &pipe,
+            &pipe.by_name("decoded").unwrap().static_pad("src").unwrap(),
+            pipe.by_name("m")
+                .unwrap()
+                .request_pad_simple("sink_%d")
+                .unwrap(),
+            "avenc_aac",
+            AudioTarget::Aac,
+            &[gst::ElementFactory::make("identity").build().unwrap()],
+            &None,
+            ceiling,
+            AudioLoudnessGains {
+                exact,
+                stereo_db: None,
+                native_db: None,
+                source_channels: Some(6),
+            },
+            dir.path(),
+        );
+        let count = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let counter = count.clone();
+        let signal = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let detected_signal = signal.clone();
+        let sink = pipe
+            .by_name("probesink")
+            .unwrap()
+            .static_pad("sink")
+            .unwrap();
+        sink.add_probe(gst::PadProbeType::BUFFER, move |_, info| {
+            counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            if let Some(gst::PadProbeData::Buffer(buffer)) = &info.data
+                && let Ok(pcm) = buffer.map_readable()
+                && pcm
+                    .chunks_exact(2)
+                    .any(|sample| i16::from_le_bytes([sample[0], sample[1]]).unsigned_abs() > 32)
+            {
+                detected_signal.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            gst::PadProbeReturn::Ok
+        });
+        pipe.set_state(gst::State::Playing).unwrap();
+        let message = pipe.bus().unwrap().timed_pop_filtered(
+            gst::ClockTime::from_seconds(30),
+            &[gst::MessageType::Eos, gst::MessageType::Error],
+        );
+        let decoded = sink
+            .current_caps()
+            .and_then(|caps| crate::loudness::layout_from_caps(&caps));
+        pipe.set_state(gst::State::Null).unwrap();
+        assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
+        assert!(count.load(std::sync::atomic::Ordering::Relaxed) > 0);
+        assert!(
+            signal.load(std::sync::atomic::Ordering::Relaxed),
+            "decoded audio is silent"
+        );
+        assert_eq!(decoded.unwrap().channels, selected.0);
+        let facts = crate::facts::read(dir.path());
+        let gains: Vec<_> = facts
+            .iter()
+            .filter(|fact| fact.kind == "audio" && fact.detail.starts_with("loudness "))
+            .collect();
+        match gain_db {
+            Some(gain_db) => assert_eq!(gains[0].detail, format!("loudness {gain_db:+.2} dB")),
+            None => assert!(
+                gains.is_empty(),
+                "missing converted-layout gain must not reuse native gain"
+            ),
+        }
+    }
+}
+
+#[test]
+fn aac_layout_probe_cache_is_per_encoder() {
+    crate::init().unwrap();
+    if !crate::testutil::require(
+        gst::ElementFactory::find("avenc_aac").is_some(),
+        "libav AAC encoder",
+    ) {
+        return;
+    }
+    assert!(aac_accepts("avenc_aac", (6, 0xc0f), 6, Some(0x3f)));
+    assert!(
+        !aac_accepts("kahawai_missing_aac_encoder", (6, 0xc0f), 6, Some(0x3f)),
+        "another encoder's successful round trip must not qualify a missing encoder"
+    );
+    assert!(aac_accepts("avenc_aac", (6, 0xc0f), 6, Some(0x3f)));
+}
+
 /// The layout search never answers with a layout the encoder refuses,
 /// never invents channel positions the source does not have, and
 /// never collapses 7.1 to something tiny — the fixation failure that

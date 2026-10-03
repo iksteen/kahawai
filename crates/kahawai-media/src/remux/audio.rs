@@ -38,11 +38,14 @@ pub(super) const AAC_LAYOUTS: &[(u32, u64)] =
 ///   therefore stages the source's own (channels, mask) upstream of the
 ///   pin, exactly like the pipeline it stands in for.
 pub(super) fn aac_accepts(enc: &str, source: (u32, u64), channels: u32, mask: Option<u64>) -> bool {
-    type Key = ((u32, u64), u32, Option<u64>);
+    // Encoder builds differ in which layouts survive TS. A result for FDK
+    // must not qualify the same layout for libav (or vice versa).
+    type Key = (String, (u32, u64), u32, Option<u64>);
     static SEEN: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<Key, bool>>> =
         std::sync::OnceLock::new();
     let seen = SEEN.get_or_init(Default::default);
-    if let Some(hit) = seen.lock().unwrap().get(&(source, channels, mask)) {
+    let key = (enc.to_string(), source, channels, mask);
+    if let Some(hit) = seen.lock().unwrap().get(&key) {
         return *hit;
     }
     // avdec_aac is libav — the same decoder family as ffmpeg and the
@@ -88,7 +91,7 @@ pub(super) fn aac_accepts(enc: &str, source: (u32, u64), channels: u32, mask: Op
         accepted = ok,
         "AAC layout probe"
     );
-    seen.lock().unwrap().insert((source, channels, mask), ok);
+    seen.lock().unwrap().insert(key, ok);
     ok
 }
 
@@ -141,7 +144,9 @@ pub(super) fn layout_label(channels: u32) -> String {
 /// The source's own layout when the encoder round-trips it. Otherwise the
 /// largest canonical layout it accepts below the client's ceiling;
 /// `audioconvert` performs the positional matrix and the loudness analyzer
-/// meters that exact target. Positioned candidates come first; count-only
+/// meters that exact target. Side-surround 5.1 may also convert to canonical
+/// rear-surround 5.1 before trying fewer channels; other positioned same-count
+/// remaps remain excluded. Positioned candidates come first; count-only
 /// ones remain a compatibility fallback for encoders that reject an explicit
 /// mask they can nevertheless produce.
 pub(super) fn aac_input_layout(
@@ -162,7 +167,11 @@ pub(super) fn aac_input_layout(
                     *target_channels <= bound
                         && (*target_channels < channels
                             || mask == 0
-                            || *target_mask & mask == *target_mask)
+                            || *target_mask & mask == *target_mask
+                            || crate::loudness::is_side_to_rear_5_1(
+                                crate::loudness::AudioLayout::new(channels, mask),
+                                crate::loudness::AudioLayout::new(*target_channels, *target_mask),
+                            ))
                 })
                 .map(|(target_channels, target_mask)| (*target_channels, Some(*target_mask))),
         );

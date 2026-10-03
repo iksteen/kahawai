@@ -1,7 +1,8 @@
 //! Source-local EBU R128 measurement keyed by exact output channel layout.
 //!
 //! One decode feeds bounded meter branches for the untouched decoded layout
-//! and every smaller canonical layout playback may choose. Static gains can
+//! and every smaller canonical layout playback may choose, plus the AAC 5.1
+//! side-to-rear surround conversion. Static gains can
 //! therefore be selected after the worker's real conversion caps are known,
 //! without deriving correlation-sensitive loudness from lossy scalar facts.
 
@@ -114,11 +115,20 @@ pub const STANDARD_LAYOUTS: &[AudioLayout] = &[
     },
 ];
 
+/// AAC-in-TS may reject side-surround 5.1 while accepting rear-surround 5.1.
+/// This specific same-count conversion retains six channels; it does not
+/// authorize reinterpreting 7.1 surrounds as front-wide channels. The default
+/// audioconvert matrix changes the signal, so its gain must be measured too.
+pub(crate) fn is_side_to_rear_5_1(source: AudioLayout, target: AudioLayout) -> bool {
+    source == AudioLayout::new(6, 0xc0f) && target == AudioLayout::new(6, 0x3f)
+}
+
 pub fn measured_layouts(source: AudioLayout) -> Vec<AudioLayout> {
     let mut layouts = vec![source];
     layouts.extend(STANDARD_LAYOUTS.iter().copied().filter(|layout| {
         layout.channels < source.channels
             || (source.channel_mask == 0 && layout.channels == source.channels)
+            || is_side_to_rear_5_1(source, *layout)
     }));
     layouts
 }
@@ -660,6 +670,70 @@ mod tests {
             true_peak_dbtp: 9.0,
         };
         assert_eq!(gain_db(very_loud), -26.0);
+    }
+
+    #[test]
+    fn side_surround_five_one_measures_its_same_count_conversion_only() {
+        assert_eq!(
+            measured_layouts(AudioLayout::new(6, 0xc0f)),
+            [
+                AudioLayout::new(6, 0xc0f),
+                AudioLayout::new(6, 0x3f),
+                AudioLayout::new(2, 0x3),
+                AudioLayout::new(1, 0x4),
+            ]
+        );
+        assert!(!measured_layouts(AudioLayout::new(8, 0xc3f)).contains(&AudioLayout::new(8, 0xff)));
+    }
+
+    #[test]
+    fn side_surround_five_one_measures_the_actual_conversion_matrix() {
+        crate::init().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let side_path = dir.path().join("side-surround.wav");
+        let rear_path = dir.path().join("rear-surround.wav");
+        for (path, mask) in [(&side_path, 0xc0fu64), (&rear_path, 0x3fu64)] {
+            let pipeline = gst::parse::launch(&format!(
+                "audiotestsrc num-buffers=200 wave=sine volume=0.02 ! \
+                 audioconvert ! audio/x-raw,rate=48000,channels=6,channel-mask=(bitmask)0xc0f \
+                 ! audioconvert ! audio/x-raw,format=S16LE,channels=6,channel-mask=(bitmask)0x{mask:x} \
+                 ! wavenc ! filesink location={}",
+                path.display()
+            ))
+            .unwrap();
+            pipeline.set_state(gst::State::Playing).unwrap();
+            let message = pipeline.bus().unwrap().timed_pop_filtered(
+                gst::ClockTime::from_seconds(10),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            );
+            pipeline.set_state(gst::State::Null).unwrap();
+            assert!(message.is_some_and(|message| message.type_() == gst::MessageType::Eos));
+        }
+        // wavenc currently drops the side-surround mask from its extensible
+        // header. Set the fixture's WAVE mask explicitly: its six samples are
+        // already FL, FR, FC, LFE, SL, SR. WAVE uses bits 9/10 for SL/SR.
+        let mut wave = std::fs::read(&side_path).unwrap();
+        assert_eq!(&wave[12..16], b"fmt ");
+        assert_eq!(&wave[20..22], &0xfffeu16.to_le_bytes());
+        wave[40..44].copy_from_slice(&0x60fu32.to_le_bytes());
+        std::fs::write(&side_path, wave).unwrap();
+        let side = AudioLayout::new(6, 0xc0f);
+        let rear = AudioLayout::new(6, 0x3f);
+        let measured = measure_file(&side_path, 0, side, || Ok(())).unwrap();
+        assert_eq!(measured.source, side);
+        let converted = measured
+            .get(rear)
+            .expect("missing six-channel surround conversion");
+        let independent = measure_file(&rear_path, 0, rear, || Ok(()))
+            .unwrap()
+            .get(rear)
+            .unwrap();
+        assert!((converted.integrated_lufs - independent.integrated_lufs).abs() < 0.05);
+        assert!((converted.true_peak_dbtp - independent.true_peak_dbtp).abs() < 0.05);
+        assert!(
+            (measured.get(side).unwrap().integrated_lufs - converted.integrated_lufs).abs() > 0.1,
+            "native gain must not stand in for the converted signal"
+        );
     }
 
     #[test]

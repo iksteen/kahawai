@@ -796,7 +796,10 @@ audio/video byte separation for manual playback testing; see
       and offline hosts remain distinct from zero pending sources; music uses ReplayGain.
 - [x] HUB-38 Measured audio loudness normalization: the mediahost background-decodes
       every non-music audio stream once and meters the untouched decoded layout
-      plus every smaller canonical output matrix playback may choose. The hub
+      plus every smaller canonical output matrix playback may choose and the
+      AAC 5.1 side-to-rear surround conversion. AAC retains six channels when
+      this source-aware TS round trip succeeds, preserves native layouts when
+      possible, and keeps client ceilings and 7.1 positional restrictions. The hub
       stores revision-guarded EBU R128 integrated-loudness/true-peak pairs keyed
       by exact channel count and mask. Workers select gain only after their
       post-conversion caps are known, apply one static move toward −18 LUFS
