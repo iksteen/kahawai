@@ -15,6 +15,15 @@
 //! The hub already knows every module's state — that is what the registry
 //! is — so it reports on all of them, and a monitor gets one endpoint
 //! instead of five it cannot reach through NAT anyway.
+//!
+//! **Label dimensions are bounded by the fleet, not the catalogue.** Global
+//! counts have no labels except the build version. Per-module samples may name
+//! an enrolled module, its display name/build and its measured encoder path;
+//! benchmark heights are the fixed 1080/2160 cases. User, item, session, file,
+//! request and provider-response identities must never become dimensions.
+//! `tests/metric_labels.rs` independently lists the reviewed families/label sets
+//! and proves that increasing catalogue/activity counts adds no time series.
+//! A new family or dimension requires explicit review of that test policy.
 
 use std::fmt::Write as _;
 

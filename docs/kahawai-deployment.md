@@ -371,6 +371,16 @@ token is 401. `/health` needs no credential and is what an uptime check
 should poll — it reports every module, and a satellite being away is
 `degraded` rather than a failure (AR-6).
 
+Metric labels describe the fleet and its measured encoder paths: module
+identity/name/build, codec, element, hardware and the fixed benchmark heights.
+Catalogue and activity counts are unlabelled gauges; user, item, session,
+file, request and provider-response identities must not become dimensions.
+Every metric family and label set has an independent regression policy, so new
+dimensions require explicit review. Run `scripts/kahawai-metrics-check.sh` for
+the fixture and HTTP endpoint checks, or pass
+`--scrape-file /path/to/scrape.prom` to also validate a captured `/metrics`
+response. The file contains only the response body, without the bearer header.
+
 ## macOS satellites
 
 The mac mini runs two launchd daemons from one checkout: an

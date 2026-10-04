@@ -1012,6 +1012,11 @@ audio/video byte separation for manual playback testing; see
       0.0.4, behind its own static token in `<data_dir>/metrics.secret`;
       no file = not served at all), SIGHUP reload for what can change
       under a running process.
+      `metric_labels` pins every metric family's reviewed dimensions and
+      proves that catalogue/session growth does not add series. The metrics
+      companion passed its fixtures, endpoint checks and a captured local HTTP
+      scrape on 2026-10-04 (`scripts/kahawai-metrics-check.sh`, readiness
+      OPS-RDY-4A).
 - [x] NFR-7 Versioned client API (`/api/v1`)
       The original `/admin/v1/items/{id}/match` request and `{"ok":true}`
       response remain supported for existing collection-copy IDs. The additive

@@ -657,10 +657,19 @@ marked in that document.
       readiness fail; optional offline satellites report degraded state
 - [ ] OPS-RDY-4 Add request latency/error, session outcome, scan, provider and
       transcoder metrics using the existing fleet-scale bounded-label policy
-- [~] OPS-RDY-4A Existing metrics already avoid labels containing user, item,
-      session, file or unbounded provider-response values. Add a regression test
-      over every exported metric family so future instrumentation cannot add
-      unbounded-cardinality or sensitive labels unnoticed
+- [x] OPS-RDY-4A Metric dimensions are independently reviewed in
+      `tests/metric_labels.rs`: every exported family must declare exactly its
+      allowed label set. Populated mediahost and software/hardware transcoder
+      fixtures exercise every family, including offline and partially measured
+      modules. Increasing catalogue/session counts preserves series identity;
+      increasing the fleet adds only its status and measured-path series.
+      Negative controls reject sensitive dimensions and unknown families.
+      `scripts/kahawai-metrics-check.sh` runs this policy and the endpoint tests;
+      `--scrape-file /path/to/scrape.prom` validates captured runtime output with
+      the same policy. On 2026-10-04 the script exited 0 with all four tests
+      passing, including a real local `/metrics` HTTP 200 response containing
+      46 reviewed series. The module documentation and deployment guide record
+      the policy; additional instrumentation remains OPS-RDY-4.
 - [ ] OPS-RDY-5 A metric query failure must surface as an observability/readiness
       error rather than silently becoming a zero-valued gauge
 - [~] OPS-RDY-6 Add request IDs to structured logs and API errors, configurable
