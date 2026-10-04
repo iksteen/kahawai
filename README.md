@@ -156,6 +156,41 @@ container image is. See
 [deployment details](./docs/kahawai-deployment.md) for running these as system
 daemons instead, which is what a Mac that must start at boot wants.
 
+### On Arch Linux, from the AUR
+
+The AUR has two packages, installed with an AUR helper such as yay or paru:
+
+```sh
+yay -S kahawai     # or: paru -S kahawai
+```
+
+`kahawai-gstreamer` comes first. It is the upstream GStreamer release with
+Kahawai's media fixes, installed under `/opt/kahawai-gstreamer` and isolated
+from Arch's own GStreamer: it ignores `GST_PLUGIN_PATH`, `GST_REGISTRY` and
+their relatives, and keeps its own plugin registry. `kahawai` is linked against it. Both build
+from source, and building GStreamer takes a while.
+
+The AUR packages are updated separately from the releases here, so they may
+lag behind the latest one. The version on the
+[AUR page](https://aur.archlinux.org/packages/kahawai) is the one you get.
+
+The package runs Kahawai as the `kahawai` system user, with its state under
+`/var/lib/kahawai` and its config in `/etc/kahawai/kahawai.toml`. That config
+explains how to add collections and give the `kahawai` user read access to
+your media. Then:
+
+```sh
+sudo systemctl enable --now kahawai
+sudo -u kahawai kahawai --config /etc/kahawai/kahawai.toml hub init-admin
+```
+
+The hub listens on `127.0.0.1:8420`. `kahawai.service` is all-in-one. To run
+the roles separately, use `kahawai-hub`, `kahawai-mediahost` and
+`kahawai-transcoder.service` instead; the end of the config explains how.
+
+Like the Homebrew formulae, these packages are not the supported artifact.
+The container image is.
+
 ## Satellites and standalone hub
 
 Expose the hub's satellite listener directly as TCP. Do not send it through the
