@@ -29,18 +29,21 @@ record the decision criteria and cost model before code; cache decisions name
 both rebuild cost and latency at the moment of use. The current no-cache-
 eviction/no-janitor decision remains in force unless explicitly reconsidered.
 
-The audit found a strong functional candidate: the locked Rust workspace tests,
-formatting and clippy pass, and the web application builds and passes its small
-test suite. It is not yet ready for public deployment. In particular, deleted
-administrator access can survive a quick restart, session endpoints are not all
-owner-scoped, restore does not restore configuration and multi-root collections
-can alias files. (Refresh rotation was on that list and is not any more: AUTH-4
-below is ticked, with `BEGIN IMMEDIATE` and a test that releases two callers
-together — this paragraph is the audit's summary and had not been re-read
-against the items under it.) The CI implementation added after the
-audit now includes the complete locked workspace, no-default and web gates, but
-the hosted jobs and first release run remain evidence that must be observed
-before those outcomes can be checked.
+The audit found a strong functional candidate. Its initial authentication,
+session-owner and multi-root identity gaps have since been closed; the AUTH,
+SEC-WEB and DATA entries record those outcomes. Configuration restoration and
+the remaining unchecked security, operational and media-core gates are still
+open. Passing the existing CI and release workflow does not by itself establish
+readiness for public deployment.
+
+Evidence refreshed on 2026-10-04 against the current implementation and the
+published `v0.0.21-rc.1` artifacts. [CI run 37164362703](https://github.com/iksteen/kahawai/actions/runs/37164362703)
+passed all seven jobs at `8201ab6`; [release run 37165079722](https://github.com/iksteen/kahawai/actions/runs/37165079722)
+passed stamped-source gates, both native image jobs and publication. The image
+logs were inspected for strict test execution, live patch verification, the
+real authentication cycle and exact-digest HLS smoke postconditions. These
+records close CI-5 and GST-27, and replace the stale first-hosted-run caveats
+below; they do not supply the still-missing MVP evidence matrix.
 
 A follow-up audit of the media core reached a different conclusion from the
 functional evidence. The GStreamer paths contain unusually valuable corpus and
@@ -334,12 +337,19 @@ marked in that document.
       replace a worker after a crash or job budget, and attribute a crash or
       timeout to the exact file. Playback remains one worker process per
       session; capability probes run one timed child per element/path
-- [ ] GST-3 Eliminate duplicated worker argument/protocol assembly through one
+- [~] GST-3 Eliminate duplicated worker argument/protocol assembly through one
       versioned, serialisable and validated job specification. It contains
       sources, stable stream selectors, routes, encoder/container choices,
       required transforms, pacing and worker resource settings; unknown enum
       values or fields are errors, never legacy defaults. `PipelineSpec` is the
-      proposed representation, not a required type name or crate boundary
+      proposed representation, not a required type name or crate boundary.
+      The duplication is removed: `kahawai-playback::job::Job` owns both worker
+      argv and `StartSession` codecs, used by hub, transcoder and runtime.
+      `scripts/kahawai-playback.sh check|worker|lean` and `job_codecs` cover
+      round trips, the real child boundary and the satellite dependency rule;
+      the current release strict suite passed those codec checks. Remaining:
+      stable stream selectors, explicit worker resource settings and strict
+      versioned job validation, including rejection of unknown wire values.
 - [ ] GST-4 A worker spawned by a process using an explicit `--config` receives
       the exact effective demotions, niceness and thread ceiling in its spec.
       The hidden worker entry point does not independently load the full hub
@@ -362,10 +372,18 @@ marked in that document.
       Wrap every pad probe, appsink/appsrc callback and dynamic signal handler
       in a common no-unwind boundary; eliminate production `unwrap` calls on
       element, pad, link, state and shared callback state operations
-- [ ] GST-9 Represent required transforms as hard invariants. A requested tone
+- [~] GST-9 Represent required transforms as hard invariants. A requested tone
       map, deinterlace, image/ASS burn, channel layout or encoder path either
       reaches the negotiated output and is reported in `PipelineActual`, or the
-      worker fails before readiness so the hub can choose an explicit fallback
+      worker fails before readiness so the hub can choose an explicit fallback.
+      An unavailable requested tone map now posts a pipeline error rather than
+      continuing with HDR, and raw-format negotiation enforces the client's
+      component-depth ceiling. `tonemap_encode_outputs_sdr_tagged_video` and
+      the audio encode/decode regressions passed in both release images;
+      `scripts/kahawai-tonemap-check.py` and the explicit `bit-depth` playback
+      check exercise headless output and seek behavior. Remaining: the complete
+      transform/actualisation contract; missing deinterlace still warns and
+      continues with fields, so this gate is not complete.
 - [ ] GST-10 Centrally declare and validate correctness-sensitive element
       properties instead of silently skipping them through
       `set_prop_if_present`. For every supported encoder, parser and segmenter,
@@ -449,16 +467,20 @@ marked in that document.
 - [ ] GST-26 Keep one bounded diagnostic ring per worker and include GStreamer
       warnings/errors, state transitions and the pipeline actualisation in the
       session bundle without allowing GST_DEBUG output to exhaust scratch space
-- [~] GST-27 The Dockerfile builds pinned GStreamer 1.28.7, gst-plugins-rs,
+- [x] GST-27 The Dockerfile builds pinned GStreamer 1.28.7, gst-plugins-rs,
       libass and codec dependencies and now makes patch verification plus
       `KAHAWAI_MEDIA_TEST_STRICT=1 cargo test --locked --release --workspace` a
       mandatory ancestor of every release image. Required prerequisites panic
       in strict mode; distro CI retains best-effort execution but records every
-      unavailable path. On 2026-08-08 the complete debug-profile strict suite
-      against the host's Kahawai-only GStreamer 1.28.5 prefix exited 0. The same
-      day the amd64 pinned-GStreamer 1.28.6 container gate passed all 11 patch
-      reproducers and the complete strict release-profile workspace suite. Both
-      hosted release architectures still need successful recorded runs
+      unavailable path. Release run 37165079722 on 2026-10-04 passed
+      [amd64 job 111326304665](https://github.com/iksteen/kahawai/actions/runs/37165079722/job/111326304665)
+      and [arm64 job 111326304690](https://github.com/iksteen/kahawai/actions/runs/37165079722/job/111326304690).
+      Both logs show successful pinned-stack verification and strict
+      `cargo test --locked --release --workspace` execution with
+      `KAHAWAI_MEDIA_TEST_STRICT=1` (exit 0) before the runtime image is built.
+      The exact pushed images then passed the authentication cycle and served
+      five HLS segments each. Ignored corpus/hardware checks are not claimed
+      by this gate; GST-28 and GST-29 retain their separate coverage requirements
 - [ ] GST-28 Add worker-process regression fixtures for every supported
       container and copy/encode/seek/subtitle route, including long/irregular
       GOPs, multiple same-kind tracks, multipart sources, missing PTS/DTS,
@@ -481,8 +503,12 @@ marked in that document.
       Kahawai-only GStreamer 1.28.5 prefix, both with the exposed NVIDIA decoder
       and with the headless parser substitute (exit 0); all 11 also passed in
       the pinned GStreamer 1.28.6 amd64 container without NVIDIA hardware.
-      Required hosted arm64 verification and recording current upstream issue,
-      release and ABI claims remain
+      Release run 37165079722 on 2026-10-04 verifies the current pinned 1.28.7
+      stack on both hosted architectures: all 13 Linux-applicable patch records
+      were LIVE, including both reproducers for the fragment-PTS record, with
+      no missing fix or reproducer. The VideoToolbox patch is explicitly N/A on
+      Linux; its macOS regression and measured results live beside patch 0011.
+      Remaining: complete current upstream issue, release and ABI records.
 
 ## Backup and filesystem safety (BKP)
 
@@ -545,7 +571,8 @@ marked in that document.
       Cargo with `KAHAWAI_REQUIRE_WEB=1`; native bundler output is not committed
       or compared across developer platforms. The original gates completed in
       the hosted run for `ad8e764` on 2026-08-08; the generated-asset ownership
-      change awaits its first hosted run
+      change passed CI run 37164362703 and both stamped-source browser gates
+      in release run 37165079722 on 2026-10-04
 - [x] CI-3 Web lint is scoped to `src` and `test`, excluding generated output
       and dependencies, and `.oxlintrc.json` carries `"ignorePatterns":
       ["dist"]` so the exclusion holds for anything that does not go through
@@ -558,15 +585,24 @@ marked in that document.
       strict full-workspace runs on 2026-08-08 show only temporary configuration
       paths, and all three worker tests also passed in the hosted run for
       `ad8e764`
-- [~] CI-5 `auth_api` covers atomic concurrent refresh, family replay,
+- [x] CI-5 `auth_api` covers atomic concurrent refresh, family replay,
       family-isolated API logout, password-reset revocation of all refresh
       families across `Auth` restart, deletion cascade and migration-time
-      invalidation of legacy refresh tokens. Access-token invalidation after
-      deletion/demotion/reset, browser logout, cookie attributes and browser
-      secret storage remain. Local setup now has foreign-Origin rejection,
-      atomic concurrent-claim coverage and durable listener/socket closure.
-      `cargo test --workspace`, formatting and clippy
-      all exited 0 locally on 2026-08-09
+      invalidation of legacy refresh tokens. `admin_deletes_users` asserts
+      deletion/demotion access invalidation and deleted-user rejection across
+      `Auth` restart; `password_reset_revokes_all_families_across_restart`
+      proves both access and refresh revocation after a separate-pool reset.
+      `explicit_auth_modes_split_bearers_from_browser_cookies` and
+      `configured_origin_controls_validation_and_request_metadata_controls_cookie_security`
+      cover browser logout and exact cookie attributes. The web
+      `session.test.ts` check `no credential is ever written to storage`
+      exercises login, refresh and sign-out with storage/cookie traps.
+      Local setup has foreign-Origin rejection, atomic concurrent-claim
+      coverage and durable listener/socket closure. All 27 `auth_api` tests
+      passed in hosted CI and both strict release-image suites on 2026-10-04;
+      the stamped-source web suite passed the storage check, and both running
+      images passed `scripts/kahawai-auth-cycle.sh`. AUTH-8/AUTH-13 also retain
+      the dated real-browser cookie/reload/storage inspection.
 - [x] CI-6 `direct_play_ranges_end_to_end` creates two users and sends the
       foreign account through stream, playlist, segment, subtitle, seek,
       progress and end routes. Every response has the same 404 code and message
@@ -627,8 +663,13 @@ marked in that document.
       unbounded-cardinality or sensitive labels unnoticed
 - [ ] OPS-RDY-5 A metric query failure must surface as an observability/readiness
       error rather than silently becoming a zero-valued gauge
-- [ ] OPS-RDY-6 Add request IDs to structured logs and API errors, configurable
-      JSON logging for containers and a documented reload policy for log levels
+- [~] OPS-RDY-6 Add request IDs to structured logs and API errors, configurable
+      JSON logging for containers and a documented reload policy for log levels.
+      Request correlation is complete: `error_bodies` checks the response id
+      against the complete structured server cause and rejects caller-supplied
+      ids (SEC-WEB-6). These checks passed in CI and both release-image suites.
+      Remaining: configurable JSON output and a documented log-level reload
+      policy; the runtime still installs the ordinary formatting subscriber.
 - [ ] OPS-RDY-7 Build non-root OCI targets for all-in-one, hub, mediahost and
       transcoder using a fixed unprivileged UID/GID, an executable healthcheck,
       read-only media mount guidance and explicit writable state mounts. Every
@@ -640,8 +681,12 @@ marked in that document.
       checksummed stamped source plus explicitly unsupported bare binaries. On
       2026-08-08 the local amd64 production image built from the gated stage and
       its smoke test scanned a generated clip and played five HLS segments. The
-      first hosted two-architecture release must still be inspected; base
-      image/action digest pinning and artifact signing remain
+      hosted `v0.0.21-rc.1` release was inspected on 2026-10-04: both images
+      passed strict gates and exact-digest smoke playback, publication succeeded,
+      and the GitHub release contains both architecture archives, stamped source,
+      OpenAPI and checksums. Workflow actions are pinned by commit. Remaining:
+      base-image digest pinning and artifact signing; SBOM/provenance and
+      checksums do not substitute for those requirements.
 - [ ] OPS-RDY-9 Publish a modular Compose example and a release runbook covering
       reverse proxy TLS, trusted proxies, persistent paths, ownership, upgrade,
       rollback and backup/restore drills
@@ -676,10 +721,20 @@ marked in that document.
       admin, provider and observability changes from sharing one implementation
       unit merely by history. The exact router/file split follows measured
       coupling rather than a prescribed directory layout
-- [ ] ENG-4 Define and enforce comparable ownership boundaries for session
+- [~] ENG-4 Define and enforce comparable ownership boundaries for session
       lifecycle/placement/artifacts/recovery, media planning/source/pipeline/
       segmenting/supervision and provider enrichment. Record the criteria before
-      selecting crate/module splits; source size alone is not a cost model
+      selecting crate/module splits; source size alone is not a cost model.
+      The shared playback boundary is implemented: `kahawai-playback` owns the
+      job codecs, executor, artifact contract and pure placement ranker, while
+      the hub owns sessions, leases, registry reservations and HTTP. Its module
+      documentation records the reason: duplicated supervision and codecs
+      drifted in behavior. Remux construction is split by source, routing,
+      audio/video, taps, sink and lifecycle. `job_codecs`, executor tests and
+      `scripts/kahawai-playback.sh lean` exercise the shared boundary; the
+      codec/executor tests passed in both release images. Remaining: enforced
+      media source/pipeline ownership and the comparable provider-enrichment
+      boundary, rather than module separation alone.
 - [ ] ENG-5 Keep the structural refactor behaviour-neutral. Contract snapshots
       and media fixtures prove unchanged JSON, manifests, timestamps,
       byte-range semantics and playback choices

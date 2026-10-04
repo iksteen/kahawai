@@ -369,6 +369,10 @@ audio/video byte separation for manual playback testing; see
       their separate administrator gate.
       Parental control needs no separate mechanism: it is a library the
       admin composes and grants.
+      Authentication coverage was rechecked on 2026-10-04: all 27 `auth_api`
+      tests passed in CI and both strict release-image suites; browser storage
+      traps passed in the stamped-source web suite, and the real image auth
+      cycle passed on amd64 and arm64. See readiness CI-5 for the named checks.
       Watch state is writable without playing: `PUT
       /api/v1/items/{id}/watched` marks an item watched or unwatched
       (`kahawai-watched.sh`), for something seen elsewhere or a tick
@@ -1023,6 +1027,11 @@ audio/video byte separation for manual playback testing; see
       subtile-ocr, so no GPL combined-work consequence exists;
       --no-default-features additionally drops the Tesseract linkage;
       hosted CI run 31788811563 built the complete feature-off workspace
+      Release run 37165079722 (`v0.0.21-rc.1`, 2026-10-04) passed the strict
+      release-profile workspace suite against pinned GStreamer 1.28.7 on native
+      amd64 and arm64. Both exact pushed images passed patch verification,
+      the authentication cycle and five-segment HLS smoke playback (readiness
+      GST-27). This does not complete the separate media-core quality gates.
 
 ## v1 acceptance criteria
 
