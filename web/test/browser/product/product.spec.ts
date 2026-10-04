@@ -190,7 +190,11 @@ test.describe.serial('real all-in-one product flows', () => {
   test('administration creates a composed library and a narrowed account', async () => {
     await page.goto(`${PUBLIC}/app/admin`)
     await expect(page.getByRole('heading', { name: 'Satellites' })).toBeVisible()
-    await expect(page.getByText('No satellites enrolled.')).toBeVisible()
+    const builtIn = page.getByRole('listitem').filter({ hasText: 'Built-in transcoder' })
+    await expect(builtIn).toBeVisible()
+    await expect(builtIn.getByText('built-in', { exact: true })).toBeVisible()
+    await expect(builtIn.getByRole('button', { name: 'Disable', exact: true })).toBeVisible()
+    await expect(builtIn.getByRole('button', { name: /^Delete/ })).toHaveCount(0)
     await accessible('admin-satellites')
 
     await page.getByRole('tab', { name: 'Libraries' }).click()

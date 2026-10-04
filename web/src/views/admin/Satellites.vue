@@ -264,7 +264,7 @@ function some(satellite: SatelliteOverview) {
           v-if="satellite.module_type === 'transcoder' && some(satellite)"
           class="mt-1 flex flex-wrap items-center gap-2"
         >
-          <span class="font-mono text-[11px] text-dimmer">measured</span>
+          <span class="font-mono text-[11px] text-dim">measured</span>
           <span
             v-for="encoder in facts(satellite).encoders"
             :key="encoder.element"
