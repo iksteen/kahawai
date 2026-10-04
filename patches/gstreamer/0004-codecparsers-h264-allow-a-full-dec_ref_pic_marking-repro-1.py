@@ -46,8 +46,10 @@ def make_stream(path):
 
 
 def framemd5_reference(path):
+    # -nostdin: ffmpeg otherwise puts a terminal on stdin into raw mode for
+    # its keys, which stops a background process group with SIGTTOU.
     out = subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "h264", "-i", path, "-map", "0:v:0",
+        ["ffmpeg", "-nostdin", "-v", "error", "-f", "h264", "-i", path, "-map", "0:v:0",
          "-an", "-pix_fmt", "yuv420p", "-f", "framemd5", "-"],
         capture_output=True, text=True).stdout
     return [l.split()[-1] for l in out.splitlines() if l and not l.startswith("#")]
@@ -59,7 +61,7 @@ def framemd5_gst(path, decoder):
          decoder, "!", "videoconvert", "!", "video/x-raw,format=I420", "!", "fdsink", "fd=1"],
         stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
     ff = subprocess.run(
-        ["ffmpeg", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
+        ["ffmpeg", "-nostdin", "-v", "error", "-f", "rawvideo", "-pix_fmt", "yuv420p",
          "-s", f"{W}x{H}", "-i", "-", "-f", "framemd5", "-"],
         stdin=gst.stdout, capture_output=True, text=True)
     gst.wait()

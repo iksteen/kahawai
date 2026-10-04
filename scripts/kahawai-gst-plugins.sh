@@ -168,9 +168,15 @@ verify() {
             # children with it. A reproducer that spawns gst-launch and is
             # killed on its own leaves that child wedged for ever — which
             # is how a 34-hour-old gst-inspect turned up on the mac.
+            #
+            # Not on the terminal, either: that group is a background one,
+            # and ffmpeg (0004's reference decoder) puts a terminal on its
+            # stdin into raw mode for its keys. The kernel stops the whole
+            # group with SIGTTOU for that, so under `makepkg` in a terminal
+            # the reproducer sat stopped until the timeout voided the patch.
             local repro_pid waited=0 timed_out=0
             set -m
-            ( cd "$out" && python3 "$repro" ) >"$log" 2>&1 &
+            ( cd "$out" && python3 "$repro" ) </dev/null >"$log" 2>&1 &
             repro_pid=$!
             set +m
             while kill -0 "$repro_pid" 2>/dev/null; do

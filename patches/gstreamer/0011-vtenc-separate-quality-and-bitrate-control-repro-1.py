@@ -29,7 +29,7 @@ def run(directory, plugin_dir):
     subprocess.run([str(binary), str(directory)], check=True, env=env, timeout=600)
     for extension, codec in (("h264", "h264"), ("hevc", "h265")):
         video = directory / f"vtenc_{codec}_hw.{extension}"
-        decoded = subprocess.run(["ffmpeg", "-v", "error", "-xerror", "-i",
+        decoded = subprocess.run(["ffmpeg", "-nostdin", "-v", "error", "-xerror", "-i",
                                   str(video), "-f", "null", "-"], check=True,
                                  capture_output=True, text=True, timeout=180)
         # Some decoder corruption diagnostics do not change ffmpeg's exit code.
