@@ -100,7 +100,24 @@ export function subtitleLabel(track: {
   format: string
   origin: string
   delivery: string
+  label?: string | null
+  forced?: boolean
+  hearing_impaired?: boolean
+  commentary?: boolean
 }): string {
+  // An embedded track's own name says what it is when it has one ("English
+  // [SDH]"); the flags say it when it does not, which several English rows
+  // in a row otherwise leave indistinguishable. A download's label is its
+  // release name, which says nothing of the kind and runs long.
+  const kind = [
+    track.forced ? 'forced' : '',
+    track.hearing_impaired ? 'SDH' : '',
+    track.commentary ? 'commentary' : '',
+  ]
+    .filter(Boolean)
+    .join(', ')
+  const own = track.origin === 'embedded' ? track.label?.trim() : undefined
+  const name = own ? ` · ${own}` : kind ? ` · ${kind}` : ''
   const origin =
     track.origin === 'sidecar'
       ? ' · file'
@@ -113,5 +130,5 @@ export function subtitleLabel(track: {
             : ''
   const delivery =
     track.delivery === 'burn' ? ' · burn-in' : track.delivery === 'none' ? ' · unavailable' : ''
-  return `${track.language ?? 'unknown'} · ${track.format}${origin}${delivery}`
+  return `${track.language ?? 'unknown'}${name} · ${track.format}${origin}${delivery}`
 }

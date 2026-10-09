@@ -3924,6 +3924,10 @@ struct ClientSubtitleStream {
     format: String,
     #[schema(required)]
     language: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    title: Option<String>,
+    #[serde(flatten)]
+    variant: kahawai_core::media::SubtitleVariant,
 }
 
 impl From<kahawai_core::media::SubtitleStream> for ClientSubtitleStream {
@@ -3931,6 +3935,8 @@ impl From<kahawai_core::media::SubtitleStream> for ClientSubtitleStream {
         Self {
             format: stream.format,
             language: stream.language,
+            title: stream.title,
+            variant: stream.variant,
         }
     }
 }
@@ -3971,6 +3977,8 @@ impl From<kahawai_core::media::MediaInfo> for ClientMediaInfo {
                 .map(|track| ClientSubtitleStream {
                     format: track.format,
                     language: track.language,
+                    title: None,
+                    variant: track.variant,
                 }),
         );
         Self {

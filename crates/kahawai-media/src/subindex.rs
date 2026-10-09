@@ -168,6 +168,14 @@ const TRACK_NUMBER: u32 = 0xD7;
 const TRACK_TYPE: u32 = 0x83;
 const CODEC_ID: u32 = 0x86;
 const CODEC_PRIVATE: u32 = 0x63A2;
+/// TrackEntry's Name and the variant flags. matroskademux stores
+/// FlagForced without exposing it and reads none of the others, so the
+/// header is the only place these are found.
+const TRACK_NAME: u32 = 0x536E;
+const FLAG_FORCED: u32 = 0x55AA;
+const FLAG_HEARING_IMPAIRED: u32 = 0x55AB;
+const FLAG_TEXT_DESCRIPTIONS: u32 = 0x55AD;
+const FLAG_COMMENTARY: u32 = 0x55AF;
 const CUES: u32 = 0x1C53_BB6B;
 const CUE_POINT: u32 = 0xBB;
 const CUE_TIME: u32 = 0xB3;
@@ -716,6 +724,37 @@ pub fn declare_container(
     Vec<kahawai_core::media::Attachment>,
     Vec<kahawai_core::media::Chapter>,
 )> {
+    let declared = declare(path)?;
+    Ok((declared.attachments, declared.chapters))
+}
+
+/// What one header walk declares. See [`declare`].
+#[derive(Debug, Default)]
+pub struct Declaration {
+    pub attachments: Vec<kahawai_core::media::Attachment>,
+    pub chapters: Vec<kahawai_core::media::Chapter>,
+    /// One per subtitle TrackEntry, in the order the `e{n}` keys count
+    /// them (extraction's `sub_index`), so entry n describes the cues
+    /// served as `e{n}`. `None` when the Tracks element was not read.
+    pub subtitles: Option<Vec<DeclaredSubtitle>>,
+}
+
+/// A subtitle TrackEntry's name and flags. Absent flags are false: the
+/// spec's default for each.
+#[derive(Debug, Default, Clone, PartialEq)]
+pub struct DeclaredSubtitle {
+    pub name: Option<String>,
+    pub forced: bool,
+    /// FlagHearingImpaired, or FlagTextDescriptions: a subtitle track that
+    /// describes the picture's sounds is the SDH track by another flag.
+    pub hearing_impaired: bool,
+    pub commentary: bool,
+}
+
+/// [`declare_container`] with the subtitle tracks' names and flags too.
+/// Tracks sits before the clusters in every layout a muxer writes, so the
+/// linear part of the walk reaches it without a read of its own.
+pub fn declare(path: &Path) -> Result<Declaration> {
     let mut src = crate::remux::FileSource::open(path)?;
     // A budget bounds the one unbounded case — a SeekHead-less file hopped
     // cluster by cluster on a slow mount. Hitting it is WEATHER (an
@@ -740,11 +779,11 @@ pub fn declare_container(
         }
     };
     let Some((segment_start, segment_end)) = span else {
-        return Ok((Vec::new(), Vec::new()));
+        return Ok(Declaration::default());
     };
 
     let end = segment_end.min(r.len);
-    let (mut attachments, mut chapters) = (None, None);
+    let (mut attachments, mut chapters, mut subtitles) = (None, None, None);
     let mut pending: Vec<u64> = Vec::new();
     let mut saw_seekhead = false;
     let mut visited = std::collections::HashSet::new();
@@ -834,7 +873,7 @@ pub fn declare_container(
                             })?;
                             // A second SeekHead usually lives at the end of
                             // the file and is where the Chapters entry hides.
-                            if matches!(target, ATTACHMENTS | CHAPTERS | SEEK_HEAD)
+                            if matches!(target, ATTACHMENTS | CHAPTERS | TRACKS | SEEK_HEAD)
                                 && let Some(p) = position
                             {
                                 // checked: a hostile SeekPosition near u64::MAX
@@ -901,6 +940,24 @@ pub fn declare_container(
                     Vec::new()
                 });
             }
+            // Unlike the two above, an unreadable Tracks settles nothing:
+            // `None` leaves the streams as discovery named them.
+            TRACKS if subtitles.is_none() && size <= MAX_HEADER_ELEMENT => {
+                match r.read_at(body, size as usize) {
+                    Ok(data) => match read_subtitle_tracks(&data) {
+                        Ok(found) => subtitles = Some(found),
+                        Err(e) => tracing::debug!(
+                            error = format!("{e:#}"),
+                            "tracks unparseable; no subtitle flags"
+                        ),
+                    },
+                    Err(e) if is_io(&e) => return Err(e),
+                    Err(e) => tracing::debug!(
+                        error = format!("{e:#}"),
+                        "tracks unreadable by shape; no subtitle flags"
+                    ),
+                }
+            }
             CLUSTER => {
                 // LINEAR-FIRST up to here, so header elements a partial
                 // SeekHead never mentioned are still found — following
@@ -918,15 +975,51 @@ pub fn declare_container(
             }
             _ => {}
         }
-        if attachments.is_some() && chapters.is_some() {
+        if attachments.is_some() && chapters.is_some() && subtitles.is_some() {
             break;
         }
         pos = body + size;
     }
-    Ok((
-        attachments.unwrap_or_default(),
-        chapters.unwrap_or_default(),
-    ))
+    Ok(Declaration {
+        attachments: attachments.unwrap_or_default(),
+        chapters: chapters.unwrap_or_default(),
+        subtitles,
+    })
+}
+
+/// The subtitle TrackEntries of a Tracks element, in order.
+fn read_subtitle_tracks(data: &[u8]) -> Result<Vec<DeclaredSubtitle>> {
+    let mut out = Vec::new();
+    walk_children(data, |id, entry| {
+        if id != TRACK_ENTRY {
+            return Ok(true);
+        }
+        let (mut ttype, mut track) = (0u64, DeclaredSubtitle::default());
+        walk_children(entry, |id, v| {
+            match id {
+                TRACK_TYPE => ttype = uint(v),
+                TRACK_NAME => {
+                    // EBML strings may be zero-padded.
+                    let name = String::from_utf8_lossy(v);
+                    let name = name.trim_end_matches('\0').trim();
+                    track.name = (!name.is_empty()).then(|| name.to_string());
+                }
+                FLAG_FORCED => track.forced = uint(v) != 0,
+                FLAG_HEARING_IMPAIRED | FLAG_TEXT_DESCRIPTIONS => {
+                    track.hearing_impaired |= uint(v) != 0
+                }
+                FLAG_COMMENTARY => track.commentary = uint(v) != 0,
+                _ => {}
+            }
+            Ok(true)
+        })?;
+        // The same test `mkv_read_index` counts `sub_index` by.
+        if ttype == 0x11 {
+            out.push(track);
+        }
+        Ok(true)
+    })?;
+    Ok(out)
 }
 
 /// The attachments half of [`declare_container`].
@@ -1897,6 +1990,68 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Intro"],
             "the cluster hop still runs when the index could not be read"
+        );
+    }
+
+    /// The subtitle TrackEntries' names and flags, in `e{n}` order: a video
+    /// track between them takes no slot, an absent flag is false, and
+    /// FlagTextDescriptions counts as hearing-impaired.
+    #[test]
+    fn subtitle_track_names_and_flags_are_declared_in_key_order() {
+        use std::io::Write as _;
+        let entry = |number: u8, ttype: u8, extra: &[Vec<u8>]| {
+            let mut body = [ebml(TRACK_NUMBER, &[number]), ebml(TRACK_TYPE, &[ttype])].concat();
+            for e in extra {
+                body.extend_from_slice(e);
+            }
+            ebml(TRACK_ENTRY, &body)
+        };
+        let tracks = ebml(
+            TRACKS,
+            &[
+                entry(1, 0x01, &[ebml(TRACK_NAME, b"Main")]),
+                entry(
+                    2,
+                    0x11,
+                    &[ebml(TRACK_NAME, b"Forced"), ebml(FLAG_FORCED, &[1])],
+                ),
+                entry(3, 0x11, &[ebml(TRACK_NAME, b"English\0\0")]),
+                entry(
+                    4,
+                    0x11,
+                    &[
+                        ebml(FLAG_TEXT_DESCRIPTIONS, &[1]),
+                        ebml(FLAG_COMMENTARY, &[0]),
+                    ],
+                ),
+            ]
+            .concat(),
+        );
+        let cluster = ebml(CLUSTER, &ebml(CLUSTER_TIMESTAMP, &[0]));
+        let mut file = ebml(EBML_HEADER, &[]);
+        file.extend(ebml(SEGMENT, &[tracks, cluster].concat()));
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        f.write_all(&file).unwrap();
+        f.flush().unwrap();
+
+        let declared = declare(f.path()).unwrap().subtitles.unwrap();
+        assert_eq!(
+            declared,
+            [
+                DeclaredSubtitle {
+                    name: Some("Forced".into()),
+                    forced: true,
+                    ..Default::default()
+                },
+                DeclaredSubtitle {
+                    name: Some("English".into()),
+                    ..Default::default()
+                },
+                DeclaredSubtitle {
+                    hearing_impaired: true,
+                    ..Default::default()
+                },
+            ]
         );
     }
 

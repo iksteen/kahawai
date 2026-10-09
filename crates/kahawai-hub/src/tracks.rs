@@ -34,8 +34,15 @@ pub struct Track {
     pub format: String,
     #[schema(required)]
     pub language: Option<String>,
+    /// The track's name: the container's for an embedded stream, the
+    /// release name for a download. Shown as given.
     #[schema(required)]
     pub label: Option<String>,
+    /// Forced / hearing-impaired / commentary, as the probe settled them.
+    /// Copied from the stored probe, never re-derived from `label`. OCR and
+    /// raster rows carry their parent's, since they are the same cues.
+    #[serde(flatten)]
+    pub variant: kahawai_core::media::SubtitleVariant,
     pub machine: bool,
     #[schema(required)]
     pub derived_from: Option<i64>,
@@ -247,6 +254,7 @@ mod tests {
             format: format.into(),
             language: None,
             label: None,
+            variant: Default::default(),
             machine: false,
             derived_from: None,
             created_by: None,

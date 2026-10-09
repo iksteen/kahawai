@@ -20,17 +20,28 @@ export const isRasterSub = (track: Pick<TrackListing, 'origin'>) => track.origin
 /// Language wishes auto-pick only CLIENT-RENDERED tracks: silently forcing a
 /// burn is a video encode restart, which is never what a language preference
 /// means. Burns are explicit picks.
-export function pickSubtitle<T extends Pick<TrackListing, 'delivery' | 'format' | 'language'>>(
-  wishlist: string[],
-  subs: T[],
-): T | null {
-  const auto = (s: T) => s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay'
-  // The server's fidelity order (HUB-32a/d): the client's own ASS renderer
-  // first, then a server-rasterised overlay, then flattened text. Within one
-  // language the BEST reading wins, not whichever row the listing happened to
-  // put first — otherwise a client with ASS masked off would take the flattened
-  // VTT and never notice the rasterised track sitting right behind it.
-  const rank = (s: T) => (s.delivery === 'ass' ? 0 : s.delivery === 'overlay' ? 1 : 2)
+export function pickSubtitle<
+  T extends Pick<
+    TrackListing,
+    'delivery' | 'format' | 'language' | 'forced' | 'hearing_impaired' | 'commentary'
+  >,
+>(wishlist: string[], subs: T[]): T | null {
+  // A commentary track is never what a language wish means.
+  const auto = (s: T) =>
+    !s.commentary && (s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay')
+  // What the track is comes before how it is drawn. A language wish asks for
+  // the dialogue: the full track first, the SDH one (the same dialogue plus
+  // sound descriptions) next, and a forced track — only the foreign or
+  // signed parts, the first English track of many a release — last, so it
+  // is taken only when nothing fuller exists in that language.
+  const kind = (s: T) => (s.forced ? 2 : s.hearing_impaired ? 1 : 0)
+  // Then the server's fidelity order (HUB-32a/d): the client's own ASS
+  // renderer first, then a server-rasterised overlay, then flattened text.
+  // Within one language the BEST reading wins, not whichever row the listing
+  // happened to put first — otherwise a client with ASS masked off would take
+  // the flattened VTT and never notice the rasterised track right behind it.
+  const fidelity = (s: T) => (s.delivery === 'ass' ? 0 : s.delivery === 'overlay' ? 1 : 2)
+  const rank = (s: T) => kind(s) * 3 + fidelity(s)
   const best = (candidates: T[]) =>
     candidates.length === 0 ? null : candidates.reduce((a, b) => (rank(b) < rank(a) ? b : a))
   for (const want of wishlist) {

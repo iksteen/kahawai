@@ -29,6 +29,26 @@ test('with nothing remembered the wishlist decides', () => {
   expect(initialSubtitle({ subs, exactId: null, wishlist: ['nl'] })?.id).toBe(9)
 })
 
+test('a language wish takes the full track over the forced one listed first', () => {
+  // The Silo release: a forced English track first, then the full one and
+  // the SDH one. Neither the first English row nor a carried id is right.
+  const forced = sub({ id: 1, forced: true, label: 'Forced' })
+  const sdh = sub({ id: 3, hearing_impaired: true, label: 'SDH' })
+  const subs = [forced, sub({ id: 2 }), sdh, sub({ id: 4, language: 'ar' })]
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'] })?.id).toBe(2)
+  // SDH before forced when there is no plain track; forced only as the last
+  // English reading; commentary never.
+  expect(initialSubtitle({ subs: [forced, sdh], exactId: null, wishlist: ['en'] })?.id).toBe(3)
+  expect(initialSubtitle({ subs: [forced], exactId: null, wishlist: ['en'] })?.id).toBe(1)
+  const commentary = sub({ id: 9, commentary: true })
+  expect(initialSubtitle({ subs: [commentary], exactId: null, wishlist: ['en'] })).toBe(null)
+})
+
+test('what a track is outranks how it is drawn', () => {
+  const subs = [sub({ id: 1, forced: true, delivery: 'ass' }), sub({ id: 2, delivery: 'text' })]
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'] })?.id).toBe(2)
+})
+
 test('no memory and no match is no subtitle', () => {
   const subs = [sub({ id: 8, language: 'de' })]
   expect(initialSubtitle({ subs, exactId: 42, wishlist: ['fr'] })).toBe(null)

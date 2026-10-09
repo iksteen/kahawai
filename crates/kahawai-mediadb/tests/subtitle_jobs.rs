@@ -319,6 +319,7 @@ async fn a_source_resolves_by_media_path_or_by_sidecar_path() {
             format: "vobsub".into(),
             language: None,
             track: Some(0),
+            ..Default::default()
         }],
         ..Default::default()
     };

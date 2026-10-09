@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "d13e56eec988b265fdb39ef61697aa3953e0d35b63a523645f289bee58fe4d49",
+  "x-kahawai-source-sha256": "d0432fd43ff7ad4ba5f4e53bb0d8dbf69091d18c85f8674a31eeb02acf57b319",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -9648,22 +9648,35 @@
         }
       },
       "ClientSubtitleStream": {
-        "type": "object",
-        "required": [
-          "format",
-          "language"
-        ],
-        "properties": {
-          "format": {
-            "type": "string"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SubtitleVariant"
           },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
+          {
+            "type": "object",
+            "required": [
+              "format",
+              "language"
+            ],
+            "properties": {
+              "format": {
+                "type": "string"
+              },
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            }
           }
-        }
+        ]
       },
       "ClientVideoStream": {
         "type": "object",
@@ -12672,6 +12685,24 @@
           "unavailable"
         ]
       },
+      "SubtitleVariant": {
+        "type": "object",
+        "description": "What a subtitle track is FOR, beyond its language: settled once, at\nprobe, from the container's flags and the track's name together.\n\nNeither source is enough alone. Measured on a 750-file sample of a real\nlibrary: most hearing-impaired tracks say so only in their name\n(\"English [SDH]\"), and anime marks its partial tracks \"Signs/Songs\" and\nnever flags them, while a remainder of forced tracks carry the Matroska\nflag and no name at all. Consumers read these booleans; nothing after\nthe probe looks at a title to decide them again.",
+        "properties": {
+          "commentary": {
+            "type": "boolean",
+            "description": "A commentary track, not the programme's dialogue."
+          },
+          "forced": {
+            "type": "boolean",
+            "description": "Only the parts the audio does not already carry: foreign-language\ndialogue, signs, songs. Not a transcript of the programme."
+          },
+          "hearing_impaired": {
+            "type": "boolean",
+            "description": "Written for viewers who cannot hear the audio (SDH, CC): speaker\nnames and sound descriptions alongside the dialogue."
+          }
+        }
+      },
       "SubtitleVerdict": {
         "type": "object",
         "required": [
@@ -12801,62 +12832,71 @@
         }
       },
       "Track": {
-        "type": "object",
-        "required": [
-          "id",
-          "item_id",
-          "origin",
-          "stream_index",
-          "format",
-          "language",
-          "label",
-          "machine",
-          "derived_from"
-        ],
-        "properties": {
-          "derived_from": {
-            "type": [
-              "integer",
-              "null"
+        "allOf": [
+          {
+            "$ref": "#/components/schemas/SubtitleVariant",
+            "description": "Forced / hearing-impaired / commentary, as the probe settled them.\nCopied from the stored probe, never re-derived from `label`. OCR and\nraster rows carry their parent's, since they are the same cues."
+          },
+          {
+            "type": "object",
+            "required": [
+              "id",
+              "item_id",
+              "origin",
+              "stream_index",
+              "format",
+              "language",
+              "label",
+              "machine",
+              "derived_from"
             ],
-            "format": "int64"
-          },
-          "format": {
-            "type": "string"
-          },
-          "id": {
-            "type": "integer",
-            "format": "int64"
-          },
-          "item_id": {
-            "type": "string"
-          },
-          "label": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "language": {
-            "type": [
-              "string",
-              "null"
-            ]
-          },
-          "machine": {
-            "type": "boolean"
-          },
-          "origin": {
-            "type": "string"
-          },
-          "stream_index": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64"
+            "properties": {
+              "derived_from": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              },
+              "format": {
+                "type": "string"
+              },
+              "id": {
+                "type": "integer",
+                "format": "int64"
+              },
+              "item_id": {
+                "type": "string"
+              },
+              "label": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "The track's name: the container's for an embedded stream, the\nrelease name for a download. Shown as given."
+              },
+              "language": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "machine": {
+                "type": "boolean"
+              },
+              "origin": {
+                "type": "string"
+              },
+              "stream_index": {
+                "type": [
+                  "integer",
+                  "null"
+                ],
+                "format": "int64"
+              }
+            }
           }
-        }
+        ]
       },
       "TrackListing": {
         "allOf": [

@@ -764,10 +764,13 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
     // discovery's TOC: matroskademux posts no TOC for some files whose
     // chapters this reads out exactly.
     if matches!(info.container.as_deref(), Some("matroska" | "webm")) {
-        match kahawai_media::subindex::declare_container(path) {
-            Ok((attachments, chapters)) => {
-                info.attachments = Some(attachments);
-                info.chapters = Some(chapters);
+        match kahawai_media::subindex::declare(path) {
+            Ok(declared) => {
+                info.attachments = Some(declared.attachments);
+                info.chapters = Some(declared.chapters);
+                if let Some(tracks) = declared.subtitles {
+                    apply_declared_subtitles(path, &mut info.subtitles, &tracks);
+                }
             }
             Err(e) => {
                 tracing::debug!(
@@ -785,6 +788,44 @@ fn inspect(root: &Path, path: &Path) -> Result<Inspected> {
         }
     }
     Ok((size, mtime_unix, head_xxh3, tail_xxh3, oshash, info))
+}
+
+/// The header's names and flags onto discovery's streams. Entry n is the
+/// stream served as `e{n}`, which is the alignment extraction already
+/// relies on; when the counts disagree that alignment is in doubt, and a
+/// flag on the wrong track is worse than none, so the streams keep only
+/// what discovery found.
+fn apply_declared_subtitles(
+    path: &Path,
+    streams: &mut [kahawai_core::media::SubtitleStream],
+    declared: &[kahawai_media::subindex::DeclaredSubtitle],
+) {
+    use kahawai_core::media::SubtitleVariant;
+    if streams.len() != declared.len() {
+        tracing::debug!(
+            path = %path.display(),
+            discovered = streams.len(),
+            declared = declared.len(),
+            "subtitle track counts differ; no header flags applied"
+        );
+        return;
+    }
+    for (stream, track) in streams.iter_mut().zip(declared) {
+        if stream.title.is_none() {
+            stream.title = track.name.clone();
+        }
+        let flags = SubtitleVariant {
+            forced: track.forced,
+            hearing_impaired: track.hearing_impaired,
+            commentary: track.commentary,
+        };
+        let named = stream
+            .title
+            .as_deref()
+            .map(SubtitleVariant::from_title)
+            .unwrap_or_default();
+        stream.variant = flags.union(named);
+    }
 }
 
 /// Refresh only facts about companion files. No media content reads or
@@ -966,11 +1007,22 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
         } else {
             ""
         };
-        let language = middle
-            .split('.')
-            .next()
-            .filter(|t| !t.is_empty() && t.len() <= 10)
-            .map(|t| t.to_lowercase());
+        // "Movie.en.forced.srt", "Movie.en.sdh.srt": the words after the
+        // language say what kind of track it is. A name that leads with
+        // one ("Movie.forced.srt") has no language rather than "forced".
+        let tokens: Vec<&str> = middle.split('.').filter(|t| !t.is_empty()).collect();
+        let (language, rest) = match tokens.split_first() {
+            Some((first, rest))
+                if !kahawai_core::media::SubtitleVariant::is_variant_word(
+                    &first.to_lowercase(),
+                ) =>
+            {
+                (Some(*first).filter(|t| t.len() <= 10), rest)
+            }
+            _ => (None, tokens.as_slice()),
+        };
+        let language = language.map(|t| t.to_lowercase());
+        let variant = kahawai_core::media::SubtitleVariant::from_words(rest.iter().copied());
         out.push(kahawai_core::media::SidecarSubtitle {
             path_rel: p
                 .strip_prefix(root)
@@ -980,6 +1032,7 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
             format: format.to_string(),
             language,
             track: None,
+            variant,
         });
     }
     // VobSub pairs: `<stem>.idx` + `<stem>.sub` — image subtitles, one
@@ -1002,6 +1055,7 @@ fn find_sidecars(root: &Path, media: &Path) -> Vec<kahawai_core::media::SidecarS
                 format: "vobsub".into(),
                 language: t.language,
                 track: Some(t.id),
+                ..Default::default()
             });
         }
     }
@@ -1726,6 +1780,9 @@ id: nl, index: 1
             "m/Heat (1995).srt",
             "m/Heat (1995).en.srt",
             "m/Heat (1995).nl.forced.ass",
+            "m/Heat (1995).en.sdh.srt",
+            "m/Heat (1995).hi.srt",
+            "m/Heat (1995).forced.srt",
             "m/Heat (1995).vtt",
             "m/Heat (1995) extras.srt", // no dot boundary → not a sidecar
             "m/Other.srt",
@@ -1733,25 +1790,75 @@ id: nl, index: 1
             std::fs::write(root.join(f), b"x").unwrap();
         }
         let subs = find_sidecars(root, &root.join("m/Heat (1995).mkv"));
-        let got: Vec<(&str, &str, Option<&str>)> = subs
+        let got: Vec<(&str, &str, Option<&str>, bool, bool)> = subs
             .iter()
             .map(|s| {
                 (
                     s.path_rel.as_str(),
                     s.format.as_str(),
                     s.language.as_deref(),
+                    s.variant.forced,
+                    s.variant.hearing_impaired,
                 )
             })
             .collect();
         assert_eq!(
             got,
             vec![
-                ("m/Heat (1995).en.srt", "srt", Some("en")),
-                ("m/Heat (1995).nl.forced.ass", "ass", Some("nl")),
-                ("m/Heat (1995).srt", "srt", None),
-                ("m/Heat (1995).vtt", "vtt", None),
+                ("m/Heat (1995).en.sdh.srt", "srt", Some("en"), false, true),
+                ("m/Heat (1995).en.srt", "srt", Some("en"), false, false),
+                // A leading kind word is not a language...
+                ("m/Heat (1995).forced.srt", "srt", None, true, false),
+                // ...but a leading "hi" is Hindi.
+                ("m/Heat (1995).hi.srt", "srt", Some("hi"), false, false),
+                (
+                    "m/Heat (1995).nl.forced.ass",
+                    "ass",
+                    Some("nl"),
+                    true,
+                    false
+                ),
+                ("m/Heat (1995).srt", "srt", None, false, false),
+                ("m/Heat (1995).vtt", "vtt", None, false, false),
             ]
         );
+    }
+
+    /// Header flags and names land on discovery's streams by position, a
+    /// name's words add to the flags, and a count mismatch applies nothing.
+    #[test]
+    fn declared_subtitle_flags_apply_by_position() {
+        use kahawai_core::media::SubtitleStream;
+        use kahawai_media::subindex::DeclaredSubtitle;
+        let stream = |title: Option<&str>| SubtitleStream {
+            format: "pgs".into(),
+            language: Some("eng".into()),
+            title: title.map(Into::into),
+            ..Default::default()
+        };
+        let declared = [
+            DeclaredSubtitle {
+                forced: true,
+                ..Default::default()
+            },
+            DeclaredSubtitle::default(),
+            DeclaredSubtitle {
+                name: Some("English [SDH]".into()),
+                ..Default::default()
+            },
+        ];
+        let mut streams = vec![stream(None), stream(Some("SDH")), stream(None)];
+        apply_declared_subtitles(Path::new("x.mkv"), &mut streams, &declared);
+        let flags: Vec<(bool, bool)> = streams
+            .iter()
+            .map(|s| (s.variant.forced, s.variant.hearing_impaired))
+            .collect();
+        assert_eq!(flags, [(true, false), (false, true), (false, true)]);
+        assert_eq!(streams[2].title.as_deref(), Some("English [SDH]"));
+
+        let mut short = vec![stream(None)];
+        apply_declared_subtitles(Path::new("x.mkv"), &mut short, &declared);
+        assert_eq!(short, [stream(None)]);
     }
 
     #[tokio::test]

@@ -301,6 +301,8 @@ pub(crate) fn tracks(
                 s.format.clone(),
                 s.language.clone(),
                 None,
+                s.title.clone(),
+                s.variant,
             )
         })
         .chain(
@@ -314,12 +316,14 @@ pub(crate) fn tracks(
                         s.format.clone(),
                         s.language.clone(),
                         Some(s.path_rel.clone()),
+                        None,
+                        s.variant,
                     )
                 }),
         )
         .enumerate()
         .map(
-            |(at, (index, origin, format, language, path))| crate::tracks::Track {
+            |(at, (index, origin, format, language, path, label, variant))| crate::tracks::Track {
                 acquired: None,
                 artifact_key: Some(crate::subtitles::catalogue::key(
                     part,
@@ -339,7 +343,8 @@ pub(crate) fn tracks(
                 stream_index: Some(index as i64),
                 format,
                 language,
-                label: None,
+                label,
+                variant,
                 machine: false,
                 derived_from: None,
                 created_by: None,
@@ -509,6 +514,7 @@ fn downloaded_tracks(
                 format: d.format.clone(),
                 language: d.language.clone(),
                 label: d.label.clone(),
+                variant: Default::default(),
                 machine: false,
                 derived_from: None,
                 created_by: Some(d.created_by.clone()),

@@ -2,7 +2,7 @@ import { expect, test } from 'vitest'
 
 import type { Preference } from '../src/api/generated/model/preference.ts'
 import { sourcePreferenceScope } from '../src/domain/source.ts'
-import { resolveTracks } from '../src/domain/tracks.ts'
+import { resolveTracks, subtitleLabel } from '../src/domain/tracks.ts'
 
 const scope = sourcePreferenceScope([{ source_id: 7, collection_item_id: 'copy-b' }], 7)
 const audio = [{ language: 'eng' }, { language: 'jpn' }, { language: 'eng' }]
@@ -50,4 +50,17 @@ test('shared language choices remain portable across copies', () => {
 
 test('a downloaded subtitle ID remains an exact source preference', () => {
   expect(resolve([{ scope: scope!, key: 'subs.track', value: '-42' }]).subTrack).toBe(-42)
+})
+
+test('several English rows are told apart by name, else by what they are', () => {
+  const row = { language: 'en', format: 'pgs', origin: 'embedded', delivery: 'overlay' }
+  expect(subtitleLabel({ ...row, label: 'English [SDH]', hearing_impaired: true })).toBe(
+    'en · English [SDH] · pgs',
+  )
+  expect(subtitleLabel({ ...row, forced: true })).toBe('en · forced · pgs')
+  expect(subtitleLabel(row)).toBe('en · pgs')
+  // A download's label is a release name, not a description.
+  expect(
+    subtitleLabel({ ...row, origin: 'downloaded', format: 'srt', label: 'Silo.S01E01.WEB' }),
+  ).toBe('en · srt · downloaded')
 })

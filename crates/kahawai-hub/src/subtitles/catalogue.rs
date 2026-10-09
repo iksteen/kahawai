@@ -289,6 +289,7 @@ mod tests {
                         format: "ass".into(),
                         language: None,
                         track: None,
+                        ..Default::default()
                     }];
             }
             let key = track.internal_key();
@@ -483,6 +484,7 @@ mod tests {
             format: "vobsub".into(),
             language: Some("en".into()),
             track: Some(0),
+            ..Default::default()
         }];
         let sidecar = crate::sessions::catalogue::tracks("movie-a", &part, &info).remove(1);
         info.external_subtitles[0].track = Some(1);
@@ -614,6 +616,7 @@ mod tests {
                 format: "vobsub".into(),
                 language: Some("eng".into()),
                 track: Some(7),
+                ..Default::default()
             }];
         let reference = subs.extract_ref(&registry, &image).await.unwrap();
         assert_eq!(

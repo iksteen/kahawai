@@ -272,6 +272,67 @@ mod tests {
                 .contains("max_keyframe_interval_ms")
         );
     }
+
+    /// The names that marked a kind with no flag beside them, from the
+    /// library survey, and the near misses a substring match would take.
+    #[test]
+    fn subtitle_titles_are_classified_by_word() {
+        let v = SubtitleVariant::from_title;
+        for forced in [
+            "Forced",
+            "British | Forced",
+            "French (Forced Narrative)",
+            "English Signs/Songs",
+            "Signs & Songs",
+            "Foreign Parts Only",
+        ] {
+            assert!(v(forced).forced, "{forced}");
+            assert!(!v(forced).hearing_impaired, "{forced}");
+        }
+        for sdh in [
+            "SDH",
+            "English [SDH]",
+            "English (CC)",
+            "English HI",
+            "Hearing Impaired",
+            "English (Hard of Hearing)",
+            "Closed Captions",
+        ] {
+            assert!(v(sdh).hearing_impaired, "{sdh}");
+            assert!(!v(sdh).forced, "{sdh}");
+        }
+        assert!(v("Director's Commentary").commentary);
+        for plain in [
+            "English", "Full", "Dialogue", "Accented", "Chinese", "Songs",
+        ] {
+            assert_eq!(v(plain), SubtitleVariant::default(), "{plain}");
+        }
+        // Both at once: a forced track that also describes sounds.
+        let both = v("English Forced SDH");
+        assert!(both.forced && both.hearing_impaired);
+    }
+
+    /// Unflagged streams serialise exactly as before the fields existed:
+    /// probe JSON feeds artifact identities, and a probe that only gained
+    /// nothing must not move them.
+    #[test]
+    fn an_unflagged_stream_serialises_as_before() {
+        let stream = SubtitleStream {
+            format: "srt".into(),
+            language: Some("eng".into()),
+            ..Default::default()
+        };
+        assert_eq!(
+            serde_json::to_string(&stream).unwrap(),
+            r#"{"format":"srt","language":"eng"}"#
+        );
+        let flagged: SubtitleStream = serde_json::from_str(
+            r#"{"format":"pgs","language":"eng","title":"SDH","hearing_impaired":true}"#,
+        )
+        .unwrap();
+        assert!(flagged.variant.hearing_impaired && !flagged.variant.forced);
+        assert_eq!(flagged.title.as_deref(), Some("SDH"));
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
@@ -460,6 +521,88 @@ pub struct SubtitleStream {
     pub format: String,
     #[schema(required)]
     pub language: Option<String>,
+    /// The track's own name as the container states it ("English [SDH]",
+    /// "Signs/Songs"). Absent when it has none, and on rows probed before
+    /// names were kept.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    #[serde(flatten)]
+    pub variant: SubtitleVariant,
+}
+
+/// What a subtitle track is FOR, beyond its language: settled once, at
+/// probe, from the container's flags and the track's name together.
+///
+/// Neither source is enough alone. Measured on a 750-file sample of a real
+/// library: most hearing-impaired tracks say so only in their name
+/// ("English [SDH]"), and anime marks its partial tracks "Signs/Songs" and
+/// never flags them, while a remainder of forced tracks carry the Matroska
+/// flag and no name at all. Consumers read these booleans; nothing after
+/// the probe looks at a title to decide them again.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct SubtitleVariant {
+    /// Only the parts the audio does not already carry: foreign-language
+    /// dialogue, signs, songs. Not a transcript of the programme.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub forced: bool,
+    /// Written for viewers who cannot hear the audio (SDH, CC): speaker
+    /// names and sound descriptions alongside the dialogue.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub hearing_impaired: bool,
+    /// A commentary track, not the programme's dialogue.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub commentary: bool,
+}
+
+impl SubtitleVariant {
+    /// Read from a track name. Words, not substrings: "cc" must not fire
+    /// inside "Accented", nor "hi" inside "Chinese".
+    pub fn from_title(title: &str) -> Self {
+        let lower = title.to_lowercase();
+        let words: Vec<&str> = lower
+            .split(|c: char| !c.is_alphanumeric())
+            .filter(|w| !w.is_empty())
+            .collect();
+        let mut variant = Self::from_words(words.iter().copied());
+        // Spelled out rather than abbreviated: "Hearing Impaired",
+        // "Hard of Hearing", "Closed Captions".
+        variant.hearing_impaired |= words
+            .iter()
+            .any(|w| matches!(*w, "hearing" | "caption" | "captions" | "captioned"));
+        variant
+    }
+
+    /// Read from the dot-separated tokens of a sidecar's name
+    /// ("Movie.en.forced.srt", "Movie.en.sdh.srt"). The caller decides
+    /// which tokens are not the language.
+    pub fn from_words<'a>(words: impl IntoIterator<Item = &'a str>) -> Self {
+        let mut variant = Self::default();
+        for word in words {
+            match word.to_ascii_lowercase().as_str() {
+                // "Signs/Songs" is anime's forced track: only what the
+                // Japanese audio leaves unexplained, never the dialogue.
+                "forced" | "foreign" | "signs" => variant.forced = true,
+                "sdh" | "cc" | "hi" | "hoh" => variant.hearing_impaired = true,
+                "commentary" | "commentaries" => variant.commentary = true,
+                _ => {}
+            }
+        }
+        variant
+    }
+
+    /// Whether a sidecar token is one of the words above, and so not the
+    /// language. "hi" is excluded: as the first token it is Hindi.
+    pub fn is_variant_word(word: &str) -> bool {
+        word != "hi" && Self::from_words([word]) != Self::default()
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self {
+            forced: self.forced || other.forced,
+            hearing_impaired: self.hearing_impaired || other.hearing_impaired,
+            commentary: self.commentary || other.commentary,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
@@ -477,6 +620,9 @@ pub struct SidecarSubtitle {
     /// can carry many languages; each becomes its own entry).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub track: Option<u32>,
+    /// From the filename's other tokens ("Movie.en.forced.srt").
+    #[serde(flatten)]
+    pub variant: SubtitleVariant,
 }
 
 /// One mediahost collection as configured (stable name, media type, roots).

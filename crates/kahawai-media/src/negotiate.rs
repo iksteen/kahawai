@@ -1973,14 +1973,17 @@ mod tests {
             SubtitleStream {
                 format: "srt".into(),
                 language: None,
+                ..Default::default()
             },
             SubtitleStream {
                 format: "ass".into(),
                 language: None,
+                ..Default::default()
             },
             SubtitleStream {
                 format: "pgs".into(),
                 language: None,
+                ..Default::default()
             },
         ];
         // This fixture's client can composite, so the PGS track does
@@ -2109,6 +2112,7 @@ mod tests {
         info.subtitles = vec![SubtitleStream {
             format: "ass".into(),
             language: Some("en".into()),
+            ..Default::default()
         }];
         let go = |p: &CapabilityProfile, ass: &AssPolicy, pick: Option<BurnPick>| {
             super::negotiate(
@@ -2222,6 +2226,7 @@ mod tests {
         multi.subtitles.push(SubtitleStream {
             format: "ass".into(),
             language: Some("de".into()),
+            ..Default::default()
         });
         let two = |pick| {
             super::negotiate(
@@ -2256,6 +2261,7 @@ mod tests {
             language: Some("en".into()),
             path_rel: "film.en.ass".into(),
             track: None,
+            ..Default::default()
         }];
         let sp = super::negotiate(
             &p,
@@ -2295,6 +2301,7 @@ mod tests {
         info.subtitles = vec![SubtitleStream {
             format: "pgs".into(),
             language: None,
+            ..Default::default()
         }];
 
         let sp = negotiate(
@@ -2416,6 +2423,7 @@ mod tests {
         info.subtitles = vec![SubtitleStream {
             format: "pgs".into(),
             language: None,
+            ..Default::default()
         }];
 
         let sp = negotiate(
@@ -2480,6 +2488,7 @@ mod tests {
             format: "vobsub".into(),
             language: Some("en".into()),
             track: Some(0),
+            ..Default::default()
         }];
         let sp = negotiate(
             &p,
@@ -2511,6 +2520,7 @@ mod tests {
         info.subtitles = vec![SubtitleStream {
             format: "pgs".into(),
             language: None,
+            ..Default::default()
         }];
 
         let sp = negotiate(
@@ -2546,6 +2556,7 @@ mod tests {
         info.subtitles = vec![SubtitleStream {
             format: "srt".into(),
             language: None,
+            ..Default::default()
         }];
         let sp = negotiate(
             &p,

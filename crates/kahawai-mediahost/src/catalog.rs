@@ -44,8 +44,12 @@
 //! without writing, and `finish_scan` consults the column only for roots the
 //! scan neither walked nor found unavailable.
 //! `catalog_files.reprobe_required` is a durable request to refresh an unchanged
-//! file. The depth migration flags ambiguous legacy measurements; only a successful
-//! full probe clears it. Failed refreshes retain the file and flag for retry.
+//! file. The depth migration flags ambiguous legacy measurements, and the
+//! subtitle-variant migration every file with embedded subtitles, whose probes
+//! predate track names and the forced/hearing-impaired/commentary flags; only a
+//! successful full probe clears it. Failed refreshes retain the file and flag
+//! for retry. A refresh is metadata-only: the bytes are unchanged, so the hub
+//! keeps their derived facts and extracted subtitles.
 //! The one-time migration updates scanner JSON and versioned protobuf records
 //! atomically, preserving byte identity and all derived facts.
 //!
@@ -2072,6 +2076,65 @@ mod tests {
                 .collect(),
             ..Default::default()
         }
+    }
+
+    /// Probes from before track names and variant flags are refreshed once,
+    /// and only where there is a subtitle track to describe.
+    #[tokio::test]
+    async fn subtitle_variant_migration_reprobes_only_subtitled_files() {
+        use sqlx::Connection as _;
+        let state = tempfile::tempdir().unwrap();
+        let root = tempfile::tempdir().unwrap();
+        let config = collection(root.path());
+        let mut old = sqlx::SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(state.path().join("catalog.db"))
+                .create_if_missing(true),
+        )
+        .await
+        .unwrap();
+        let migrations = sqlx::migrate!("./migrations");
+        sqlx::migrate::Migrator::with_migrations(
+            migrations
+                .iter()
+                .filter(|m| m.version < 8)
+                .cloned()
+                .collect(),
+        )
+        .run_direct(None, &mut old, false)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO catalog_collections(id,media_type,epoch,current_version) VALUES('movies','movies','epoch',1)")
+            .execute(&mut old).await.unwrap();
+        let token = kahawai_core::media::root_token(root.path());
+        for (path, streams, error) in [
+            (
+                "Subbed.mkv",
+                r#"{"subtitles":[{"format":"pgs","language":"eng"}]}"#,
+                "",
+            ),
+            ("Plain.mkv", r#"{"subtitles":[]}"#, ""),
+            ("Bare.mp4", r#"{}"#, ""),
+            (
+                "Broken.mkv",
+                r#"{"subtitles":[{"format":"srt"}]}"#,
+                "unreadable",
+            ),
+        ] {
+            sqlx::query("INSERT INTO catalog_files(collection_id,root_token,path_rel,size,mtime_unix,head_xxh3,tail_xxh3,oshash,streams_json,seen_generation,version,error) VALUES('movies',?,?,1,1,1,1,1,?,0,1,?)")
+                .bind(&token).bind(path).bind(streams).bind(error).execute(&mut old).await.unwrap();
+        }
+        old.close().await.unwrap();
+        let catalog = Catalog::open(state.path(), std::slice::from_ref(&config))
+            .await
+            .unwrap();
+        let flagged: Vec<String> = sqlx::query_scalar(
+            "SELECT path_rel FROM catalog_files WHERE reprobe_required=1 ORDER BY path_rel",
+        )
+        .fetch_all(&catalog.db)
+        .await
+        .unwrap();
+        assert_eq!(flagged, ["Subbed.mkv"]);
     }
 
     #[tokio::test]

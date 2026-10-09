@@ -433,9 +433,24 @@ fn map_info(info: &DiscovererInfo) -> MediaInfo {
             .caps()
             .and_then(|c| c.structure(0).map(|st| st.name().to_string()))
             .unwrap_or_default();
+        // The demuxer's name for the track. Matroska's flags never get this
+        // far (matroskademux keeps FlagForced to itself and does not read
+        // FlagHearingImpaired); the mediahost reads those off the header.
+        let title = s
+            .tags()
+            .and_then(|t| {
+                t.get::<gst::tags::Title>()
+                    .map(|v| v.get().trim().to_string())
+            })
+            .filter(|t| !t.is_empty());
         out.subtitles.push(SubtitleStream {
             format: normalize_subtitle_format(&name),
             language: s.language().map(|l| l.to_string()),
+            variant: title
+                .as_deref()
+                .map(kahawai_core::media::SubtitleVariant::from_title)
+                .unwrap_or_default(),
+            title,
         });
     }
 
