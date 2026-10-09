@@ -115,7 +115,7 @@ class KahawaiGstreamer < Formula
   depends_on "opencore-amr"
   depends_on "openexr"
   depends_on "openjpeg"
-  depends_on "openssl@3"
+  depends_on "openssl@4"
   depends_on "opus"
   depends_on "orc"
   depends_on "pango"
@@ -177,6 +177,14 @@ class KahawaiGstreamer < Formula
   patch do
     url "https://gitlab.freedesktop.org/gstreamer/gstreamer/-/commit/49b4b4129e3b488f246493d3a57dc70652ec9dcf.diff"
     sha256 "25ef9fc417878e0aac46ffb0f16c5a5d1a44341cd3364c97111980fb5bfd64b8"
+    type :unofficial
+    resolves "https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12148"
+  end
+
+  # Support faac 2.2 `faac_params_init` signature
+  patch do
+    url "https://gitlab.freedesktop.org/gstreamer/gstreamer/-/commit/2890668a8e8aec2f41f36a62036e4e7daf93f976.diff"
+    sha256 "b39d939f1b614dfcb9bfd89e259779196ba64f9d0277588c42be4d16b84486f8"
     type :unofficial
     resolves "https://gitlab.freedesktop.org/gstreamer/gstreamer/-/merge_requests/12148"
   end
@@ -297,7 +305,10 @@ class KahawaiGstreamer < Formula
     ENV.append_to_rustflags "--codegen link-args=-Wl,#{rpath_args.join(",")}"
 
     # Make sure the `openssl-sys` crate uses our OpenSSL.
-    ENV["OPENSSL_DIR"] = formula_opt_prefix("openssl@3")
+    ENV["OPENSSL_DIR"] = formula_opt_prefix("openssl@4")
+
+    # Work around superenv breaking aws-lc-sys `-O0` needed to build CPU Jitter RNG
+    ENV["AWS_LC_SYS_NO_JITTER_ENTROPY"] = "1"
 
     system "meson", "setup", "build", *args, *std_meson_args
     system "meson", "compile", "-C", "build", "--verbose"
