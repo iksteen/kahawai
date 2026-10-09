@@ -331,7 +331,7 @@ export KAHAWAI_BUILD
 # this and the binaries link stock gstreamer, and any patched plugin
 # beside it is a second copy of a library in one process, which on macOS
 # is a crash rather than a warning.
-KEG=/opt/homebrew/Cellar/kahawai-gstreamer/1.28.7
+KEG=/opt/homebrew/Cellar/kahawai-gstreamer/1.28.8
 [ -d "$KEG/lib/pkgconfig" ] || { echo "missing patched GStreamer: $KEG" >&2; exit 1; }
 [ "$(cd /opt/homebrew/opt/kahawai-gstreamer && pwd -P)" = "$KEG" ] || {
     echo "patched GStreamer runtime link does not resolve to $KEG" >&2; exit 1;

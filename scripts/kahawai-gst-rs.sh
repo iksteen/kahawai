@@ -13,7 +13,7 @@
 # and say so where they do.
 
 # The gst-plugins-rs release to build hlssink3 from.
-RS_TAG=gstreamer-1.28.7
+RS_TAG=gstreamer-1.28.8
 
 # Patches in patches/gst-plugins-rs that NO gst-plugins-rs release carries
 # yet. A system's hlssink3 therefore cannot have them however new it is,

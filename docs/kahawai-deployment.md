@@ -39,7 +39,7 @@ scripts/kahawai-silence.sh ingmar@192.168.0.109 --activate
 ```
 
 Mac staging builds in `target/staged` and requires the patched
-`/opt/homebrew/Cellar/kahawai-gstreamer/1.28.7` keg, checks dynamic links and signs
+`/opt/homebrew/Cellar/kahawai-gstreamer/1.28.8` keg, checks dynamic links and signs
 both binaries. Activation saves `.previous` binaries, replaces both executable
 paths and kills the old daemon PIDs so launchd respawns them; it verifies changed
 PIDs and fresh startup/link log entries. NAS staging writes `.kahawai-stage`;

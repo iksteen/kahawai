@@ -16,14 +16,14 @@ ARG NODE_VERSION=24.19.0
 # on a fragment whose first buffer has no PTS, and on an unwrapped
 # running time when a segment is added. Both panic inside an FFI
 # callback, which cannot unwind.
-ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.7
-ARG GST_PLUGINS_RS_REV=e9229628528b19e9b42e52620be4e79a2e054363
+ARG GST_PLUGINS_RS_VERSION=gstreamer-1.28.8
+ARG GST_PLUGINS_RS_REV=fe01b57bfd3be92feb5b5894b24ba5826fb3295c
 # The whole GStreamer stack — core, base, good, bad, ugly, libav —
 # comes from this tag, patched with patches/gstreamer. None of Ubuntu's
 # gstreamer packages are installed: one tree means one version, one ABI,
 # and the fixes in patches/ apply to everything that could load them.
-ARG GSTREAMER_VERSION=1.28.7
-ARG GSTREAMER_REV=070125524a8422e29d3b69a372ed4f62fd343ffa
+ARG GSTREAMER_VERSION=1.28.8
+ARG GSTREAMER_REV=1b2a95a1b72787cda146b46df9605b168e5b683b
 
 FROM rust:${RUST_VERSION}-bookworm AS rust-toolchain
 FROM node:${NODE_VERSION}-bookworm-slim AS node-toolchain

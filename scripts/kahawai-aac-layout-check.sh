@@ -5,7 +5,7 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 if [ "$(uname -s)" = Darwin ]; then
-    keg=/opt/homebrew/Cellar/kahawai-gstreamer/1.28.7
+    keg=/opt/homebrew/Cellar/kahawai-gstreamer/1.28.8
     export PKG_CONFIG_PATH="$keg/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
     [ "$(pkg-config --variable=prefix gstreamer-1.0)" = "$keg" ] || {
         echo "GStreamer must come from $keg" >&2
