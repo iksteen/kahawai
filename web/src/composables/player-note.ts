@@ -1,7 +1,7 @@
 /// A notice painted inside the picture, for failures the toast cannot carry.
 ///
-/// The shell's toast host is a sibling of `.videobox`, and `.videobox` is what
-/// goes fullscreen — while it is, the browser paints only that subtree, so a
+/// The shell's toast host is outside the player frame that goes fullscreen —
+/// while it is, the browser paints only that subtree, so a
 /// toast raised there is shown to nobody. That is exactly the mode where a
 /// freeze is most alarming.
 ///

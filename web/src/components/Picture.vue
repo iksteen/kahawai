@@ -1291,22 +1291,6 @@ function onKey(event: KeyboardEvent) {
 onMounted(() => window.addEventListener('keydown', onKey))
 onBeforeUnmount(() => window.removeEventListener('keydown', onKey))
 
-// Fullscreen is the browser's, so it can be left without asking us — Escape, or
-// the window's own control. Follow it rather than assume.
-function onFullscreen() {
-  if (!document.fullscreenElement && props.mode === 'full') emit('mode', 'window')
-}
-onMounted(() => document.addEventListener('fullscreenchange', onFullscreen))
-onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscreen))
-
-watch(
-  () => props.mode,
-  (mode) => {
-    if (mode === 'full' && !document.fullscreenElement) void box.value?.requestFullscreen?.()
-    if (mode !== 'full' && document.fullscreenElement) void document.exitFullscreen?.()
-  },
-)
-
 /// A player that has given up must let go of its session.
 ///
 /// The keepalive pings for as long as the picture is mounted, and that ping is
@@ -1596,7 +1580,11 @@ const remember = (scope: string, key: string, value: string) =>
   <div
     ref="box"
     class="videobox"
-    :class="[(barShown || playing.paused) && 'bar-up', docPipOn && 'in-doc-pip']"
+    :class="[
+      (barShown || playing.paused) && 'bar-up',
+      mode === 'full' && 'in-fullscreen',
+      docPipOn && 'in-doc-pip',
+    ]"
     :style="{ '--video-ratio': ratio }"
     @mousemove="wake"
     @mouseleave="away"
@@ -2091,9 +2079,8 @@ const remember = (scope: string, key: string, value: string) =>
 <style scoped>
 @reference '../theme.css';
 
-/* A black stage with everything drawn over it. The stage is the element that
-   goes fullscreen, because the subtitle canvases are its children and taking
-   only the <video> would strand them. */
+/* A black stage with everything drawn over it. The persistent player frame
+   goes fullscreen, keeping this stage and its subtitle canvases together. */
 .videobox {
   position: relative;
   /* A stacking context, so the overlays inside stay inside. `z-9` on a dialog
@@ -2137,10 +2124,11 @@ const remember = (scope: string, key: string, value: string) =>
 .videobox:not(.bar-up) video {
   cursor: none;
 }
-.videobox:fullscreen {
+.videobox.in-fullscreen {
   border-radius: 0;
+  height: 100%;
 }
-.videobox:fullscreen video {
+.videobox.in-fullscreen video {
   width: 100%;
   height: 100%;
   max-height: none;

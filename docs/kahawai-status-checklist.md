@@ -634,6 +634,9 @@ audio/video byte separation for manual playback testing; see
       `scripts/kahawai-work.sh`.
 - [x] HUB-27 MVP player: login, browse, detail w/ stream info, direct/remux playback,
       audio/video/subtitle track selection, resume, watch state
+      Fullscreen belongs to the persistent player frame and survives next-episode
+      handovers and session restarts. Browser exit still updates the controls;
+      `web/test/browser/player-fullscreen.spec.ts` checks automatic and manual advance.
 - [x] Descriptive metadata shares mediadb's `Description` across enrichment, NFO
       parsing, the typed catalogue API and generated UI types; no hub `Fields`
       or handwritten UI description mirror remains. Dates use `release_date`,

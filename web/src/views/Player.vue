@@ -13,7 +13,7 @@ import { playbackItem } from '../api/playback.ts'
 /// The session lives here rather than in the picture so that a restart still
 /// REMOUNTS the picture — it keeps a run's worth of state and expects a fresh
 /// mount per session — while the route stays the same page.
-import { computed, onBeforeUnmount, ref, watch } from 'vue'
+import { computed, onBeforeUnmount, onMounted, ref, watch } from 'vue'
 import { useQueryClient } from '@tanstack/vue-query'
 import { useRoute, useRouter } from 'vue-router'
 
@@ -101,6 +101,32 @@ useScreenName(
 /// not, which is the whole point — the window, and the way out of it, must not
 /// blink when what is behind them is rebuilt.
 const mode = ref<PlayerMode>('window')
+const frame = ref<HTMLElement | null>(null)
+
+// Keep the fullscreen element across keyed Picture replacements. Removing it
+// exits fullscreen, and an automatic advance cannot request it again without
+// a user gesture: https://fullscreen.spec.whatwg.org/#model
+function onFullscreen() {
+  if (document.fullscreenElement !== frame.value && mode.value === 'full') mode.value = 'window'
+}
+onMounted(() => document.addEventListener('fullscreenchange', onFullscreen))
+onBeforeUnmount(() => document.removeEventListener('fullscreenchange', onFullscreen))
+watch(mode, async (value) => {
+  try {
+    if (value === 'full') {
+      if (!frame.value?.requestFullscreen) {
+        mode.value = 'window'
+        return
+      }
+      if (document.fullscreenElement !== frame.value) await frame.value.requestFullscreen()
+    } else if (document.fullscreenElement === frame.value) {
+      await document.exitFullscreen()
+    }
+  } catch (cause) {
+    onFullscreen()
+    notify(`Could not change fullscreen mode: ${sentence(cause)}`)
+  }
+})
 
 /// A session started after the viewer left is one nobody will play, ping or
 /// end.
@@ -445,7 +471,13 @@ function advanced(
   <!-- `tabindex="-1"` so the focus has somewhere to land: the picture is keyed
        on the session id, so every restart and every next episode destroys the
        element the focus was on and drops it to `<body>`. -->
-  <main v-else :class="mode === 'theater' ? 'theater' : ''" tabindex="-1">
+  <main
+    v-else
+    ref="frame"
+    class="player-frame"
+    :class="mode === 'theater' ? 'theater' : ''"
+    tabindex="-1"
+  >
     <Btn v-if="mode === 'window'" ghost small class="mb-[18px]" @click="leave">← Back</Btn>
 
     <!-- The item's own geometry, not 16:9: the box that appears while the
@@ -493,5 +525,11 @@ function advanced(
   width: 100vw;
   max-width: 100vw;
   margin-left: calc(50% - 50vw);
+}
+.player-frame:fullscreen {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: #000;
 }
 </style>

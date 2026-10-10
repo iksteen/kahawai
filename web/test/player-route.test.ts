@@ -565,6 +565,55 @@ describe('a session nobody will play', () => {
   })
 })
 
+describe('fullscreen across sessions', () => {
+  test.each(['next episode', 'restart'])('keeps the same frame for a %s', async (transition) => {
+    const { wrapper } = await open()
+    const frame = wrapper.get('main').element
+    let fullscreen: Element | null = null
+    const descriptor = Object.getOwnPropertyDescriptor(document, 'fullscreenElement')
+    Object.defineProperty(document, 'fullscreenElement', {
+      configurable: true,
+      get: () => fullscreen,
+    })
+    const request = vi.fn(async () => {
+      fullscreen = frame
+      document.dispatchEvent(new Event('fullscreenchange'))
+    })
+    Object.defineProperty(frame, 'requestFullscreen', { value: request })
+    try {
+      const picture = wrapper.findComponent(Picture)
+      picture.vm.$emit('mode', 'full')
+      await flushPromises()
+      expect(document.fullscreenElement).toBe(frame)
+      if (transition === 'next episode') {
+        picture.vm.$emit('playNext', 'heat', film({ id: 'next' }), session('s2'), [])
+      } else {
+        picture.vm.$emit('restart', 'heat', session('s2'), 1000, {
+          audio: 0,
+          video: 0,
+          subKey: '',
+        })
+      }
+      await flushPromises()
+      expect(wrapper.findComponent(Picture).vm).not.toBe(picture.vm)
+      expect(wrapper.get('main').element).toBe(frame)
+      expect(wrapper.findComponent(Picture).props('mode')).toBe('full')
+      expect(wrapper.get('.videobox').classes()).toContain('in-fullscreen')
+      expect(request).toHaveBeenCalledTimes(1)
+
+      // Escape is browser-owned; the replacement Picture still follows it.
+      fullscreen = null
+      document.dispatchEvent(new Event('fullscreenchange'))
+      await flushPromises()
+      expect(wrapper.findComponent(Picture).props('mode')).toBe('window')
+    } finally {
+      wrapper.unmount()
+      if (descriptor) Object.defineProperty(document, 'fullscreenElement', descriptor)
+      else Reflect.deleteProperty(document, 'fullscreenElement')
+    }
+  })
+})
+
 describe('refreshing the physical source after recovery', () => {
   const choice = {
     audio: 1,
