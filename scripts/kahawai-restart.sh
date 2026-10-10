@@ -51,6 +51,10 @@ pids() { pgrep -f "$pat" || true; }
 before=$(pids | tr '\n' ' ')
 echo "==> running before: ${before:-none}" >&2
 
+# The patched GStreamer the service is built against and runs on. Before
+# the build: it carries the PKG_CONFIG_PATH that build must link through.
+. "$repo/scripts/kahawai-gst-env.sh"
+
 if $build; then
   echo "==> cargo build --release" >&2
   cargo build --release
@@ -78,9 +82,6 @@ fi
 [ -z "$(pids)" ] || { echo "FAILED to stop $svc" >&2; exit 1; }
 echo "==> stopped" >&2
 $stop_only && exit 0
-
-# The locally staged codec stack the service must run against.
-. "$(dirname "$0")/kahawai-gst-env.sh"
 
 log="${KAHAWAI_LOG_DIR:-$HOME/.local/share/kahawai}/${svc}.log"
 mkdir -p "$(dirname "$log")"

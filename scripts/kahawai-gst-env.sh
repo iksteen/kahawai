@@ -1,38 +1,45 @@
-# Sourced, never run: point this shell at the locally built GStreamer.
+
+# Sourced, never run: point this shell at the patched GStreamer.
 #
 #   . "$(dirname "$0")/kahawai-gst-env.sh"
 #
-# Every script that runs a kahawai pipeline ON THIS BOX has to do this,
-# and the ones that did not were quietly testing a different GStreamer
-# from the one that ships. `kahawai-sweep.sh` is the case that bit:
-# it exists to validate the real remux pipeline before a release, and
-# without these two variables it validated the system plugins instead.
+# Every script that builds or runs a kahawai pipeline ON THIS BOX has to
+# do this, and the ones that did not were quietly testing a different
+# GStreamer from the one that ships. `kahawai-sweep.sh` is the case that
+# bit: it exists to validate the real remux pipeline before a release,
+# and without the patched stack it validated the system plugins instead.
 # Two files failed to demux under those and pass under ours — the AVI
 # push-mode fixes in patches/gstreamer/0001 and 0002 — so the sweep was
 # reporting failures the shipping stack does not have. It could as
 # easily have hidden ones it does.
 #
-# patches/gstreamer/0004 changes the size of a public H.264 struct, so
-# the plugins holding one and the library they hold it from must come
-# from the same build and must not be reachable by anything built
-# against the other ABI. Hence a kahawai-only directory that
-# `kahawai-gst-plugins.sh` owns and wipes, invisible to every other
-# GStreamer program on the box. The plugins carry an RPATH to the
-# matching library; the path is exported anyway so a hand-run
-# gst-launch against the same directory behaves like the service does.
+# The patched stack is the kahawai-gstreamer package (AUR): a whole
+# GStreamer in /opt that nothing else on the box loads. patches/gstreamer/0004 changes the size
+# of a public H.264 struct, so kahawai must be BUILT against that tree's
+# headers, not only run against its libraries — hence PKG_CONFIG_PATH,
+# which is why a script must source this before `cargo build`, not after.
+# Its libgstreamer ignores GST_PLUGIN_PATH and GST_REGISTRY (the package's
+# kahawai-isolate.patch) and finds its plugins beside itself, so the
+# library path is all a kahawai process needs; PATH and GI_TYPELIB_PATH
+# make a hand-run gst-launch, gst-inspect or reproducer use the same tree.
 #
-# Missing is a WARNING, not an error: a box with no staged build can
-# still run these scripts, it just is not answering for the shipping
-# stack, and it should say so rather than look identical to one that is.
-kahawai_gst="$HOME/.local/lib/kahawai-gst"
-if [ -d "$kahawai_gst/plugins" ]; then
-  export GST_PLUGIN_PATH="$kahawai_gst/plugins${GST_PLUGIN_PATH:+:$GST_PLUGIN_PATH}"
+# Exported only into the shell that sources this, on purpose: in a login
+# shell LD_LIBRARY_PATH would hand this GStreamer to every other program
+# started from it.
+#
+# Missing is a WARNING, not an error: a box without the package can still
+# run these scripts, it just is not answering for the shipping stack, and
+# it should say so rather than look identical to one that is.
+kahawai_gst=/opt/kahawai-gstreamer
+if [ -d "$kahawai_gst/lib/pkgconfig" ]; then
+  export PKG_CONFIG_PATH="$kahawai_gst/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
   export LD_LIBRARY_PATH="$kahawai_gst/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
-  echo "==> staged plugins: $kahawai_gst/plugins" >&2
+  export GI_TYPELIB_PATH="$kahawai_gst/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+  export PATH="$kahawai_gst/bin:$PATH"
+  echo "==> patched GStreamer: $kahawai_gst" >&2
 else
-  echo "==> WARNING: no patched plugins at $kahawai_gst/plugins" >&2
+  echo "==> WARNING: no patched GStreamer at $kahawai_gst" >&2
   echo "    using the system GStreamer, which is NOT what ships." >&2
-  echo "    build them: scripts/kahawai-gst-plugins.sh build" >&2
-  echo "    check them: scripts/kahawai-gst-plugins.sh verify" >&2
+  echo "    install the kahawai-gstreamer package (AUR)" >&2
 fi
 unset kahawai_gst

@@ -204,11 +204,15 @@ existing deployments with no `[gstreamer]`, Kahawai merges the old
 the global section by seeding that union before adding newly measured failures,
 so the compatibility cutover cannot discard an operator's old policy.
 
-The Silence deploy script copies `~/.local/lib/kahawai-gst/`, sets an exclusive
-custom-plus-system plugin search path for both satellite processes, and refuses
-to restart them unless `matroskademux` resolves to the staged directory. This
-matters for segment analysis: it now runs inside the mediahost process and must
-see the same patched demuxers as scans and playback workers.
+The dev box and Silence both run the `kahawai-gstreamer` package (AUR) in
+`/opt/kahawai-gstreamer`. `scripts/kahawai-gst-env.sh` points a script's builds
+and processes at it. The Silence deploy script builds the satellites here
+against that tree's headers and refuses to deploy unless Silence's package is
+the same GStreamer version. It runs both satellite processes with only its
+library path, refuses to restart them unless `matroskademux` resolves inside
+`/opt`, and checks that the started processes mapped `/opt`'s libgstreamer.
+This matters for segment analysis: it now runs inside the mediahost process and
+must see the same patched demuxers as scans and playback workers.
 
 Source-local loudness measurement is built into Kahawai; mediahosts need their
 ordinary audio decoders and `audioconvert`, not the optional `rsaudiofx`

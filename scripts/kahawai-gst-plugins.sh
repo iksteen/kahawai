@@ -488,15 +488,30 @@ build_hlssink3() {
 }
 
 action="${1:-verify}"
+explicit_dirs=""
 [ "$#" -gt 0 ] && shift
 while [ "$#" -gt 0 ]; do
     case "$1" in
-        --library-dir) [ "$#" -ge 2 ] || die "--library-dir needs a path"; VERIFY_LIBRARY_DIR="$2"; shift 2 ;;
-        --plugin-dir) [ "$#" -ge 2 ] || die "--plugin-dir needs a path"; VERIFY_PLUGIN_DIR="$2"; shift 2 ;;
+        --library-dir) [ "$#" -ge 2 ] || die "--library-dir needs a path"; VERIFY_LIBRARY_DIR="$2"; explicit_dirs=1; shift 2 ;;
+        --plugin-dir) [ "$#" -ge 2 ] || die "--plugin-dir needs a path"; VERIFY_PLUGIN_DIR="$2"; explicit_dirs=1; shift 2 ;;
         --exclusive) VERIFY_EXCLUSIVE=1; shift ;;
         *) die "unknown argument: $1" ;;
     esac
 done
+
+# No directories given: verify what this box's kahawai processes load,
+# which is the kahawai-gstreamer package wherever it is installed (see
+# kahawai-gst-env.sh). Only then — the PKGBUILD's check() passes its
+# staged tree explicitly, possibly on a box that already has /opt, and
+# must not be answered by the installed copy.
+if [ "$action" = verify ] && [ -z "$explicit_dirs" ] && [ -d /opt/kahawai-gstreamer/lib/gstreamer-1.0 ]; then
+    VERIFY_LIBRARY_DIR=/opt/kahawai-gstreamer/lib
+    VERIFY_PLUGIN_DIR=/opt/kahawai-gstreamer/lib/gstreamer-1.0
+    VERIFY_EXCLUSIVE=1
+    export PATH="/opt/kahawai-gstreamer/bin:$PATH"
+    export PKG_CONFIG_PATH="/opt/kahawai-gstreamer/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}"
+    export GI_TYPELIB_PATH="/opt/kahawai-gstreamer/lib/girepository-1.0${GI_TYPELIB_PATH:+:$GI_TYPELIB_PATH}"
+fi
 
 case "$action" in
     verify) verify ;;

@@ -24,25 +24,35 @@ for arg in "${@:2}"; do
 done
 repo=$(cd "$(dirname "$0")/.." && pwd)
 
+# Both ends run the kahawai-gstreamer package in /opt: the binaries are
+# built here against its headers and run there against its libraries, so
+# the two must be the same GStreamer. The package ships no plugins to
+# stage; a satellite needs only its library path.
+gst=/opt/kahawai-gstreamer
+gst_version() { "$@" --version | sed -n 's/^GStreamer //p' | head -1; }
+
 if [[ "$mode" != activate ]]; then
-echo "==> building lean satellite binaries" >&2
+. "$repo/scripts/kahawai-gst-env.sh"
+[[ -d "$gst/lib/pkgconfig" ]] || { echo "error: no kahawai-gstreamer at $gst on this box" >&2; exit 1; }
+here=$(gst_version "$gst/bin/gst-inspect-1.0")
+there=$(ssh "$HOST" "$gst/bin/gst-inspect-1.0 --version" | sed -n 's/^GStreamer //p' | head -1) || true
+[[ -n "$there" ]] || { echo "error: no kahawai-gstreamer at $gst on $HOST" >&2; exit 1; }
+[[ "$here" == "$there" ]] || {
+    echo "error: kahawai-gstreamer $here here, $there on $HOST — build and run must match" >&2
+    exit 1
+}
+
+echo "==> building lean satellite binaries against GStreamer $here" >&2
 (cd "$repo" && cargo build --release -p kahawai-mediahostd)
 if ! $mediahost_only; then
     (cd "$repo" && cargo build --release -p kahawai-transcoderd)
 fi
 
-gst_dir="$HOME/.local/lib/kahawai-gst"
-if [[ ! -d "$gst_dir/plugins" || ! -d "$gst_dir/lib" ]]; then
-    echo "error: staged GStreamer missing at $gst_dir" >&2
-    exit 1
-fi
-
 ssh "$HOST" 'mkdir -p ~/.kahawai-stage'
-echo "==> shipping binaries and staged GStreamer to $HOST" >&2
+echo "==> shipping binaries to $HOST" >&2
 scp -q "$repo/target/release/kahawai-mediahost" "$HOST:~/.kahawai-stage/"
 if ! $mediahost_only; then
     scp -q "$repo/target/release/kahawai-transcoder" "$HOST:~/.kahawai-stage/"
-    rsync -a "$gst_dir/" "$HOST:~/.kahawai-stage/gst/"
 fi
 
 fi
@@ -51,7 +61,7 @@ fi
 ssh "$HOST" bash -s -- "$mediahost_only" <<'REMOTE'
 set -euo pipefail
 test -x ~/.kahawai-stage/kahawai-mediahost
-if ! "$1"; then test -x ~/.kahawai-stage/kahawai-transcoder; test -d ~/.kahawai-stage/gst/plugins; fi
+if ! "$1"; then test -x ~/.kahawai-stage/kahawai-transcoder; fi
 REMOTE
 
 # Stop FIRST: scp into a running executable fails with ETXTBSY.
@@ -99,24 +109,27 @@ for bin in $bins; do
     cp -p "$HOME/.kahawai-stage/$bin" "$HOME/$bin.next"
     mv -f "$HOME/$bin.next" "$HOME/$bin"
 done
-if ! "$1"; then
-    cp -a ~/.local/lib/kahawai-gst "$HOME/.kahawai-stage/gst.previous.$(date +%s)"
-    rsync -a ~/.kahawai-stage/gst/ ~/.local/lib/kahawai-gst/
-fi
 REMOTE
 
 echo "==> starting" >&2
 ssh "$HOST" bash -s -- "$mediahost_only" <<'REMOTE'
 set -euo pipefail
 mediahost_only=$1
-gst="$HOME/.local/lib/kahawai-gst"
-export GST_PLUGIN_PATH="$gst/plugins"
-export GST_PLUGIN_SYSTEM_PATH_1_0="$gst/plugins:/usr/lib/gstreamer-1.0"
+gst=/opt/kahawai-gstreamer
 export LD_LIBRARY_PATH="$gst/lib"
-loaded=$(gst-inspect-1.0 matroskademux | sed -n 's/^  Filename *//p')
-[[ "$loaded" == "$gst/plugins/libgstmatroska.so" ]] || {
-    echo "staged matroskademux did not load: $loaded" >&2
+loaded=$("$gst/bin/gst-inspect-1.0" matroskademux | sed -n 's/^  Filename *//p')
+[[ "$loaded" == "$gst/lib/gstreamer-1.0/libgstmatroska.so" ]] || {
+    echo "patched matroskademux did not load: $loaded" >&2
     exit 1
+}
+# The binaries carry no rpath; a process that found another libgstreamer
+# would run, just not on the patched stack. Check the processes themselves.
+on_patched() {
+    sleep 2
+    grep -q " $gst/lib/libgstreamer-1.0.so" "/proc/$1/maps" || {
+        echo "PID $1 is not running on $gst" >&2
+        exit 1
+    }
 }
 tc_mark=$(wc -l < ~/kahawai-transcoder.log)
 nohup ~/kahawai-mediahost >> ~/kahawai-mediahost.log 2>&1 &
@@ -126,6 +139,8 @@ if ! $mediahost_only; then
     nohup ~/kahawai-transcoder >> ~/kahawai-transcoder.log 2>&1 &
     tc_pid=$!
 fi
+on_patched "$mh_pid"
+if [[ -n "$tc_pid" ]]; then on_patched "$tc_pid"; fi
 for attempt in $(seq 1 60); do
     kill -0 "$mh_pid"
     if [[ -n "$tc_pid" ]]; then kill -0 "$tc_pid"; fi
