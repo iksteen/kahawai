@@ -89,9 +89,21 @@ const REFERENCE_FPS: f32 = 24.0;
 /// reference content, which the wall cap usually cuts short.
 const FRAMES: usize = 240;
 
-/// Wall-clock ceiling per measurement, matching the dry-run budget:
-/// a box slower than this reports what it managed, honestly.
+/// Wall-clock window per measurement, from the first buffer out,
+/// matching the dry-run budget: a box slower than this reports what it
+/// managed, honestly.
 const CAP: Duration = Duration::from_secs(5);
+
+/// How long a pipeline may take to put out its first buffer, before the
+/// window starts. Preroll, GL context creation, encoder init and the
+/// encoder's own lookahead are one-off, and they are not small: x264enc's
+/// defaults (which sessions use) hold ~40 frames back, so its first 1080p
+/// buffer came 1.9-3 s after PLAYING on a desktop CPU given one core or
+/// four (measured). With the window counted from PLAYING, a contended CI
+/// runner put out no buffer at all inside 5 s, and a slow box such as a
+/// J5005 can miss it the same way. Generous, because only a pipeline that
+/// produces nothing for this long is unmeasured.
+const STARTUP_CAP: Duration = Duration::from_secs(30);
 
 /// Reference clips: 24 frames (1 s at the reference rate) of Annex-B
 /// noise each, looped until the cap.
@@ -680,7 +692,9 @@ pub fn decode_fps(element: &str, codec: Codec) -> Option<f32> {
             });
         }
     }
-    count_through_capped(&pipe, &dec, DECODE_CAP, || {}).map(|m| m * REFERENCE_FPS)
+    // Decoders have no lookahead to wait out, and doctor is waited on:
+    // the same 2 s bounds both the first frame and the window.
+    count_through_capped(&pipe, &dec, DECODE_CAP, DECODE_CAP, || {}).map(|m| m * REFERENCE_FPS)
 }
 
 /// A codec OPS-9 can measure a decoder against.
@@ -797,21 +811,25 @@ fn noise_frame(bytes: usize, seed: u64) -> Vec<u8> {
     out
 }
 
-/// Run a built pipeline to EOS or the cap, counting buffers out of
-/// `at`. The clock starts at the first buffer: preroll, GL context
-/// creation and encoder init are one-off, while sustain is not.
+/// Run a built pipeline to EOS or the end of its window, counting
+/// buffers out of `at`. The clock starts at the first buffer: preroll,
+/// GL context creation, encoder init and lookahead are one-off, while
+/// sustain is not. The window starts there too, so they cannot eat it.
 fn count_through(
     pipe: &gst::Pipeline,
     at: &gst::Element,
     on_playing: impl FnOnce(),
 ) -> Option<f32> {
-    count_through_capped(pipe, at, CAP, on_playing)
+    count_through_capped(pipe, at, STARTUP_CAP, CAP, on_playing)
 }
 
+/// `startup` bounds the wait for the first buffer, counted from PLAYING;
+/// `window` is the measurement, counted from that buffer.
 fn count_through_capped(
     pipe: &gst::Pipeline,
     at: &gst::Element,
-    cap: Duration,
+    startup: Duration,
+    window: Duration,
     on_playing: impl FnOnce(),
 ) -> Option<f32> {
     let frames = std::sync::Arc::new(AtomicU64::new(0));
@@ -839,25 +857,40 @@ fn count_through_capped(
     // Probe attached, pipeline rolling: only now may a feeder start, so
     // the first buffer produced is the first buffer counted.
     on_playing();
-    let deadline = Instant::now() + cap;
-    // Wait for the run to finish or the cap to expire, whichever comes
-    // first; a slow box simply reports the frames it managed.
+    let startup_deadline = Instant::now() + startup;
+    // Wait for the run to finish or the window to close, whichever comes
+    // first; a slow box simply reports the frames it managed. Until the
+    // first buffer the deadline is the startup bound, so the wait wakes
+    // often enough to move it to first-buffer + window once one arrives.
     if let Some(bus) = pipe.bus() {
-        let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(msg) = bus.timed_pop_filtered(
-            gst::ClockTime::from_nseconds(left.as_nanos() as u64),
-            &[gst::MessageType::Eos, gst::MessageType::Error],
-        ) && msg.type_() == gst::MessageType::Error
-        {
+        loop {
+            let first = *started.lock().unwrap();
+            let deadline = first.map_or(startup_deadline, |t| t + window);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let wait = if first.is_none() {
+                left.min(Duration::from_millis(50))
+            } else {
+                left
+            };
+            let Some(msg) = bus.timed_pop_filtered(
+                gst::ClockTime::from_nseconds(wait.as_nanos() as u64),
+                &[gst::MessageType::Eos, gst::MessageType::Error],
+            ) else {
+                continue;
+            };
             if let gst::MessageView::Error(e) = msg.view() {
                 tracing::debug!(
                     src = %e.src().map(|s| s.name().to_string()).unwrap_or_default(),
                     error = %e.error(),
                     "benchmark pipeline failed"
                 );
+                let _ = pipe.set_state(gst::State::Null);
+                return None;
             }
-            let _ = pipe.set_state(gst::State::Null);
-            return None;
+            break; // EOS
         }
     }
     let elapsed = started
