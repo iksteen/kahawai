@@ -97,6 +97,7 @@ pub fn record(
     kind: MediaType,
 ) -> ProviderRecord {
     ProviderRecord {
+        season_artwork: None,
         children: None,
         provider: provider.into(),
         namespace: kind.as_str().into(),

@@ -130,12 +130,15 @@ pub(crate) async fn compatible(c: &mut SqliteConnection, record: &str, kind: &st
 }
 // Local, assigned and supplemental evidence use one eligibility/order rule for
 // descriptions and child catalogues. Child lists are selected whole, never merged.
-async fn evidence(c: &mut SqliteConnection, item: &str) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
-    Ok(sqlx::query("SELECT p.id,p.provider,p.description_json,p.children_json,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
+pub(crate) async fn evidence(
+    c: &mut SqliteConnection,
+    item: &str,
+) -> Result<Vec<sqlx::sqlite::SqliteRow>> {
+    Ok(sqlx::query("SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,-1 AS position FROM local_metadata l JOIN provider_records p ON p.id=l.record_id WHERE l.item_id=?1
         AND NOT EXISTS(SELECT 1 FROM metadata_assignments a WHERE a.item_id=l.item_id AND a.manual=1 AND a.record_id<>l.record_id)
         AND NOT EXISTS(SELECT 1 FROM metadata_rejections r WHERE r.item_id=l.item_id AND r.record_id=l.record_id)
-        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
-        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
+        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
+        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
         JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 ORDER BY position")
         .bind(item).fetch_all(&mut *c).await?)
@@ -222,6 +225,10 @@ impl Store {
 
 pub(crate) fn record(row: &sqlx::sqlite::SqliteRow) -> Result<ProviderRecord> {
     Ok(ProviderRecord {
+        season_artwork: row
+            .get::<Option<&str>, _>("season_artwork_json")
+            .map(serde_json::from_str)
+            .transpose()?,
         children: row
             .get::<Option<&str>, _>("children_json")
             .map(serde_json::from_str)
@@ -253,10 +260,11 @@ pub(crate) async fn put_record(
         .as_ref()
         .is_some_and(|r| title_key(&r.2) != title_key(&record.title) || r.3 != record.year);
     let record_id = existing.map(|r| r.0).unwrap_or_else(id);
-    sqlx::query("INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,year,description_json,children_json) VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json,children_json=excluded.children_json")
+    sqlx::query("INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,year,description_json,children_json,season_artwork_json) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET title=excluded.title,year=excluded.year,description_json=excluded.description_json,children_json=excluded.children_json,season_artwork_json=excluded.season_artwork_json")
             .bind(&record_id).bind(&record.provider).bind(&record.namespace).bind(&record.external_id).bind(&record.language)
             .bind(record.media_type.as_str()).bind(&record.title).bind(record.year).bind(serde_json::to_string(&record.description)?)
             .bind(record.children.as_ref().map(serde_json::to_string).transpose()?)
+            .bind(record.season_artwork.as_ref().map(serde_json::to_string).transpose()?)
             .execute(&mut *c).await?;
     if identity_changed {
         let copies: Vec<String> =

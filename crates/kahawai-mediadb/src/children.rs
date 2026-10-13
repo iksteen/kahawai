@@ -101,6 +101,8 @@ pub struct ChildGroup {
     pub kind: String,
     pub number: Option<u32>,
     pub total: u64,
+    #[serde(default)]
+    pub metadata: Option<ResolvedDescription>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct LibraryChildren {
@@ -120,6 +122,7 @@ struct Copy {
     id: String,
     entries: Vec<MediaEntry>,
     children: Option<crate::metadata::ChildCatalogue>,
+    artwork: Vec<crate::season_artwork::SeasonEvidence>,
 }
 struct Snapshot {
     parent: LibraryItem,
@@ -128,6 +131,30 @@ struct Snapshot {
     unnumbered: BTreeMap<Option<u32>, Vec<String>>,
 }
 impl Snapshot {
+    fn season_artwork(&self, season: Option<u32>) -> Option<ResolvedSeasonArtwork> {
+        let copies: Vec<_> = self
+            .copies
+            .iter()
+            .filter_map(|copy| {
+                let groups: std::collections::BTreeSet<_> = copy
+                    .entries
+                    .iter()
+                    .flat_map(|e| match &e.data.kind {
+                        EntryKind::Episode { episodes } => {
+                            episodes.iter().map(|s| s.season).collect::<Vec<_>>()
+                        }
+                        _ => vec![],
+                    })
+                    .collect();
+                groups.contains(&season).then_some((
+                    copy.id.as_str(),
+                    groups.len() == 1,
+                    copy.artwork.as_slice(),
+                ))
+            })
+            .collect();
+        crate::season_artwork::resolve(&copies, season)
+    }
     async fn read(c: &mut sqlx::SqliteConnection, library: &str, parent: &str) -> Result<Self> {
         let parent = crate::library::read_item(c, library, parent).await?;
         let mut copies = Vec::new();
@@ -164,6 +191,7 @@ impl Snapshot {
                 id: id.clone(),
                 entries,
                 children: crate::metadata::resolve_children(c, id).await?,
+                artwork: crate::season_artwork::evidence(c, id).await?,
             });
         }
         for intervals in ranges.values_mut() {
@@ -341,6 +369,23 @@ pub struct PlaybackItem {
     pub renditions: Vec<PlaybackRendition>,
 }
 impl Store {
+    pub async fn library_season_artwork(
+        &self,
+        library: &str,
+        parent: &str,
+        season: Option<u32>,
+    ) -> Result<Option<ResolvedSeasonArtwork>> {
+        let mut c = self.db.read_pool().acquire().await?;
+        let mut tx = c.begin().await?;
+        let snapshot = Snapshot::read(&mut tx, library, parent).await?;
+        ensure!(
+            snapshot.ranges.contains_key(&Group::Episode(season)),
+            crate::NotFound
+        );
+        let cover = snapshot.season_artwork(season);
+        tx.commit().await?;
+        Ok(cover)
+    }
     pub async fn playback_item(&self, library: &str, item: &str) -> Result<PlaybackItem> {
         use sqlx::Row;
         let mut tx = self.db.read_pool().begin().await?;
@@ -604,6 +649,11 @@ impl Store {
                     kind: kind.into(),
                     number,
                     total: count,
+                    metadata: if kind == "episode" {
+                        snapshot.season_artwork(number).map(|a| a.metadata)
+                    } else {
+                        None
+                    },
                 });
             }
             if !allowed {

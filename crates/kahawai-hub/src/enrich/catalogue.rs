@@ -854,6 +854,7 @@ fn base_record(
     media_type: m::MediaType,
 ) -> m::ProviderRecord {
     m::ProviderRecord {
+        season_artwork: None,
         children: None,
         provider: provider.into(),
         namespace: namespace.into(),

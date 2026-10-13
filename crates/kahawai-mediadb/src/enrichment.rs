@@ -620,6 +620,7 @@ impl Store {
         let record = crate::metadata::put_record(
             &mut tx,
             &ProviderRecord {
+                season_artwork: None,
                 children: None,
                 provider: "manual".into(),
                 namespace: kind.as_str().into(),

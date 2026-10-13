@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "d0432fd43ff7ad4ba5f4e53bb0d8dbf69091d18c85f8674a31eeb02acf57b319",
+  "x-kahawai-source-sha256": "500563579219e7891e47cfd6312ee5244613964791497504b6e7b8a5b9b107d7",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -9404,6 +9404,16 @@
           "kind": {
             "type": "string"
           },
+          "metadata": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/ResolvedDescription"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "number": {
             "type": [
               "integer",
@@ -10388,6 +10398,16 @@
                   },
                   "provider": {
                     "type": "string"
+                  },
+                  "season_artwork": {
+                    "type": [
+                      "array",
+                      "null"
+                    ],
+                    "items": {
+                      "$ref": "#/components/schemas/ProviderSeasonArtwork"
+                    },
+                    "description": "None predates collection; an empty list is a completed lookup. Covers\nresolve per source-backed group independently of the child catalogue."
                   },
                   "title": {
                     "type": "string"
@@ -11576,6 +11596,16 @@
           "provider": {
             "type": "string"
           },
+          "season_artwork": {
+            "type": [
+              "array",
+              "null"
+            ],
+            "items": {
+              "$ref": "#/components/schemas/ProviderSeasonArtwork"
+            },
+            "description": "None predates collection; an empty list is a completed lookup. Covers\nresolve per source-backed group independently of the child catalogue."
+          },
           "title": {
             "type": "string"
           },
@@ -11585,6 +11615,30 @@
               "null"
             ],
             "format": "int32"
+          }
+        }
+      },
+      "ProviderSeasonArtwork": {
+        "type": "object",
+        "required": [
+          "scope",
+          "artwork"
+        ],
+        "properties": {
+          "artwork": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            }
+          },
+          "provider_id": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "scope": {
+            "$ref": "#/components/schemas/SeasonArtworkScope"
           }
         }
       },
@@ -12065,6 +12119,44 @@
             "$ref": "#/components/schemas/SubtitleSource"
           }
         }
+      },
+      "SeasonArtworkScope": {
+        "oneOf": [
+          {
+            "type": "object",
+            "required": [
+              "number",
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "season"
+                ]
+              },
+              "number": {
+                "type": "integer",
+                "format": "int32",
+                "minimum": 0
+              }
+            }
+          },
+          {
+            "type": "object",
+            "required": [
+              "kind"
+            ],
+            "properties": {
+              "kind": {
+                "type": "string",
+                "enum": [
+                  "native_entry"
+                ]
+              }
+            }
+          }
+        ]
       },
       "SeekRequest": {
         "type": "object",

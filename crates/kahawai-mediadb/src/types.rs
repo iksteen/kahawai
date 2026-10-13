@@ -82,6 +82,24 @@ pub struct ProviderRecord {
     /// follow the same evidence precedence as descriptions but resolve separately.
     #[serde(default)]
     pub children: Option<Vec<ProviderChild>>,
+    /// None predates collection; an empty list is a completed lookup. Covers
+    /// resolve per source-backed group independently of the child catalogue.
+    #[serde(default)]
+    pub season_artwork: Option<Vec<ProviderSeasonArtwork>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, utoipa::ToSchema)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum SeasonArtworkScope {
+    Season { number: u32 },
+    NativeEntry,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct ProviderSeasonArtwork {
+    pub provider_id: Option<String>,
+    pub scope: SeasonArtworkScope,
+    pub artwork: Vec<String>,
 }
 #[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
 pub struct DetectedMetadata {

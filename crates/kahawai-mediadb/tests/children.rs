@@ -16,6 +16,7 @@ fn episode(season: Option<u32>, episode: u32, title: &str) -> ProviderChild {
 async fn describe(s: &Store, copy: &str, title: &str, children: Vec<ProviderChild>) -> String {
     let r = s
         .put_provider_record(&ProviderRecord {
+            season_artwork: None,
             provider: "fixture".into(),
             namespace: "show".into(),
             external_id: title.into(),

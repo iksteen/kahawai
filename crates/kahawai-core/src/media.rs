@@ -79,6 +79,12 @@ impl ReplayGain {
     }
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+pub struct LocalSeasonArtwork {
+    pub season: u32,
+    pub path: String,
+}
+
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, utoipa::ToSchema)]
 pub struct MediaInfo {
     /// Container format, normalized ("matroska", "mp4", "webm", …).
@@ -104,6 +110,10 @@ pub struct MediaInfo {
     /// cover/folder/poster image, path relative to the collection root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<String>,
+    /// Season-specific sidecars advertised by this source. None predates
+    /// discovery; an empty list records that the directory was inspected.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub season_artwork: Option<Vec<LocalSeasonArtwork>>,
     /// A Kodi-style .nfo beside the media file or in its directory, path
     /// relative to the collection root. Recorded at scan so
     /// the hub can decline instantly for the files that have none — it
