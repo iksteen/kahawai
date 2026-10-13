@@ -10,6 +10,8 @@ const PROVIDERS: &[&str] = &[
     "tmdb-artwork",
     "tvdb-artwork",
     "anilist-artwork",
+    "anidb-artwork",
+    "fanart-artwork",
     "local-artwork",
     "coverartarchive",
     "artist-collage",
@@ -39,7 +41,7 @@ pub(super) fn now() -> i64 {
 }
 #[derive(Debug, thiserror::Error)]
 #[error("provider credentials are not configured")]
-struct Unconfigured;
+pub(super) struct Unconfigured;
 
 // Verified provider links identify the namespace directly. Otherwise physical
 // entries distinguish movies from series even inside a mixed anime collection.
@@ -184,6 +186,8 @@ impl Enricher {
             "tmdb-artwork"
                 | "tvdb-artwork"
                 | "anilist-artwork"
+                | "anidb-artwork"
+                | "fanart-artwork"
                 | "local-artwork"
                 | "coverartarchive"
                 | "artist-collage"
@@ -198,6 +202,11 @@ impl Enricher {
         }
         if provider == "local" {
             return self.catalogue_local(registry, input).await;
+        }
+        if provider == "fanart"
+            && matches!(input.media_type, m::MediaType::Series | m::MediaType::Anime)
+        {
+            return self.catalogue_fanart_seasons(registry, input, force).await;
         }
         if matches!(provider, "fanart" | "theaudiodb") {
             return self
@@ -283,7 +292,26 @@ impl Enricher {
                 .recent_cache_answer(provider, &question, now() - 7 * 24 * 3600)
                 .await?
         {
-            return Ok(serde_json::from_str(&cached)?);
+            let mut answer: m::EnrichmentAnswer = serde_json::from_str(&cached)?;
+            // Old AniList answers already retained the native cover. Upgrade in
+            // memory without spending a provider request or erasing cached misses.
+            if provider == "anilist" {
+                for candidate in &mut answer.candidates {
+                    if candidate.record.season_artwork.is_none() {
+                        candidate.record.season_artwork =
+                            Some(vec![super::season_artwork::native_cover(&candidate.record)]);
+                    }
+                }
+            }
+            let needs_cover = matches!(provider, "tmdb" | "tvdb" | "anidb")
+                && kind == "show"
+                && answer
+                    .candidates
+                    .iter()
+                    .any(|c| c.complete && c.record.season_artwork.is_none());
+            if !needs_cover {
+                return Ok(answer);
+            }
         }
         provider_ready(registry.catalogue(), provider).await?;
         let answer = match provider {
@@ -315,6 +343,7 @@ impl Enricher {
     ) -> Result<m::EnrichmentAnswer> {
         let mut candidates;
         let mut episodes = Vec::new();
+        let mut season_artwork = Vec::new();
         let mut rich: Option<serde_json::Value> = None;
         let mut linked = Vec::new();
         if provider == "tmdb" {
@@ -364,16 +393,20 @@ impl Enricher {
                 && kind == "show"
             {
                 let mut absolute = 0;
-                for (season, count) in self.tmdb_seasons(&key, &t.external_id, &lease).await? {
-                    let question = format!("season:{}:{season}", t.external_id);
-                    let mut children: Vec<EpisodeData> = if let Some(cached) = registry
+                for (season, count) in super::season_artwork::tmdb_seasons(
+                    rich.as_ref().context("TMDB series details missing")?,
+                ) {
+                    // Old normalized episode pages discarded poster_path. Keep
+                    // them intact; only this new representation needs a refetch.
+                    let question = format!("season-artwork-v1:{}:{season}", t.external_id);
+                    let page: super::season_artwork::SeasonPage = if let Some(cached) = registry
                         .catalogue()
                         .recent_cache_answer("tmdb-pages", &question, now() - 7 * 24 * 3600)
                         .await?
                     {
                         serde_json::from_str(&cached)?
                     } else {
-                        let children = self
+                        let page = self
                             .tmdb_season(&key, &t.external_id, season, &lease)
                             .await?;
                         registry
@@ -381,16 +414,22 @@ impl Enricher {
                             .put_cache_answer(
                                 "tmdb-pages",
                                 &question,
-                                &serde_json::to_string(&children)?,
+                                &serde_json::to_string(&page)?,
                                 now(),
                             )
                             .await?;
-                        children
+                        page
                     };
+                    season_artwork.push(page.cover);
+                    let mut children = page.episodes;
                     for child in &mut children {
-                        child.absolute = Some(absolute + child.episode);
+                        if season > 0 {
+                            child.absolute = Some(absolute + child.episode);
+                        }
                     }
-                    absolute += count;
+                    if season > 0 {
+                        absolute += count;
+                    }
                     episodes.extend(children);
                 }
             }
@@ -399,10 +438,15 @@ impl Enricher {
             let lease = self.provider_lease(TVDB);
             let token = self.tvdb_token(&creds, &lease).await?;
             candidates = if let Some(t) = target {
-                vec![
-                    self.tvdb_details(&token, kind, t.external_id.parse()?, &lease)
-                        .await?,
-                ]
+                let (candidate, details) = self
+                    .tvdb_details(&token, kind, t.external_id.parse()?, &lease)
+                    .await?;
+                if kind == "show" {
+                    season_artwork = self
+                        .tvdb_season_covers(registry, &token, &details, &lease)
+                        .await?;
+                }
+                vec![candidate]
             } else {
                 self.tvdb_search(&token, kind, &input.title, &lease).await?
             };
@@ -433,6 +477,9 @@ impl Enricher {
                 0
             };
             let mut record = candidate_record(provider, kind, &c, input.media_type);
+            if target.is_some() && kind == "show" {
+                record.season_artwork = Some(season_artwork.clone());
+            }
             if let Some(value) = &rich {
                 record.description.genres = value["genres"].as_array().map(|v| {
                     v.iter()
@@ -542,6 +589,7 @@ impl Enricher {
                     .map(|u| vec![u]),
                 ..Default::default()
             };
+            record.season_artwork = Some(vec![super::season_artwork::native_cover(&record)]);
             let strength = if target.is_some() || exact.len() == 1 && exact[0] == media.id {
                 10
             } else {
@@ -562,9 +610,6 @@ impl Enricher {
         input: &m::EnrichmentInput,
         target: Option<&m::RecordLink>,
     ) -> Result<m::EnrichmentAnswer> {
-        if let Some(remaining) = crate::anidb::ban_remaining(&self.data_dir)? {
-            return Err(AniDbPaused(remaining).into());
-        }
         let mut aids = Vec::new();
         let mut exact = false;
         for hash in input
@@ -600,6 +645,14 @@ impl Enricher {
         let unique = aids.len() == 1;
         let mut answer = m::EnrichmentAnswer::default();
         for aid in aids.into_iter().take(10) {
+            if !crate::anime::anime_dir(&self.data_dir)
+                .join("httpapi")
+                .join(format!("{aid}.xml"))
+                .is_file()
+                && let Some(remaining) = crate::anidb::ban_remaining(&self.data_dir)?
+            {
+                return Err(AniDbPaused(remaining).into());
+            }
             let info = crate::anime::anidb_anime_info(&self.http, &self.data_dir, aid).await?;
             let mut record = base_record(
                 "anidb",
@@ -609,6 +662,8 @@ impl Enricher {
                 m::MediaType::Anime,
             );
             record.year = info.year.and_then(|y| i32::try_from(y).ok());
+            record.description.artwork = info.artwork.map(|u| vec![u]);
+            record.season_artwork = Some(vec![super::season_artwork::native_cover(&record)]);
             let children =
                 crate::anime::anidb_episode_titles(&self.http, &self.data_dir, aid, &[]).await?;
             record.children = Some(
@@ -654,6 +709,7 @@ impl Enricher {
             input.media_type,
         );
         record.year = input.year;
+        record.season_artwork = Some(vec![]);
         let mut seen = std::collections::HashSet::new();
         let mut children = Vec::new();
         for entry in registry.catalogue().media_entries(&input.item_id).await? {
@@ -671,6 +727,20 @@ impl Enricher {
         }
         for source in &input.sources {
             let Some(media) = &source.media else { continue };
+            for art in media.season_artwork.iter().flatten() {
+                let cover = m::ProviderSeasonArtwork {
+                    provider_id: None,
+                    scope: m::SeasonArtworkScope::Season { number: art.season },
+                    artwork: vec![format!("local://{}/{}", source.root_token, art.path)],
+                };
+                let covers = record
+                    .season_artwork
+                    .as_mut()
+                    .expect("local season answer initialized");
+                if !covers.iter().any(|c| c.scope == cover.scope) {
+                    covers.push(cover);
+                }
+            }
             if let Some(art) = &media.artwork {
                 record.description.artwork =
                     Some(vec![format!("local://{}/{}", source.root_token, art)]);
@@ -743,9 +813,16 @@ impl Enricher {
         if !children.is_empty() {
             record.children = Some(children);
         }
+        for candidate in &mut answer.candidates {
+            candidate.record = record.clone();
+        }
         if !answer.candidates.is_empty()
             || record.description.artwork.is_some()
             || record.children.is_some()
+            || record
+                .season_artwork
+                .as_ref()
+                .is_some_and(|v| !v.is_empty())
         {
             answer.local = Some(record);
         }
@@ -1059,11 +1136,16 @@ impl Enricher {
                     .await?;
             }
         } else {
-            let metadata = registry
+            let owner = if provider == "coverartarchive" {
+                "musicbrainz"
+            } else {
+                provider.trim_end_matches("-artwork")
+            };
+            for poster in registry
                 .catalogue()
-                .resolve_metadata(&input.item_id)
-                .await?;
-            for poster in metadata.description.artwork.unwrap_or_default() {
+                .provider_artwork(&input.item_id, owner)
+                .await?
+            {
                 let host = reqwest::Url::parse(&poster)
                     .ok()
                     .and_then(|u| u.host_str().map(str::to_owned))
@@ -1073,7 +1155,9 @@ impl Enricher {
                     "tmdb-artwork" => host == "image.tmdb.org",
                     "coverartarchive" => host == "coverartarchive.org",
                     "tvdb-artwork" => host == "thetvdb.com" || host.ends_with(".thetvdb.com"),
-                    "anilist-artwork" => host.ends_with(".anilist.co"),
+                    "anilist-artwork" => host == "anilist.co" || host.ends_with(".anilist.co"),
+                    "anidb-artwork" => host == "cdn.anidb.net",
+                    "fanart-artwork" => host == "fanart.tv" || host.ends_with(".fanart.tv"),
                     _ => false,
                 };
                 if !owns {
@@ -1212,7 +1296,7 @@ struct ProviderPaused;
 #[derive(Debug, thiserror::Error)]
 #[error("provider attempt timed out")]
 struct AttemptTimedOut;
-async fn provider_ready(store: &m::Store, provider: &str) -> Result<()> {
+pub(super) async fn provider_ready(store: &m::Store, provider: &str) -> Result<()> {
     if let Some((until, blocked)) = store.provider_pause(provider).await?
         && (blocked || until > now())
     {

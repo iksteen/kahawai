@@ -138,9 +138,9 @@ pub(crate) async fn evidence(
         AND NOT EXISTS(SELECT 1 FROM metadata_assignments a WHERE a.item_id=l.item_id AND a.manual=1 AND a.record_id<>l.record_id)
         AND NOT EXISTS(SELECT 1 FROM metadata_rejections r WHERE r.item_id=l.item_id AND r.record_id=l.record_id)
         UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
-        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,o.position+1 FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
+        UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,CASE WHEN p.provider='fanart' THEN 2147483647 ELSE o.position+1 END AS position FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
-        JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 ORDER BY position")
+        LEFT JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 AND (o.provider IS NOT NULL OR (p.provider='fanart' AND col.media_type IN ('series','anime'))) ORDER BY position")
         .bind(item).fetch_all(&mut *c).await?)
 }
 

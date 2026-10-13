@@ -834,6 +834,12 @@ fn apply_declared_subtitles(
 fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::MediaInfo) {
     info.external_subtitles = find_sidecars(root, path);
     info.artwork = find_artwork(root, path);
+    info.season_artwork = path
+        .strip_prefix(root)
+        .ok()
+        .and_then(|p| p.to_str())
+        .and_then(kahawai_core::names::parse_episode)
+        .map(|_| find_season_artwork(root, path));
     info.nfo = find_nfo(root, path);
     let mut paths: Vec<String> = info
         .external_subtitles
@@ -841,6 +847,7 @@ fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::Me
         .map(|s| s.path_rel.clone())
         .chain(info.artwork.iter().cloned())
         .chain(info.nfo.iter().cloned())
+        .chain(info.season_artwork.iter().flatten().map(|a| a.path.clone()))
         .collect();
     // VobSub's index and payload are one external subtitle.
     paths.extend(
@@ -890,6 +897,7 @@ fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::Me
 fn sidecar_sig(root: &Path, media: &Path) -> String {
     let nfo = find_nfo(root, media).unwrap_or_default();
     let art = find_artwork(root, media).unwrap_or_default();
+    let seasons = find_season_artwork(root, media);
     // Subtitle sidecars too (.srt/.ass/.vtt, .idx pairs): a pair
     // appearing next to an UNCHANGED movie must bust the identity
     // fast-path, or it stays invisible until the movie changes.
@@ -899,42 +907,141 @@ fn sidecar_sig(root: &Path, media: &Path) -> String {
         .collect();
     subs.sort();
     subs.dedup();
-    if nfo.is_empty() && art.is_empty() && subs.is_empty() {
+    if nfo.is_empty() && art.is_empty() && subs.is_empty() && seasons.is_empty() {
         return String::new();
     }
-    format!("n:{nfo}|a:{art}|s:{}", subs.join(","))
+    let base = format!("n:{nfo}|a:{art}|s:{}", subs.join(","));
+    if seasons.is_empty() {
+        base
+    } else {
+        format!(
+            "{base}|seasons:{}",
+            seasons
+                .iter()
+                .map(|s| format!("{}:{}", s.season, s.path))
+                .collect::<Vec<_>>()
+                .join(",")
+        )
+    }
 }
 
-fn find_artwork(root: &Path, media: &Path) -> Option<String> {
-    const NAMES: &[&str] = &["cover", "folder", "poster", "front"];
-    const EXTS: &[&str] = &["jpg", "jpeg", "png", "webp"];
-    let dir = media.parent()?;
-    let entries: Vec<PathBuf> = std::fs::read_dir(dir)
+/// Conventional season directory names must agree with the episode's own
+/// parsed number; folder positions and absolute anime numbers are not evidence.
+fn season_dir(dir: &Path) -> Option<u32> {
+    let name = dir.file_name()?.to_str()?.to_ascii_lowercase();
+    if name == "specials" {
+        return Some(0);
+    }
+    let number = name
+        .strip_prefix("season")
+        .or_else(|| name.strip_prefix('s'))?
+        .trim();
+    if number.is_empty() || !number.chars().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    number.parse().ok()
+}
+fn image_in(root: &Path, dir: &Path, names: &[String]) -> Option<String> {
+    let mut paths: Vec<_> = std::fs::read_dir(dir)
         .ok()?
         .flatten()
         .map(|e| e.path())
         .collect();
-    for name in NAMES {
-        for p in &entries {
-            let stem_ok = p
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .is_some_and(|s| s.eq_ignore_ascii_case(name));
-            let ext_ok = p
-                .extension()
-                .and_then(|x| x.to_str())
-                .is_some_and(|x| EXTS.contains(&x.to_ascii_lowercase().as_str()));
-            if stem_ok && ext_ok {
-                return Some(
-                    p.strip_prefix(root)
-                        .unwrap_or(p)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
+    paths.sort();
+    for name in names {
+        for ext in ["jpg", "jpeg", "png", "webp"] {
+            for p in &paths {
+                if p.is_file()
+                    && p.file_stem()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case(name))
+                    && p.extension()
+                        .and_then(|s| s.to_str())
+                        .is_some_and(|s| s.eq_ignore_ascii_case(ext))
+                {
+                    return p
+                        .strip_prefix(root)
+                        .ok()
+                        .map(|p| p.to_string_lossy().into_owned());
+                }
             }
         }
     }
     None
+}
+fn find_artwork(root: &Path, media: &Path) -> Option<String> {
+    let mut dir = media.parent()?;
+    let parsed = media
+        .strip_prefix(root)
+        .ok()
+        .and_then(|p| p.to_str())
+        .and_then(kahawai_core::names::parse_episode);
+    if season_dir(dir).is_some_and(|n| parsed.as_ref().is_some_and(|g| g.season == Some(n))) {
+        dir = dir.parent()?;
+    }
+    image_in(
+        root,
+        dir,
+        &[
+            "cover".into(),
+            "folder".into(),
+            "poster".into(),
+            "front".into(),
+        ],
+    )
+}
+fn find_season_artwork(root: &Path, media: &Path) -> Vec<kahawai_core::media::LocalSeasonArtwork> {
+    let Some(rel) = media.strip_prefix(root).ok().and_then(|p| p.to_str()) else {
+        return vec![];
+    };
+    let Some(number) = kahawai_core::names::parse_episode(rel).and_then(|g| g.season) else {
+        return vec![];
+    };
+    let Some(dir) = media.parent() else {
+        return vec![];
+    };
+    let in_season = season_dir(dir) == Some(number);
+    let show = if in_season {
+        dir.parent().unwrap_or(dir)
+    } else {
+        dir
+    };
+    let names = if number == 0 {
+        vec![
+            "season-specials-poster".into(),
+            "season00-poster".into(),
+            "season0-poster".into(),
+        ]
+    } else {
+        vec![
+            format!("season{number:02}-poster"),
+            format!("season{number}-poster"),
+        ]
+    };
+    let image = image_in(root, show, &names).or_else(|| {
+        in_season
+            .then(|| {
+                image_in(
+                    root,
+                    dir,
+                    &[
+                        "poster".into(),
+                        "cover".into(),
+                        "folder".into(),
+                        "front".into(),
+                    ],
+                )
+            })
+            .flatten()
+    });
+    image
+        .map(|path| {
+            vec![kahawai_core::media::LocalSeasonArtwork {
+                season: number,
+                path,
+            }]
+        })
+        .unwrap_or_default()
 }
 
 /// A Kodi-style .nfo for this file (HUB-9): `<stem>.nfo` beside it, else
@@ -1656,6 +1763,36 @@ id: nl, index: 1
             return String::new();
         }
         format!("n:{nfo}|a:{artwork}|s:{}", subs.join(","))
+    }
+
+    #[test]
+    fn season_sidecars_refresh_without_reprobing_or_borrowing_show_art() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Show/Season 02");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("Show.S02E01.mkv");
+        std::fs::write(&media, b"unchanged media").unwrap();
+        std::fs::write(root.path().join("Show/poster.jpg"), b"show").unwrap();
+        let mut info = kahawai_core::media::MediaInfo::default();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert_eq!(info.artwork.as_deref(), Some("Show/poster.jpg"));
+        assert_eq!(info.season_artwork.as_deref(), Some([].as_slice()));
+        let before = sidecar_sig(root.path(), &media);
+        std::fs::write(dir.join("Poster.PNG"), b"season").unwrap();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert_ne!(before, sidecar_sig(root.path(), &media));
+        assert_eq!(info.season_artwork.as_ref().unwrap()[0].season, 2);
+        let revision = info.sidecar_revision.clone();
+        std::fs::write(dir.join("Poster.PNG"), b"changed season image").unwrap();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert_ne!(revision, info.sidecar_revision);
+        std::fs::write(root.path().join("Show/season02-poster.webp"), b"preferred").unwrap();
+        assert_eq!(
+            find_season_artwork(root.path(), &media)[0].path,
+            "Show/season02-poster.webp"
+        );
+        assert!(find_season_artwork(root.path(), &dir.join("Show - 12.mkv")).is_empty());
+        assert_eq!(std::fs::read(&media).unwrap(), b"unchanged media");
     }
 
     #[test]

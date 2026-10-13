@@ -44,6 +44,9 @@ pub struct EnrichmentCandidate {
 pub struct EnrichmentAnswer {
     #[serde(default)]
     pub artist: Option<ArtistIdentity>,
+    /// Artwork-only evidence linked to a verified TVDB show; never an identity candidate.
+    #[serde(default)]
+    pub artwork_supplement: Option<ProviderRecord>,
     #[serde(default)]
     pub links: Vec<(String, RecordLink)>,
     #[serde(default)]
@@ -382,6 +385,30 @@ impl Store {
                         .execute(&mut *tx)
                         .await?;
                 }
+            }
+        }
+        if let Some(record) = &answer.artwork_supplement {
+            ensure!(
+                job.provider == "fanart"
+                    && record.provider == "fanart"
+                    && record.namespace == "show"
+                    && matches!(kind.as_str(), "series" | "anime")
+                    && record.children.is_none()
+                    && record.description == Description::default(),
+                "invalid auxiliary artwork answer"
+            );
+            let verified: Option<String> = sqlx::query_scalar("SELECT a.record_id FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1 AND ((p.provider='tvdb' AND p.namespace='show' AND p.external_id=?2) OR EXISTS(SELECT 1 FROM provider_links l WHERE l.record_id=a.record_id AND l.provider='tvdb' AND l.namespace='show' AND l.external_id=?2) OR EXISTS(SELECT 1 FROM metadata_supplements s JOIN provider_records q ON q.id=s.record_id WHERE s.item_id=a.item_id AND s.primary_record_id=a.record_id AND q.provider='tvdb' AND q.namespace='show' AND q.external_id=?2))")
+                .bind(&job.item_id).bind(&record.external_id).fetch_optional(&mut *tx).await?;
+            if let Some(primary) = verified {
+                let record_id = crate::metadata::put_record(&mut tx, record).await?;
+                sqlx::query("DELETE FROM metadata_supplements WHERE item_id=? AND record_id IN (SELECT id FROM provider_records WHERE provider='fanart')")
+                    .bind(&job.item_id).execute(&mut *tx).await?;
+                sqlx::query("INSERT OR IGNORE INTO metadata_supplements VALUES(?,?,?)")
+                    .bind(&job.item_id)
+                    .bind(primary)
+                    .bind(record_id)
+                    .execute(&mut *tx)
+                    .await?;
             }
         }
         for (anchor, link) in &answer.links {

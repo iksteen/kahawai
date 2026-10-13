@@ -19,6 +19,7 @@ const inputs = [
   'crates/kahawai-hub/src/api/catalogue.rs',
   'crates/kahawai-hub/src/api/enrichment.rs',
   'crates/kahawai-mediadb/src/types.rs',
+  'crates/kahawai-mediadb/src/children.rs',
   'crates/kahawai-mediadb/src/enrichment.rs',
   'crates/kahawai-hub/src/auth.rs',
   'crates/kahawai-hub/src/enrich.rs',

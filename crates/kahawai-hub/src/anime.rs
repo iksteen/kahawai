@@ -552,6 +552,7 @@ pub struct AnidbAnimeInfo {
     /// Liberator, 2026-07-28: type OVA, one episode, invisible until
     /// this let it mint).
     pub episode_count: Option<i64>,
+    pub artwork: Option<String>,
 }
 
 pub async fn anidb_anime_info(
@@ -606,6 +607,16 @@ pub async fn anidb_anime_info(
         title,
         year,
         episode_count,
+        // AniDB HTTP XML supplies the image filename, not a season number.
+        // Verified against cached XML and cdn.anidb.net on 2026-10-13.
+        artwork: doc
+            .root_element()
+            .children()
+            .find(|n| n.has_tag_name("picture"))
+            .and_then(|n| n.text())
+            .map(str::trim)
+            .filter(|p| !p.is_empty() && !p.contains('/') && !p.contains('\\'))
+            .map(|p| format!("https://cdn.anidb.net/images/main/{p}")),
     })
 }
 
@@ -642,6 +653,21 @@ fn parse_episode_titles(xml: &str) -> Result<std::collections::HashMap<i64, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn cached_anidb_xml_retains_native_art_without_a_network_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let xml = anime_dir(dir.path()).join("httpapi");
+        std::fs::create_dir_all(&xml).unwrap();
+        std::fs::write(xml.join("42.xml"), "<anime><type>TV Series</type><titles><title type='main'>Example</title></titles><picture>123.jpg</picture><episodecount>12</episodecount></anime>").unwrap();
+        let info = anidb_anime_info(&crate::gate::Http::new().unwrap(), dir.path(), 42)
+            .await
+            .unwrap();
+        assert_eq!(
+            info.artwork.as_deref(),
+            Some("https://cdn.anidb.net/images/main/123.jpg")
+        );
+        assert_eq!(info.episode_count, Some(12));
+    }
 
     #[test]
     fn mapping_parses_real_schema() {

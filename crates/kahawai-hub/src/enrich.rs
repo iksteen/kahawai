@@ -4,6 +4,7 @@
 //! Every external request goes through the shared provider gate.
 
 mod catalogue;
+mod season_artwork;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -952,27 +953,7 @@ impl Enricher {
         show_id: &str,
         season: i64,
         lease: &crate::gate::CredentialLease,
-    ) -> Result<Vec<EpisodeData>> {
-        #[derive(Deserialize)]
-        struct Ep {
-            episode_number: i64,
-            #[serde(default)]
-            name: Option<String>,
-            #[serde(default)]
-            overview: Option<String>,
-            #[serde(default)]
-            still_path: Option<String>,
-            #[serde(default)]
-            air_date: Option<String>,
-            #[serde(default)]
-            vote_average: Option<f64>,
-            id: u64,
-        }
-        #[derive(Deserialize)]
-        struct Season {
-            #[serde(default)]
-            episodes: Vec<Ep>,
-        }
+    ) -> Result<season_artwork::SeasonPage> {
         let mut req = self.http.get(format!(
             "https://api.themoviedb.org/3/tv/{show_id}/season/{season}"
         ));
@@ -981,68 +962,35 @@ impl Enricher {
         } else {
             req = req.query(&[("api_key", key)]);
         }
-        let s: Season = self
+        let value: serde_json::Value = self
             .http
             .send_current(req, lease.clone())
             .await?
             .status_checked()?
             .json()
             .await?;
-        Ok(s.episodes
-            .into_iter()
-            .map(|e| EpisodeData {
-                provider_id: e.id.to_string(),
-                season: Some(season),
-                episode: e.episode_number,
-                absolute: None,
-                title: e.name,
-                overview: e.overview,
-                image: e.still_path, // relative: poster pipeline prefixes
-                aired: e.air_date,
-                rating: e.vote_average,
-            })
-            .collect())
-    }
-
-    /// TMDB show's season list: (season_number, episode_count) — used to
-    /// map absolute numbering onto seasons cumulatively.
-    async fn tmdb_seasons(
-        &self,
-        key: &str,
-        show_id: &str,
-        lease: &crate::gate::CredentialLease,
-    ) -> Result<Vec<(i64, i64)>> {
-        #[derive(Deserialize)]
-        struct S {
-            season_number: i64,
-            #[serde(default)]
-            episode_count: i64,
+        let mut page = season_artwork::tmdb_page(&value, season)?;
+        if page.cover.artwork.is_empty() {
+            // Only ask for alternatives when the provider has no selected poster.
+            // https://developer.themoviedb.org/reference/tv-season-images (2026-10-13).
+            let mut request = self.http.get(format!(
+                "https://api.themoviedb.org/3/tv/{show_id}/season/{season}/images"
+            ));
+            if is_v4_token(key) {
+                request = request.bearer_auth(key);
+            } else {
+                request = request.query(&[("api_key", key)]);
+            }
+            let images = self
+                .http
+                .send_current(request, lease.clone())
+                .await?
+                .status_checked()?
+                .json()
+                .await?;
+            page.cover.artwork = season_artwork::tmdb_poster(&images).into_iter().collect();
         }
-        #[derive(Deserialize)]
-        struct Show {
-            #[serde(default)]
-            seasons: Vec<S>,
-        }
-        let mut req = self
-            .http
-            .get(format!("https://api.themoviedb.org/3/tv/{show_id}"));
-        if is_v4_token(key) {
-            req = req.bearer_auth(key);
-        } else {
-            req = req.query(&[("api_key", key)]);
-        }
-        let s: Show = self
-            .http
-            .send_current(req, lease.clone())
-            .await?
-            .status_checked()?
-            .json()
-            .await?;
-        Ok(s.seasons
-            .into_iter()
-            .filter(|s| s.season_number > 0)
-            .map(|s| (s.season_number, s.episode_count))
-            .collect())
+        Ok(page)
     }
 
     async fn tvdb_episodes_english_cached(
@@ -1898,7 +1846,7 @@ impl Enricher {
         kind: &str,
         tvdb_id: i64,
         lease: &crate::gate::CredentialLease,
-    ) -> Result<Candidate> {
+    ) -> Result<(Candidate, serde_json::Value)> {
         #[derive(Deserialize)]
         struct Extended {
             #[serde(default)]
@@ -1923,7 +1871,7 @@ impl Enricher {
                 "https://api4.thetvdb.com/v4/{path}/{tvdb_id}/extended"
             ))
             .bearer_auth(token);
-        let r: Resp = self
+        let value: serde_json::Value = self
             .http
             .send_current(req, lease.clone())
             .await
@@ -1932,16 +1880,20 @@ impl Enricher {
             .json()
             .await
             .context("tvdb details json")?;
-        Ok(Candidate {
-            id: tvdb_id as u64,
-            title: r.data.name.unwrap_or_default(),
-            original_title: None,
-            overview: r.data.overview,
-            poster_path: r.data.image,
-            vote_average: r.data.score,
-            release_date: r.data.first_aired,
-            original_language: None,
-        })
+        let r: Resp = serde_json::from_value(value.clone())?;
+        Ok((
+            Candidate {
+                id: tvdb_id as u64,
+                title: r.data.name.unwrap_or_default(),
+                original_title: None,
+                overview: r.data.overview,
+                poster_path: r.data.image,
+                vote_average: r.data.score,
+                release_date: r.data.first_aired,
+                original_language: None,
+            },
+            value["data"].clone(),
+        ))
     }
 }
 fn parse_nfo(xml: &str) -> Option<(Option<String>, kahawai_mediadb::Description, Option<String>)> {

@@ -187,3 +187,84 @@ async fn native_entry_cover_requires_one_unambiguous_group() {
             .is_some()
     );
 }
+
+#[tokio::test]
+async fn fanart_is_auxiliary_and_requires_a_verified_bridge() {
+    let (_dir, s) = store().await;
+    let col = collection(&s, "shows", MediaType::Series, &["Show/Show.S01E01.mkv"]).await;
+    let lib = s
+        .create_library("Shows", MediaType::Series, std::slice::from_ref(&col))
+        .await
+        .unwrap();
+    let copy = s.collection_items(&col).await.unwrap().remove(0);
+    let primary = s
+        .put_provider_record(&record("tmdb", "1", "Show", None, MediaType::Series))
+        .await
+        .unwrap();
+    s.assign_metadata(&copy.id, Some(&primary)).await.unwrap();
+    let mut art = record("fanart", "99", "Show", None, MediaType::Series);
+    art.namespace = "show".into();
+    art.description = Description::default();
+    art.season_artwork = Some(vec![cover(
+        SeasonArtworkScope::Season { number: 1 },
+        "fanart-cover",
+    )]);
+    let answer = EnrichmentAnswer {
+        artwork_supplement: Some(art.clone()),
+        ..Default::default()
+    };
+    let job = s.claim_enrichment("fanart", 1, 180).await.unwrap().unwrap();
+    assert!(s.finish_enrichment(&job, &answer).await.unwrap());
+    assert!(
+        s.provider_artwork(&copy.id, "fanart")
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let input = s.enrichment_input(&copy.id).await.unwrap();
+    let tmdb = s.claim_enrichment("tmdb", 1, 180).await.unwrap().unwrap();
+    s.finish_enrichment(
+        &tmdb,
+        &EnrichmentAnswer {
+            links: vec![(
+                primary.clone(),
+                RecordLink {
+                    provider: "tvdb".into(),
+                    namespace: "show".into(),
+                    external_id: "99".into(),
+                },
+            )],
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let job = s.claim_enrichment("fanart", 1, 180).await.unwrap().unwrap();
+    assert!(s.finish_enrichment(&job, &answer).await.unwrap());
+    assert_eq!(
+        s.enrichment_input(&copy.id)
+            .await
+            .unwrap()
+            .selected
+            .unwrap()
+            .0,
+        primary
+    );
+    assert!(
+        s.review_candidates(&copy.id)
+            .await
+            .unwrap()
+            .iter()
+            .all(|c| c.record.provider != "fanart")
+    );
+    assert_eq!(
+        s.provider_artwork(&copy.id, "fanart").await.unwrap(),
+        ["fanart-cover"]
+    );
+    let cover = s
+        .library_season_artwork(&lib, &input.library_item_id, Some(1))
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(cover.metadata.providers.values().next().unwrap(), "fanart");
+}
