@@ -125,7 +125,9 @@ audio/video byte separation for manual playback testing; see
       (extraction/OCR; no tap, so no overlay/burn).
       Subtitle sidecars are part of the MH-5 sidecar signature, so a
       pair appearing next to an unchanged media file busts the fast-path
-      and is discovered on the next scan
+      and is discovered on the next scan. Season poster sidecars are advertised
+      separately, including stat revisions for edits and removals; show posters
+      remain separate from images inside matching season directories.
 - [x] MH-5 Content identity (size/mtime fast path; head/tail xxh3 + oshash) with
       local seen-generation reconciliation and versioned projection replay
 - [x] MH-6 Byte-range lease serving (dedicated byte-plane connection); reads
@@ -244,7 +246,12 @@ audio/video byte separation for manual playback testing; see
 - [x] HUB-6 Descriptive metadata: titles, plots, dates, ratings, posters,
       episode stills, season/episode and album/release structure, genres
       and cast; all stored, so everything reads back with providers
-      unreachable.
+      unreachable. Season cover answers and provenance are exposed through the
+      source-backed children API, with a cache-only, library-scoped season image
+      endpoint. TMDB, TVDB, Fanart TV, native AniDB/AniList and local posters
+      participate; migration 12 backfills once without stealing running claims or
+      discarding retries/blocks. Each provider cover is prefetched independently
+      of the winning answer (see `season-artwork.md`; client presentation follows).
       *(Cast is TMDB-only and TVDB's own genre list is unread; both reach
       TVDB-owned items by side-fill when TMDB also answered.)*
 - [x] HUB-7 Provider rate limits/caching. One queue per provider host

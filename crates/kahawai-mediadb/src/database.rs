@@ -142,6 +142,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn season_backfill_is_once_and_preserves_existing_work_and_evidence() {
+        use crate::{EnrichmentAnswer, EnrichmentJob};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("mediadb.db");
+        std::fs::File::create(&path).unwrap();
+        let old = Migrator::with_migrations(
+            MIGRATOR
+                .iter()
+                .filter(|m| m.version < 12)
+                .cloned()
+                .collect(),
+        );
+        let s = connect(&path, old).await.unwrap();
+        let mut tx = s.db.begin().await.unwrap();
+        sqlx::raw_sql("INSERT INTO mediahosts VALUES('host','Fixture');
+          INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch) VALUES('collection','host','shows','series','epoch');
+          INSERT INTO collection_roots(id,collection_id,token,path) VALUES('root','collection','root','/media');
+          INSERT INTO libraries(id,name,media_type) VALUES('library','Shows','series');
+          INSERT INTO library_collections VALUES('library','collection','series',0);
+          INSERT INTO provider_records(id,provider,namespace,external_id,language,media_type,title,description_json) VALUES('record','tmdb','show','1','en','series','Show','{}');
+          INSERT INTO enrichment_cache VALUES('anidb-hash','ed2k:fixture','null',123);
+          INSERT INTO enrichment_providers VALUES('tvdb',999,1,'configuration block');")
+          .execute(&mut *tx).await.unwrap();
+        for state in ["done", "running", "retry", "blocked", "pending"] {
+            sqlx::query("INSERT INTO library_items(id,media_type,title,title_key,singleton) VALUES(?,'series','Show','show',?)").bind(state).bind(state).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO collection_items(id,collection_id,root_id,occurrence,title,library_item_id,description_json) VALUES(?,'collection','root',?,'Show',?,'{}')").bind(state).bind(state).bind(state).execute(&mut *tx).await.unwrap();
+            sqlx::query(
+                "INSERT INTO files(id,collection_id,root_id,path) VALUES(?,'collection','root',?)",
+            )
+            .bind(state)
+            .bind(state)
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO media_entries(id,collection_id,item_id,occurrence,kind,title) VALUES(?,'collection',?,?,'episode','Episode')").bind(state).bind(state).bind(state).execute(&mut *tx).await.unwrap();
+            sqlx::query("INSERT INTO media_parts VALUES(?,'collection',1,?)")
+                .bind(state)
+                .bind(state)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("INSERT INTO metadata_assignments(item_id,record_id) VALUES(?,'record')")
+                .bind(state)
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+            sqlx::query("UPDATE enrichment_jobs SET state=?,force=1,attempts=6,due_at=123,token='lease',lease_until=999,error='failure' WHERE item_id=? AND provider='tmdb'").bind(state).bind(state).execute(&mut *tx).await.unwrap();
+        }
+        // A match without physical sources and an unmatched physical copy must
+        // not consume provider budget merely because the schema upgraded.
+        sqlx::raw_sql("INSERT INTO library_items(id,media_type,title,title_key,singleton) VALUES('empty','series','Empty','empty','empty'),('unmatched','series','Unknown','unknown','unmatched');
+          INSERT INTO collection_items(id,collection_id,root_id,occurrence,title,library_item_id,description_json) VALUES('empty','collection','root','empty','Empty','empty','{}'),('unmatched','collection','root','unmatched','Unknown','unmatched','{}');
+          INSERT INTO metadata_assignments(item_id,record_id) VALUES('empty','record');
+          INSERT INTO files(id,collection_id,root_id,path) VALUES('unmatched','collection','root','unmatched');
+          INSERT INTO media_entries(id,collection_id,item_id,occurrence,kind,title) VALUES('unmatched','collection','unmatched','unmatched','episode','Episode');
+          INSERT INTO media_parts VALUES('unmatched','collection',1,'unmatched');
+          UPDATE enrichment_jobs SET state='done' WHERE item_id IN ('empty','unmatched');")
+          .execute(&mut *tx).await.unwrap();
+        tx.commit().await.unwrap();
+        s.close().await;
+        let s = Store::open(&path).await.unwrap();
+        let unaffected:i64=sqlx::query_scalar("SELECT count(*) FROM enrichment_jobs WHERE item_id IN ('empty','unmatched') AND (state<>'done' OR request_generation<>0)").fetch_one(s.db.read_pool()).await.unwrap();
+        assert_eq!(unaffected, 0);
+        for state in ["done", "running", "retry", "blocked", "pending"] {
+            let row:(String,bool,i64,i64,String,i64,String,i64)=sqlx::query_as("SELECT state,force,attempts,due_at,token,lease_until,error,request_generation FROM enrichment_jobs WHERE item_id=? AND provider='tmdb'").bind(state).fetch_one(s.db.read_pool()).await.unwrap();
+            assert_eq!(
+                row,
+                (
+                    if state == "done" { "pending" } else { state }.into(),
+                    true,
+                    6,
+                    if state == "done" { 0 } else { 123 },
+                    "lease".into(),
+                    999,
+                    "failure".into(),
+                    1
+                )
+            );
+        }
+        assert_eq!(
+            s.cache_answer("anidb-hash", "ed2k:fixture")
+                .await
+                .unwrap()
+                .as_deref(),
+            Some("null")
+        );
+        assert_eq!(s.provider_pause("tvdb").await.unwrap(), Some((999, true)));
+        let revision: i64 = sqlx::query_scalar(
+            "SELECT enrichment_revision FROM collection_items WHERE id='running'",
+        )
+        .fetch_one(s.db.read_pool())
+        .await
+        .unwrap();
+        let job = EnrichmentJob {
+            item_id: "running".into(),
+            provider: "tmdb".into(),
+            revision,
+            request_generation: 0,
+            token: "lease".into(),
+            force: true,
+            attempts: 6,
+        };
+        assert!(
+            s.finish_enrichment(&job, &EnrichmentAnswer::default())
+                .await
+                .unwrap()
+        );
+        let state: String = sqlx::query_scalar(
+            "SELECT state FROM enrichment_jobs WHERE item_id='running' AND provider='tmdb'",
+        )
+        .fetch_one(s.db.read_pool())
+        .await
+        .unwrap();
+        assert_eq!(state, "pending");
+        let generations:Vec<(String,String,i64)>=sqlx::query_as("SELECT item_id,provider,request_generation FROM enrichment_jobs ORDER BY item_id,provider").fetch_all(s.db.read_pool()).await.unwrap();
+        let mut tx = s.db.begin().await.unwrap();
+        sqlx::query("UPDATE enrichment_jobs SET state='done'")
+            .execute(&mut *tx)
+            .await
+            .unwrap();
+        tx.commit().await.unwrap();
+        s.close().await;
+        let s = Store::open(&path).await.unwrap();
+        let again:Vec<(String,String,i64)>=sqlx::query_as("SELECT item_id,provider,request_generation FROM enrichment_jobs ORDER BY item_id,provider").fetch_all(s.db.read_pool()).await.unwrap();
+        assert_eq!(again, generations);
+        let pending: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM enrichment_jobs WHERE state<>'done'")
+                .fetch_one(s.db.read_pool())
+                .await
+                .unwrap();
+        assert_eq!(pending, 0);
+    }
+
+    #[tokio::test]
     async fn subtitle_upgrade_removes_completion_and_preserves_outstanding_state() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mediadb.db");

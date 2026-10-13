@@ -345,6 +345,15 @@ viewport—there is no separate load-more interaction. The artist index remains
 a synthetic grouping rather than a canonical artist entity, and an Album
 Artist rename therefore changes its key.
 
+Season artwork in mediadb is independent of whole episode catalogues and
+parent descriptions. Each provider retains its selected covers with explicit
+numbered-season or native-entry scope; physical library groups decide eligibility.
+The children API exposes resolved artwork and provenance, and its season image
+endpoint reads the prefilled cache with show-art fallback. Migration 12 performs
+one durable backfill, using request generations to preserve active claims and
+existing pauses/retries. Provider retrieval, local file conventions and operational
+checks are documented in [Season artwork](season-artwork.md).
+
 Artist portraits are a durable projection over that group. MusicBrainz album
 answers retain the exact credited-artist MBID; precisely one distinct MBID is
 required for a group, so same-named or conflicting credits produce no image

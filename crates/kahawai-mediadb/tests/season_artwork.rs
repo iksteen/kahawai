@@ -268,3 +268,71 @@ async fn fanart_is_auxiliary_and_requires_a_verified_bridge() {
         .unwrap();
     assert_eq!(cover.metadata.providers.values().next().unwrap(), "fanart");
 }
+
+#[tokio::test]
+async fn artwork_refresh_does_not_steal_claims_or_erase_retry_deadlines() {
+    let (_dir, s) = store().await;
+    let col = collection(&s, "shows", MediaType::Series, &["Show/Show.S01E01.mkv"]).await;
+    s.create_library("Shows", MediaType::Series, std::slice::from_ref(&col))
+        .await
+        .unwrap();
+    let copy = s.collection_items(&col).await.unwrap().remove(0);
+    let mut record = record("tmdb", "1", "Show", None, MediaType::Series);
+    let primary = s.put_provider_record(&record).await.unwrap();
+    s.assign_metadata(&copy.id, Some(&primary)).await.unwrap();
+    let running = s
+        .claim_enrichment("tmdb-artwork", 1, 180)
+        .await
+        .unwrap()
+        .unwrap();
+    record.season_artwork = Some(vec![cover(
+        SeasonArtworkScope::Season { number: 1 },
+        "first",
+    )]);
+    s.put_provider_record(&record).await.unwrap();
+    assert!(
+        s.claim_enrichment("tmdb-artwork", 2, 180)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert!(
+        s.finish_enrichment(&running, &EnrichmentAnswer::default())
+            .await
+            .unwrap()
+    );
+    let followup = s
+        .claim_enrichment("tmdb-artwork", 2, 180)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(followup.request_generation > running.request_generation);
+    s.fail_enrichment(&followup, 1000, "retry", false, false)
+        .await
+        .unwrap();
+    record.season_artwork = Some(vec![cover(
+        SeasonArtworkScope::Season { number: 1 },
+        "second",
+    )]);
+    s.put_provider_record(&record).await.unwrap();
+    assert!(
+        s.claim_enrichment("tmdb-artwork", 999, 180)
+            .await
+            .unwrap()
+            .is_none()
+    );
+    let retry = s
+        .claim_enrichment("tmdb-artwork", 1000, 180)
+        .await
+        .unwrap()
+        .unwrap();
+    s.finish_enrichment(&retry, &EnrichmentAnswer::default())
+        .await
+        .unwrap();
+    assert!(
+        s.claim_enrichment("tmdb-artwork", 1001, 180)
+            .await
+            .unwrap()
+            .is_none()
+    );
+}

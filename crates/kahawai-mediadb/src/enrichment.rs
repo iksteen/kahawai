@@ -21,6 +21,8 @@ pub struct EnrichmentJob {
     pub item_id: String,
     pub provider: String,
     pub revision: i64,
+    #[serde(default)]
+    pub request_generation: i64,
     pub token: String,
     pub attempts: i64,
 }
@@ -128,6 +130,23 @@ impl std::fmt::Display for StaleEnrichment {
 }
 impl std::error::Error for StaleEnrichment {}
 
+// An input revision invalidates obsolete answers. A request generation instead
+// records new work against the SAME input: keep running tokens, retries, pauses,
+// force flags and attempt counts; completion leaves a follow-up pending. Migration
+// 12 uses this rule for its one-time, source-backed series/anime backfill. Existing
+// provider cache representations and the legacy content-hash import remain intact.
+async fn request_work(
+    tx: &mut sqlx::SqliteConnection,
+    item: &str,
+    providers: &[&str],
+) -> Result<()> {
+    for provider in providers {
+        sqlx::query("UPDATE enrichment_jobs SET request_generation=request_generation+1,state=CASE WHEN state='done' THEN 'pending' ELSE state END,due_at=CASE WHEN state='done' THEN 0 ELSE due_at END WHERE item_id=? AND provider=?")
+            .bind(item).bind(provider).execute(&mut *tx).await?;
+    }
+    Ok(())
+}
+
 use crate::metadata::record;
 
 impl Store {
@@ -215,6 +234,7 @@ impl Store {
             item_id: row.get("item_id"),
             provider: provider.into(),
             revision: row.get("revision"),
+            request_generation: row.get("request_generation"),
             token: id(),
             attempts: row.get::<i64, _>("attempts") + 1,
         };
@@ -429,7 +449,7 @@ impl Store {
                 .await?
                 .rows_affected();
             if added > 0 {
-                sqlx::query("UPDATE enrichment_jobs SET state='pending',due_at=0 WHERE item_id=? AND provider=? AND state='done'").bind(&job.item_id).bind(&link.provider).execute(&mut *tx).await?;
+                request_work(&mut tx, &job.item_id, &[&link.provider]).await?;
             }
         }
         if job.provider == "local" {
@@ -465,7 +485,7 @@ impl Store {
             .execute(&mut *tx)
             .await?;
             sqlx::query("INSERT INTO collection_item_artists SELECT id,?,enrichment_revision FROM collection_items WHERE id=? ON CONFLICT(item_id) DO UPDATE SET artist_id=excluded.artist_id,revision=excluded.revision").bind(&artist.id).bind(&job.item_id).execute(&mut *tx).await?;
-            sqlx::query("UPDATE enrichment_jobs SET state='pending',due_at=0 WHERE item_id=? AND provider IN ('fanart','theaudiodb') AND state='done'").bind(&job.item_id).execute(&mut *tx).await?;
+            request_work(&mut tx, &job.item_id, &["fanart", "theaudiodb"]).await?;
         }
         // Assignment invalidation may have replaced this job in the transaction.
         // Its answer is current; siblings must rerun against the new parent.
@@ -474,13 +494,13 @@ impl Store {
                 .bind(&job.item_id)
                 .fetch_optional(&mut *tx)
                 .await?;
-        sqlx::query("UPDATE enrichment_jobs SET state=?,due_at=?,force=0,token=NULL,lease_until=0,error=NULL WHERE item_id=? AND provider=?")
-            .bind(if before!=after {"pending"} else {"done"}).bind(if before!=after {0} else {answer.refresh_at.unwrap_or(0)}).bind(&job.item_id).bind(&job.provider).execute(&mut *tx).await?;
+        sqlx::query("UPDATE enrichment_jobs SET state=CASE WHEN request_generation>?1 OR ?2 THEN 'pending' ELSE 'done' END,due_at=CASE WHEN request_generation>?1 OR ?2 THEN 0 ELSE ?3 END,force=CASE WHEN request_generation>?1 THEN force ELSE 0 END,token=NULL,lease_until=0,error=NULL WHERE item_id=?4 AND provider=?5")
+            .bind(job.request_generation).bind(before!=after).bind(answer.refresh_at.unwrap_or(0)).bind(&job.item_id).bind(&job.provider).execute(&mut *tx).await?;
         if job.provider.ends_with("-artwork") || job.provider == "coverartarchive" {
-            sqlx::query("UPDATE enrichment_jobs SET state='pending',due_at=0 WHERE item_id=? AND provider='artist-collage' AND state='done'").bind(&job.item_id).execute(&mut *tx).await?;
+            request_work(&mut tx, &job.item_id, &["artist-collage"]).await?;
         }
         if job.provider == "anidb-hash" {
-            sqlx::query("UPDATE enrichment_jobs SET state='pending',due_at=0,token=NULL,lease_until=0 WHERE item_id=? AND provider='anidb'").bind(&job.item_id).execute(&mut *tx).await?;
+            request_work(&mut tx, &job.item_id, &["anidb"]).await?;
         }
         choose_automatic(&mut tx, &job.item_id).await?;
         tx.commit().await?;
