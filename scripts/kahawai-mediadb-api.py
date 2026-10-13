@@ -182,7 +182,7 @@ match args.command:
         if args.season is not None and args.disc is not None:
             parser.error("--season and --disc cannot be combined")
         params = {k: getattr(args, k) for k in ("offset", "limit", "disc") if getattr(args, k) is not None}
-        route = f"seasons/{quote(args.season, safe='')}/items" if args.season is not None else "children"
+        route = f"seasons/{quote(args.season)}/items" if args.season is not None else "children"
         answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/{route}?" + urllib.parse.urlencode(params))
     case "item":
         answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}")
