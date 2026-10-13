@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "500563579219e7891e47cfd6312ee5244613964791497504b6e7b8a5b9b107d7",
+  "x-kahawai-source-sha256": "10a26c9b75a3d2ae5b388a5f13bdc54d4f91c920e39c1ff47bf1724741186d4d",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -6064,6 +6064,15 @@
             "schema": {
               "type": "string"
             }
+          },
+          {
+            "name": "season",
+            "in": "query",
+            "description": "A native season number, or absolute; serves cached season artwork with a show-poster fallback",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
@@ -6080,6 +6089,23 @@
               "image/jpeg": {
                 "schema": {
                   "type": "string"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }

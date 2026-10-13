@@ -28,6 +28,9 @@ parser = argparse.ArgumentParser(description=__doc__)
 sub = parser.add_subparsers(dest="command", required=True)
 sub.add_parser("collections")
 sub.add_parser("libraries")
+seasons = sub.add_parser("seasons", help="inspect source-backed season groups and cover provenance")
+seasons.add_argument("library")
+seasons.add_argument("item")
 match_command = sub.add_parser("match", help="apply enrichment correction JSON to a collection copy")
 match_command.add_argument("copy")
 match_command.add_argument("body_file")
@@ -112,6 +115,8 @@ quote = lambda value: urllib.parse.quote(value, safe="")
 base = "/api/v1/catalogue/libraries"
 admin = "/admin/v1/catalogue/libraries"
 match args.command:
+    case "seasons":
+        answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/children?limit=1")["groups"]
     case "match":
         with open(args.body_file) as source:
             body = json.load(source)

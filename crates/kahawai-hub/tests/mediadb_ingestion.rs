@@ -2766,3 +2766,142 @@ async fn matching_search_aggregates_anime_movie_results_and_provider_failures() 
     assert_eq!(result["errors"].as_object().unwrap().len(), 1, "{result}");
     assert!(result["errors"]["tvdb"].is_string());
 }
+
+#[tokio::test]
+async fn season_artwork_api_is_scoped_and_uses_only_cached_images() {
+    use kahawai_mediadb::{ProviderRecord, ProviderSeasonArtwork, SeasonArtworkScope};
+    let f = Fixture::new().await;
+    let s = f.registry.catalogue();
+    s.put_mediahost("host", "Fixture").await.unwrap();
+    let mut o = offer("shows", 1);
+    o.media_type = "series".into();
+    let (col, _) = s.offer_collection("host", &o).await.unwrap();
+    s.apply_catalogue(
+        "host",
+        &delta("shows", 1, "Show (2000)/Show.S01E01.mkv", true, true),
+    )
+    .await
+    .unwrap();
+    let library = s
+        .create_library("Shows", MediaType::Series, std::slice::from_ref(&col))
+        .await
+        .unwrap();
+    let copy = s.collection_items(&col).await.unwrap().remove(0);
+    let show_url = "http://127.0.0.1:1/show.jpg";
+    let season_url = "http://127.0.0.1:1/season.jpg";
+    let r = s
+        .put_provider_record(&ProviderRecord {
+            provider: "tmdb".into(),
+            namespace: "show".into(),
+            external_id: "1".into(),
+            language: "en".into(),
+            media_type: MediaType::Series,
+            title: "Show".into(),
+            year: Some(2000),
+            description: kahawai_mediadb::Description {
+                artwork: Some(vec![show_url.into()]),
+                ..Default::default()
+            },
+            children: None,
+            season_artwork: Some(vec![ProviderSeasonArtwork {
+                provider_id: None,
+                scope: SeasonArtworkScope::Season { number: 1 },
+                artwork: vec![season_url.into()],
+            }]),
+        })
+        .await
+        .unwrap();
+    s.assign_metadata(&copy.id, Some(&r)).await.unwrap();
+    let parent = s.enrichment_input(&copy.id).await.unwrap().library_item_id;
+    let base = format!("/api/v1/catalogue/libraries/{library}/items/{parent}");
+    let groups = f
+        .request(
+            "GET",
+            &format!("{base}/children"),
+            Value::Null,
+            Some(&f.token),
+        )
+        .await
+        .1;
+    assert_eq!(
+        groups["groups"][0]["metadata"]["description"]["artwork"],
+        json!([season_url])
+    );
+    let cache = f.dir.path().join("artwork");
+    std::fs::create_dir_all(&cache).unwrap();
+    let key = |url: &str| format!("tmdb-{:016x}", xxhash_rust::xxh3::xxh3_64(url.as_bytes()));
+    std::fs::write(cache.join(key(show_url)), b"show-image").unwrap();
+    for (selector, status) in [
+        ("1", StatusCode::OK),
+        ("2", StatusCode::NOT_FOUND),
+        ("absolute", StatusCode::NOT_FOUND),
+        ("bad", StatusCode::BAD_REQUEST),
+        ("-1", StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            f.request(
+                "GET",
+                &format!("{base}/artwork?season={selector}"),
+                Value::Null,
+                Some(&f.token)
+            )
+            .await
+            .0,
+            status
+        );
+    }
+    for (present, expected) in [
+        (false, b"show-image".as_slice()),
+        (true, b"season-image".as_slice()),
+    ] {
+        if present {
+            std::fs::write(cache.join(key(season_url)), expected).unwrap();
+        }
+        let response = f
+            .api
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(format!("{base}/artwork?season=1"))
+                    .header("authorization", format!("Bearer {}", f.token))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            axum::body::to_bytes(response.into_body(), 100)
+                .await
+                .unwrap()
+                .as_ref(),
+            expected
+        );
+    }
+    let hidden = s
+        .create_library("Empty", MediaType::Series, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request(
+            "GET",
+            &format!("/api/v1/catalogue/libraries/{hidden}/items/{parent}/artwork?season=1"),
+            Value::Null,
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+    assert_eq!(
+        f.request(
+            "GET",
+            &format!("{base}/artwork?season=1"),
+            Value::Null,
+            None
+        )
+        .await
+        .0,
+        StatusCode::UNAUTHORIZED
+    );
+}

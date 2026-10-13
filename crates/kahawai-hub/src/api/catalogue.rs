@@ -1040,7 +1040,7 @@ pub(super) async fn catalogue_artists(
     }))
 }
 
-#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("size"=Option<String>,Query)),responses((status=200,body=String,content_type="image/jpeg"),(status=404,body=ApiErrorBody)))]
+#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("size"=Option<String>,Query),("season"=Option<String>,Query,description="A native season number, or absolute; serves cached season artwork with a show-poster fallback")),responses((status=200,body=String,content_type="image/jpeg"),(status=400,body=ApiErrorBody),(status=404,body=ApiErrorBody)))]
 pub(super) async fn catalogue_artwork(
     State(s): State<AppState>,
     ApiPath((id, item)): ApiPath<(String, String)>,
@@ -1050,6 +1050,54 @@ pub(super) async fn catalogue_artwork(
     use axum::response::IntoResponse;
     visible(&s, &claims, &id).await?;
     let store = s.registry.catalogue();
+    if let Some(selector) = q.get("season") {
+        if item.starts_with("child1:") {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "season artwork requires a parent item",
+            ));
+        }
+        let season = if selector == "absolute" {
+            None
+        } else {
+            Some(
+                selector
+                    .parse::<u32>()
+                    .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid season"))?,
+            )
+        };
+        let cover = store
+            .library_season_artwork(&id, &item, season)
+            .await
+            .map_err(store_error)?;
+        let parent = store.library_item(&id, &item).await.map_err(store_error)?;
+        let mut candidates = Vec::new();
+        if let Some(cover) = cover {
+            candidates.push((cover.representative_id, cover.metadata));
+        }
+        candidates.push((parent.representative_id, parent.metadata));
+        for (copy, metadata) in candidates {
+            let input = store.enrichment_input(&copy).await.map_err(store_error)?;
+            for poster in metadata.description.artwork.unwrap_or_default() {
+                if let Some((bytes, mime)) = s
+                    .artwork
+                    .catalogue_cached_at(&input, &poster, q.get("size").map(String::as_str))
+                    .await
+                    .map_err(store_error)?
+                {
+                    return Ok((
+                        [
+                            (axum::http::header::CONTENT_TYPE, mime),
+                            (axum::http::header::CACHE_CONTROL, "private, no-cache"),
+                        ],
+                        bytes,
+                    )
+                        .into_response());
+                }
+            }
+        }
+        return Err(hidden("artwork"));
+    }
     let row = if item.starts_with("child1:") {
         m::ChildId::parse(&item)
             .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid child ID"))?;

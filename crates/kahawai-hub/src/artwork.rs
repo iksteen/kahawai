@@ -532,6 +532,38 @@ async fn read_all(lease: crate::leases::Lease) -> Result<Vec<u8>> {
 impl Artwork {
     /// Mediadb preview: the caller supplies an authorized copy and a URL from
     /// its stored metadata. Local paths must still be advertised by that copy.
+    /// A season browse is strictly a cache read. Prefetch owns remote/image
+    /// work; a missing variant can fall back to the parent's cached poster.
+    pub(crate) async fn catalogue_cached_at(
+        &self,
+        input: &kahawai_mediadb::EnrichmentInput,
+        poster: &str,
+        size: Option<&str>,
+    ) -> Result<Option<(Vec<u8>, &'static str)>> {
+        let Some(local) = poster.strip_prefix("local://") else {
+            return self.get_cached_remote_at(poster, size).await;
+        };
+        let (root, path) = local
+            .split_once('/')
+            .context("invalid local artwork address")?;
+        let key = catalogue_local_key(input, root, path)?;
+        let variant = size.and_then(|name| SIZES.iter().find(|(n, _)| *n == name));
+        let cache = match variant {
+            Some((name, px)) => self.dir.join(variant_dir(name, *px)).join(key),
+            None => self.dir.join(key),
+        };
+        let mime = if variant.is_some() {
+            "image/jpeg"
+        } else if path.ends_with(".png") {
+            "image/png"
+        } else if path.ends_with(".webp") {
+            "image/webp"
+        } else {
+            "image/jpeg"
+        };
+        Ok(std::fs::read(cache).ok().map(|bytes| (bytes, mime)))
+    }
+
     pub(crate) async fn catalogue_at(
         &self,
         registry: &Registry,
@@ -544,24 +576,7 @@ impl Artwork {
             let (root, path) = local
                 .split_once('/')
                 .context("invalid local artwork address")?;
-            let source = input
-                .sources
-                .iter()
-                .find(|s| {
-                    s.root_token == root
-                        && s.media.as_ref().and_then(|m| m.artwork.as_deref()) == Some(path)
-                })
-                .context("artwork is not advertised by this copy")?;
-            let key = format!(
-                "{:016x}",
-                xxhash_rust::xxh3::xxh3_64(
-                    format!(
-                        "{}\n{}\n{}\n{}\n{:?}",
-                        input.mediahost_id, input.remote_id, root, path, source.media
-                    )
-                    .as_bytes()
-                )
-            );
+            let key = catalogue_local_key(input, root, path)?;
             let cache = self.dir.join(&key);
             let bytes = match std::fs::read(&cache) {
                 Ok(bytes) => bytes,
@@ -722,6 +737,36 @@ impl Artwork {
                 .map(|bytes| (bytes, "image/jpeg")),
         )
     }
+}
+
+fn catalogue_local_key(
+    input: &kahawai_mediadb::EnrichmentInput,
+    root: &str,
+    path: &str,
+) -> Result<String> {
+    let source = input
+        .sources
+        .iter()
+        .find(|s| {
+            s.root_token == root
+                && s.media.as_ref().is_some_and(|m| {
+                    m.artwork.as_deref() == Some(path)
+                        || m.season_artwork
+                            .as_ref()
+                            .is_some_and(|covers| covers.iter().any(|c| c.path == path))
+                })
+        })
+        .context("artwork is not advertised by this copy")?;
+    Ok(format!(
+        "{:016x}",
+        xxhash_rust::xxh3::xxh3_64(
+            format!(
+                "{}\n{}\n{}\n{}\n{:?}",
+                input.mediahost_id, input.remote_id, root, path, source.media
+            )
+            .as_bytes()
+        )
+    ))
 }
 
 #[cfg(test)]
