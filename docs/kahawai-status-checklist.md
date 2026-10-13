@@ -247,7 +247,7 @@ audio/video byte separation for manual playback testing; see
       episode stills, season/episode and album/release structure, genres
       and cast; all stored, so everything reads back with providers
       unreachable. Season cover answers and provenance are exposed through the
-      source-backed `/seasons` and children APIs, with a cache-only, library-scoped season image
+      source-backed `/seasons` and `/seasons/{season}/items` APIs, with a cache-only, library-scoped season image
       endpoint. TMDB, TVDB, Fanart TV, native AniDB/AniList and local posters
       participate; migration 12 backfills once without stealing running claims or
       discarding retries/blocks. Each provider cover is prefetched independently

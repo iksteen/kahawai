@@ -8,6 +8,7 @@ import {
   catalogueContinue,
   catalogueUpNext,
   catalogueChildren as getCatalogueChildren,
+  catalogueSeasonItems as getCatalogueSeasonItems,
 } from './generated/kahawai.ts'
 import { descriptionProviders } from '../domain/attribution.ts'
 import type { ItemQuery } from './generated/model/itemQuery.ts'
@@ -155,7 +156,12 @@ export async function catalogueChildren(
   id: string,
   params: CatalogueChildrenParams = {},
 ) {
-  const page = await getCatalogueChildren(library, id, params)
+  const { season, ...query } = params
+  const { disc, ...seasonQuery } = query
+  if (season != null && disc != null) throw new Error('Season and disc filters cannot be combined.')
+  const page = await (season == null
+    ? getCatalogueChildren(library, id, query)
+    : getCatalogueSeasonItems(library, id, season, seasonQuery))
   return {
     ...page,
     children: page.children.map((child) => ({

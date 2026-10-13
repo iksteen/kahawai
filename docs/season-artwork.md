@@ -32,14 +32,18 @@ endpoint falls back to cached show artwork:
 
 ```text
 GET /api/v1/catalogue/libraries/{library}/items/{parent}/seasons
-GET /api/v1/catalogue/libraries/{library}/items/{parent}/children?season=2&limit=200&offset=0
+GET /api/v1/catalogue/libraries/{library}/items/{parent}/seasons/2/items?limit=200&offset=0
 GET /api/v1/catalogue/libraries/{library}/items/{parent}/artwork?season=2&size=card
 GET /api/v1/catalogue/libraries/{library}/items/{parent}/artwork?season=absolute
 scripts/kahawai-mediadb.sh api seasons LIBRARY PARENT
+scripts/kahawai-mediadb.sh api children LIBRARY PARENT --season 2 --limit 200
 ```
 
 `0` means specials; `absolute` selects the unnumbered group. Access follows the
-library's normal authorization. Season image reads serve cached bytes only.
+library's normal authorization. Season items support `offset` and `limit` (1–200),
+include viewer watch state, and return 404 for absent source-backed seasons.
+The older `/children?season=…` filter remains a compatibility alias; Android, web
+and CLI season browsing use `/seasons/{season}/items`. Season image reads serve cached bytes only.
 Background workers prefetch every provider's selected cover and all standard
 sizes, including covers that currently lose resolution. Caches are retained.
 

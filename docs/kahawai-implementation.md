@@ -350,7 +350,8 @@ parent descriptions. Each provider retains its selected covers with explicit
 numbered-season or native-entry scope; physical library groups decide eligibility.
 The dedicated `/seasons` endpoint exposes all source-backed season summaries,
 viewer watched counts, resolved artwork and provenance without resolving episode
-rows; the same groups are included in children pages. The season image
+rows; `/seasons/{season}/items` pages the selected season with viewer watch state.
+The same groups are included in children pages. The season image
 endpoint reads the prefilled cache with show-art fallback. Migration 12 performs
 one durable backfill, using request generations to preserve active claims and
 existing pauses/retries. Provider retrieval, local file conventions and operational

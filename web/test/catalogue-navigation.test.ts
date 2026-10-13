@@ -7,6 +7,7 @@ import {
   catalogueContinue,
   catalogueUpNext,
   catalogueChildren as children,
+  catalogueSeasonItems as seasonItems,
 } from '../src/api/generated/kahawai.ts'
 import {
   listItems,
@@ -25,6 +26,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   catalogueContinue: vi.fn(),
   catalogueUpNext: vi.fn(),
   catalogueChildren: vi.fn(),
+  catalogueSeasonItems: vi.fn(),
 }))
 const entry = {
   negotiated: null,
@@ -91,7 +93,7 @@ test('stable physical children are supplied by the catalogue, not metadata list 
     source_count: 2,
     metadata: { description: { overview: 'Second episode.' }, provenance: {} },
   }
-  vi.mocked(children).mockResolvedValue({
+  vi.mocked(seasonItems).mockResolvedValue({
     children: [child],
     total: 202,
     offset: 200,
@@ -100,7 +102,11 @@ test('stable physical children are supplied by the catalogue, not metadata list 
     watch: { [child.id]: { played: true } },
   })
   const page = await catalogueChildren('shows', 'parent', { offset: 200, season: '1' })
-  expect(children).toHaveBeenCalledWith('shows', 'parent', { offset: 200, season: '1' })
+  expect(seasonItems).toHaveBeenCalledWith('shows', 'parent', '1', {
+    offset: 200,
+    limit: undefined,
+  })
+  expect(children).not.toHaveBeenCalled()
   expect(page.total).toBe(202)
   expect(page.children[0]).toMatchObject({
     id: child.id,
@@ -281,4 +287,29 @@ test('catalogue detail uses the generated description without remapping fields',
   expect(result.attribution).toEqual(['tmdb', 'tvdb'])
   expect(result.provider).toBe('tmdb')
   expect(result.match_confidence).toBe('weak')
+})
+
+test.each(['0', 'absolute'])('season item URLs preserve the %s selector', async (season) => {
+  vi.mocked(seasonItems).mockResolvedValue({
+    children: [],
+    total: 0,
+    offset: 0,
+    limit: 200,
+    groups: [],
+    watch: {},
+  })
+  await catalogueChildren('shows', 'parent', { season, limit: 200 })
+  expect(seasonItems).toHaveBeenCalledWith('shows', 'parent', season, {
+    offset: undefined,
+    limit: 200,
+  })
+  expect(children).not.toHaveBeenCalled()
+})
+
+test('season and disc filters cannot be combined', async () => {
+  await expect(catalogueChildren('shows', 'parent', { season: '1', disc: '1' })).rejects.toThrow(
+    'Season and disc filters cannot be combined.',
+  )
+  expect(seasonItems).not.toHaveBeenCalled()
+  expect(children).not.toHaveBeenCalled()
 })

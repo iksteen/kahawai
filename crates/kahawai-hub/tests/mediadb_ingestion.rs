@@ -2947,3 +2947,182 @@ async fn season_artwork_api_is_scoped_and_uses_only_cached_images() {
         StatusCode::UNAUTHORIZED
     );
 }
+
+#[tokio::test]
+async fn nested_season_items_preserve_pagination_watch_and_library_scope() {
+    use kahawai_mediadb::{EntryKind, EpisodeSpan, NewOccurrence};
+    let f = Fixture::new().await;
+    let s = f.registry.catalogue();
+    s.put_mediahost("host", "Fixture").await.unwrap();
+    let mut o = offer("shows", 1);
+    o.media_type = "series".into();
+    let (col, _) = s.offer_collection("host", &o).await.unwrap();
+    s.apply_catalogue(
+        "host",
+        &delta("shows", 1, "Show (2000)/Show.S01E01.mkv", true, true),
+    )
+    .await
+    .unwrap();
+    let library = s
+        .create_library("Shows", MediaType::Series, std::slice::from_ref(&col))
+        .await
+        .unwrap();
+    let copy = s.collection_items(&col).await.unwrap().remove(0);
+    let mut entry = s.media_entries(&copy.id).await.unwrap().remove(0).data;
+    entry.kind = EntryKind::Episode {
+        episodes: vec![
+            EpisodeSpan {
+                season: Some(1),
+                episode: 1,
+                episode_end: Some(201),
+            },
+            EpisodeSpan {
+                season: Some(0),
+                episode: 1,
+                episode_end: None,
+            },
+            EpisodeSpan {
+                season: None,
+                episode: 1,
+                episode_end: None,
+            },
+        ],
+    };
+    s.put_occurrence(&NewOccurrence {
+        collection_id: col,
+        root_id: copy.root_id,
+        occurrence: copy.occurrence,
+        detected: copy.detected,
+        entries: vec![entry],
+    })
+    .await
+    .unwrap();
+    let parent = copy.library_item_id;
+    let base = format!("/api/v1/catalogue/libraries/{library}/items/{parent}");
+    let path = format!("{base}/seasons/1/items");
+    assert_eq!(
+        f.request("GET", &path, Value::Null, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let (status, first) = f.request("GET", &path, Value::Null, Some(&f.token)).await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    assert_eq!(first["total"], 201);
+    assert_eq!(first["children"].as_array().unwrap().len(), 200);
+    assert_eq!(first["groups"].as_array().unwrap().len(), 3);
+    let (status, last) = f
+        .request(
+            "GET",
+            &format!("{path}?offset=200&limit=1"),
+            Value::Null,
+            Some(&f.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{last}");
+    assert_eq!(last["offset"], 200);
+    assert_eq!(last["limit"], 1);
+    assert_eq!(last["children"][0]["position"]["episode"], 201);
+    let child = last["children"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        f.request(
+            "PUT",
+            &format!("{base}/watched"),
+            json!({"items":[child],"played":true}),
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, watched) = f
+        .request(
+            "GET",
+            &format!("{path}?offset=200&limit=1"),
+            Value::Null,
+            Some(&f.token),
+        )
+        .await;
+    assert_eq!(watched["watch"][child]["played"], true);
+    assert_eq!(
+        watched["groups"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|g| g["number"] == 1)
+            .unwrap()["played"],
+        1
+    );
+    for (selector, number, total) in [
+        ("1", json!(1), 201),
+        ("0", json!(0), 1),
+        ("absolute", Value::Null, 1),
+    ] {
+        let (status, page) = f
+            .request(
+                "GET",
+                &format!("{base}/seasons/{selector}/items?limit=1"),
+                Value::Null,
+                Some(&f.token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::OK, "{page}");
+        assert_eq!(page["total"], total);
+        assert_eq!(page["children"][0]["position"]["season"], number);
+        let (_, legacy) = f
+            .request(
+                "GET",
+                &format!("{base}/children?season={selector}&limit=1"),
+                Value::Null,
+                Some(&f.token),
+            )
+            .await;
+        assert_eq!(page, legacy);
+    }
+    let (status, empty) = f
+        .request(
+            "GET",
+            &format!("{path}?offset=201"),
+            Value::Null,
+            Some(&f.token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(empty["children"], json!([]));
+    assert_eq!(empty["total"], 201);
+    for (suffix, expected) in [
+        ("2/items", StatusCode::NOT_FOUND),
+        ("bad/items", StatusCode::BAD_REQUEST),
+        ("-1/items", StatusCode::BAD_REQUEST),
+        ("4294967296/items", StatusCode::BAD_REQUEST),
+        ("1/items?limit=0", StatusCode::BAD_REQUEST),
+        ("1/items?limit=201", StatusCode::BAD_REQUEST),
+        ("1/items?offset=bad", StatusCode::BAD_REQUEST),
+    ] {
+        assert_eq!(
+            f.request(
+                "GET",
+                &format!("{base}/seasons/{suffix}"),
+                Value::Null,
+                Some(&f.token)
+            )
+            .await
+            .0,
+            expected,
+            "{suffix}"
+        );
+    }
+    let hidden = s
+        .create_library("Empty", MediaType::Series, &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        f.request(
+            "GET",
+            &format!("/api/v1/catalogue/libraries/{hidden}/items/{parent}/seasons/1/items"),
+            Value::Null,
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
+}

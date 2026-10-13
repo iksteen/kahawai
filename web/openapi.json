@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "5f31009b9e97ff7459a49c64d01847af25dce24a517f361310d162abdc3f0016",
+  "x-kahawai-source-sha256": "3caf8f1e65f5c779437a6eabceac3043b05a36b24ffacf01ab339c07a9d980fa",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -6181,7 +6181,7 @@
           {
             "name": "season",
             "in": "query",
-            "description": "A native season number, or \"absolute\".",
+            "description": "Legacy season filter; prefer /seasons/{season}/items.",
             "required": false,
             "schema": {
               "type": "string"
@@ -6261,6 +6261,119 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/CatalogueSeasons"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons/{season}/items": {
+      "get": {
+        "tags": [
+          "Catalogue"
+        ],
+        "operationId": "catalogue_season_items",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "season",
+            "in": "path",
+            "description": "Native season number, including 0 for specials, or absolute for unnumbered episodes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogueChildren"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
                 }
               }
             }

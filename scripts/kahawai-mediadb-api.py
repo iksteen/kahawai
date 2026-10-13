@@ -179,8 +179,11 @@ match args.command:
     case "items":
         answer = request("GET", f"{base}/{quote(args.library)}/items?" + urllib.parse.urlencode({k:v for k,v in {"offset":args.offset,"limit":args.limit,"q":args.query,"sort":args.sort,"artist":args.artist}.items() if v is not None}))
     case "children":
-        params = {k: getattr(args, k) for k in ("offset", "limit", "season", "disc") if getattr(args, k) is not None}
-        answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/children?" + urllib.parse.urlencode(params))
+        if args.season is not None and args.disc is not None:
+            parser.error("--season and --disc cannot be combined")
+        params = {k: getattr(args, k) for k in ("offset", "limit", "disc") if getattr(args, k) is not None}
+        route = f"seasons/{quote(args.season, safe='')}/items" if args.season is not None else "children"
+        answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/{route}?" + urllib.parse.urlencode(params))
     case "item":
         answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}")
 print(json.dumps(answer, indent=2))

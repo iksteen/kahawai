@@ -147,6 +147,10 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
             get(catalogue_seasons),
         )
         .route(
+            "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons/{season}/items",
+            get(catalogue_season_items),
+        )
+        .route(
             "/api/v1/catalogue/libraries/{id}/artists",
             get(catalogue_artists),
         )
@@ -454,7 +458,7 @@ pub(super) async fn items(
 pub struct ChildPage {
     offset: Option<u64>,
     limit: Option<u32>,
-    /// A native season number, or "absolute".
+    /// Legacy season filter; prefer /seasons/{season}/items.
     season: Option<String>,
     /// A disc number, or "unknown".
     disc: Option<String>,
@@ -484,7 +488,65 @@ pub(super) async fn catalogue_children(
         season: parse(q.season, "absolute")?,
         disc: parse(q.disc, "unknown")?,
     };
-    let limit = q.limit.unwrap_or(200);
+    child_page(&s, &claims, &id, &parent, q.offset, q.limit, filter).await
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SeasonItemsPage {
+    offset: Option<u64>,
+    limit: Option<u32>,
+}
+#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons/{season}/items",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("season"=String,Path,description="Native season number, including 0 for specials, or absolute for unnumbered episodes"),SeasonItemsPage),responses((status=200,body=CatalogueChildren),(status=400,body=ApiErrorBody),(status=404,body=ApiErrorBody)))]
+pub(super) async fn catalogue_season_items(
+    State(s): State<AppState>,
+    ApiPath((library, parent, season)): ApiPath<(String, String, String)>,
+    ApiQuery(q): ApiQuery<SeasonItemsPage>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<CatalogueChildren>, ApiError> {
+    visible(&s, &claims, &library).await?;
+    let season = if season == "absolute" {
+        None
+    } else {
+        Some(
+            season
+                .parse()
+                .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid season"))?,
+        )
+    };
+    let page = child_page(
+        &s,
+        &claims,
+        &library,
+        &parent,
+        q.offset,
+        q.limit,
+        m::ChildFilter {
+            season: Some(season),
+            disc: None,
+        },
+    )
+    .await?;
+    if !page
+        .groups
+        .iter()
+        .any(|g| g.group.kind == "episode" && g.group.number == season)
+    {
+        return Err(hidden("season"));
+    }
+    Ok(page)
+}
+
+async fn child_page(
+    s: &AppState,
+    claims: &crate::auth::Claims,
+    id: &str,
+    parent: &str,
+    offset: Option<u64>,
+    limit: Option<u32>,
+    filter: m::ChildFilter,
+) -> Result<Json<CatalogueChildren>, ApiError> {
+    let limit = limit.unwrap_or(200);
     if !(1..=200).contains(&limit)
         || (filter.season.is_some() && filter.disc.is_some())
         || filter.disc == Some(Some(0))
@@ -494,7 +556,7 @@ pub(super) async fn catalogue_children(
     let page = s
         .registry
         .catalogue()
-        .library_children(&id, &parent, q.offset.unwrap_or(0), limit, &filter)
+        .library_children(id, parent, offset.unwrap_or(0), limit, &filter)
         .await
         .map_err(store_error)?;
     let watch = watch::read(
@@ -508,7 +570,7 @@ pub(super) async fn catalogue_children(
     )
     .await
     .map_err(internal)?;
-    let groups = watched_groups(&s, &claims.sub, &id, &parent, page.groups).await?;
+    let groups = watched_groups(s, &claims.sub, id, parent, page.groups).await?;
     Ok(Json(CatalogueChildren {
         children: page.children,
         groups,
