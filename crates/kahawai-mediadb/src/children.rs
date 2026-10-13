@@ -156,6 +156,21 @@ impl Snapshot {
         crate::season_artwork::resolve(&copies, season)
     }
     async fn read(c: &mut sqlx::SqliteConnection, library: &str, parent: &str) -> Result<Self> {
+        Self::read_with_catalogues(c, library, parent, true).await
+    }
+    async fn read_groups(
+        c: &mut sqlx::SqliteConnection,
+        library: &str,
+        parent: &str,
+    ) -> Result<Self> {
+        Self::read_with_catalogues(c, library, parent, false).await
+    }
+    async fn read_with_catalogues(
+        c: &mut sqlx::SqliteConnection,
+        library: &str,
+        parent: &str,
+        descriptions: bool,
+    ) -> Result<Self> {
         let parent = crate::library::read_item(c, library, parent).await?;
         let mut copies = Vec::new();
         let mut ranges: BTreeMap<Group, Vec<(u32, u32)>> = BTreeMap::new();
@@ -190,7 +205,11 @@ impl Snapshot {
             copies.push(Copy {
                 id: id.clone(),
                 entries,
-                children: crate::metadata::resolve_children(c, id).await?,
+                children: if descriptions {
+                    crate::metadata::resolve_children(c, id).await?
+                } else {
+                    None
+                },
                 artwork: crate::season_artwork::evidence(c, id).await?,
             });
         }
@@ -218,6 +237,43 @@ impl Snapshot {
             ranges,
             unnumbered,
         })
+    }
+    fn count(&self, group: &Group) -> u64 {
+        match group {
+            Group::Unnumbered(disc) => self.unnumbered[disc].len() as u64,
+            _ => self.ranges[group]
+                .iter()
+                .map(|&(a, b)| u64::from(b) - u64::from(a) + 1)
+                .sum(),
+        }
+    }
+    fn groups(&self) -> Vec<ChildGroup> {
+        let mut groups: Vec<ChildGroup> = Vec::new();
+        for group in self.ranges.keys() {
+            let (kind, number) = match group {
+                Group::Episode(season) => ("episode", *season),
+                Group::Track(disc) | Group::Unnumbered(disc) => ("track", *disc),
+            };
+            let count = self.count(group);
+            if let Some(existing) = groups
+                .iter_mut()
+                .find(|g| g.kind == kind && g.number == number)
+            {
+                existing.total += count;
+            } else {
+                groups.push(ChildGroup {
+                    kind: kind.into(),
+                    number,
+                    total: count,
+                    metadata: if kind == "episode" {
+                        self.season_artwork(number).map(|a| a.metadata)
+                    } else {
+                        None
+                    },
+                });
+            }
+        }
+        groups
     }
     fn contains(entry: &MediaEntry, position: &ChildPosition) -> bool {
         match (&entry.data.kind, position) {
@@ -377,7 +433,7 @@ impl Store {
     ) -> Result<Option<ResolvedSeasonArtwork>> {
         let mut c = self.db.read_pool().acquire().await?;
         let mut tx = c.begin().await?;
-        let snapshot = Snapshot::read(&mut tx, library, parent).await?;
+        let snapshot = Snapshot::read_groups(&mut tx, library, parent).await?;
         ensure!(
             snapshot.ranges.contains_key(&Group::Episode(season)),
             crate::NotFound
@@ -577,7 +633,7 @@ impl Store {
         }
         let mut c = self.db.read_pool().acquire().await?;
         let mut tx = c.begin().await?;
-        let snapshot = Snapshot::read(&mut tx, library, parent).await?;
+        let snapshot = Snapshot::read_groups(&mut tx, library, parent).await?;
         let found = ids
             .iter()
             .filter_map(|id| ChildId::parse(id).ok())
@@ -592,6 +648,20 @@ impl Store {
             .collect();
         tx.commit().await?;
         Ok(found)
+    }
+    /// All source-backed episode groups, independent of child pagination. No
+    /// provider child catalogue is decoded and no episode interval is expanded.
+    pub async fn library_seasons(&self, library: &str, parent: &str) -> Result<Vec<ChildGroup>> {
+        let mut c = self.db.read_pool().acquire().await?;
+        let mut tx = c.begin().await?;
+        let snapshot = Snapshot::read_groups(&mut tx, library, parent).await?;
+        let groups = snapshot
+            .groups()
+            .into_iter()
+            .filter(|g| g.kind == "episode")
+            .collect();
+        tx.commit().await?;
+        Ok(groups)
     }
     pub async fn library_children(
         &self,
@@ -609,53 +679,20 @@ impl Store {
         let mut c = self.db.read_pool().acquire().await?;
         let mut tx = c.begin().await?;
         let snapshot = Snapshot::read(&mut tx, library, parent).await?;
-        let mut groups = Vec::new();
+        let groups = snapshot.groups();
         let mut children = Vec::new();
         let mut skip = offset;
         let mut total = 0;
         for (group, intervals) in &snapshot.ranges {
-            let (kind, number, allowed) = match group {
-                Group::Episode(season) => (
-                    "episode",
-                    *season,
-                    filter.disc.is_none() && filter.season.is_none_or(|s| s == *season),
-                ),
-                Group::Track(disc) => (
-                    "track",
-                    *disc,
-                    filter.season.is_none() && filter.disc.is_none_or(|d| d == *disc),
-                ),
-                Group::Unnumbered(disc) => (
-                    "track",
-                    *disc,
-                    filter.season.is_none() && filter.disc.is_none_or(|d| d == *disc),
-                ),
+            let allowed = match group {
+                Group::Episode(season) => {
+                    filter.disc.is_none() && filter.season.is_none_or(|s| s == *season)
+                }
+                Group::Track(disc) | Group::Unnumbered(disc) => {
+                    filter.season.is_none() && filter.disc.is_none_or(|d| d == *disc)
+                }
             };
-            let count = if let Group::Unnumbered(disc) = group {
-                snapshot.unnumbered[disc].len() as u64
-            } else {
-                intervals
-                    .iter()
-                    .map(|&(a, b)| u64::from(b) - u64::from(a) + 1)
-                    .sum()
-            };
-            if let Some(g) = groups
-                .iter_mut()
-                .find(|g: &&mut ChildGroup| g.kind == kind && g.number == number)
-            {
-                g.total += count;
-            } else {
-                groups.push(ChildGroup {
-                    kind: kind.into(),
-                    number,
-                    total: count,
-                    metadata: if kind == "episode" {
-                        snapshot.season_artwork(number).map(|a| a.metadata)
-                    } else {
-                        None
-                    },
-                });
-            }
+            let count = snapshot.count(group);
             if !allowed {
                 continue;
             }

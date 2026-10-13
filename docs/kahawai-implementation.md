@@ -348,7 +348,9 @@ Artist rename therefore changes its key.
 Season artwork in mediadb is independent of whole episode catalogues and
 parent descriptions. Each provider retains its selected covers with explicit
 numbered-season or native-entry scope; physical library groups decide eligibility.
-The children API exposes resolved artwork and provenance, and its season image
+The dedicated `/seasons` endpoint exposes all source-backed season summaries,
+viewer watched counts, resolved artwork and provenance without resolving episode
+rows; the same groups are included in children pages. The season image
 endpoint reads the prefilled cache with show-art fallback. Migration 12 performs
 one durable backfill, using request generations to preserve active claims and
 existing pauses/retries. Provider retrieval, local file conventions and operational

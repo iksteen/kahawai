@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "6d1a4d71dc2cd053104dde9fe2052eed71031630914a4aba26408b72495775c8",
+  "x-kahawai-source-sha256": "5f31009b9e97ff7459a49c64d01847af25dce24a517f361310d162abdc3f0016",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -6223,6 +6223,73 @@
         ]
       }
     },
+    "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons": {
+      "get": {
+        "tags": [
+          "Catalogue"
+        ],
+        "operationId": "catalogue_seasons",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogueSeasons"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
     "/api/v1/catalogue/libraries/{id}/items/{item_id}/watched": {
       "put": {
         "tags": [
@@ -9360,6 +9427,20 @@
           },
           "token": {
             "type": "string"
+          }
+        }
+      },
+      "CatalogueSeasons": {
+        "type": "object",
+        "required": [
+          "seasons"
+        ],
+        "properties": {
+          "seasons": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/CatalogueChildGroup"
+            }
           }
         }
       },

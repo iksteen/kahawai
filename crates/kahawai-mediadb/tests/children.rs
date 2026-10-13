@@ -198,6 +198,23 @@ async fn ranges_are_paged_without_expansion_and_access_is_scoped() {
     })
     .await
     .unwrap();
+    let seasons = s
+        .library_seasons(&lib, &copy.library_item_id)
+        .await
+        .unwrap();
+    assert_eq!(seasons.len(), 2);
+    assert_eq!(seasons[0].number, None);
+    assert_eq!(seasons[0].total, 1);
+    assert_eq!(seasons[1].total, u64::from(u32::MAX) + 1);
+    let hidden = s
+        .create_library("Hidden", MediaType::Series, &[])
+        .await
+        .unwrap();
+    assert!(
+        s.library_seasons(&hidden, &copy.library_item_id)
+            .await
+            .is_err()
+    );
     let finished = std::collections::BTreeSet::from([(Some(1), 0), (Some(1), 1)]);
     assert_eq!(
         s.next_episode(&lib, &copy.library_item_id, (None, 1), &finished)

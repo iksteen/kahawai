@@ -143,6 +143,10 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
             get(catalogue_children),
         )
         .route(
+            "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons",
+            get(catalogue_seasons),
+        )
+        .route(
             "/api/v1/catalogue/libraries/{id}/artists",
             get(catalogue_artists),
         )
@@ -504,22 +508,60 @@ pub(super) async fn catalogue_children(
     )
     .await
     .map_err(internal)?;
+    let groups = watched_groups(&s, &claims.sub, &id, &parent, page.groups).await?;
+    Ok(Json(CatalogueChildren {
+        children: page.children,
+        groups,
+        watch,
+        total: page.total,
+        offset: page.offset,
+        limit: page.limit,
+    }))
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CatalogueSeasons {
+    seasons: Vec<CatalogueChildGroup>,
+}
+#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path)),responses((status=200,body=CatalogueSeasons),(status=404,body=ApiErrorBody)))]
+pub(super) async fn catalogue_seasons(
+    State(s): State<AppState>,
+    ApiPath((library, parent)): ApiPath<(String, String)>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<CatalogueSeasons>, ApiError> {
+    visible(&s, &claims, &library).await?;
+    let groups = s
+        .registry
+        .catalogue()
+        .library_seasons(&library, &parent)
+        .await
+        .map_err(store_error)?;
+    Ok(Json(CatalogueSeasons {
+        seasons: watched_groups(&s, &claims.sub, &library, &parent, groups).await?,
+    }))
+}
+async fn watched_groups(
+    s: &AppState,
+    user: &str,
+    library: &str,
+    parent: &str,
+    groups: Vec<m::ChildGroup>,
+) -> Result<Vec<CatalogueChildGroup>, ApiError> {
     let played: Vec<String> = sqlx::query_scalar(
         "SELECT item_id FROM catalogue_watch_state WHERE user_id=? AND parent_id=? AND played=1",
     )
-    .bind(&claims.sub)
-    .bind(&parent)
+    .bind(user)
+    .bind(parent)
     .fetch_all(s.registry.db())
     .await
     .map_err(internal)?;
     let existing = s
         .registry
         .catalogue()
-        .existing_children(&id, &parent, &played)
+        .existing_children(library, parent, &played)
         .await
         .map_err(store_error)?;
-    let groups = page
-        .groups
+    Ok(groups
         .into_iter()
         .map(|group| {
             let played = existing
@@ -536,15 +578,7 @@ pub(super) async fn catalogue_children(
                 .count() as u64;
             CatalogueChildGroup { group, played }
         })
-        .collect();
-    Ok(Json(CatalogueChildren {
-        children: page.children,
-        groups,
-        watch,
-        total: page.total,
-        offset: page.offset,
-        limit: page.limit,
-    }))
+        .collect())
 }
 
 #[derive(Serialize, ToSchema)]

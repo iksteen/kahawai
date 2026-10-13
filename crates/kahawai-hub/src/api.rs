@@ -110,7 +110,7 @@ pub struct NetOptions {
     paths(
         catalogue::feeds::catalogue_continue, catalogue::feeds::catalogue_up_next,
         catalogue::collections, catalogue::libraries, catalogue::create_library, catalogue::refresh_library,
-        catalogue::set_collections, catalogue::delete_library, catalogue::items, catalogue::item, catalogue::playback::catalogue_playback, catalogue::playback::catalogue_next, catalogue::playback::session_fonts, catalogue::playback::session_font, catalogue::playback::session_subtitle, catalogue::catalogue_children, catalogue::catalogue_set_watched, catalogue::catalogue_artists, catalogue::catalogue_artwork, catalogue::catalogue_artist_artwork,
+        catalogue::set_collections, catalogue::delete_library, catalogue::items, catalogue::item, catalogue::playback::catalogue_playback, catalogue::playback::catalogue_next, catalogue::playback::session_fonts, catalogue::playback::session_font, catalogue::playback::session_subtitle, catalogue::catalogue_children, catalogue::catalogue_seasons, catalogue::catalogue_set_watched, catalogue::catalogue_artists, catalogue::catalogue_artwork, catalogue::catalogue_artist_artwork,
         health,
         metrics,
         bootstrap,
@@ -4746,6 +4746,10 @@ mod tests {
             (
                 "get",
                 "/api/v1/catalogue/libraries/{id}/items/{item_id}/children",
+            ),
+            (
+                "get",
+                "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons",
             ),
             (
                 "put",

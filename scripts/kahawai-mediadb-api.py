@@ -116,7 +116,7 @@ base = "/api/v1/catalogue/libraries"
 admin = "/admin/v1/catalogue/libraries"
 match args.command:
     case "seasons":
-        answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/children?limit=1")["groups"]
+        answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/seasons")["seasons"]
     case "match":
         with open(args.body_file) as source:
             body = json.load(source)

@@ -2827,6 +2827,37 @@ async fn season_artwork_api_is_scoped_and_uses_only_cached_images() {
         groups["groups"][0]["metadata"]["description"]["artwork"],
         json!([season_url])
     );
+    let seasons_path = format!("{base}/seasons");
+    let (status, seasons) = f
+        .request("GET", &seasons_path, Value::Null, Some(&f.token))
+        .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(seasons["seasons"], groups["groups"]);
+    assert!(seasons.get("children").is_none());
+    assert_eq!(
+        f.request("GET", &seasons_path, Value::Null, None).await.0,
+        StatusCode::UNAUTHORIZED
+    );
+    let child_id = groups["children"][0]["id"].as_str().unwrap();
+    assert_eq!(
+        f.request(
+            "PUT",
+            &format!("{base}/watched"),
+            json!({"items":[child_id],"played":true}),
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::OK
+    );
+    let (_, watched) = f
+        .request("GET", &seasons_path, Value::Null, Some(&f.token))
+        .await;
+    assert_eq!(watched["seasons"][0]["played"], 1);
+    assert_eq!(
+        watched["seasons"][0]["metadata"]["provenance"]["artwork"],
+        r
+    );
     let cache = f.dir.path().join("artwork");
     std::fs::create_dir_all(&cache).unwrap();
     let key = |url: &str| format!("tmdb-{:016x}", xxhash_rust::xxh3::xxh3_64(url.as_bytes()));
@@ -2882,6 +2913,17 @@ async fn season_artwork_api_is_scoped_and_uses_only_cached_images() {
         .create_library("Empty", MediaType::Series, &[])
         .await
         .unwrap();
+    assert_eq!(
+        f.request(
+            "GET",
+            &format!("/api/v1/catalogue/libraries/{hidden}/items/{parent}/seasons"),
+            Value::Null,
+            Some(&f.token)
+        )
+        .await
+        .0,
+        StatusCode::NOT_FOUND
+    );
     assert_eq!(
         f.request(
             "GET",

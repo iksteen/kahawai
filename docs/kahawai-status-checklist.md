@@ -247,11 +247,12 @@ audio/video byte separation for manual playback testing; see
       episode stills, season/episode and album/release structure, genres
       and cast; all stored, so everything reads back with providers
       unreachable. Season cover answers and provenance are exposed through the
-      source-backed children API, with a cache-only, library-scoped season image
+      source-backed `/seasons` and children APIs, with a cache-only, library-scoped season image
       endpoint. TMDB, TVDB, Fanart TV, native AniDB/AniList and local posters
       participate; migration 12 backfills once without stealing running claims or
       discarding retries/blocks. Each provider cover is prefetched independently
-      of the winning answer (see `season-artwork.md`; client presentation follows).
+      of the winning answer (see `season-artwork.md`). Android season cards and
+      selected-season pages consume these covers; web presentation follows.
       *(Cast is TMDB-only and TVDB's own genre list is unread; both reach
       TVDB-owned items by side-fill when TMDB also answered.)*
 - [x] HUB-7 Provider rate limits/caching. One queue per provider host
