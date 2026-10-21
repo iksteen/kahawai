@@ -542,6 +542,7 @@ test('community skip lookup runs in the browser with catalogue provider IDs', as
   await page.getByRole('button', { name: 'Sign in', exact: true }).click()
   await page.getByRole('button', { name: /^(?:▶ )?Play$/ }).click()
   await expect.poll(() => lookup).toContain('tmdb_id=1234')
+  expect(new URL(lookup).pathname).toBe('/v4/media')
   await expect
     .poll(
       () =>

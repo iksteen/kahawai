@@ -1138,7 +1138,9 @@ not describe this branch's current runtime.
       verified by a real browser pressing Skip intro and checking playback time.
 - [x] Client-side community skip lookup receives selected/verified-linked video
       provider IDs from mediadb, with movie/show namespace checks and the existing
-      opt-in preference and measured-marker precedence.
+      opt-in preference and measured-marker precedence. The browser calls
+      TheIntroDB `/v4/media` directly with the playing rendition's duration;
+      existing local hit/miss caches, request coalescing and backoff are retained.
 - [x] Subtitle search/download/delete uses the selected mediadb rendition and
       ordered file version, with atomic stored text, duplicate download reuse,
       creator/admin deletion and session-captured delivery. The existing detail

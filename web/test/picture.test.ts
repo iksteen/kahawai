@@ -1738,6 +1738,7 @@ describe('chapter marks on the bar', () => {
     // item's minimum across renditions — the wrong one fetches the wrong
     // cut's times.
     const url = String(wire.mock.calls.find((c) => String(c[0]).includes('theintrodb'))![0])
+    expect(new URL(url).pathname).toBe('/v4/media')
     expect(url).toContain('duration_ms=600000')
   })
 

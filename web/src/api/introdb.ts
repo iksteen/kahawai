@@ -1,9 +1,8 @@
 import type { ItemDetail } from './catalogue-model.ts'
 /// theintrodb.org: community skip timestamps, used only where the hub's own
 /// detector has nothing — movies (never analysed locally) and seasons the
-/// sweep has not reached. Their terms want exactly this shape: "The API is
-/// intended for CLIENT SIDE USE ONLY", so the BROWSER asks and the hub never
-/// proxies or stores the answers.
+/// sweep has not reached. The browser asks directly; the hub never stores
+/// the answers.
 ///
 /// A bare `fetch` on purpose — `api/transport.ts` attaches the kahawai
 /// bearer token, which must never reach a third party — and `no-referrer`
@@ -16,7 +15,9 @@ import type { ItemDetail } from './catalogue-model.ts'
 import type { Segment } from '../api/generated/model/segment.ts'
 import { cacheKey, cached, makeRoom, remember } from '../domain/introdb-cache.ts'
 
-const BASE = 'https://api.theintrodb.org/v3/media'
+// v4 still accepts TMDB IDs and resolves their episode numbering server-side.
+// https://theintrodb.org/openapi.yaml (read 2026-10-21).
+const BASE = 'https://api.theintrodb.org/v4/media'
 const TIMEOUT_MS = 4_000
 const KINDS = ['intro', 'recap', 'credits', 'preview'] as const
 /// Their own documented submission ceilings, applied to spans with an
