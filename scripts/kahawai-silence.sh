@@ -43,9 +43,9 @@ there=$(ssh "$HOST" "$gst/bin/gst-inspect-1.0 --version" | sed -n 's/^GStreamer 
 }
 
 echo "==> building lean satellite binaries against GStreamer $here" >&2
-(cd "$repo" && cargo build --release -p kahawai-mediahostd)
+(cd "$repo" && cargo build --locked --release -p kahawai-mediahostd)
 if ! $mediahost_only; then
-    (cd "$repo" && cargo build --release -p kahawai-transcoderd)
+    (cd "$repo" && cargo build --locked --release -p kahawai-transcoderd)
 fi
 
 ssh "$HOST" 'mkdir -p ~/.kahawai-stage'

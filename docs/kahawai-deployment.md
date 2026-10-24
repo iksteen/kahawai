@@ -22,6 +22,34 @@ docker exec -it <container-name> kahawai hub init-admin
 
 Neither first-admin path exists after setup succeeds.
 
+## Packaging after a release
+
+The AUR repositories are separate checkouts under `arch/`; publishing a GitHub
+release does not update them. After the source archive and checksums are public:
+
+```sh
+scripts/kahawai-packaging-check.py                 # newest release, including RCs
+scripts/kahawai-packaging-check.py --tag v0.0.24-rc.1
+```
+
+This read-only check compares both AUR recipes and their generated `.SRCINFO`
+with the published source checksum and stamped commit, and compares GStreamer
+versions across AUR, Docker, Homebrew and Mac deployment. Use `--arch-dir` for
+checkouts outside the usual workspace layout.
+
+Update `_tag` / `_commit` in `arch/kahawai/PKGBUILD` and `_kahawai` in
+`arch/kahawai-gstreamer/PKGBUILD`, using the release's source asset and release
+notes, rather than the unstamped tag commit. Reset Kahawai's `pkgrel` for a new
+version; increment GStreamer's `pkgrel` when its Kahawai source changes without
+a GStreamer version change. Regenerate `.SRCINFO` with `makepkg --printsrcinfo`
+and run `makepkg` in each package checkout before publishing. The metadata check
+does not replace package builds, patch reproducers or platform-specific tests.
+
+Homebrew's Kahawai formula follows `master`; its patched GStreamer recipe and
+Docker must use matching upstream core and Rust plugin releases. Keep the
+fallback version in `kahawai-site/index.html` current too: installation commands
+must work when the browser cannot fetch the latest release from GitHub.
+
 ## Staged fleet deployment
 
 Stage every binary before activating the fleet. For a protocol-major upgrade,

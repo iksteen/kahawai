@@ -1017,12 +1017,17 @@ audio/video byte separation for manual playback testing; see
       aarch64 — cross-compiled against a device sysroot
       (scripts/kahawai-cross-aarch64.sh), proven on a Pi 3 end to end:
       doctor green (encoders dry-run verified), enrolled as mediahost
-      over mTLS, scanned, served direct play through the hub
+      over mTLS, scanned, served direct play through the hub.
+      The cross-builder now requires the patched GStreamer in the target
+      sysroot, embeds the web bundle and builds with the Cargo lockfile.
 - [x] NFR-6 Operability: structured logging, single-file TOML with env
       overrides, `GET /health` (public) and `GET /metrics` (Prometheus
       0.0.4, behind its own static token in `<data_dir>/metrics.secret`;
       no file = not served at all), SIGHUP reload for what can change
       under a running process.
+      `scripts/kahawai-packaging-check.py` checks the published release against
+      both AUR recipes and compares Docker/Homebrew/Mac GStreamer versions;
+      packaging updates and build verification are documented in deployment notes.
       `metric_labels` pins every metric family's reviewed dimensions and
       proves that catalogue/session growth does not add series. The metrics
       companion passed its fixtures, endpoint checks and a captured local HTTP

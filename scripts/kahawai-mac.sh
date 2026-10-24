@@ -346,9 +346,9 @@ export CARGO_TARGET_DIR=target/staged
 # everything binary runs this box's own all-in-one hub, and that one does
 # need Homebrew's tesseract for the OCR tier.
 export KAHAWAI_REQUIRE_WEB=1
-cargo build --release -p kahawai-transcoderd \
+cargo build --locked --release -p kahawai-transcoderd \
     --bin kahawai-transcoder 2>&1 | tail -1
-cargo build --release -p kahawai --bin kahawai 2>&1 | tail -1
+cargo build --locked --release -p kahawai --bin kahawai 2>&1 | tail -1
 BINS="target/staged/release/kahawai-transcoder target/staged/release/kahawai"
 for BIN in $BINS; do
     links=$(otool -L "$BIN")
