@@ -284,8 +284,31 @@ describe('what spends quota', () => {
 })
 
 describe('the request itself', () => {
+  test('a movie uses v4 and accepts its TVDB-keyed response', async () => {
+    const wire = answer({
+      tvdb_id: 1305,
+      type: 'movie',
+      intro: [{ start_ms: null, end_ms: 30_000 }],
+      credits: [{ start_ms: 6_408_000, end_ms: null }],
+    })
+    vi.stubGlobal('fetch', wire)
+    expect(await introdbSegments(film(), DUR)).toEqual([
+      { kind: 'intro', start_ms: 0, end_ms: 30_000, source: 'introdb' },
+      { kind: 'credits', start_ms: 6_408_000, end_ms: DUR, source: 'introdb' },
+    ])
+    expect(String(wire.mock.calls[0]![0])).toBe(
+      'https://api.theintrodb.org/v4/media?tmdb_id=949&duration_ms=7200000',
+    )
+  })
+
   test('a TV lookup keys on the show, preferring the curated numbering', async () => {
-    const wire = answer({ intro: [{ start_ms: 0, end_ms: 10_000 }] })
+    const wire = answer({
+      tvdb_id: 73762,
+      type: 'tv',
+      season: 2,
+      episode: 1,
+      intro: [{ start_ms: 0, end_ms: 10_000 }],
+    })
     vi.stubGlobal('fetch', wire)
     await introdbSegments(
       film({
@@ -300,10 +323,36 @@ describe('the request itself', () => {
       2_700_000,
     )
     const url = String(wire.mock.calls[0]![0])
+    expect(new URL(url).pathname).toBe('/v4/media')
     expect(url).toContain('tmdb_id=1403')
     expect(url).toContain('season=2')
     expect(url).toContain('episode=1')
     expect(url).toContain('duration_ms=2700000')
+  })
+
+  test('season zero is sent for specials', async () => {
+    const wire = answer({ tvdb_id: 73762, type: 'tv', season: 0, episode: 2 })
+    vi.stubGlobal('fetch', wire)
+    await introdbSegments(film({ kind: 'episode', season: 0, episode: 2 }), DUR)
+    const url = new URL(String(wire.mock.calls[0]![0]))
+    expect(url.pathname).toBe('/v4/media')
+    expect(url.searchParams.get('season')).toBe('0')
+    expect(url.searchParams.get('episode')).toBe('2')
+  })
+
+  test('the v4 episode-list fallback offers no spans and is cached', async () => {
+    const wire = answer({
+      tvdb_id: 73762,
+      type: 'tv',
+      episodes: [{ season: 1, episode: 1, total_submission_count: 0 }],
+    })
+    vi.stubGlobal('fetch', wire)
+    const item = film({ kind: 'episode', season: 1, episode: 1 })
+    expect(await introdbSegments(item, DUR)).toEqual([])
+    forgetIntrodb()
+    resetIntrodb()
+    expect(await introdbSegments(item, DUR)).toEqual([])
+    expect(wire).toHaveBeenCalledTimes(1)
   })
 
   test('falls back to tvdb when tmdb is absent', async () => {
