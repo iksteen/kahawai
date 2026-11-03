@@ -2,6 +2,8 @@
 //! authentication and external library grants belong to the hub.
 use super::*;
 pub(super) mod feeds;
+#[cfg(test)]
+mod images_tests;
 pub(super) mod playback;
 pub(super) mod subtitles;
 use crate::watch::{self, WatchState};
@@ -167,6 +169,10 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
             .route(
                 "/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",
                 get(catalogue_artwork),
+            )
+            .route(
+                "/api/v1/catalogue/libraries/{id}/items/{item_id}/cast/{person}/artwork",
+                get(catalogue_cast_artwork),
             )
             .route(
                 "/api/v1/catalogue/libraries/{id}/artists/{key}/artwork",
@@ -1136,7 +1142,18 @@ pub(super) async fn catalogue_artists(
     }))
 }
 
-#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("size"=Option<String>,Query),("season"=Option<String>,Query,description="A native season number, or absolute; serves cached season artwork with a show-poster fallback")),responses((status=200,body=String,content_type="image/jpeg"),(status=400,body=ApiErrorBody),(status=404,body=ApiErrorBody)))]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtworkKind {
+    #[default]
+    Poster,
+    Logo,
+    Banner,
+    Backdrop,
+    Still,
+}
+
+#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/artwork",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("size"=Option<String>,Query),("kind"=Option<ArtworkKind>,Query,description="Defaults to poster. Logo, banner, backdrop and episode still reads use cached images only."),("season"=Option<String>,Query,description="A native season number, or absolute; serves cached season artwork with a show-poster fallback")),responses((status=200,body=String,content_type="image/*"),(status=400,body=ApiErrorBody),(status=404,body=ApiErrorBody)))]
 pub(super) async fn catalogue_artwork(
     State(s): State<AppState>,
     ApiPath((id, item)): ApiPath<(String, String)>,
@@ -1146,7 +1163,25 @@ pub(super) async fn catalogue_artwork(
     use axum::response::IntoResponse;
     visible(&s, &claims, &id).await?;
     let store = s.registry.catalogue();
+    let kind: ArtworkKind = q
+        .get("kind")
+        .map(|value| serde_json::from_value(serde_json::Value::String(value.clone())))
+        .transpose()
+        .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid artwork kind"))?
+        .unwrap_or_default();
+    if kind == ArtworkKind::Still && !item.starts_with("child1:") {
+        return Err(ApiError::new(
+            ErrorCode::BadRequest,
+            "still artwork requires an episode",
+        ));
+    }
     if let Some(selector) = q.get("season") {
+        if kind != ArtworkKind::Poster {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "season artwork requires poster kind",
+            ));
+        }
         if item.starts_with("child1:") {
             return Err(ApiError::new(
                 ErrorCode::BadRequest,
@@ -1198,9 +1233,19 @@ pub(super) async fn catalogue_artwork(
         m::ChildId::parse(&item)
             .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid child ID"))?;
         let child = store.library_child(&id, &item).await.map_err(store_error)?;
+        if kind == ArtworkKind::Still
+            && !matches!(child.child.position, m::ChildPosition::Episode { .. })
+        {
+            return Err(ApiError::new(
+                ErrorCode::BadRequest,
+                "still artwork requires an episode",
+            ));
+        }
         let mut row = child.parent;
-        row.representative_id = child.child.representative_id;
-        row.metadata = child.child.metadata;
+        if matches!(kind, ArtworkKind::Poster | ArtworkKind::Still) {
+            row.representative_id = child.child.representative_id;
+            row.metadata = child.child.metadata;
+        }
         if !matches!(child.child.position, m::ChildPosition::Episode { .. })
             && row.metadata.description.artwork.is_none()
         {
@@ -1221,13 +1266,32 @@ pub(super) async fn catalogue_artwork(
         .enrichment_input(&row.representative_id)
         .await
         .map_err(store_error)?;
-    let poster = row
-        .metadata
-        .description
-        .artwork
-        .as_ref()
-        .and_then(|p| p.first())
-        .ok_or_else(|| hidden("artwork"))?;
+    let description = &row.metadata.description;
+    let poster = match kind {
+        ArtworkKind::Poster | ArtworkKind::Still => {
+            description.artwork.as_ref().and_then(|p| p.first())
+        }
+        ArtworkKind::Logo => description.logo.as_ref(),
+        ArtworkKind::Banner => description.banner.as_ref(),
+        ArtworkKind::Backdrop => description.backdrop.as_ref(),
+    }
+    .ok_or_else(|| hidden("artwork"))?;
+    if kind != ArtworkKind::Poster {
+        let (bytes, mime) = s
+            .artwork
+            .catalogue_cached_at(&input, poster, q.get("size").map(String::as_str))
+            .await
+            .map_err(store_error)?
+            .ok_or_else(|| hidden("artwork"))?;
+        return Ok((
+            [
+                (axum::http::header::CONTENT_TYPE, mime),
+                (axum::http::header::CACHE_CONTROL, "private, no-cache"),
+            ],
+            bytes,
+        )
+            .into_response());
+    }
     let (bytes, mime) = s
         .artwork
         .catalogue_at(
@@ -1240,6 +1304,54 @@ pub(super) async fn catalogue_artwork(
         .await
         .map_err(store_error)?
         .ok_or_else(|| hidden("artwork"))?;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, mime),
+            (axum::http::header::CACHE_CONTROL, "private, no-cache"),
+        ],
+        bytes,
+    )
+        .into_response())
+}
+
+/// A headshot is selected only from this accessible title's resolved cast.
+/// The caller cannot name an arbitrary image URL or browse a global people list.
+#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items/{item_id}/cast/{person}/artwork",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),("item_id"=String,Path),("person"=String,Path,description="Provider-qualified cast ID from metadata, for example tmdb:123"),("size"=Option<String>,Query)),responses((status=200,body=String,content_type="image/*"),(status=404,body=ApiErrorBody)))]
+pub(super) async fn catalogue_cast_artwork(
+    State(s): State<AppState>,
+    ApiPath((id, item, person)): ApiPath<(String, String, String)>,
+    ApiQuery(q): ApiQuery<std::collections::HashMap<String, String>>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<axum::response::Response, ApiError> {
+    visible(&s, &claims, &id).await?;
+    let store = s.registry.catalogue();
+    let row = if item.starts_with("child1:") {
+        m::ChildId::parse(&item)
+            .map_err(|_| ApiError::new(ErrorCode::BadRequest, "invalid child ID"))?;
+        store
+            .library_child(&id, &item)
+            .await
+            .map_err(store_error)?
+            .parent
+    } else {
+        store.library_item(&id, &item).await.map_err(store_error)?
+    };
+    let image = row
+        .metadata
+        .description
+        .cast
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .find(|credit| credit.id.as_deref() == Some(person.as_str()))
+        .and_then(|credit| credit.image.as_deref())
+        .ok_or_else(|| hidden("cast artwork"))?;
+    let (bytes, mime) = s
+        .artwork
+        .get_cached_remote_at(image, q.get("size").map(String::as_str))
+        .await
+        .map_err(store_error)?
+        .ok_or_else(|| hidden("cast artwork"))?;
     Ok((
         [
             (axum::http::header::CONTENT_TYPE, mime),

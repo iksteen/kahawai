@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "3caf8f1e65f5c779437a6eabceac3043b05a36b24ffacf01ab339c07a9d980fa",
+  "x-kahawai-source-sha256": "f5d245e6d0bbf662727c609435e8f829f39405e5581eb98e66167c93f785e49c",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -6066,6 +6066,15 @@
             }
           },
           {
+            "name": "kind",
+            "in": "query",
+            "description": "Defaults to poster. Logo, banner, backdrop and episode still reads use cached images only.",
+            "required": false,
+            "schema": {
+              "$ref": "#/components/schemas/ArtworkKind"
+            }
+          },
+          {
             "name": "season",
             "in": "query",
             "description": "A native season number, or absolute; serves cached season artwork with a show-poster fallback",
@@ -6086,7 +6095,7 @@
               }
             },
             "content": {
-              "image/jpeg": {
+              "image/*": {
                 "schema": {
                   "type": "string"
                 }
@@ -6106,6 +6115,91 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogue/libraries/{id}/items/{item_id}/cast/{person}/artwork": {
+      "get": {
+        "tags": [
+          "Catalogue"
+        ],
+        "summary": "A headshot is selected only from this accessible title's resolved cast.\nThe caller cannot name an arbitrary image URL or browse a global people list.",
+        "operationId": "catalogue_cast_artwork",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "item_id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "person",
+            "in": "path",
+            "description": "Provider-qualified cast ID from metadata, for example tmdb:123",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "size",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "image/*": {
+                "schema": {
+                  "type": "string"
                 }
               }
             }
@@ -8877,6 +8971,16 @@
           }
         }
       },
+      "ArtworkKind": {
+        "type": "string",
+        "enum": [
+          "poster",
+          "logo",
+          "banner",
+          "backdrop",
+          "still"
+        ]
+      },
       "AuthClient": {
         "type": "string",
         "enum": [
@@ -10268,6 +10372,19 @@
           "name"
         ],
         "properties": {
+          "id": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Provider-qualified person identity; names are not unique identifiers."
+          },
+          "image": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "name": {
             "type": "string"
           },
@@ -10348,6 +10465,18 @@
               "type": "string"
             }
           },
+          "backdrop": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "banner": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "cast": {
             "type": [
               "array",
@@ -10365,6 +10494,13 @@
             "items": {
               "type": "string"
             }
+          },
+          "logo": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Selected images resolve independently; `artwork` remains the poster (or episode still)."
           },
           "original_language": {
             "type": [

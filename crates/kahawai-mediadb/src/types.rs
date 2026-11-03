@@ -32,6 +32,11 @@ impl MediaType {
 pub struct Credit {
     pub name: String,
     pub role: Option<String>,
+    /// Provider-qualified person identity; names are not unique identifiers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<String>,
 }
 /// Provider evidence for one episode or track, not a library child identity.
 /// Position associates this record with physical entries; editing the description
@@ -65,6 +70,13 @@ pub struct Description {
     pub release_date: Option<String>,
     pub rating: Option<f64>,
     pub artwork: Option<Vec<String>>,
+    /// Selected images resolve independently; `artwork` remains the poster (or episode still).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub logo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub banner: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub backdrop: Option<String>,
     pub genres: Option<Vec<String>>,
     pub cast: Option<Vec<Credit>>,
 }

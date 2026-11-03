@@ -10,7 +10,7 @@ import urllib.parse
 import urllib.request
 
 
-def request(method, path, body=None):
+def request(method, path, body=None, binary=False):
     headers = {"Content-Type": "application/json"}
     if token := os.environ.get("KAHAWAI_TOKEN"):
         headers["Authorization"] = "Bearer " + token
@@ -19,6 +19,8 @@ def request(method, path, body=None):
     try:
         with urllib.request.urlopen(req, timeout=30) as response:
             raw = response.read()
+            if binary:
+                return raw
             return (json.loads(raw) if "application/json" in response.headers.get("Content-Type", "") else raw.decode()) if raw else None
     except urllib.error.HTTPError as error:
         sys.exit(f"HTTP {error.code}: {error.read().decode()}")
@@ -31,6 +33,14 @@ sub.add_parser("libraries")
 seasons = sub.add_parser("seasons", help="inspect source-backed season groups and cover provenance")
 seasons.add_argument("library")
 seasons.add_argument("item")
+artwork = sub.add_parser("artwork", help="download title artwork or a cached cast headshot")
+artwork.add_argument("library")
+artwork.add_argument("item")
+artwork.add_argument("--kind", choices=["poster", "logo", "banner", "backdrop", "still"], default="poster")
+artwork.add_argument("--person", help="provider-qualified cast ID, for example tmdb:123")
+artwork.add_argument("--season")
+artwork.add_argument("--size", choices=["thumb", "card1x", "card"])
+artwork.add_argument("--out", required=True)
 match_command = sub.add_parser("match", help="apply enrichment correction JSON to a collection copy")
 match_command.add_argument("copy")
 match_command.add_argument("body_file")
@@ -115,6 +125,19 @@ quote = lambda value: urllib.parse.quote(value, safe="")
 base = "/api/v1/catalogue/libraries"
 admin = "/admin/v1/catalogue/libraries"
 match args.command:
+    case "artwork":
+        from pathlib import Path
+        path = f"{base}/{quote(args.library)}/items/{quote(args.item)}"
+        path += f"/cast/{quote(args.person)}/artwork" if args.person else "/artwork"
+        params = {key: value for key, value in {"size": args.size, "season": args.season}.items() if value is not None}
+        if not args.person:
+            params["kind"] = args.kind
+        elif args.kind != "poster" or args.season is not None:
+            sys.exit("--person cannot be combined with --kind or --season")
+        data = request("GET", path + ("?" + urllib.parse.urlencode(params) if params else ""), binary=True)
+        Path(args.out).write_bytes(data)
+        print(args.out)
+        sys.exit(0)
     case "seasons":
         answer = request("GET", f"{base}/{quote(args.library)}/items/{quote(args.item)}/seasons")["seasons"]
     case "match":

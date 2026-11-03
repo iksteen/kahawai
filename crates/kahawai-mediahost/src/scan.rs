@@ -834,6 +834,7 @@ fn apply_declared_subtitles(
 fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::MediaInfo) {
     info.external_subtitles = find_sidecars(root, path);
     info.artwork = find_artwork(root, path);
+    info.artwork_images = find_title_images(root, path);
     info.season_artwork = path
         .strip_prefix(root)
         .ok()
@@ -846,6 +847,7 @@ fn refresh_sidecars(root: &Path, path: &Path, info: &mut kahawai_core::media::Me
         .iter()
         .map(|s| s.path_rel.clone())
         .chain(info.artwork.iter().cloned())
+        .chain(info.artwork_images.values().cloned())
         .chain(info.nfo.iter().cloned())
         .chain(info.season_artwork.iter().flatten().map(|a| a.path.clone()))
         .collect();
@@ -898,6 +900,7 @@ fn sidecar_sig(root: &Path, media: &Path) -> String {
     let nfo = find_nfo(root, media).unwrap_or_default();
     let art = find_artwork(root, media).unwrap_or_default();
     let seasons = find_season_artwork(root, media);
+    let images = find_title_images(root, media);
     // Subtitle sidecars too (.srt/.ass/.vtt, .idx pairs): a pair
     // appearing next to an UNCHANGED movie must bust the identity
     // fast-path, or it stays invisible until the movie changes.
@@ -907,10 +910,25 @@ fn sidecar_sig(root: &Path, media: &Path) -> String {
         .collect();
     subs.sort();
     subs.dedup();
-    if nfo.is_empty() && art.is_empty() && subs.is_empty() && seasons.is_empty() {
+    if nfo.is_empty()
+        && art.is_empty()
+        && subs.is_empty()
+        && seasons.is_empty()
+        && images.is_empty()
+    {
         return String::new();
     }
-    let base = format!("n:{nfo}|a:{art}|s:{}", subs.join(","));
+    let mut base = format!("n:{nfo}|a:{art}|s:{}", subs.join(","));
+    if !images.is_empty() {
+        base.push_str(&format!(
+            "|images:{}",
+            images
+                .iter()
+                .map(|(kind, path)| format!("{kind}:{path}"))
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
     if seasons.is_empty() {
         base
     } else {
@@ -969,7 +987,7 @@ fn image_in(root: &Path, dir: &Path, names: &[String]) -> Option<String> {
     }
     None
 }
-fn find_artwork(root: &Path, media: &Path) -> Option<String> {
+fn title_artwork_dir<'a>(root: &Path, media: &'a Path) -> Option<&'a Path> {
     let mut dir = media.parent()?;
     let parsed = media
         .strip_prefix(root)
@@ -979,6 +997,32 @@ fn find_artwork(root: &Path, media: &Path) -> Option<String> {
     if season_dir(dir).is_some_and(|n| parsed.as_ref().is_some_and(|g| g.season == Some(n))) {
         dir = dir.parent()?;
     }
+    Some(dir)
+}
+
+fn find_title_images(root: &Path, media: &Path) -> std::collections::BTreeMap<String, String> {
+    let Some(dir) = title_artwork_dir(root, media) else {
+        return Default::default();
+    };
+    [
+        ("logo", &["clearlogo", "logo"][..]),
+        ("banner", &["banner"][..]),
+        ("backdrop", &["fanart", "backdrop", "background"][..]),
+    ]
+    .into_iter()
+    .filter_map(|(kind, names)| {
+        image_in(
+            root,
+            dir,
+            &names.iter().map(|s| (*s).to_owned()).collect::<Vec<_>>(),
+        )
+        .map(|path| (kind.to_owned(), path))
+    })
+    .collect()
+}
+
+fn find_artwork(root: &Path, media: &Path) -> Option<String> {
+    let dir = title_artwork_dir(root, media)?;
     image_in(
         root,
         dir,
@@ -1202,6 +1246,32 @@ fn sum_u64_le(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn title_image_sidecars_refresh_without_a_media_probe() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("Show/Season 01");
+        std::fs::create_dir_all(&dir).unwrap();
+        let media = dir.join("Show.S01E01.mkv");
+        std::fs::write(&media, b"media").unwrap();
+        let logo = root.path().join("Show/ClearLogo.PNG");
+        std::fs::write(&logo, b"logo").unwrap();
+        std::fs::write(root.path().join("Show/banner.jpg"), b"banner").unwrap();
+        std::fs::write(root.path().join("Show/fanart.webp"), b"background").unwrap();
+        let mut info = kahawai_core::media::MediaInfo::default();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert_eq!(info.artwork_images["logo"], "Show/ClearLogo.PNG");
+        assert_eq!(info.artwork_images["banner"], "Show/banner.jpg");
+        assert_eq!(info.artwork_images["backdrop"], "Show/fanart.webp");
+        assert!(sidecar_sig(root.path(), &media).contains("|images:"));
+        let revision = info.sidecar_revision.clone();
+        std::fs::write(&logo, b"replacement logo").unwrap();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert_ne!(revision, info.sidecar_revision);
+        std::fs::remove_file(&logo).unwrap();
+        refresh_sidecars(root.path(), &media, &mut info);
+        assert!(!info.artwork_images.contains_key("logo"));
+    }
 
     fn scan_admission(cfg: &CollectionConfig) -> ScanAdmission {
         let scheduler =

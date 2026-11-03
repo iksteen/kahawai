@@ -291,6 +291,8 @@ pub struct AnilistMedia {
     pub title: AnilistTitle,
     pub description: Option<String>,
     pub cover_image: Option<AnilistCover>,
+    /// https://docs.anilist.co/reference/object/media (2026-11-03).
+    pub banner_image: Option<String>,
     pub average_score: Option<f64>,
     pub start_date: Option<AnilistDate>,
     pub format: Option<String>, // TV | MOVIE | OVA | ONA | SPECIAL | TV_SHORT | MUSIC
@@ -386,6 +388,7 @@ const MEDIA_FIELDS: &str = "
   title { romaji english }
   description(asHtml: false)
   coverImage { extraLarge large }
+  bannerImage
   averageScore
   startDate { year month day }
   format
@@ -710,6 +713,7 @@ mod tests {
             country_of_origin: None,
             description: Some("Line one.<br><br>\n<i>Note.</i>".into()),
             cover_image: None,
+            banner_image: None,
             average_score: Some(78.0),
             start_date: Some(AnilistDate {
                 year: Some(2011),

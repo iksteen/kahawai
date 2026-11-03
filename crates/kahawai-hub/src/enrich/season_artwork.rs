@@ -214,20 +214,12 @@ fn fanart_covers(value: &Value) -> Vec<m::ProviderSeasonArtwork> {
         .collect()
 }
 impl Enricher {
-    pub(super) async fn tvdb_season_covers(
+    pub(super) async fn tvdb_artwork_types(
         &self,
         registry: &Registry,
         token: &str,
-        series: &Value,
         lease: &crate::gate::CredentialLease,
-    ) -> Result<Vec<m::ProviderSeasonArtwork>> {
-        let seasons = tvdb_seasons(series);
-        if seasons.is_empty() {
-            return Ok(vec![]);
-        }
-        // Read type IDs from the provider, never assume IDs or alternate season
-        // orders. The official v4 schema links imageType/type to /artwork/types.
-        // https://github.com/thetvdb/v4-api/blob/master/docs/swagger.yml (2026-10-13).
+    ) -> Result<Value> {
         let types: Value = if let Some(cached) = registry
             .catalogue()
             .recent_cache_answer(
@@ -262,6 +254,23 @@ impl Enricher {
                 .await?;
             types
         };
+        Ok(types)
+    }
+    pub(super) async fn tvdb_season_covers(
+        &self,
+        registry: &Registry,
+        token: &str,
+        series: &Value,
+        lease: &crate::gate::CredentialLease,
+    ) -> Result<Vec<m::ProviderSeasonArtwork>> {
+        let seasons = tvdb_seasons(series);
+        if seasons.is_empty() {
+            return Ok(vec![]);
+        }
+        // Read type IDs from the provider, never assume IDs or alternate season
+        // orders. The official v4 schema links imageType/type to /artwork/types.
+        // https://github.com/thetvdb/v4-api/blob/master/docs/swagger.yml (2026-10-13).
+        let types = self.tvdb_artwork_types(registry, token, lease).await?;
         let types = poster_types(&types);
         let mut out = vec![];
         for season in seasons {
@@ -311,7 +320,7 @@ impl Enricher {
         }
         Ok(out)
     }
-    pub(super) async fn catalogue_fanart_seasons(
+    pub(super) async fn catalogue_fanart_artwork(
         &self,
         registry: &Registry,
         input: &m::EnrichmentInput,
@@ -320,20 +329,33 @@ impl Enricher {
         let Some((_, selected)) = &input.selected else {
             return Ok(Default::default());
         };
-        let tvdb = if selected.provider == "tvdb" && selected.namespace == "show" {
+        let movie = selected.namespace == "movie"
+            || input.media_type == m::MediaType::Movies
+            || (input.media_type == m::MediaType::Anime
+                && registry
+                    .catalogue()
+                    .media_entries(&input.item_id)
+                    .await?
+                    .iter()
+                    .all(|entry| matches!(entry.data.kind, m::EntryKind::Movie)));
+        let provider = if movie { "tmdb" } else { "tvdb" };
+        let namespace = if movie { "movie" } else { "show" };
+        let identity = if selected.provider == provider && selected.namespace == namespace {
             Some(selected.external_id.as_str())
         } else {
             input
                 .links
                 .iter()
-                .find(|l| l.provider == "tvdb" && l.namespace == "show")
-                .map(|l| l.external_id.as_str())
+                .find(|link| link.provider == provider && link.namespace == namespace)
+                .map(|link| link.external_id.as_str())
         };
-        let Some(tvdb) = tvdb else {
+        let Some(identity) = identity else {
             return Ok(Default::default());
         };
-        let question = format!("season-artwork-v1:tvdb:{tvdb}");
-        let covers: Vec<m::ProviderSeasonArtwork> = if !force
+        // Keep old season-only cached answers. This representation retains all
+        // title image roles from the same response for future enrichment.
+        let question = format!("title-images-v1:{provider}:{namespace}:{identity}");
+        let value: Value = if !force
             && let Some(cached) = registry
                 .catalogue()
                 .cache_answer("fanart", &question)
@@ -345,45 +367,52 @@ impl Enricher {
             let key = fanart_client_key(registry)
                 .await?
                 .ok_or(catalogue::Unconfigured)?;
-            // Fanart TV v3 TV requests use the verified TVDB series ID. Reuse the
-            // existing personal-key header and host gate used by artist artwork.
-            // https://api.fanart.tv/ and https://github.com/fanart-tv/fanart.tv-api (2026-10-13).
+            // Movies accept TMDB IDs; TV accepts TVDB IDs. All title artwork
+            // roles share one request and the existing credential/host gate.
+            // https://github.com/fanart-tv/fanart.tv-api (2026-11-03).
+            let endpoint = if movie { "movies" } else { "tv" };
             let response = self
                 .http
                 .send_current(
                     self.http
-                        .get_no_redirect(format!("https://webservice.fanart.tv/v3.2/tv/{tvdb}"))
+                        .get_no_redirect(format!(
+                            "https://webservice.fanart.tv/v3.2/{endpoint}/{identity}"
+                        ))
                         .header("client-key", key),
                     self.provider_lease(FANART),
                 )
                 .await?;
-            let covers = if response.status() == reqwest::StatusCode::NOT_FOUND {
-                vec![]
+            let value = if response.status() == reqwest::StatusCode::NOT_FOUND {
+                serde_json::json!({})
             } else {
-                fanart_covers(&response.status_checked()?.json().await?)
+                response.status_checked()?.json().await?
             };
             registry
                 .catalogue()
                 .put_cache_answer(
                     "fanart",
                     &question,
-                    &serde_json::to_string(&covers)?,
+                    &serde_json::to_string(&value)?,
                     catalogue::now(),
                 )
                 .await?;
-            covers
+            value
         };
         let record = m::ProviderRecord {
             provider: "fanart".into(),
-            namespace: "show".into(),
-            external_id: tvdb.into(),
+            namespace: namespace.into(),
+            external_id: identity.into(),
             title: input.title.clone(),
             year: input.year,
-            media_type: m::MediaType::Series,
+            media_type: if movie {
+                m::MediaType::Movies
+            } else {
+                m::MediaType::Series
+            },
             language: "en".into(),
-            description: Default::default(),
+            description: super::images::fanart(&value, movie),
             children: None,
-            season_artwork: Some(covers),
+            season_artwork: Some(if movie { vec![] } else { fanart_covers(&value) }),
         };
         // Auxiliary evidence has no descriptive identity or episode catalogue.
         Ok(m::EnrichmentAnswer {

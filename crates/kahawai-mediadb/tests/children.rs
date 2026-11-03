@@ -417,6 +417,7 @@ async fn child_catalogue_precedence_is_separate_from_description_resolution() {
         cast: Some(vec![Credit {
             name: "Actor".into(),
             role: Some("Role".into()),
+            ..Default::default()
         }]),
         artwork: Some(vec!["still-a".into(), "still-b".into()]),
         ..Default::default()

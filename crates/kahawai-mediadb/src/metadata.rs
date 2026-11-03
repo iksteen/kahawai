@@ -5,6 +5,12 @@
 //! `children_json` preserves missing versus explicitly empty answers. Migration 5
 //! moves existing records and cached enrichment answers without refetching providers
 //! or scheduling artwork work for a structural change.
+//!
+//! Posters/episode stills retain the historical `artwork` field. Logo, banner
+//! and backdrop are independent optional fields with ordinary per-field
+//! provenance and precedence. Cast is one provider's ordered credit list;
+//! provider-qualified person IDs address headshots without matching names or
+//! introducing globally browsable people. Image absence never changes identity.
 use crate::*;
 use anyhow::{Result, ensure};
 use sqlx::{Row, SqliteConnection};
@@ -140,7 +146,7 @@ pub(crate) async fn evidence(
         UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,0 AS position FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1
         UNION ALL SELECT p.id,p.provider,p.description_json,p.children_json,p.season_artwork_json,p.namespace,p.external_id,CASE WHEN p.provider='fanart' THEN 2147483647 ELSE o.position+1 END AS position FROM metadata_supplements s JOIN provider_records p ON p.id=s.record_id
         JOIN collection_items i ON i.id=s.item_id JOIN collections col ON col.id=i.collection_id
-        LEFT JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 AND (o.provider IS NOT NULL OR (p.provider='fanart' AND col.media_type IN ('series','anime'))) ORDER BY position")
+        LEFT JOIN provider_order o ON o.media_type=col.media_type AND o.provider=p.provider WHERE s.item_id=?1 AND (o.provider IS NOT NULL OR (p.provider='fanart' AND col.media_type IN ('movies','series','anime'))) ORDER BY position")
         .bind(item).fetch_all(&mut *c).await?)
 }
 
@@ -208,6 +214,9 @@ fn fill(target: &mut ResolvedDescription, source: Description, record: &str) {
         release_date,
         rating,
         artwork,
+        logo,
+        banner,
+        backdrop,
         genres,
         cast
     );

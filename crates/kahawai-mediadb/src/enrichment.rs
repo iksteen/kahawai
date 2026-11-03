@@ -46,7 +46,7 @@ pub struct EnrichmentCandidate {
 pub struct EnrichmentAnswer {
     #[serde(default)]
     pub artist: Option<ArtistIdentity>,
-    /// Artwork-only evidence linked to a verified TVDB show; never an identity candidate.
+    /// Artwork-only evidence linked to a verified title; never an identity candidate.
     #[serde(default)]
     pub artwork_supplement: Option<ProviderRecord>,
     #[serde(default)]
@@ -133,7 +133,7 @@ impl std::error::Error for StaleEnrichment {}
 // An input revision invalidates obsolete answers. A request generation instead
 // records new work against the SAME input: keep running tokens, retries, pauses,
 // force flags and attempt counts; completion leaves a follow-up pending. Migration
-// 12 uses this rule for its one-time, source-backed series/anime backfill. Existing
+// 12 and 13 use this rule for the one-time season/title-artwork backfills. Existing
 // provider cache representations and the legacy content-hash import remain intact.
 async fn request_work(
     tx: &mut sqlx::SqliteConnection,
@@ -408,17 +408,31 @@ impl Store {
             }
         }
         if let Some(record) = &answer.artwork_supplement {
+            let only_artwork = Description {
+                artwork: record.description.artwork.clone(),
+                logo: record.description.logo.clone(),
+                banner: record.description.banner.clone(),
+                backdrop: record.description.backdrop.clone(),
+                ..Default::default()
+            };
             ensure!(
                 job.provider == "fanart"
                     && record.provider == "fanart"
-                    && record.namespace == "show"
-                    && matches!(kind.as_str(), "series" | "anime")
+                    && ((record.namespace == "show"
+                        && matches!(kind.as_str(), "series" | "anime"))
+                        || (record.namespace == "movie"
+                            && matches!(kind.as_str(), "movies" | "anime")))
                     && record.children.is_none()
-                    && record.description == Description::default(),
+                    && record.description == only_artwork,
                 "invalid auxiliary artwork answer"
             );
-            let verified: Option<String> = sqlx::query_scalar("SELECT a.record_id FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1 AND ((p.provider='tvdb' AND p.namespace='show' AND p.external_id=?2) OR EXISTS(SELECT 1 FROM provider_links l WHERE l.record_id=a.record_id AND l.provider='tvdb' AND l.namespace='show' AND l.external_id=?2) OR EXISTS(SELECT 1 FROM metadata_supplements s JOIN provider_records q ON q.id=s.record_id WHERE s.item_id=a.item_id AND s.primary_record_id=a.record_id AND q.provider='tvdb' AND q.namespace='show' AND q.external_id=?2))")
-                .bind(&job.item_id).bind(&record.external_id).fetch_optional(&mut *tx).await?;
+            let provider = if record.namespace == "movie" {
+                "tmdb"
+            } else {
+                "tvdb"
+            };
+            let verified: Option<String> = sqlx::query_scalar("SELECT a.record_id FROM metadata_assignments a JOIN provider_records p ON p.id=a.record_id WHERE a.item_id=?1 AND ((p.provider=?3 AND p.namespace=?4 AND p.external_id=?2) OR EXISTS(SELECT 1 FROM provider_links l WHERE l.record_id=a.record_id AND l.provider=?3 AND l.namespace=?4 AND l.external_id=?2) OR EXISTS(SELECT 1 FROM metadata_supplements s JOIN provider_records q ON q.id=s.record_id WHERE s.item_id=a.item_id AND s.primary_record_id=a.record_id AND q.provider=?3 AND q.namespace=?4 AND q.external_id=?2))")
+                .bind(&job.item_id).bind(&record.external_id).bind(provider).bind(&record.namespace).fetch_optional(&mut *tx).await?;
             if let Some(primary) = verified {
                 let record_id = crate::metadata::put_record(&mut tx, record).await?;
                 sqlx::query("DELETE FROM metadata_supplements WHERE item_id=? AND record_id IN (SELECT id FROM provider_records WHERE provider='fanart')")

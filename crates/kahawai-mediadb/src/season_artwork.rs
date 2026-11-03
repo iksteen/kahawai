@@ -98,6 +98,7 @@ impl Store {
     pub async fn provider_artwork(&self, item: &str, provider: &str) -> Result<Vec<String>> {
         let mut c = self.db.read_pool().acquire().await?;
         let rows = crate::metadata::evidence(&mut c, item).await?;
+        let entries = crate::occurrence::read_entries(&mut c, item).await?;
         let mut urls = BTreeSet::new();
         for row in rows
             .into_iter()
@@ -105,6 +106,62 @@ impl Store {
         {
             let description: Description = serde_json::from_str(row.get("description_json"))?;
             urls.extend(description.artwork.unwrap_or_default());
+            urls.extend(description.logo);
+            urls.extend(description.banner);
+            urls.extend(description.backdrop);
+            urls.extend(
+                description
+                    .cast
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|credit| credit.image),
+            );
+            let children: Vec<ProviderChild> = row
+                .get::<Option<&str>, _>("children_json")
+                .map(serde_json::from_str)
+                .transpose()?
+                .unwrap_or_default();
+            for child in children {
+                let visible = entries.iter().any(|entry| match &entry.data.kind {
+                    EntryKind::Episode { episodes } => episodes.iter().any(|span| {
+                        let number = if let Some(season) = span.season {
+                            (child.position.season == Some(season))
+                                .then_some(child.position.episode)
+                                .flatten()
+                        } else {
+                            child.position.absolute.or_else(|| {
+                                child
+                                    .position
+                                    .season
+                                    .is_none()
+                                    .then_some(child.position.episode)
+                                    .flatten()
+                            })
+                        };
+                        number.is_some_and(|number| {
+                            number >= span.episode
+                                && number <= span.episode_end.unwrap_or(span.episode)
+                        })
+                    }),
+                    _ => false,
+                });
+                if visible {
+                    urls.extend(
+                        child
+                            .description
+                            .artwork
+                            .unwrap_or_default()
+                            .into_iter()
+                            .map(|url| {
+                                if provider == "tmdb" && url.starts_with('/') {
+                                    format!("https://image.tmdb.org/t/p/w780{url}")
+                                } else {
+                                    url
+                                }
+                            }),
+                    );
+                }
+            }
             let covers: Vec<ProviderSeasonArtwork> = row
                 .get::<Option<&str>, _>("season_artwork_json")
                 .map(serde_json::from_str)

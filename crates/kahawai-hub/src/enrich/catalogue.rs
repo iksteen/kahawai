@@ -204,9 +204,12 @@ impl Enricher {
             return self.catalogue_local(registry, input).await;
         }
         if provider == "fanart"
-            && matches!(input.media_type, m::MediaType::Series | m::MediaType::Anime)
+            && matches!(
+                input.media_type,
+                m::MediaType::Movies | m::MediaType::Series | m::MediaType::Anime
+            )
         {
-            return self.catalogue_fanart_seasons(registry, input, force).await;
+            return self.catalogue_fanart_artwork(registry, input, force).await;
         }
         if matches!(provider, "fanart" | "theaudiodb") {
             return self
@@ -286,6 +289,13 @@ impl Enricher {
         } else {
             question
         };
+        // Older complete answers discarded these fields. Keep them intact and
+        // version only the richer, identified representation being requested.
+        let question = if target.is_some() && matches!(provider, "tmdb" | "tvdb" | "anilist") {
+            format!("title-images-v1:{question}")
+        } else {
+            question
+        };
         if !force
             && let Some(cached) = registry
                 .catalogue()
@@ -345,6 +355,7 @@ impl Enricher {
         let mut episodes = Vec::new();
         let mut season_artwork = Vec::new();
         let mut rich: Option<serde_json::Value> = None;
+        let mut tvdb_types = serde_json::Value::Null;
         let mut linked = Vec::new();
         if provider == "tmdb" {
             let key = tmdb_key(registry).await?.ok_or(Unconfigured)?;
@@ -361,7 +372,7 @@ impl Enricher {
                             "https://api.themoviedb.org/3/{path}/{}",
                             t.external_id
                         ))
-                        .query(&[("append_to_response", "credits,external_ids")]);
+                        .query(&[("append_to_response", "credits,external_ids,images")]);
                     if is_v4_token(&key) {
                         request = request.bearer_auth(&key);
                     } else {
@@ -446,6 +457,8 @@ impl Enricher {
                         .tvdb_season_covers(registry, &token, &details, &lease)
                         .await?;
                 }
+                tvdb_types = self.tvdb_artwork_types(registry, &token, &lease).await?;
+                rich = Some(details);
                 vec![candidate]
             } else {
                 self.tvdb_search(&token, kind, &input.title, &lease).await?
@@ -481,21 +494,11 @@ impl Enricher {
                 record.season_artwork = Some(season_artwork.clone());
             }
             if let Some(value) = &rich {
-                record.description.genres = value["genres"].as_array().map(|v| {
-                    v.iter()
-                        .filter_map(|g| g["name"].as_str().map(str::to_owned))
-                        .collect()
-                });
-                record.description.cast = value["credits"]["cast"].as_array().map(|v| {
-                    v.iter()
-                        .filter_map(|c| {
-                            Some(m::Credit {
-                                name: c["name"].as_str()?.into(),
-                                role: c["character"].as_str().map(str::to_owned),
-                            })
-                        })
-                        .collect()
-                });
+                if provider == "tmdb" {
+                    super::images::tmdb(&mut record.description, value);
+                } else {
+                    super::images::tvdb(&mut record.description, value, &tvdb_types, kind);
+                }
             }
             if !episodes.is_empty() {
                 record.children = Some(episodes.iter().map(child).collect());
@@ -582,6 +585,7 @@ impl Enricher {
                 release_date: media.release_date(),
                 rating: media.average_score.map(|s| s / 10.0),
                 genres: media.genres.clone(),
+                banner: media.banner_image.clone(),
                 artwork: media
                     .cover_image
                     .as_ref()
@@ -727,6 +731,18 @@ impl Enricher {
         }
         for source in &input.sources {
             let Some(media) = &source.media else { continue };
+            let local_image = |kind| {
+                media
+                    .artwork_images
+                    .get(kind)
+                    .map(|path| format!("local://{}/{path}", source.root_token))
+            };
+            record.description.logo = record.description.logo.or_else(|| local_image("logo"));
+            record.description.banner = record.description.banner.or_else(|| local_image("banner"));
+            record.description.backdrop = record
+                .description
+                .backdrop
+                .or_else(|| local_image("backdrop"));
             for art in media.season_artwork.iter().flatten() {
                 let cover = m::ProviderSeasonArtwork {
                     provider_id: None,
@@ -800,6 +816,9 @@ impl Enricher {
                         .and_then(year)
                         .or(input.year);
                     description.artwork = record.description.artwork.take();
+                    description.logo = record.description.logo.take();
+                    description.banner = record.description.banner.take();
+                    description.backdrop = record.description.backdrop.take();
                     record.description = description;
                     answer.candidates = vec![m::EnrichmentCandidate {
                         complete: true,
@@ -818,6 +837,9 @@ impl Enricher {
         }
         if !answer.candidates.is_empty()
             || record.description.artwork.is_some()
+            || record.description.logo.is_some()
+            || record.description.banner.is_some()
+            || record.description.backdrop.is_some()
             || record.children.is_some()
             || record
                 .season_artwork
@@ -982,7 +1004,13 @@ fn candidate_record(
 fn child(e: &EpisodeData) -> m::ProviderChild {
     m::ProviderChild {
         description: m::Description {
-            artwork: e.image.clone().map(|image| vec![image]),
+            artwork: e.image.clone().map(|image| {
+                vec![if image.starts_with('/') {
+                    format!("https://image.tmdb.org/t/p/w780{image}")
+                } else {
+                    image
+                }]
+            }),
             release_date: e.aired.clone(),
             rating: e.rating,
             overview: e.overview.clone(),

@@ -253,8 +253,14 @@ audio/video byte separation for manual playback testing; see
       discarding retries/blocks. Each provider cover is prefetched independently
       of the winning answer (see `season-artwork.md`). Android season cards and
       selected-season pages consume these covers; web presentation follows.
-      *(Cast is TMDB-only and TVDB's own genre list is unread; both reach
-      TVDB-owned items by side-fill when TMDB also answered.)*
+      Logos, banners, backdrops and cast headshots resolve independently with
+      provenance, through cache-only, library-scoped image reads. TMDB/TVDB,
+      Fanart, AniList banners and local sidecars participate where supported.
+      Cast credits retain provider-qualified IDs and photos; TVDB genres and
+      cast are read directly. Episode stills and headshots join the existing
+      prefetch lanes. Migration 13 backfills matched source-backed titles once,
+      preserving claims, retries, blocks and caches; transparent resizes retain
+      alpha. See `title-artwork.md`. Client presentation is pending.
 - [x] HUB-7 Provider rate limits/caching. One queue per provider host
       (`hub/gate.rs`) spaced at each provider's documented limit, 429/503
       parks that provider alone; caching is the permanent answer store

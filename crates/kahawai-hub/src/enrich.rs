@@ -4,6 +4,7 @@
 //! Every external request goes through the shared provider gate.
 
 mod catalogue;
+mod images;
 mod season_artwork;
 use std::collections::{BTreeMap, BTreeSet};
 use std::sync::Arc;
@@ -1376,8 +1377,22 @@ impl Enricher {
             tracing::debug!(%url, "provider holds no poster here");
             return Ok(None);
         }
-        let resp = resp.status_checked()?;
-        Ok(Some(resp.bytes().await?.to_vec()))
+        let mut resp = resp.status_checked()?;
+        const MAX_IMAGE_BYTES: usize = 32 << 20;
+        anyhow::ensure!(
+            resp.content_length()
+                .is_none_or(|len| len <= MAX_IMAGE_BYTES as u64),
+            "artwork image too large"
+        );
+        let mut bytes = Vec::new();
+        while let Some(chunk) = resp.chunk().await? {
+            anyhow::ensure!(
+                bytes.len() + chunk.len() <= MAX_IMAGE_BYTES,
+                "artwork image too large"
+            );
+            bytes.extend_from_slice(&chunk);
+        }
+        Ok(Some(bytes))
     }
 }
 

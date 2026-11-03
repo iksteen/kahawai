@@ -116,6 +116,19 @@ fn remote_cache_key(url: &str) -> String {
     )
 }
 
+fn image_mime(bytes: &[u8]) -> &'static str {
+    match image::guess_format(bytes).ok() {
+        Some(image::ImageFormat::Png) => "image/png",
+        Some(image::ImageFormat::WebP) => "image/webp",
+        _ => "image/jpeg",
+    }
+}
+
+fn cached_image(bytes: Vec<u8>) -> (Vec<u8>, &'static str) {
+    let mime = image_mime(&bytes);
+    (bytes, mime)
+}
+
 impl Artwork {
     pub fn new(dir: PathBuf, enricher: Arc<crate::enrich::Enricher>) -> Self {
         let art = Self {
@@ -232,7 +245,7 @@ impl Artwork {
         let dir = self.dir.join(variant_dir(name, *px));
         let path = dir.join(&key);
         if let Ok(small) = std::fs::read(&path) {
-            return Ok((small, "image/jpeg"));
+            return Ok(cached_image(small));
         }
         // Decoding and re-encoding is CPU work on a runtime thread that
         // is otherwise serving requests, so it goes to the blocking pool.
@@ -247,7 +260,7 @@ impl Artwork {
             tracing::warn!(path = %path.display(), error = %error,
                 "resized artwork served but could not be cached");
         }
-        Ok((small, "image/jpeg"))
+        Ok(cached_image(small))
     }
 
     /// Serve an Album Artist portrait strictly from the cache populated by
@@ -266,7 +279,7 @@ impl Artwork {
                     .map(|(name, px)| self.dir.join(variant_dir(name, *px)).join(&key))
             })
             .unwrap_or_else(|| self.dir.join(&key));
-        Ok(std::fs::read(path).ok().map(|bytes| (bytes, "image/jpeg")))
+        Ok(std::fs::read(path).ok().map(cached_image))
     }
 
     fn read_artist_collage_manifest(
@@ -350,7 +363,8 @@ impl Artwork {
         let _guard = lock.lock().await;
         let cache_path = self.dir.join(&cache_key);
         if let Ok(bytes) = std::fs::read(&cache_path) {
-            return Ok(Some((bytes, "image/jpeg", cache_key)));
+            let mime = image_mime(&bytes);
+            return Ok(Some((bytes, mime, cache_key)));
         }
         // A miss is remembered for an hour, as an empty file beside the real
         // ones. Nothing was written before, on the reasoning that an upload
@@ -383,7 +397,8 @@ impl Artwork {
         };
         std::fs::create_dir_all(&self.dir)?;
         Self::write_atomic(&cache_path, &bytes)?;
-        Ok(Some((bytes, "image/jpeg", cache_key)))
+        let mime = image_mime(&bytes);
+        Ok(Some((bytes, mime, cache_key)))
     }
 }
 
@@ -493,10 +508,14 @@ fn resize_to(bytes: &[u8], px: u32) -> Result<Vec<u8>> {
     let img = image::load_from_memory(bytes).context("decoding artwork")?;
     let small = img.resize(px, px, image::imageops::FilterType::Lanczos3);
     let mut out = std::io::Cursor::new(Vec::new());
-    small
-        .to_rgb8()
-        .write_to(&mut out, image::ImageFormat::Jpeg)
-        .context("encoding resized artwork")?;
+    if small.color().has_alpha() {
+        small.write_to(&mut out, image::ImageFormat::Png)?;
+    } else {
+        small
+            .to_rgb8()
+            .write_to(&mut out, image::ImageFormat::Jpeg)
+            .context("encoding resized artwork")?;
+    }
     Ok(out.into_inner())
 }
 
@@ -552,16 +571,7 @@ impl Artwork {
             Some((name, px)) => self.dir.join(variant_dir(name, *px)).join(key),
             None => self.dir.join(key),
         };
-        let mime = if variant.is_some() {
-            "image/jpeg"
-        } else if path.ends_with(".png") {
-            "image/png"
-        } else if path.ends_with(".webp") {
-            "image/webp"
-        } else {
-            "image/jpeg"
-        };
-        Ok(std::fs::read(cache).ok().map(|bytes| (bytes, mime)))
+        Ok(std::fs::read(cache).ok().map(cached_image))
     }
 
     pub(crate) async fn catalogue_at(
@@ -751,6 +761,7 @@ fn catalogue_local_key(
             s.root_token == root
                 && s.media.as_ref().is_some_and(|m| {
                     m.artwork.as_deref() == Some(path)
+                        || m.artwork_images.values().any(|image| image == path)
                         || m.season_artwork
                             .as_ref()
                             .is_some_and(|covers| covers.iter().any(|c| c.path == path))
@@ -772,6 +783,20 @@ fn catalogue_local_key(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transparent_logo_resizes_preserve_alpha_and_report_the_real_mime() {
+        let original = image::RgbaImage::from_pixel(80, 40, image::Rgba([100, 80, 60, 0]));
+        let mut bytes = std::io::Cursor::new(Vec::new());
+        original
+            .write_to(&mut bytes, image::ImageFormat::Png)
+            .unwrap();
+        let small = resize_to(&bytes.into_inner(), 40).unwrap();
+        assert_eq!(image_mime(&small), "image/png");
+        let decoded = image::load_from_memory(&small).unwrap().into_rgba8();
+        assert_eq!(decoded.dimensions(), (40, 20));
+        assert_eq!(decoded.get_pixel(0, 0)[3], 0);
+    }
 
     fn solid_png(color: [u8; 3]) -> Vec<u8> {
         let mut bytes = std::io::Cursor::new(Vec::new());

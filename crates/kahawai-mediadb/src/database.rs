@@ -143,6 +143,16 @@ mod tests {
 
     #[tokio::test]
     async fn season_backfill_is_once_and_preserves_existing_work_and_evidence() {
+        check_artwork_backfill(11, 12, 1).await;
+    }
+
+    #[tokio::test]
+    async fn title_image_backfill_is_once_and_composes_with_the_season_backfill() {
+        check_artwork_backfill(12, 13, 1).await;
+        check_artwork_backfill(11, 13, 2).await;
+    }
+
+    async fn check_artwork_backfill(from: i64, through: i64, expected_generation: i64) {
         use crate::{EnrichmentAnswer, EnrichmentJob};
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("mediadb.db");
@@ -150,7 +160,7 @@ mod tests {
         let old = Migrator::with_migrations(
             MIGRATOR
                 .iter()
-                .filter(|m| m.version < 12)
+                .filter(|m| m.version <= from)
                 .cloned()
                 .collect(),
         );
@@ -200,9 +210,28 @@ mod tests {
           INSERT INTO media_parts VALUES('unmatched','collection',1,'unmatched');
           UPDATE enrichment_jobs SET state='done' WHERE item_id IN ('empty','unmatched');")
           .execute(&mut *tx).await.unwrap();
+        if from >= 12 {
+            // The fixture's captured claims start at generation zero, as they
+            // do when upgrading from the schema before this column existed.
+            sqlx::query("UPDATE enrichment_jobs SET request_generation=0")
+                .execute(&mut *tx)
+                .await
+                .unwrap();
+        }
         tx.commit().await.unwrap();
         s.close().await;
-        let s = Store::open(&path).await.unwrap();
+        let s = open(
+            &path,
+            Migrator::with_migrations(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= through)
+                    .cloned()
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap();
         let unaffected:i64=sqlx::query_scalar("SELECT count(*) FROM enrichment_jobs WHERE item_id IN ('empty','unmatched') AND (state<>'done' OR request_generation<>0)").fetch_one(s.db.read_pool()).await.unwrap();
         assert_eq!(unaffected, 0);
         for state in ["done", "running", "retry", "blocked", "pending"] {
@@ -217,7 +246,7 @@ mod tests {
                     "lease".into(),
                     999,
                     "failure".into(),
-                    1
+                    expected_generation
                 )
             );
         }
@@ -264,7 +293,18 @@ mod tests {
             .unwrap();
         tx.commit().await.unwrap();
         s.close().await;
-        let s = Store::open(&path).await.unwrap();
+        let s = open(
+            &path,
+            Migrator::with_migrations(
+                MIGRATOR
+                    .iter()
+                    .filter(|m| m.version <= through)
+                    .cloned()
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap();
         let again:Vec<(String,String,i64)>=sqlx::query_as("SELECT item_id,provider,request_generation FROM enrichment_jobs ORDER BY item_id,provider").fetch_all(s.db.read_pool()).await.unwrap();
         assert_eq!(again, generations);
         let pending: i64 =

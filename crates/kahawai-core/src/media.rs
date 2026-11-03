@@ -110,6 +110,9 @@ pub struct MediaInfo {
     /// cover/folder/poster image, path relative to the collection root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub artwork: Option<String>,
+    /// Additional local image roles, with paths relative to the collection root.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub artwork_images: std::collections::BTreeMap<String, String>,
     /// Season-specific sidecars advertised by this source. None predates
     /// discovery; an empty list records that the directory was inspected.
     #[serde(default, skip_serializing_if = "Option::is_none")]
