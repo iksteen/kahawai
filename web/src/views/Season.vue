@@ -11,6 +11,7 @@ import { computed, ref, watch } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 
 import Btn from '../components/Btn.vue'
+import DetailHead from '../components/DetailHead.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
 import Art from '../components/Art.vue'
@@ -92,6 +93,11 @@ const watched = computed(
 )
 const allSeen = computed(
   () => (children.total.value ?? 0) > 0 && watched.value === children.total.value,
+)
+const counts = computed(() =>
+  mine.value === undefined
+    ? ''
+    : `${children.total.value ?? mine.value.length} episodes · ${watched.value} watched`,
 )
 
 /// Which still is open underneath the strip. The episode itself is fetched per
@@ -177,17 +183,25 @@ function play(id: string, fromStart = false) {
       >← {{ show.data.value?.title ?? 'Series' }}</Btn
     >
 
-    <div class="mb-4 flex flex-wrap items-baseline gap-3">
-      <h1 class="text-[22px] font-[650] tracking-[0.01em]">
+    <component
+      :is="show.data.value ? DetailHead : 'div'"
+      v-bind="
+        show.data.value
+          ? {
+              item: show.data.value,
+              season,
+              heading: seasonLabel(season, projected),
+              progress: null,
+              subline: [show.data.value.title, counts].filter(Boolean).join(' · '),
+            }
+          : {}
+      "
+      class="mb-4"
+    >
+      <h1 v-if="!show.data.value" class="text-[22px] font-[650]">
         {{ seasonLabel(season, projected) }}
       </h1>
-      <span class="font-mono text-dim">
-        {{
-          mine === undefined
-            ? ''
-            : `${children.total.value ?? mine.length} episodes · ${watched} watched`
-        }}
-      </span>
+      <p v-if="!show.data.value" class="font-mono text-dim">{{ counts }}</p>
       <!-- One press for a season somebody has already watched elsewhere.
            WHICH episodes are in it is decided here, because the season a
            viewer sees can be a projection of absolute numbering. -->
@@ -215,7 +229,7 @@ function play(id: string, fromStart = false) {
         <Icon name="check" :size="13" />
         {{ allSeen ? 'Mark none watched' : 'Mark all watched' }}
       </Btn>
-    </div>
+    </component>
 
     <!-- A hand-typed or stale season number renders a heading, an empty strip
          and two dead arrows, which reads as broken rather than as empty. -->

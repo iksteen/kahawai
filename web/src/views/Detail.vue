@@ -21,6 +21,8 @@ import MatchButton from '../components/MatchButton.vue'
 import CapabilityDebug from '../components/CapabilityDebug.vue'
 import SubtitlePanel from '../components/SubtitlePanel.vue'
 import DetailHead from '../components/DetailHead.vue'
+import Art from '../components/Art.vue'
+import CastList from '../components/CastList.vue'
 import Failed from '../components/Failed.vue'
 import Icon from '../components/Icon.vue'
 import { childCount, continueAt, discsIn, ordered, seasonsIn } from '../domain/detail.ts'
@@ -543,6 +545,13 @@ function markSeason(season: number | null, played: boolean) {
       </template>
     </DetailHead>
 
+    <CastList
+      v-if="item.kind !== 'album' && item.kind !== 'song' && item.metadata?.cast?.length"
+      :cast="item.metadata.cast"
+      :item="item.id"
+      :library="item.library_id"
+    />
+
     <!-- A series -->
     <template v-if="item.kind === 'series'">
       <!-- Always in the document, and empty most of the time: a live region
@@ -566,7 +575,15 @@ function markSeason(season: number | null, played: boolean) {
       </p>
 
       <section v-for="season in seasons" :key="String(season)" class="mt-6">
-        <div class="mb-2 flex items-baseline gap-3">
+        <div class="mb-3 flex flex-wrap items-center gap-3">
+          <button
+            class="w-14 shrink-0 cursor-pointer rounded focus-visible:outline-teal"
+            type="button"
+            :aria-label="`Open ${seasonLabel(season, projected)}`"
+            @click="openSeason(season)"
+          >
+            <Art :item="item" size="thumb" :season="season" :progress="false" />
+          </button>
           <!-- The heading is the way into the season's own page, where the
                episodes are stills rather than rows. -->
           <h2 class="m-0">
@@ -599,27 +616,31 @@ function markSeason(season: number | null, played: boolean) {
             class="flex items-center gap-2 border-b border-hairline last:border-0"
           >
             <button
-              class="flex flex-1 cursor-pointer items-center gap-3 py-2 text-left hover:text-teal"
+              class="flex min-w-0 flex-1 cursor-pointer items-center gap-3 py-2 text-left hover:text-teal"
               type="button"
               @click="openItem(episode.id)"
             >
-              <span class="w-16 shrink-0 font-mono text-[12px] text-dim">
-                {{
-                  seLabel(
-                    seasonOf(episode, projected),
-                    episodeOf(episode, projected),
-                    episode.episode_end,
-                  )
-                }}
-                <!-- Under a projection the file's own number is still worth
-                     showing: it is what the filename says. -->
-                <span v-if="projected" class="text-dimmer">#{{ episode.episode }}</span>
+              <span class="w-20 shrink-0 sm:w-28" style="--card-ratio: 16 / 9">
+                <Art :item="episode" size="card1x" />
               </span>
-              <span class="flex-1 truncate">{{ episode.title }}</span>
-              <span v-if="episode.id === next?.id && !episode.played" class="chip-sand">
-                next up
+              <span class="min-w-0 flex-1">
+                <span class="mb-1 flex flex-wrap items-center gap-2 font-mono text-[12px] text-dim">
+                  {{
+                    seLabel(
+                      seasonOf(episode, projected),
+                      episodeOf(episode, projected),
+                      episode.episode_end,
+                    )
+                  }}
+                  <!-- Keep the file's number alongside its projected number. -->
+                  <span v-if="projected" class="text-dimmer">#{{ episode.episode }}</span>
+                  <span v-if="episode.id === next?.id && !episode.played" class="chip-sand">
+                    next up
+                  </span>
+                </span>
+                <span class="block truncate">{{ episode.title }}</span>
               </span>
-              <span class="w-16 shrink-0 text-right font-mono text-[12px] text-dim">
+              <span class="hidden w-16 shrink-0 text-right font-mono text-[12px] text-dim sm:block">
                 {{
                   !episode.played && episode.resume_position_ms && episode.resume_duration_ms
                     ? `${Math.round(watchedPct(episode) ?? 0)}% in`
@@ -757,22 +778,6 @@ function markSeason(season: number | null, played: boolean) {
 
     <!-- A film or an episode -->
     <template v-else>
-      <!-- Columns, not a wrap. Names are short and characters are not, so a
-           flex wrap packs a ragged line of them across the whole page and the
-           eye has nothing to run down. A grid of 15rem columns inside a 46rem
-           measure gives two or three of them, aligned. -->
-      <section v-if="item.metadata?.cast?.length" class="mt-9 max-w-[46rem]">
-        <h2 class="mb-3 text-[14px] font-[650] tracking-[0.08em] text-dim uppercase">Cast</h2>
-        <ul
-          class="grid grid-cols-[repeat(auto-fill,minmax(15rem,1fr))] gap-x-6 gap-y-[0.15rem] text-[0.85rem] leading-[1.5]"
-        >
-          <li v-for="person in item.metadata.cast" :key="person.name">
-            {{ person.name }}
-            <span v-if="person.role" class="text-dim">as {{ person.role }}</span>
-          </li>
-        </ul>
-      </section>
-
       <!-- What the hub says it would do with this file, for this client. Never
            re-derived here: the point of asking the item what it would serve is
            that the answer comes from the code that will serve it. -->

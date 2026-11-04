@@ -67,4 +67,23 @@ reopening does not schedule the backfill again. Older complete TMDB/TVDB/AniList
 answers discarded these fields, so their richer identified representations use
 new cache questions while retaining old answers. Fanart retains its complete
 response for all image roles. Existing season and subtitle backfills stay
-independent. Client presentation is separate work.
+independent.
+
+## Web presentation
+
+Movie and series detail pages show cached backdrops (or banners when no backdrop
+is selected), clear logos and posters. Episode headings retain their own title.
+Season pages use the selected season cover; the show page has season-cover links
+and lazy episode stills. Cast portraits use provider-qualified IDs through the
+library-scoped cast route, with names and roles retained when photos are absent.
+
+Logos replace the visual title only after loading; the text heading remains
+accessible, and failed images leave a plain readable layout. Narrow screens use
+the backdrop and logo without the poster column. Artwork URLs stay stable across
+watched-state refreshes, retaining browser caches. A deterministic revision of the
+selected image is included in its URL, so changed metadata replaces both successful
+and failed images without reusing the browser's previous decoded image.
+
+Run `cd web && npm run test:csp -- artwork.spec.ts` after building the web bundle
+(with the patched GStreamer environment and `KAHAWAI_SKIP_WEB_BUILD=1`). It checks
+desktop/mobile artwork, missing-image fallbacks, episode stills and season navigation.

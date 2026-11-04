@@ -252,7 +252,8 @@ audio/video byte separation for manual playback testing; see
       participate; migration 12 backfills once without stealing running claims or
       discarding retries/blocks. Each provider cover is prefetched independently
       of the winning answer (see `season-artwork.md`). Android season cards and
-      selected-season pages consume these covers; web presentation follows.
+      selected-season pages consume these covers; web season links and selected-season
+      headers also use them.
       Logos, banners, backdrops and cast headshots resolve independently with
       provenance, through cache-only, library-scoped image reads. TMDB/TVDB,
       Fanart, AniList banners and local sidecars participate where supported.
@@ -260,7 +261,9 @@ audio/video byte separation for manual playback testing; see
       cast are read directly. Episode stills and headshots join the existing
       prefetch lanes. Migration 13 backfills matched source-backed titles once,
       preserving claims, retries, blocks and caches; transparent resizes retain
-      alpha. See `title-artwork.md`. Client presentation is pending.
+      alpha. Web detail pages show cached logos/backdrops (with banner fallback),
+      cast portraits and episode stills, with responsive layouts and missing-image
+      fallbacks. See `title-artwork.md`.
 - [x] HUB-7 Provider rate limits/caching. One queue per provider host
       (`hub/gate.rs`) spaced at each provider's documented limit, 429/503
       parks that provider alone; caching is the permanent answer store

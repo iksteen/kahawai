@@ -3,12 +3,7 @@
 /// silently.
 
 import { mount } from '@vue/test-utils'
-import { describe, expect, test, vi } from 'vitest'
-
-vi.mock('../src/api/generated/kahawai.ts', () => ({
-  getCatalogueArtworkUrl: (library: string, id: string, params?: { size?: string }) =>
-    `/api/v1/catalogue/libraries/${library}/items/${id}/artwork${params?.size ? `?size=${params.size}` : ''}`,
-}))
+import { describe, expect, test } from 'vitest'
 
 const DetailHead = (await import('../src/components/DetailHead.vue')).default
 
@@ -108,5 +103,89 @@ describe('the artwork', () => {
     return wrapper.vm.$nextTick().then(() => {
       expect(wrapper.find('img').classes()).toContain('invisible')
     })
+  })
+})
+
+describe('additional cached artwork', () => {
+  test('replacing selected images changes the actual sources, including both poster densities', async () => {
+    const metadata = { artwork: ['poster-first'], logo: 'logo-first', backdrop: 'backdrop-first' }
+    const wrapper = head({ metadata })
+    const sources = () => wrapper.findAll('img').map((image) => image.attributes('src'))
+    const previous = sources()
+    const previousSrcset = wrapper.find('.art-box img').attributes('srcset')
+    await wrapper.setProps({
+      item: item({
+        metadata: { artwork: ['poster-second'], logo: 'logo-second', backdrop: 'backdrop-second' },
+      }),
+    })
+    const replacements = sources()
+    expect(replacements).toHaveLength(previous.length)
+    replacements.forEach((source, index) => expect(source).not.toBe(previous[index]))
+    expect(wrapper.find('.art-box img').attributes('srcset')).not.toBe(previousSrcset)
+    await wrapper.setProps({
+      item: item({
+        played: true,
+        metadata: {
+          artwork: ['poster-second'],
+          logo: 'logo-second',
+          backdrop: 'backdrop-second',
+          rating: 9,
+        },
+      }),
+    })
+    expect(sources()).toEqual(replacements)
+  })
+
+  test('uses a backdrop and logo from this library, retaining an accessible heading', async () => {
+    const wrapper = head({
+      metadata: { backdrop: 'https://provider/backdrop.jpg', logo: 'https://provider/logo.png' },
+    })
+    expect(wrapper.find('.detail-backdrop').attributes('src')).toContain('kind=backdrop')
+    expect(wrapper.html()).not.toContain('src="https://provider/')
+    await wrapper.find('.title-logo img').trigger('load')
+    expect(wrapper.find('h1').classes()).toContain('sr-only')
+    expect(wrapper.find('h1').text()).toContain('Heat')
+    const logo = wrapper.find('.title-logo img').element
+    await wrapper.setProps({
+      item: item({
+        played: true,
+        metadata: { backdrop: 'https://provider/backdrop.jpg', logo: 'https://provider/logo.png' },
+      }),
+    })
+    expect(wrapper.find('.title-logo img').element).toBe(logo)
+    expect(wrapper.find('h1').classes()).toContain('sr-only')
+  })
+
+  test('uses a banner if there is no backdrop and keeps music compact', () => {
+    expect(
+      head({ metadata: { banner: 'banner' } })
+        .find('.detail-backdrop')
+        .attributes('src'),
+    ).toContain('kind=banner')
+    const album = head({ kind: 'album', metadata: { backdrop: 'backdrop', logo: 'logo' } })
+    expect(album.find('.detail-backdrop').exists()).toBe(false)
+    expect(album.find('.title-logo').exists()).toBe(false)
+    expect(album.find('h1').classes()).not.toContain('sr-only')
+  })
+
+  test('failed images leave the title visible and a newly delivered image can retry', async () => {
+    const wrapper = head({ metadata: { logo: 'first', backdrop: 'first' } })
+    await wrapper.find('.title-logo img').trigger('error')
+    await wrapper.find('.detail-backdrop').trigger('error')
+    expect(wrapper.find('.title-logo').exists()).toBe(false)
+    expect(wrapper.find('.detail-backdrop').exists()).toBe(false)
+    expect(wrapper.find('h1').classes()).not.toContain('sr-only')
+    await wrapper.setProps({ item: item({ metadata: { logo: 'second', backdrop: 'second' } }) })
+    expect(wrapper.find('.title-logo img').exists()).toBe(true)
+    expect(wrapper.find('.detail-backdrop').exists()).toBe(true)
+  })
+
+  test('a season uses its cover and keeps the season heading beside the show logo', async () => {
+    const wrapper = head({ metadata: { logo: 'logo' } }, { season: 0, heading: 'Specials' })
+    expect(wrapper.find('.art-box img').attributes('src')).toContain('season=0')
+    expect(wrapper.find('.art-box img').attributes('srcset')).toContain('season=0')
+    await wrapper.find('.title-logo img').trigger('load')
+    expect(wrapper.find('h1').text()).toBe('Specials')
+    expect(wrapper.find('h1').classes()).not.toContain('sr-only')
   })
 })

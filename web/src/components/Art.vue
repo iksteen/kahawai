@@ -47,6 +47,7 @@ const props = withDefaults(
     /// a cache key that lies. The cost is that a re-matched show keeps its old
     /// poster here until the browser's copy expires.
     posterOf?: string | null
+    season?: number | null
   }>(),
   { progress: true, posterOf: null },
 )
@@ -62,7 +63,9 @@ const artVersion = computed(() => (props.posterOf ? undefined : props.item.art_v
 // Grid cells are reused when matching reorders the library. A failed poster
 // belongs to its URL, not to the cell that happened to display it.
 const source = computed(() =>
-  artworkUrl(artId.value, artVersion.value, props.size, props.item.library_id),
+  artworkUrl(artId.value, artVersion.value, props.size, props.item.library_id, {
+    ...(props.season !== undefined ? { season: props.season } : {}),
+  }),
 )
 watch(source, () => (broken.value = false))
 const done = computed(() => (props.progress ? watchedPct(props.item) : null))
@@ -87,7 +90,11 @@ const glyph = computed(() => kindGlyph(props.item.kind))
       :class="broken && 'invisible'"
       :src="source"
       :srcset="
-        props.size === 'card' ? artworkSrcSet(artId, artVersion, props.item.library_id) : undefined
+        props.size === 'card'
+          ? artworkSrcSet(artId, artVersion, props.item.library_id, {
+              ...(props.season !== undefined ? { season: props.season } : {}),
+            })
+          : undefined
       "
       loading="lazy"
       alt=""

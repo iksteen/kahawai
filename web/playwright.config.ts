@@ -4,7 +4,12 @@ const port = 18420
 
 export default defineConfig({
   testDir: './test/browser',
-  testMatch: ['csp.spec.ts', 'browse-scroll.spec.ts', 'player-fullscreen.spec.ts'],
+  testMatch: [
+    'csp.spec.ts',
+    'browse-scroll.spec.ts',
+    'player-fullscreen.spec.ts',
+    'artwork.spec.ts',
+  ],
   fullyParallel: false,
   workers: 1,
   retries: process.env.CI ? 1 : 0,
