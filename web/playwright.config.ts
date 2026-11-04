@@ -9,6 +9,7 @@ export default defineConfig({
     'browse-scroll.spec.ts',
     'player-fullscreen.spec.ts',
     'artwork.spec.ts',
+    'subtitle-kind.spec.ts',
   ],
   fullyParallel: false,
   workers: 1,

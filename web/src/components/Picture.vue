@@ -61,6 +61,7 @@ import {
   type SessionEvent,
 } from '../domain/player-session.ts'
 import { initialSubtitle, needsBurnRestart } from '../domain/track-choice.ts'
+import { subtitleKindPreference, SUBTITLE_KIND, LEGACY_WEB_SUBTITLE_KIND } from '../domain/prefs.ts'
 import { chapterTicks } from '../domain/chapters.ts'
 import { hms } from '../domain/label.ts'
 import type { Segment } from '../api/generated/model/segment.ts'
@@ -378,7 +379,17 @@ function resolve() {
       : undefined
     if (props.carried?.subKey && !carried)
       playerNote('The previously selected subtitle is unavailable on this source.')
-    const pick = carried ?? initialSubtitle({ subs, exactId: subTrackWish, wishlist: subsWish })
+    const pick =
+      carried ??
+      initialSubtitle({
+        subs,
+        exactId: subTrackWish,
+        wishlist: subsWish,
+        kind: subtitleKindPreference(
+          props.prefs.find((p) => p.scope === '' && p.key === SUBTITLE_KIND)?.value ??
+            props.prefs.find((p) => p.scope === '' && p.key === LEGACY_WEB_SUBTITLE_KIND)?.value,
+        ),
+      })
     if (!pick) return
     // Never overrides a choice already made.
     sendTrack({ type: 'subtitle-chosen', key: String(pick.id), onlyIfUnset: true })

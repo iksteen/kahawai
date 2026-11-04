@@ -173,6 +173,40 @@ describe('the bandwidth ceiling', () => {
   })
 })
 
+describe('subtitle type', () => {
+  test.each(['forced', 'regular', 'sdh'])(
+    'defaults to automatic and saves %s as an account preference',
+    async (kind) => {
+      const wrapper = await open()
+      const field = wrapper.get('#subtitle-kind')
+      expect((field.element as HTMLSelectElement).value).toBe('')
+      await field.setValue(kind)
+      await flushPromises()
+      expect(putPref).toHaveBeenCalledWith({ scope: '', key: 'subs.kind', value: kind })
+    },
+  )
+
+  test('restores a saved choice and clears it back to automatic', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'sdh' }) as never)
+    const wrapper = await open()
+    const field = wrapper.get('#subtitle-kind')
+    expect((field.element as HTMLSelectElement).value).toBe('sdh')
+    await field.setValue('')
+    await flushPromises()
+    expect(putPref).toHaveBeenCalledWith({ scope: '', key: 'subs.kind', value: '' })
+  })
+
+  test('a failed save restores the confirmed type', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'forced' }) as never)
+    vi.mocked(putPref).mockRejectedValue(new ApiError(500, 'nope'))
+    const wrapper = await open()
+    await wrapper.get('#subtitle-kind').setValue('sdh')
+    await flushPromises()
+    expect((wrapper.get('#subtitle-kind').element as HTMLSelectElement).value).toBe('forced')
+    expect(notice.value).toContain('Could not save')
+  })
+})
+
 describe('loudness normalization', () => {
   test('defaults to encoded audio and stores force mode', async () => {
     const wrapper = await open()

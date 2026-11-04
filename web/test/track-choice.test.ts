@@ -2,6 +2,7 @@ import { expect, test } from 'vitest'
 import { initialSubtitle, needsBurnRestart } from '../src/domain/track-choice.ts'
 import type { PlaybackStreams } from '../src/api/generated/model/playbackStreams.ts'
 import type { TrackListing } from '../src/api/generated/model/trackListing.ts'
+import type { SubtitleKind } from '../src/domain/prefs.ts'
 
 const sub = (p: Partial<TrackListing>) =>
   ({
@@ -47,6 +48,60 @@ test('a language wish takes the full track over the forced one listed first', ()
 test('what a track is outranks how it is drawn', () => {
   const subs = [sub({ id: 1, forced: true, delivery: 'ass' }), sub({ id: 2, delivery: 'text' })]
   expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'] })?.id).toBe(2)
+})
+
+test.each<[SubtitleKind, number]>([
+  ['forced', 1],
+  ['regular', 2],
+  ['sdh', 3],
+])('only %s tracks are selected automatically', (kind, id) => {
+  const subs = [
+    sub({ id: 1, forced: true }),
+    sub({ id: 2 }),
+    sub({ id: 3, hearing_impaired: true }),
+  ]
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kind })?.id).toBe(id)
+  const others = subs.filter((track) => track.id !== id)
+  expect(initialSubtitle({ subs: others, exactId: others[0]!.id, wishlist: ['any'], kind })).toBe(
+    null,
+  )
+})
+
+test('the type filter applies across languages and preserves fidelity within the chosen type', () => {
+  const subs = [
+    sub({ id: 1, language: 'en', forced: true }),
+    sub({ id: 2, language: 'nl', hearing_impaired: true, delivery: 'text' }),
+    sub({ id: 3, language: 'nl', hearing_impaired: true, delivery: 'ass' }),
+  ]
+  expect(initialSubtitle({ subs, exactId: 1, wishlist: ['en', 'nl'], kind: 'sdh' })?.id).toBe(3)
+  expect(initialSubtitle({ subs, exactId: 2, wishlist: ['en'], kind: 'sdh' })?.id).toBe(2)
+})
+
+test('flags determine type, and forced takes precedence over SDH', () => {
+  const both = sub({ id: 1, forced: true, hearing_impaired: true })
+  const named = sub({ id: 2, label: 'English [SDH]' })
+  expect(
+    initialSubtitle({ subs: [both, named], exactId: null, wishlist: ['en'], kind: 'sdh' }),
+  ).toBe(null)
+  expect(
+    initialSubtitle({ subs: [both], exactId: null, wishlist: ['en'], kind: 'forced' })?.id,
+  ).toBe(1)
+  expect(
+    initialSubtitle({ subs: [both, named], exactId: null, wishlist: ['en'], kind: 'regular' })?.id,
+  ).toBe(2)
+})
+
+test('a type preference never auto-selects unavailable, commentary, bitmap or burn tracks', () => {
+  const subs = [
+    sub({ id: 1, forced: true, delivery: 'none' }),
+    sub({ id: 2, forced: true, commentary: true }),
+    sub({ id: 3, forced: true, format: 'pgs', delivery: 'overlay' }),
+    sub({ id: 4, forced: true, delivery: 'burn' }),
+  ]
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kind: 'forced' })).toBe(null)
+  expect(
+    initialSubtitle({ subs: [sub({ forced: true })], exactId: null, wishlist: [], kind: 'forced' }),
+  ).toBe(null)
 })
 
 test('no memory and no match is no subtitle', () => {

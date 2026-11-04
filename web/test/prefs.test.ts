@@ -9,9 +9,16 @@ import {
   bandwidthValue,
   ORIGINAL,
   stored,
+  subtitleKindPreference,
   validToken,
   wishlist,
 } from '../src/domain/prefs.ts'
+
+test('unknown subtitle type preferences preserve automatic selection', () => {
+  expect(subtitleKindPreference()).toBe(null)
+  expect(subtitleKindPreference('')).toBe(null)
+  expect(subtitleKindPreference('unknown')).toBe(null)
+})
 
 describe('a language token', () => {
   test('is a two- or three-letter code, or the backstop', () => {

@@ -5,6 +5,16 @@
 /// can be served — a masked run changes these answers, not just the wording.
 
 import type { TrackListing } from '../api/generated/model/trackListing.ts'
+import type { SubtitleKind } from './prefs.ts'
+
+/// A forced SDH track is still only a subset of the dialogue: forced takes
+/// precedence so the three choices stay exclusive. Track names are not flags.
+export function matchesSubtitleKind(
+  track: Pick<TrackListing, 'forced' | 'hearing_impaired'>,
+  kind: SubtitleKind | null | undefined,
+): boolean {
+  return !kind || (track.forced ? 'forced' : track.hearing_impaired ? 'sdh' : 'regular') === kind
+}
 
 /// A bitmap track: its cues are pictures, not text.
 export const isImageSub = (track: Pick<TrackListing, 'format'>) =>
@@ -25,7 +35,7 @@ export function pickSubtitle<
     TrackListing,
     'delivery' | 'format' | 'language' | 'forced' | 'hearing_impaired' | 'commentary'
   >,
->(wishlist: string[], subs: T[]): T | null {
+>(wishlist: string[], subs: T[], preferredKind?: SubtitleKind | null): T | null {
   // A commentary track is never what a language wish means.
   const auto = (s: T) =>
     !s.commentary && (s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay')
@@ -45,7 +55,9 @@ export function pickSubtitle<
   const best = (candidates: T[]) =>
     candidates.length === 0 ? null : candidates.reduce((a, b) => (rank(b) < rank(a) ? b : a))
   for (const want of wishlist) {
-    const eligible = subs.filter((s) => auto(s) && !isImageSub(s))
+    const eligible = subs.filter(
+      (s) => auto(s) && !isImageSub(s) && matchesSubtitleKind(s, preferredKind),
+    )
     const hit =
       want === 'any'
         ? best(eligible)

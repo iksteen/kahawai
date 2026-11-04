@@ -1,20 +1,24 @@
 import type { PlaybackStreams } from '../api/generated/model/playbackStreams.ts'
-import { pickSubtitle } from './subtitles.ts'
+import { matchesSubtitleKind, pickSubtitle } from './subtitles.ts'
+import type { SubtitleKind } from './prefs.ts'
 import type { TrackListing } from '../api/generated/model/trackListing.ts'
 
 /// Which subtitle track a session opens with.
 ///
 /// Exact memory first — the id is the only spelling that can name a downloaded
 /// or OCR row, which no language wish will ever match. A remembered track the
-/// hub now says it cannot serve (`delivery: 'none'`) is not a choice, so the
-/// wishlist gets its turn instead of the viewer getting nothing.
+/// hub now says it cannot serve (`delivery: 'none'`), or that fails an explicit
+/// subtitle-kind filter, leaves the choice to the language wishlist.
 export function initialSubtitle(p: {
   subs: TrackListing[]
   exactId: number | null
   wishlist: string[]
+  kind?: SubtitleKind | null
 }): TrackListing | null {
-  const exact = p.subs.find((s) => s.id === p.exactId && s.delivery !== 'none')
-  return exact ?? pickSubtitle(p.wishlist, p.subs)
+  const exact = p.subs.find(
+    (s) => s.id === p.exactId && s.delivery !== 'none' && matchesSubtitleKind(s, p.kind),
+  )
+  return exact ?? pickSubtitle(p.wishlist, p.subs, p.kind)
 }
 
 /// Whether re-applying a remembered burn means restarting the pipeline.

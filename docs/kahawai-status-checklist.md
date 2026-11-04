@@ -782,7 +782,13 @@ audio/video byte separation for manual playback testing; see
       resolves via the stored original_language) and subtitles; explicit
       in-player changes are remembered per series/movie. Resolution is
       client-side: item track id (subs.track, unification) > series
-      memory > per-type settings > track 0 / no subs
+      memory > per-type settings > track 0 / no subs. The account's
+      subtitle-type setting (`subs.kind`) can restrict automatic selection,
+      including remembered tracks, to forced, regular or SDH; absent/unknown
+      values preserve the existing automatic order. No matching type in the
+      preferred languages leaves subtitles off. Explicit in-player choices and
+      their restart recovery remain available. Clients apply this account
+      preference locally.
 - [x] HUB-34 Retrieval efficiency ladder: cache/sidecar → live session tap →
       mediahost sparse/sequential extraction → hub lease, cached at-most-once
       — fonts included: declared attachment ranges serve via exact lease

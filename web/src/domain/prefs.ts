@@ -1,9 +1,8 @@
 /// The settings' own rules: what a language token may be, how a wishlist is
 /// spelled, and what the subtitle ladder means.
 ///
-/// All of it is about a stored string that the hub parses its own way — so
-/// these mirror that parse rather than inventing one, and every list is
-/// written back in the same shape it was read in.
+/// Shared policies mirror the hub's parse; client selection preferences are
+/// opaque to the hub. Every list is written back in the shape it was read in.
 
 /// A language token, or the backstop. Two- and three-letter codes, because
 /// both are in use and the hub accepts either.
@@ -64,6 +63,21 @@ export function wishlist(stored: string, kind: 'audio' | 'subs'): string[] {
 /// And back into the one string the hub stores.
 export function stored(items: string[]): string {
   return items.join(',')
+}
+
+export const SUBTITLE_KIND = 'subs.kind'
+/// Read the previously deployed name until the shared preference is saved.
+export const LEGACY_WEB_SUBTITLE_KIND = 'web.subs.kind'
+export const SUBTITLE_KINDS = [
+  { value: 'forced', label: 'Forced only' },
+  { value: 'regular', label: 'Regular only' },
+  { value: 'sdh', label: 'SDH only' },
+] as const
+export type SubtitleKind = (typeof SUBTITLE_KINDS)[number]['value']
+
+/// Missing or unrecognised values preserve the existing automatic selection.
+export function subtitleKindPreference(value?: string): SubtitleKind | null {
+  return SUBTITLE_KINDS.find((kind) => kind.value === value)?.value ?? null
 }
 
 /// HUB-32: what to do with a styled subtitle track this client cannot render

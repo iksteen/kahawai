@@ -16,9 +16,13 @@ import {
   assLadder,
   bandwidthValue,
   ORIGINAL,
+  LEGACY_WEB_SUBTITLE_KIND,
   stored,
+  SUBTITLE_KINDS,
+  subtitleKindPreference,
   suggestions,
   validToken,
+  SUBTITLE_KIND,
   wishlist,
 } from '../domain/prefs.ts'
 import {
@@ -402,6 +406,33 @@ async function disconnect() {
           >, a community database — directly from your browser, so that site sees your address, this
           server's web address, and the provider id, episode numbering and running time of what you
           are watching. Off unless you turn it on.
+        </p>
+      </section>
+
+      <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">
+        <span class="text-[12.5px] font-[600]">Subtitles</span>
+        <div class="flex flex-wrap items-center gap-2.5">
+          <label for="subtitle-kind" class="font-mono text-[12px] text-dim">Subtitle type</label>
+          <select
+            id="subtitle-kind"
+            class="rounded border border-line bg-bg px-2 py-1 text-[12.5px]"
+            aria-describedby="subtitle-kind-help"
+            :value="
+              subtitleKindPreference(values[SUBTITLE_KIND] ?? values[LEGACY_WEB_SUBTITLE_KIND]) ??
+              ''
+            "
+            @change="save(SUBTITLE_KIND, ($event.target as HTMLSelectElement).value)"
+          >
+            <option value="">Automatic</option>
+            <option v-for="kind in SUBTITLE_KINDS" :key="kind.value" :value="kind.value">
+              {{ kind.label }}
+            </option>
+          </select>
+        </div>
+        <p id="subtitle-kind-help" class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          Limits automatic selection, including saved track choices. If none of your subtitle
+          languages has this type, subtitles stay off. You can still choose another track manually.
+          SDH includes descriptions of sounds and speakers.
         </p>
       </section>
 

@@ -1237,6 +1237,16 @@ describe('a restart keeps the choice the viewer made', () => {
     expect(value(wrapper)).toBe('7')
   })
 
+  test('a restart preserves a manual choice outside the automatic type filter', async () => {
+    const { wrapper } = await watching({
+      item: subbed() as never,
+      prefs: [...wishes, { scope: '', key: 'subs.kind', value: 'forced' }] as never,
+      mediaType: 'movies',
+      carried: { audio: 0, video: 0, subKey: '7' } as never,
+    })
+    expect(value(wrapper)).toBe('7')
+  })
+
   test('and carried-off stays off, even with a wishlist that would pick', async () => {
     const { wrapper } = await watching({
       item: subbed() as never,
@@ -1342,6 +1352,45 @@ describe('choosing subtitles', () => {
     await wrapper.find('[aria-label="Subtitles"]').setValue(value)
     await flushPromises()
   }
+
+  test.each([
+    ['forced', '7'],
+    ['regular', '8'],
+    ['sdh', '9'],
+  ])('opens with %s subtitles and still allows another manual choice', async (kind, selected) => {
+    const { wrapper } = await withSubs(
+      [
+        listing({ id: 7, forced: true }),
+        listing({ id: 8 }),
+        listing({ id: 9, hearing_impaired: true }),
+      ],
+      {
+        mediaType: 'movies',
+        prefs: [
+          { scope: '', key: 'subs.movies', value: 'en' },
+          { scope: '', key: 'subs.kind', value: kind },
+        ],
+      },
+    )
+    const picker = () => wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement
+    expect(picker().value).toBe(selected)
+    expect(picker().options).toHaveLength(4)
+    const manual = selected === '7' ? '8' : '7'
+    await choose(wrapper, manual)
+    expect(picker().value).toBe(manual)
+  })
+
+  test('ignores a saved track of the wrong type, and stays off when no requested type exists', async () => {
+    const { wrapper } = await withSubs([listing({ id: 7, hearing_impaired: true })], {
+      mediaType: 'movies',
+      prefs: [
+        { scope: '', key: 'subs.movies', value: 'en' },
+        { scope: '', key: 'subs.kind', value: 'forced' },
+        { scope: 'source:heat-copy:1', key: 'subs.track', value: '7' },
+      ],
+    })
+    expect((wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe('')
+  })
 
   test('playback updates leave an open subtitle picker alone', async () => {
     const { wrapper, element } = await withSubs([listing(), listing({ id: 8, language: 'nld' })])
