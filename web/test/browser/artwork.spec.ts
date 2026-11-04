@@ -71,7 +71,12 @@ async function catalogue(page: Page, missing = false) {
         copy_ids: [],
         representative_id: 'copy',
         played: false,
-        metadata,
+        metadata: id.startsWith('episode-')
+          ? { description: {}, provenance: {}, providers: {} }
+          : metadata,
+        ...(id.startsWith('episode-')
+          ? { child: child(Number(id.slice(8))), parent_title: 'The Series' }
+          : {}),
         sources: [],
         copies: [],
         chapters: [],
@@ -82,6 +87,26 @@ async function catalogue(page: Page, missing = false) {
   })
   return errors
 }
+
+test('episode pages keep their still and borrow a cached series backdrop', async ({
+  page,
+}, testInfo) => {
+  const errors = await catalogue(page)
+  const reads: string[] = []
+  page.on('request', (request) => reads.push(request.url()))
+  await page.goto('/app/library/films/item/episode-1')
+  const background = page.locator('.detail-backdrop')
+  await expect(background).toBeVisible()
+  await expect(background).toHaveAttribute('src', /items\/show\/artwork\?kind=backdrop&v=/)
+  await expect(page.locator('.detail-head .art-box img')).toHaveAttribute(
+    'src',
+    /items\/episode-1\/artwork\?size=card/,
+  )
+  await expect(page.getByRole('heading', { level: 1 })).toHaveText('Episode 1')
+  expect(reads.some((url) => url.includes('/items/show/playback'))).toBe(false)
+  await page.screenshot({ path: testInfo.outputPath('episode-backdrop.png'), fullPage: true })
+  expect(errors).toEqual([])
+})
 
 test('changed metadata replaces decoded artwork without bypassing caches on ordinary refreshes', async ({
   page,

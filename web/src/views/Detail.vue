@@ -47,6 +47,7 @@ import {
 } from '../domain/label.ts'
 import { chapterTitle } from '../domain/chapters.ts'
 import { adminItemLog } from '../api/generated/kahawai.ts'
+import { catalogueDetail } from '../api/catalogue.ts'
 import { useLibraries } from '../composables/catalogue.ts'
 import { notify } from '../composables/notices.ts'
 import { loadMask } from '../api/capabilities.ts'
@@ -119,6 +120,24 @@ const item = computed(() =>
   sourceOverride.value === undefined
     ? query.data.value
     : (sourceQuery.data.value ?? query.data.value),
+)
+// Only episodes missing their own background need their series metadata.
+// This is a descriptive GET, without playback negotiation. Query keys include
+// the library so navigation cannot borrow artwork from a previous library.
+const backgroundParent = computed(() =>
+  item.value?.kind === 'episode' && !item.value.metadata?.backdrop && !item.value.metadata?.banner
+    ? (item.value.parent_id ?? '')
+    : '',
+)
+const seriesBackground = useQuery({
+  queryKey: computed(() => ['backdrop', library.value, backgroundParent.value]),
+  enabled: computed(() => !!library.value && !!backgroundParent.value),
+  queryFn: () => catalogueDetail(library.value, backgroundParent.value),
+})
+const backgroundItem = computed(() =>
+  backgroundParent.value && seriesBackground.data.value?.id === backgroundParent.value
+    ? seriesBackground.data.value
+    : undefined,
 )
 const sourceFailure = computed(() =>
   sourceOverride.value === undefined
@@ -456,6 +475,7 @@ function markSeason(season: number | null, played: boolean) {
     <DetailHead
       :item="item"
       :subline="subline"
+      :background-item="backgroundItem"
       :progress="item.kind === 'series' ? null : undefined"
     >
       <template v-if="item.kind === 'series'">

@@ -156,6 +156,46 @@ describe('additional cached artwork', () => {
     expect(wrapper.find('h1').classes()).toContain('sr-only')
   })
 
+  test('borrows the series background without replacing the episode still or title', async () => {
+    const series = { id: 'show', library_id: 'films', metadata: { backdrop: 'series-background' } }
+    const wrapper = head(
+      { id: 'episode', kind: 'episode', metadata: { artwork: ['still'] } },
+      { backgroundItem: series },
+    )
+    const url = wrapper.get('.detail-backdrop').attributes('src')
+    expect(url).toContain('/items/show/artwork?kind=backdrop')
+    expect(url).toContain('v=')
+    expect(wrapper.get('.art-box img').attributes('src')).toContain(
+      '/items/episode/artwork?size=card',
+    )
+    expect(wrapper.find('.title-logo').exists()).toBe(false)
+    const img = wrapper.get('.detail-backdrop').element
+    await wrapper.setProps({ backgroundItem: { ...series } })
+    expect(wrapper.get('.detail-backdrop').element).toBe(img)
+    await wrapper.setProps({ backgroundItem: { ...series, metadata: { backdrop: 'replacement' } } })
+    expect(wrapper.get('.detail-backdrop').attributes('src')).not.toBe(url)
+    await wrapper.setProps({ backgroundItem: { ...series, metadata: { banner: 'wide-banner' } } })
+    expect(wrapper.get('.detail-backdrop').attributes('src')).toContain('kind=banner')
+    await wrapper.setProps({ backgroundItem: undefined })
+    expect(wrapper.find('.detail-backdrop').exists()).toBe(false)
+  })
+
+  test('an item background takes precedence over borrowed artwork', () => {
+    const wrapper = head(
+      { id: 'episode', kind: 'episode', metadata: { backdrop: 'own-background' } },
+      {
+        backgroundItem: {
+          id: 'show',
+          library_id: 'films',
+          metadata: { backdrop: 'series-background' },
+        },
+      },
+    )
+    expect(wrapper.get('.detail-backdrop').attributes('src')).toContain(
+      '/items/episode/artwork?kind=backdrop',
+    )
+  })
+
   test('uses a banner if there is no backdrop and keeps music compact', () => {
     expect(
       head({ metadata: { banner: 'banner' } })

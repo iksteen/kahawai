@@ -1661,6 +1661,58 @@ describe('the season page, in more detail', () => {
   })
 })
 
+describe('episode backgrounds', () => {
+  test('loads the series background from the episode library without negotiating playback', async () => {
+    vi.mocked(catalogueDetail).mockImplementation(
+      async (_library, id) =>
+        film(
+          id === 'episode'
+            ? { id, kind: 'episode', parent_id: 'show', metadata: { artwork: ['still'] } }
+            : {
+                id,
+                kind: 'series',
+                library_id: 'shows',
+                metadata: { backdrop: 'series-background' },
+              },
+        ) as never,
+    )
+    const { wrapper, router } = await open(Detail, '/library/shows/item/episode')
+    expect(catalogueDetail).toHaveBeenCalledWith('shows', 'show')
+    expect(wrapper.findComponent({ name: 'DetailHead' }).props('backgroundItem')?.id).toBe('show')
+    expect(wrapper.get('.detail-backdrop').attributes('src')).toContain(
+      '/libraries/shows/items/show/artwork',
+    )
+    expect(wrapper.get('.art-box img').attributes('src')).toContain('/items/episode/artwork')
+    await router.push('/library/shows/item/other')
+    await flushPromises()
+    expect(wrapper.findComponent({ name: 'DetailHead' }).props('backgroundItem')).toBeUndefined()
+  })
+
+  test('a failed series lookup leaves the episode usable without a backdrop', async () => {
+    vi.mocked(catalogueDetail).mockImplementation(async (_library, id) => {
+      if (id === 'show') throw new ApiError(404, 'missing series')
+      return film({ id, kind: 'episode', parent_id: 'show' }) as never
+    })
+    const { wrapper } = await open(Detail, '/library/shows/item/episode')
+    expect(wrapper.get('h1').text()).toContain('Heat')
+    expect(wrapper.find('.detail-backdrop').exists()).toBe(false)
+    expect(wrapper.text()).not.toContain('Could not load this item')
+  })
+
+  test('does not fetch a series when the episode already has a background', async () => {
+    vi.mocked(catalogueDetail).mockResolvedValue(
+      film({
+        id: 'episode',
+        kind: 'episode',
+        parent_id: 'show',
+        metadata: { backdrop: 'own-background' },
+      }) as never,
+    )
+    await open(Detail, '/library/shows/item/episode')
+    expect(vi.mocked(catalogueDetail).mock.calls.map((call) => call[1])).not.toContain('show')
+  })
+})
+
 describe('what an item page does not ask for', () => {
   test('a film has no children, so none are asked for', async () => {
     await open(Detail, '/library/films/item/heat')

@@ -263,7 +263,8 @@ audio/video byte separation for manual playback testing; see
       preserving claims, retries, blocks and caches; transparent resizes retain
       alpha. Web detail pages show cached logos/backdrops (with banner fallback),
       cast portraits and episode stills, with responsive layouts and missing-image
-      fallbacks. See `title-artwork.md`.
+      fallbacks. Episode pages borrow their series background while keeping their
+      own still and description. See `title-artwork.md`.
 - [x] HUB-7 Provider rate limits/caching. One queue per provider host
       (`hub/gate.rs`) spaced at each provider's documented limit, 429/503
       parks that provider alone; caching is the permanent answer store

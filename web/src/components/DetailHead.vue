@@ -26,6 +26,15 @@ const props = defineProps<{
   /// it — a show counts episodes, an album counts tracks, a film says how long
   /// it is.
   subline: string
+  /// An episode can borrow its series background without borrowing its still,
+  /// title or description. The owner's metadata also pins the browser cache.
+  backgroundItem?:
+    | {
+        id: string
+        library_id?: string | null
+        metadata?: Description | null
+      }
+    | undefined
   /// How far through, or null when it has not been started, or absent to read
   /// it off the item. A series says nothing here: its progress is the season
   /// counts under it.
@@ -47,14 +56,23 @@ const source = computed(() =>
 watch(source, () => (broken.value = false))
 // Keep the browser cache. Only a changed selected image resets a failed load;
 // watched-state refreshes keep the same URL and must not remount images.
+const backgroundOwner = computed(() =>
+  props.item.metadata?.backdrop || props.item.metadata?.banner
+    ? props.item
+    : (props.backgroundItem ?? props.item),
+)
 const backgroundKind = computed(() =>
-  props.item.metadata?.backdrop ? 'backdrop' : props.item.metadata?.banner ? 'banner' : null,
+  backgroundOwner.value.metadata?.backdrop
+    ? 'backdrop'
+    : backgroundOwner.value.metadata?.banner
+      ? 'banner'
+      : null,
 )
 const background = computed(() =>
   video.value && backgroundKind.value
-    ? artworkUrl(props.item.id, null, undefined, props.item.library_id, {
+    ? artworkUrl(backgroundOwner.value.id, null, undefined, backgroundOwner.value.library_id, {
         kind: backgroundKind.value,
-        image: props.item.metadata?.[backgroundKind.value] ?? null,
+        image: backgroundOwner.value.metadata?.[backgroundKind.value] ?? null,
       })
     : '',
 )
