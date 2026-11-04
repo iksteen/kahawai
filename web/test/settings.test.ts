@@ -173,36 +173,67 @@ describe('the bandwidth ceiling', () => {
   })
 })
 
-describe('subtitle type', () => {
-  test.each(['forced', 'regular', 'sdh'])(
-    'defaults to automatic and saves %s as an account preference',
-    async (kind) => {
-      const wrapper = await open()
-      const field = wrapper.get('#subtitle-kind')
-      expect((field.element as HTMLSelectElement).value).toBe('')
-      await field.setValue(kind)
-      await flushPromises()
-      expect(putPref).toHaveBeenCalledWith({ scope: '', key: 'subs.kind', value: kind })
-    },
-  )
+describe('subtitle type order', () => {
+  const list = (wrapper: Awaited<ReturnType<typeof open>>) =>
+    wrapper.get('[aria-label="Subtitle types, in order"]')
+  const names = (wrapper: Awaited<ReturnType<typeof open>>) =>
+    list(wrapper)
+      .findAll('li')
+      .map((row) => row.attributes('aria-label')?.split(',')[0])
 
-  test('restores a saved choice and clears it back to automatic', async () => {
-    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'sdh' }) as never)
+  test('defaults to regular, SDH, forced and saves the reordered list', async () => {
     const wrapper = await open()
-    const field = wrapper.get('#subtitle-kind')
-    expect((field.element as HTMLSelectElement).value).toBe('sdh')
-    await field.setValue('')
+    expect(names(wrapper)).toEqual(['Regular', 'SDH', 'Forced'])
+    expect(list(wrapper).findAll('button')).toHaveLength(0)
+    await list(wrapper).findAll('li')[1]!.trigger('keydown', { key: 'ArrowUp' })
     await flushPromises()
-    expect(putPref).toHaveBeenCalledWith({ scope: '', key: 'subs.kind', value: '' })
+    expect(names(wrapper)).toEqual(['SDH', 'Regular', 'Forced'])
+    expect(putPref).toHaveBeenCalledWith({
+      scope: '',
+      key: 'subs.kind',
+      value: 'sdh,regular,forced',
+    })
   })
 
-  test('a failed save restores the confirmed type', async () => {
-    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'forced' }) as never)
+  test('restores a saved order, including a legacy single-type preference', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'forced,sdh,regular' }) as never)
+    expect(names(await open())).toEqual(['Forced', 'SDH', 'Regular'])
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'sdh' }) as never)
+    expect(names(await open())).toEqual(['SDH', 'Regular', 'Forced'])
+  })
+
+  test('reads an older preference but saves changes under the shared key', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'web.subs.kind': 'sdh,forced,regular' }) as never)
+    const wrapper = await open()
+    expect(names(wrapper)).toEqual(['SDH', 'Forced', 'Regular'])
+    expect(wrapper.text()).not.toContain('Web subtitles')
+    await list(wrapper).findAll('li')[1]!.trigger('keydown', { key: 'ArrowUp' })
+    await flushPromises()
+    expect(putPref).toHaveBeenCalledWith({
+      scope: '',
+      key: 'subs.kind',
+      value: 'forced,sdh,regular',
+    })
+    expect(putPref).not.toHaveBeenCalledWith(expect.objectContaining({ key: 'web.subs.kind' }))
+  })
+
+  test.each([
+    ['regular,forced,sdh', ['Regular', 'Forced', 'SDH']],
+    ['', ['Regular', 'SDH', 'Forced']],
+  ])('the shared value %s overrides the legacy preference', async (value, expected) => {
+    vi.mocked(getPrefs).mockResolvedValue(
+      prefs({ 'web.subs.kind': 'forced', 'subs.kind': value as string }) as never,
+    )
+    expect(names(await open())).toEqual(expected)
+  })
+
+  test('a failed save restores the confirmed order', async () => {
+    vi.mocked(getPrefs).mockResolvedValue(prefs({ 'subs.kind': 'forced,regular,sdh' }) as never)
     vi.mocked(putPref).mockRejectedValue(new ApiError(500, 'nope'))
     const wrapper = await open()
-    await wrapper.get('#subtitle-kind').setValue('sdh')
+    await list(wrapper).findAll('li')[1]!.trigger('keydown', { key: 'ArrowUp' })
     await flushPromises()
-    expect((wrapper.get('#subtitle-kind').element as HTMLSelectElement).value).toBe('forced')
+    expect(names(wrapper)).toEqual(['Forced', 'Regular', 'SDH'])
     expect(notice.value).toContain('Could not save')
   })
 })

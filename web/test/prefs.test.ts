@@ -9,15 +9,21 @@ import {
   bandwidthValue,
   ORIGINAL,
   stored,
-  subtitleKindPreference,
+  subtitleKindOrder,
   validToken,
   wishlist,
 } from '../src/domain/prefs.ts'
 
-test('unknown subtitle type preferences preserve automatic selection', () => {
-  expect(subtitleKindPreference()).toBe(null)
-  expect(subtitleKindPreference('')).toBe(null)
-  expect(subtitleKindPreference('unknown')).toBe(null)
+test('subtitle types default to regular, SDH, forced', () => {
+  for (const value of [undefined, '', 'unknown']) {
+    expect(subtitleKindOrder(value)).toEqual(['regular', 'sdh', 'forced'])
+  }
+})
+
+test('subtitle type order preserves priority and completes missing fallbacks', () => {
+  expect(subtitleKindOrder('forced,sdh,regular')).toEqual(['forced', 'sdh', 'regular'])
+  expect(subtitleKindOrder('sdh')).toEqual(['sdh', 'regular', 'forced'])
+  expect(subtitleKindOrder(' forced,unknown,forced ')).toEqual(['forced', 'regular', 'sdh'])
 })
 
 describe('a language token', () => {

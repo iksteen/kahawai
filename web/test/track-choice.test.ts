@@ -50,44 +50,69 @@ test('what a track is outranks how it is drawn', () => {
   expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'] })?.id).toBe(2)
 })
 
-test.each<[SubtitleKind, number]>([
-  ['forced', 1],
-  ['regular', 2],
-  ['sdh', 3],
-])('only %s tracks are selected automatically', (kind, id) => {
-  const subs = [
-    sub({ id: 1, forced: true }),
-    sub({ id: 2 }),
-    sub({ id: 3, hearing_impaired: true }),
-  ]
-  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kind })?.id).toBe(id)
-  const others = subs.filter((track) => track.id !== id)
-  expect(initialSubtitle({ subs: others, exactId: others[0]!.id, wishlist: ['any'], kind })).toBe(
-    null,
-  )
+test.each<SubtitleKind[]>([
+  ['forced', 'regular', 'sdh'],
+  ['forced', 'sdh', 'regular'],
+  ['regular', 'forced', 'sdh'],
+  ['regular', 'sdh', 'forced'],
+  ['sdh', 'forced', 'regular'],
+  ['sdh', 'regular', 'forced'],
+])('tries subtitle types in order: %s, %s, %s', (...kindOrder) => {
+  const byKind = {
+    forced: sub({ id: 1, forced: true }),
+    regular: sub({ id: 2 }),
+    sdh: sub({ id: 3, hearing_impaired: true }),
+  }
+  let subs = Object.values(byKind)
+  for (const kind of kindOrder) {
+    expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kindOrder })?.id).toBe(
+      byKind[kind].id,
+    )
+    subs = subs.filter((track) => track.id !== byKind[kind].id)
+  }
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kindOrder })).toBe(null)
 })
 
-test('the type filter applies across languages and preserves fidelity within the chosen type', () => {
+test('language priority comes before type order, then fidelity breaks ties', () => {
   const subs = [
     sub({ id: 1, language: 'en', forced: true }),
     sub({ id: 2, language: 'nl', hearing_impaired: true, delivery: 'text' }),
     sub({ id: 3, language: 'nl', hearing_impaired: true, delivery: 'ass' }),
   ]
-  expect(initialSubtitle({ subs, exactId: 1, wishlist: ['en', 'nl'], kind: 'sdh' })?.id).toBe(3)
-  expect(initialSubtitle({ subs, exactId: 2, wishlist: ['en'], kind: 'sdh' })?.id).toBe(2)
+  const kindOrder: SubtitleKind[] = ['sdh', 'regular', 'forced']
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en', 'nl'], kindOrder })?.id).toBe(1)
+  expect(initialSubtitle({ subs, exactId: null, wishlist: ['nl'], kindOrder })?.id).toBe(3)
+  expect(initialSubtitle({ subs, exactId: 2, wishlist: ['en'], kindOrder })?.id).toBe(2)
 })
 
 test('flags determine type, and forced takes precedence over SDH', () => {
   const both = sub({ id: 1, forced: true, hearing_impaired: true })
   const named = sub({ id: 2, label: 'English [SDH]' })
+  const sdh = sub({ id: 3, hearing_impaired: true })
+  const subs = [both, named, sdh]
   expect(
-    initialSubtitle({ subs: [both, named], exactId: null, wishlist: ['en'], kind: 'sdh' }),
-  ).toBe(null)
+    initialSubtitle({
+      subs,
+      exactId: null,
+      wishlist: ['en'],
+      kindOrder: ['sdh', 'forced', 'regular'],
+    })?.id,
+  ).toBe(3)
   expect(
-    initialSubtitle({ subs: [both], exactId: null, wishlist: ['en'], kind: 'forced' })?.id,
+    initialSubtitle({
+      subs,
+      exactId: null,
+      wishlist: ['en'],
+      kindOrder: ['forced', 'sdh', 'regular'],
+    })?.id,
   ).toBe(1)
   expect(
-    initialSubtitle({ subs: [both, named], exactId: null, wishlist: ['en'], kind: 'regular' })?.id,
+    initialSubtitle({
+      subs,
+      exactId: null,
+      wishlist: ['en'],
+      kindOrder: ['regular', 'sdh', 'forced'],
+    })?.id,
   ).toBe(2)
 })
 
@@ -98,9 +123,21 @@ test('a type preference never auto-selects unavailable, commentary, bitmap or bu
     sub({ id: 3, forced: true, format: 'pgs', delivery: 'overlay' }),
     sub({ id: 4, forced: true, delivery: 'burn' }),
   ]
-  expect(initialSubtitle({ subs, exactId: null, wishlist: ['en'], kind: 'forced' })).toBe(null)
   expect(
-    initialSubtitle({ subs: [sub({ forced: true })], exactId: null, wishlist: [], kind: 'forced' }),
+    initialSubtitle({
+      subs,
+      exactId: null,
+      wishlist: ['en'],
+      kindOrder: ['forced', 'regular', 'sdh'],
+    }),
+  ).toBe(null)
+  expect(
+    initialSubtitle({
+      subs: [sub({ forced: true })],
+      exactId: null,
+      wishlist: [],
+      kindOrder: ['forced', 'regular', 'sdh'],
+    }),
   ).toBe(null)
 })
 

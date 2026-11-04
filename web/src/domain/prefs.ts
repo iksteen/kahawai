@@ -69,15 +69,25 @@ export const SUBTITLE_KIND = 'subs.kind'
 /// Read the previously deployed name until the shared preference is saved.
 export const LEGACY_WEB_SUBTITLE_KIND = 'web.subs.kind'
 export const SUBTITLE_KINDS = [
-  { value: 'forced', label: 'Forced only' },
-  { value: 'regular', label: 'Regular only' },
-  { value: 'sdh', label: 'SDH only' },
+  { value: 'regular', label: 'Regular', note: 'Full dialogue without sound descriptions.' },
+  { value: 'sdh', label: 'SDH', note: 'Dialogue plus descriptions of sounds and speakers.' },
+  {
+    value: 'forced',
+    label: 'Forced',
+    note: 'Only foreign dialogue, signs and other selected lines.',
+  },
 ] as const
 export type SubtitleKind = (typeof SUBTITLE_KINDS)[number]['value']
 
-/// Missing or unrecognised values preserve the existing automatic selection.
-export function subtitleKindPreference(value?: string): SubtitleKind | null {
-  return SUBTITLE_KINDS.find((kind) => kind.value === value)?.value ?? null
+/// Always a complete order. A legacy single-type value becomes the first
+/// preference; missing, duplicate and unknown entries cannot remove fallbacks.
+export function subtitleKindOrder(value = ''): SubtitleKind[] {
+  const all = SUBTITLE_KINDS.map((kind) => kind.value)
+  const parsed = value
+    .split(',')
+    .map((kind) => kind.trim())
+    .filter((kind): kind is SubtitleKind => (all as string[]).includes(kind))
+  return [...new Set([...parsed, ...all])]
 }
 
 /// HUB-32: what to do with a styled subtitle track this client cannot render

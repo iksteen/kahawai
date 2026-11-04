@@ -29,12 +29,12 @@ test.beforeAll(() => {
 })
 test.afterAll(() => rmSync(work, { recursive: true, force: true }))
 
-for (const [kind, selected] of [
-  ['forced', '1'],
-  ['regular', '2'],
-  ['sdh', '3'],
+for (const [order, selected, fallback] of [
+  ['forced,sdh,regular', '1', '3'],
+  ['regular,forced,sdh', '2', '1'],
+  ['sdh,regular,forced', '3', '2'],
 ]) {
-  test(`saved ${kind}-only setting controls web playback and leaves manual choices available`, async ({
+  test(`saved ${order} order controls playback, fallback and manual choices`, async ({
     page,
   }, testInfo) => {
     const errors: string[] = []
@@ -140,21 +140,40 @@ for (const [kind, selected] of [
     })
 
     await page.goto('/app/settings')
-    const field = page.getByLabel('Subtitle type', { exact: true })
-    await expect(field).toHaveValue('')
-    await field.selectOption(kind!)
-    await expect.poll(() => prefs.find((pref) => pref.key === 'subs.kind')?.value).toBe(kind)
+    const list = page.getByRole('list', { name: 'Subtitle types, in order' })
+    const positions = ['regular', 'sdh', 'forced']
+    for (const [target, kind] of order!.split(',').entries()) {
+      let at = positions.indexOf(kind)
+      while (at > target) {
+        await list.getByRole('listitem').nth(at).press('ArrowUp')
+        positions.splice(at - 1, 0, positions.splice(at, 1)[0]!)
+        at--
+      }
+    }
+    await expect.poll(() => prefs.find((pref) => pref.key === 'subs.kind')?.value).toBe(order)
     await page.reload()
-    await expect(field).toHaveValue(kind!)
+    const labels = { regular: 'Regular', sdh: 'SDH', forced: 'Forced' }
+    for (const [at, kind] of order!.split(',').entries()) {
+      await expect(list.getByRole('listitem').nth(at)).toHaveAttribute(
+        'aria-label',
+        new RegExp(`^${labels[kind as keyof typeof labels]},`),
+      )
+    }
     await page
       .locator('section')
-      .filter({ has: field })
-      .screenshot({ path: testInfo.outputPath(`subtitle-${kind}.png`) })
+      .filter({ has: list })
+      .screenshot({ path: testInfo.outputPath(`subtitle-${selected}.png`) })
 
     await page.goto('/app/library/films/item/film/play')
     const picker = page.getByLabel('Subtitles', { exact: true })
     await expect(picker).toHaveValue(selected!)
     await expect(picker.locator('option')).toHaveCount(4)
+    available = tracks.filter((track) => String(track.id) !== selected)
+    await page.reload()
+    await expect(picker).toHaveValue(fallback!)
+    available = tracks
+    await page.reload()
+    await expect(picker).toHaveValue(selected!)
     await page.locator('.videobox').hover()
     const manual = selected === '1' ? '2' : '1'
     await picker.selectOption(manual)
@@ -167,11 +186,13 @@ for (const [kind, selected] of [
       )
       .toBe(manual)
 
-    // A remembered manual choice remains stored, but must not defeat the type
-    // setting on the next fresh playback when no eligible type is available.
-    available = tracks.filter((track) => String(track.id) !== selected)
+    // A manual title choice still wins over the automatic order on reopen.
     await page.reload()
-    await expect(picker).toHaveValue('')
+    await expect(picker).toHaveValue(manual)
+    // If the remembered track disappears, the ordered preference takes over.
+    available = tracks.filter((track) => String(track.id) !== manual)
+    await page.reload()
+    await expect(picker).toHaveValue(selected!)
     expect(errors).toEqual([])
   })
 }

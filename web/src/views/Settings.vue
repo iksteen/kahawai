@@ -19,7 +19,7 @@ import {
   LEGACY_WEB_SUBTITLE_KIND,
   stored,
   SUBTITLE_KINDS,
-  subtitleKindPreference,
+  subtitleKindOrder,
   suggestions,
   validToken,
   SUBTITLE_KIND,
@@ -146,6 +146,14 @@ async function saveBandwidth(typed: string) {
   if (next === (values.value['bandwidth_kbps'] ?? '')) return
   await save('bandwidth_kbps', next)
   bandwidth.value = values.value['bandwidth_kbps'] ?? ''
+}
+
+const subtitleKinds = computed(() =>
+  subtitleKindOrder(values.value[SUBTITLE_KIND] ?? values.value[LEGACY_WEB_SUBTITLE_KIND]),
+)
+function moveSubtitleKind(from: number, to: number) {
+  const next = moved(subtitleKinds.value, from, to)
+  if (next) void save(SUBTITLE_KIND, stored(next))
 }
 
 const ladder = computed(() => assLadder(values.value['ass_order'] ?? ''))
@@ -411,29 +419,19 @@ async function disconnect() {
 
       <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">
         <span class="text-[12.5px] font-[600]">Subtitles</span>
-        <div class="flex flex-wrap items-center gap-2.5">
-          <label for="subtitle-kind" class="font-mono text-[12px] text-dim">Subtitle type</label>
-          <select
-            id="subtitle-kind"
-            class="rounded border border-line bg-bg px-2 py-1 text-[12.5px]"
-            aria-describedby="subtitle-kind-help"
-            :value="
-              subtitleKindPreference(values[SUBTITLE_KIND] ?? values[LEGACY_WEB_SUBTITLE_KIND]) ??
-              ''
-            "
-            @change="save(SUBTITLE_KIND, ($event.target as HTMLSelectElement).value)"
-          >
-            <option value="">Automatic</option>
-            <option v-for="kind in SUBTITLE_KINDS" :key="kind.value" :value="kind.value">
-              {{ kind.label }}
-            </option>
-          </select>
-        </div>
-        <p id="subtitle-kind-help" class="m-0 max-w-[560px] text-[12.5px] text-dim">
-          Limits automatic selection, including saved track choices. If none of your subtitle
-          languages has this type, subtitles stay off. You can still choose another track manually.
-          SDH includes descriptions of sounds and speakers.
+        <p class="m-0 max-w-[560px] text-[12.5px] text-dim">
+          For each preferred language, try subtitle types in this order. If a type is unavailable,
+          try the next one. Drag to reorder, or use the arrow keys on a row. A track you choose
+          manually for a title takes precedence.
         </p>
+        <Ordered
+          :items="subtitleKinds"
+          fixed
+          label="Subtitle types, in order"
+          :display="(kind) => SUBTITLE_KINDS.find((item) => item.value === kind)!.label"
+          :note="(kind) => SUBTITLE_KINDS.find((item) => item.value === kind)!.note"
+          @move="moveSubtitleKind"
+        />
       </section>
 
       <section class="flex flex-col gap-3 rounded-md border border-line bg-surface px-4 py-3.5">

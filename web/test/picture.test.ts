@@ -1237,7 +1237,7 @@ describe('a restart keeps the choice the viewer made', () => {
     expect(value(wrapper)).toBe('7')
   })
 
-  test('a restart preserves a manual choice outside the automatic type filter', async () => {
+  test('a restart preserves a manual choice over the automatic type order', async () => {
     const { wrapper } = await watching({
       item: subbed() as never,
       prefs: [...wishes, { scope: '', key: 'subs.kind', value: 'forced' }] as never,
@@ -1354,9 +1354,9 @@ describe('choosing subtitles', () => {
   }
 
   test.each([
-    ['forced', '7'],
-    ['regular', '8'],
-    ['sdh', '9'],
+    ['forced,sdh,regular', '7'],
+    ['regular,forced,sdh', '8'],
+    ['sdh,regular,forced', '9'],
   ])('opens with %s subtitles and still allows another manual choice', async (kind, selected) => {
     const { wrapper } = await withSubs(
       [
@@ -1380,16 +1380,52 @@ describe('choosing subtitles', () => {
     expect(picker().value).toBe(manual)
   })
 
-  test('ignores a saved track of the wrong type, and stays off when no requested type exists', async () => {
+  test.each([
+    { name: 'uses the deployed legacy key', shared: undefined, selected: '7' },
+    { name: 'prefers the shared key', shared: 'sdh,forced,regular', selected: '9' },
+    { name: 'honours an explicit shared default', shared: '', selected: '8' },
+  ])('$name when selecting subtitles', async ({ shared, selected }) => {
+    const { wrapper } = await withSubs(
+      [
+        listing({ id: 7, forced: true }),
+        listing({ id: 8 }),
+        listing({ id: 9, hearing_impaired: true }),
+      ],
+      {
+        mediaType: 'movies',
+        prefs: [
+          { scope: '', key: 'subs.movies', value: 'en' },
+          { scope: '', key: 'web.subs.kind', value: 'forced,sdh,regular' },
+          ...(shared === undefined ? [] : [{ scope: '', key: 'subs.kind', value: shared }]),
+        ],
+      },
+    )
+    expect((wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe(
+      selected,
+    )
+  })
+
+  test('a saved manual track wins over the type order', async () => {
     const { wrapper } = await withSubs([listing({ id: 7, hearing_impaired: true })], {
       mediaType: 'movies',
       prefs: [
         { scope: '', key: 'subs.movies', value: 'en' },
-        { scope: '', key: 'subs.kind', value: 'forced' },
+        { scope: '', key: 'subs.kind', value: 'forced,regular,sdh' },
         { scope: 'source:heat-copy:1', key: 'subs.track', value: '7' },
       ],
     })
-    expect((wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe('')
+    expect((wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe('7')
+  })
+
+  test('falls back to the next type when the first is unavailable', async () => {
+    const { wrapper } = await withSubs([listing({ id: 7, hearing_impaired: true })], {
+      mediaType: 'movies',
+      prefs: [
+        { scope: '', key: 'subs.movies', value: 'en' },
+        { scope: '', key: 'subs.kind', value: 'forced,sdh,regular' },
+      ],
+    })
+    expect((wrapper.get('[aria-label="Subtitles"]').element as HTMLSelectElement).value).toBe('7')
   })
 
   test('playback updates leave an open subtitle picker alone', async () => {

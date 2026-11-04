@@ -61,7 +61,7 @@ import {
   type SessionEvent,
 } from '../domain/player-session.ts'
 import { initialSubtitle, needsBurnRestart } from '../domain/track-choice.ts'
-import { subtitleKindPreference, SUBTITLE_KIND, LEGACY_WEB_SUBTITLE_KIND } from '../domain/prefs.ts'
+import { subtitleKindOrder, SUBTITLE_KIND, LEGACY_WEB_SUBTITLE_KIND } from '../domain/prefs.ts'
 import { chapterTicks } from '../domain/chapters.ts'
 import { hms } from '../domain/label.ts'
 import type { Segment } from '../api/generated/model/segment.ts'
@@ -385,7 +385,7 @@ function resolve() {
         subs,
         exactId: subTrackWish,
         wishlist: subsWish,
-        kind: subtitleKindPreference(
+        kindOrder: subtitleKindOrder(
           props.prefs.find((p) => p.scope === '' && p.key === SUBTITLE_KIND)?.value ??
             props.prefs.find((p) => p.scope === '' && p.key === LEGACY_WEB_SUBTITLE_KIND)?.value,
         ),

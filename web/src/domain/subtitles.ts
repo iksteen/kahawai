@@ -5,15 +5,14 @@
 /// can be served — a masked run changes these answers, not just the wording.
 
 import type { TrackListing } from '../api/generated/model/trackListing.ts'
-import type { SubtitleKind } from './prefs.ts'
+import { subtitleKindOrder, type SubtitleKind } from './prefs.ts'
 
 /// A forced SDH track is still only a subset of the dialogue: forced takes
 /// precedence so the three choices stay exclusive. Track names are not flags.
-export function matchesSubtitleKind(
+export function subtitleKind(
   track: Pick<TrackListing, 'forced' | 'hearing_impaired'>,
-  kind: SubtitleKind | null | undefined,
-): boolean {
-  return !kind || (track.forced ? 'forced' : track.hearing_impaired ? 'sdh' : 'regular') === kind
+): SubtitleKind {
+  return track.forced ? 'forced' : track.hearing_impaired ? 'sdh' : 'regular'
 }
 
 /// A bitmap track: its cues are pictures, not text.
@@ -35,16 +34,20 @@ export function pickSubtitle<
     TrackListing,
     'delivery' | 'format' | 'language' | 'forced' | 'hearing_impaired' | 'commentary'
   >,
->(wishlist: string[], subs: T[], preferredKind?: SubtitleKind | null): T | null {
+>(
+  wishlist: string[],
+  subs: T[],
+  kindOrder: readonly SubtitleKind[] = subtitleKindOrder(),
+): T | null {
   // A commentary track is never what a language wish means.
   const auto = (s: T) =>
     !s.commentary && (s.delivery === 'text' || s.delivery === 'ass' || s.delivery === 'overlay')
-  // What the track is comes before how it is drawn. A language wish asks for
-  // the dialogue: the full track first, the SDH one (the same dialogue plus
-  // sound descriptions) next, and a forced track — only the foreign or
-  // signed parts, the first English track of many a release — last, so it
-  // is taken only when nothing fuller exists in that language.
-  const kind = (s: T) => (s.forced ? 2 : s.hearing_impaired ? 1 : 0)
+  // Within each preferred language, try the viewer's type order. Missing
+  // types fall through to the next one; they never exclude other tracks.
+  const kind = (s: T) => {
+    const at = kindOrder.indexOf(subtitleKind(s))
+    return at < 0 ? kindOrder.length : at
+  }
   // Then the server's fidelity order (HUB-32a/d): the client's own ASS
   // renderer first, then a server-rasterised overlay, then flattened text.
   // Within one language the BEST reading wins, not whichever row the listing
@@ -55,9 +58,7 @@ export function pickSubtitle<
   const best = (candidates: T[]) =>
     candidates.length === 0 ? null : candidates.reduce((a, b) => (rank(b) < rank(a) ? b : a))
   for (const want of wishlist) {
-    const eligible = subs.filter(
-      (s) => auto(s) && !isImageSub(s) && matchesSubtitleKind(s, preferredKind),
-    )
+    const eligible = subs.filter((s) => auto(s) && !isImageSub(s))
     const hit =
       want === 'any'
         ? best(eligible)
