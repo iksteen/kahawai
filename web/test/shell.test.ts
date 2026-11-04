@@ -286,6 +286,8 @@ describe('the menus', () => {
       global: { plugins: [router, withQuery()] },
       attachTo: document.body,
     })
+    // Finish the initial render before simulating the first user action.
+    await nextTick()
     const trigger = wrapper.findAll('button')[0]!.element as HTMLElement
     trigger.focus()
     await wrapper.findAll('button')[0]!.trigger('click')
@@ -361,6 +363,30 @@ describe('the menus', () => {
 })
 
 describe('leaving a screen', () => {
+  test('the brand mark goes straight home and clears the filter while the wordmark opens the menu', async () => {
+    const { wrapper, router } = await shell('/library/L1')
+    await wrapper.find('input').setValue('heat')
+    await wrapper.find('button[title="Jump to…"]').trigger('click')
+    expect(router.currentRoute.value.name).toBe('library')
+    expect(wrapper.find('[role="menu"]').exists()).toBe(true)
+    const home = wrapper.find('a[aria-label="Home"]')
+    expect(home.attributes('href')).toBe('/')
+    await home.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('libraries')
+    expect(wrapper.find('[role="menu"]').exists()).toBe(false)
+    expect(wrapper.findComponent(SearchBox).props('modelValue')).toBe('')
+  })
+
+  test('opening Home in another tab leaves the current route and filter alone', async () => {
+    const { wrapper, router } = await shell('/library/L1')
+    await wrapper.find('input').setValue('heat')
+    await wrapper.find('a[aria-label="Home"]').trigger('click', { ctrlKey: true })
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('library')
+    expect(wrapper.findComponent(SearchBox).props('modelValue')).toBe('heat')
+  })
+
   test('going home clears a standing filter', async () => {
     // It would otherwise follow you there and read as missing items.
     const { wrapper } = await shell('/library/L1')

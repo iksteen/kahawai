@@ -1113,6 +1113,7 @@ not describe this branch's current runtime.
       Enrichment admin tab is removed. Copy context, revision conflicts, stable
       membership and keyboard navigation are checked.
 - [x] Viewer library navigation uses catalogue APIs: original home shelves/jump menu,
+      the header's brand mark links directly Home while its wordmark opens the jump menu,
       virtual poster and artist grids with representative-copy match confidence,
       sorting/search, scoped artwork and metadata
       detail, physical source lists, runtime/chapters, reload/back navigation and browser checks.

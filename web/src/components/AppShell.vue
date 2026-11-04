@@ -6,9 +6,10 @@
 /// page rather than pushing it — without it the last row of a library sits
 /// under the bar and cannot be reached.
 import { computed, nextTick, ref, useTemplateRef, watch } from 'vue'
-import { useRoute, useRouter } from 'vue-router'
+import { RouterLink, useRoute, useRouter } from 'vue-router'
 
-import Brand from './Brand.vue'
+import mark from '../assets/brand/kahawai-mark.svg'
+import wordmark from '../assets/brand/kahawai-wordmark-light.svg'
 import Icon, { type IconName } from './Icon.vue'
 import MenuItem from './MenuItem.vue'
 import MenuPopover from './MenuPopover.vue'
@@ -163,6 +164,12 @@ function openProfile() {
   profileOpen.value = !profileOpen.value
 }
 
+function home() {
+  navOpen.value = false
+  profileOpen.value = false
+  clear()
+}
+
 /// Only the destinations that SHOW what was filtered clear it. Going to
 /// Settings and back to a library keeps the filter you were using — the old
 /// header cleared on Home and on a library and nowhere else, and a detour is
@@ -205,46 +212,57 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
          its own line at full width instead of shrinking to something no title
          fits in. -->
     <header class="flex flex-wrap items-center justify-between gap-3 pt-5 pb-6.5">
-      <div class="relative">
-        <button
-          class="flex cursor-pointer items-center"
-          title="Jump to…"
-          type="button"
-          :aria-expanded="navOpen"
-          aria-haspopup="menu"
-          @click="openNav"
+      <div class="flex items-center">
+        <RouterLink
+          :to="{ name: 'libraries' }"
+          class="relative z-15 -my-1.5 -ml-2 grid size-10 shrink-0 place-items-center rounded focus-visible:outline-teal"
+          aria-label="Home"
+          title="Home"
+          @click.left.exact="home"
         >
-          <Brand class="h-7 w-auto" />
-          <!-- Hidden: `aria-expanded` already says which way it points, and a
+          <img :src="mark" alt="" class="size-10" width="120" height="120" />
+        </RouterLink>
+        <div class="relative">
+          <button
+            class="flex cursor-pointer items-center"
+            title="Jump to…"
+            type="button"
+            :aria-expanded="navOpen"
+            aria-haspopup="menu"
+            @click="openNav"
+          >
+            <img :src="wordmark" alt="Kahawai" class="h-[25px] w-auto" width="179" height="37" />
+            <!-- Hidden: `aria-expanded` already says which way it points, and a
                glyph inside the button becomes part of its name — so the name
                would change on every toggle and be read out again. -->
-          <span class="ml-[7px] flex text-dim" aria-hidden="true">
-            <Icon :name="navOpen ? 'chevronUp' : 'chevronDown'" />
-          </span>
-        </button>
-        <MenuPopover :open="navOpen" align="left" @close="navOpen = false">
-          <MenuItem
-            glyph="home"
-            :here="name === 'libraries'"
-            @click="go({ name: 'libraries' }, true)"
-          >
-            Home
-          </MenuItem>
-          <span
-            v-if="props.libraries.length"
-            class="my-1 block h-px bg-hairline"
-            role="separator"
-          />
-          <MenuItem
-            v-for="library in props.libraries"
-            :key="library.id"
-            :glyph="libGlyph(library.media_type)"
-            :here="name === 'library' && route.params.library === library.id"
-            @click="go({ name: 'library', params: { library: library.id } }, true)"
-          >
-            {{ library.name }}
-          </MenuItem>
-        </MenuPopover>
+            <span class="ml-[7px] flex text-dim" aria-hidden="true">
+              <Icon :name="navOpen ? 'chevronUp' : 'chevronDown'" />
+            </span>
+          </button>
+          <MenuPopover :open="navOpen" align="left" @close="navOpen = false">
+            <MenuItem
+              glyph="home"
+              :here="name === 'libraries'"
+              @click="go({ name: 'libraries' }, true)"
+            >
+              Home
+            </MenuItem>
+            <span
+              v-if="props.libraries.length"
+              class="my-1 block h-px bg-hairline"
+              role="separator"
+            />
+            <MenuItem
+              v-for="library in props.libraries"
+              :key="library.id"
+              :glyph="libGlyph(library.media_type)"
+              :here="name === 'library' && route.params.library === library.id"
+              @click="go({ name: 'library', params: { library: library.id } }, true)"
+            >
+              {{ library.name }}
+            </MenuItem>
+          </MenuPopover>
+        </div>
       </div>
 
       <!-- Below `sm` the search box takes a line of its own, under the

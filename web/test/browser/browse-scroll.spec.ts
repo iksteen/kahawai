@@ -43,6 +43,9 @@ async function catalogue(page: Page) {
     const path = url.pathname
     if (path.endsWith('/libraries')) return json(route, libraries)
     if (path.endsWith('/artwork')) return route.fulfill({ status: 404 })
+    if (path.endsWith('/continue-watching') || path.endsWith('/up-next')) {
+      return json(route, { items: [], total: 0, offset: 0, limit: 100 })
+    }
     if (path.endsWith('/children')) {
       return json(route, {
         children: [],
@@ -97,6 +100,38 @@ async function depth(page: Page, top: number) {
   await expect.poll(() => page.evaluate(() => window.scrollY)).toBe(top)
   const cards = page.locator('button.card').filter({ visible: true })
   await expect(cards.first()).toBeVisible()
+}
+
+for (const width of [1280, 390]) {
+  test(`the brand mark goes Home while the wordmark remains a menu at ${width}px`, async ({
+    page,
+  }, testInfo) => {
+    await page.setViewportSize({ width, height: 900 })
+    const fixture = await catalogue(page)
+    await page.goto('/app/library/fixture-films')
+    const wordmark = page.getByRole('button', { name: 'Kahawai', exact: true })
+    const home = page.getByRole('link', { name: 'Home', exact: true })
+    await wordmark.click()
+    await expect(page).toHaveURL(/\/library\/fixture-films$/)
+    await expect(page.getByRole('menu')).toBeVisible()
+    await page.keyboard.press('Escape')
+    await expect(wordmark).toBeFocused()
+    await wordmark.click()
+    // The menu's dismissing sheet must not intercept the mark's Home action.
+    await home.click()
+    await expect(page).toHaveURL(/\/app\/$/)
+    await expect(page.getByRole('heading', { name: 'Your libraries', exact: true })).toBeAttached()
+    await expect(page.getByRole('menu')).toHaveCount(0)
+    await wordmark.click()
+    await page.getByRole('menuitem', { name: 'Films', exact: true }).click()
+    await expect(page).toHaveURL(/\/library\/fixture-films$/)
+    await expect(wordmark).toHaveAttribute('aria-expanded', 'false')
+    await page.screenshot({
+      path: testInfo.outputPath(`header-${width}.png`),
+      animations: 'disabled',
+    })
+    expect(fixture.errors).toEqual([])
+  })
 }
 
 async function openCard(page: Page) {
