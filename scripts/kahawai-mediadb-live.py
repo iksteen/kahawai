@@ -105,6 +105,14 @@ def cli(script, *args, ok=True):
     return result
 
 
+def record_progress(library, child, position_ms=120000):
+    """Leave `child` part-watched through a real playback session, so it is
+    on its library's continue-watching feed."""
+    session = api("POST", "/api/v1/playback/sessions", {"library_id": library, "item_id": child, "mode": "direct"})
+    api("POST", f"/api/v1/playback/sessions/{session['session_id']}/progress", {"position_ms": position_ms})
+    api("DELETE", f"/api/v1/playback/sessions/{session['session_id']}")
+
+
 def check_cli(library, item, child_checks):
     auth = ["fixture", "fixture-password"]
     cli("kahawai-users.sh", *auth, "create", "cli-viewer", "cli-password")
@@ -147,7 +155,12 @@ def check_cli(library, item, child_checks):
     assert artists[0]['key'] in cli("kahawai-list.sh", "-l", music, "-r", *auth).stdout
     assert music_path.split('/')[7] in cli("kahawai-list.sh", "-l", music, "-A", artists[0]['key'], *auth).stdout
     show_library = child_checks[0][0].split('/')[5]
-    assert child_checks[0][1][1] in cli("kahawai-list.sh", "-p", "-l", show_library, *auth).stdout
+    # Its own progress, not what an earlier step left: the browser checks run
+    # before this one and mark that season watched and unwatched again. The
+    # third episode, so the second keeps the diagnostic session a later step
+    # finds in its item log (which holds only the latest).
+    record_progress(show_library, child_checks[0][1][2])
+    assert child_checks[0][1][2] in cli("kahawai-list.sh", "-p", "-l", show_library, *auth).stdout
     cli("kahawai-list.sh", "-n", *auth)
     detail = json.loads(cli("kahawai-library.sh", "copies", library, item).stdout)
     entry = detail['sources'][0]['media_entry_id']
@@ -200,21 +213,35 @@ def check_segment_admin(host):
 
 
 def check_rescans(library, count=2):
-    def status():
+    """Normal rescans skip unchanged files, deep ones re-probe them.
+
+    The counts come from the mediahost's own completion line: since mediahost
+    migration 0006 they live in its memory (`scan::ScanCounters`), not the
+    catalogue. Only `scanning` and the generations stayed durable, and the
+    hub's API reports no more than `scanning`. The line is logged after the
+    scan's generation is finished, with the counter the old columns held —
+    `scanned` + `refreshed`, `failed`, `skipped`."""
+    def scanning():
         with sqlite3.connect(f"file:{work / 'mediahost' / 'catalog.db'}?mode=ro", uri=True) as db:
-            return db.execute("SELECT scan_generation,scanning,scanned,skipped,failed FROM catalog_collections WHERE id='movies'").fetchone()
+            return db.execute("SELECT scanning FROM catalog_collections WHERE id='movies'").fetchone()[0]
+    def completions():
+        found = []
+        for log in logs:
+            for line in log.read_text(errors="replace").splitlines():
+                plain = re.sub(r"\x1b\[[0-9;]*m", "", line)
+                if "local catalogue scan complete" in plain and re.search(r"\bcollection=movies\b", plain):
+                    found.append({k: int(v) for k, v in re.findall(r"\b(scanned|refreshed|failed|skipped)=(\d+)", plain)})
+        return found
     for deep in (False, True, False):
-        until(lambda: status()[1] == 0, "scan settled")
-        before = status()
+        until(lambda: scanning() == 0, "scan settled")
+        seen = len(completions())
         answer = api("POST", f"/admin/v1/catalogue/libraries/{library}/refresh?deep={str(deep).lower()}")
         assert answer == {"asked": 1, "offline": 0, "unsupported": 0}, answer
-        def completed():
-            row = status()
-            return row if row[0] > before[0] and row[1] == 0 else None
-        row = until(completed, "deep rescan completed" if deep else "rescan completed")
-        assert row[4] == 0, row
-        assert row[2] == (count if deep else 0), row
-        assert row[3] == (0 if deep else count), row
+        scan = until(lambda: completions()[seen] if len(completions()) > seen else None,
+                     "deep rescan completed" if deep else "rescan completed")
+        assert scan["failed"] == 0, scan
+        assert scan["scanned"] + scan["refreshed"] == (count if deep else 0), scan
+        assert scan["skipped"] == (0 if deep else count), scan
     print("PASS: normal skips, deep re-probes, next normal skips again")
 
 

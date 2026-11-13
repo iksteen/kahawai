@@ -266,7 +266,7 @@ ENV GST_GL_WINDOW=surfaceless \
     XDG_RUNTIME_DIR=/tmp/kahawai-runtime
 RUN mkdir -p "$XDG_RUNTIME_DIR" && chmod 0700 "$XDG_RUNTIME_DIR"
 
-RUN scripts/kahawai-gst-plugins.sh verify \
+RUN scripts/kahawai-gst-verify.sh \
         --library-dir /usr/local/lib \
         --plugin-dir /usr/local/lib/gstreamer-1.0 \
         --exclusive

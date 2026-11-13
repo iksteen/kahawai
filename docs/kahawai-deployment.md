@@ -603,8 +603,6 @@ spends that time failing to spawn a program that does not exist —
 `last exit code = 78: EX_CONFIG` and a wedged job needing
 `sudo launchctl bootout` and `bootstrap`.
 
-`scripts/kahawai-gst-plugins.sh` is Linux-only and does not run here.
-
 Two macOS-only behaviours are already handled in code and worth knowing
 about: `vtdec`/`vtdec_hw` are demoted at startup (they build a GL
 texture cache and SIGSEGV without an AppKit main loop, which a headless

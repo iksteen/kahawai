@@ -2,9 +2,10 @@
 #
 #   . "$(dirname "$0")/kahawai-gst-rs.sh"
 #
-# Three places build hlssink3 from source — this box through
-# kahawai-gst-plugins.sh, the container through the Dockerfile, the mac
-# through HomebrewFormula/kahawai-gstreamer.rb — and they must build
+# Three places build hlssink3 from source — the kahawai-gstreamer package
+# through its PKGBUILD (which sources this file), the container through the
+# Dockerfile, the mac through HomebrewFormula/kahawai-gstreamer.rb — and
+# they must build
 # the SAME thing. A constant copied into all of them is a constant that
 # drifts, and a satellite quietly running a different sink from the hub is
 # the class of bug this arrangement exists to prevent. So the tag, the

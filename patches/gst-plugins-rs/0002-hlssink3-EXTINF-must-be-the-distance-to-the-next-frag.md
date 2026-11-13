@@ -1,7 +1,7 @@
 # hlssink3: EXTINF must be the distance to the next fragment
 
 **Upstream:** not reported yet. **Observed on:** gst-plugins-rs
-`gstreamer-1.28.6` (the tag `kahawai-gst-plugins.sh` builds), GStreamer
+`gstreamer-1.28.6` (the tag `scripts/kahawai-gst-rs.sh` pinned), GStreamer
 1.28.6. **Reproducer:** `…-repro-1.py`.
 
 hlssink3 writes splitmuxsink's `fragment-duration` straight into `EXTINF`.

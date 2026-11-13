@@ -230,7 +230,7 @@ test('compose libraries from a real mediahost, persist edits and revoke grants o
   await expect(review.getByText('ingestion-fixture · movies', { exact: true })).toBeVisible()
   await page.keyboard.press('Escape')
   await expect(review).not.toBeVisible()
-  await page.getByRole('button', { name: 'kahawai~', exact: true }).click()
+  await page.getByRole('button', { name: 'Kahawai', exact: true }).click()
   await page.getByRole('menuitem', { name: 'Browser films', exact: true }).click()
   await expect(page.getByRole('heading', { name: 'Browser films', exact: true })).toBeVisible()
   // The original grid retains poster geometry and filters through the new API.
@@ -401,13 +401,17 @@ test('physical episodes and tracks keep stable links and source details', async 
     .getByRole('button', { name: /Season 1/ })
     .first()
     .click()
-  await expect(page.getByText('3 episodes · 0 watched', { exact: true })).toBeVisible()
+  // A substring, not the whole line: the count stands alone while the show is
+  // loading and joins the hero's subline ("Example · 3 episodes · …") once it
+  // has, and which one the assertion meets is a race.
+  const counted = (watched: number) => page.getByText(`3 episodes · ${watched} watched`)
+  await expect(counted(0)).toBeVisible()
   await page.getByRole('button', { name: 'Mark all watched', exact: true }).click()
-  await expect(page.getByText('3 episodes · 3 watched', { exact: true })).toBeVisible()
+  await expect(counted(3)).toBeVisible()
   await page.reload()
-  await expect(page.getByText('3 episodes · 3 watched', { exact: true })).toBeVisible()
+  await expect(counted(3)).toBeVisible()
   await page.getByRole('button', { name: 'Mark none watched', exact: true }).click()
-  await expect(page.getByText('3 episodes · 0 watched', { exact: true })).toBeVisible()
+  await expect(counted(0)).toBeVisible()
   await page.screenshot({ path: '/tmp/kahawai-stable-season.png', fullPage: true })
   const tracks = await children(music.id, album)
   expect(tracks).toHaveLength(2)
@@ -682,25 +686,28 @@ test('rendered ASS overlays use the selected catalogue source and session URL', 
   }
 })
 
-test('segment administration reports the real mediahost setting in the provider panel', async ({
+test('background work reflects the real mediahost setting: no skip-point queue while detection is off', async ({
   page,
 }) => {
+  // The fixture's mediahost runs with detect_segments=false. The provider
+  // panel's "Media analysis" section is gone; the Background work tab lists
+  // each mediahost's discovery queues instead, and a host with detection off
+  // has no skip-point queue to list — nor anything to rerun, since a
+  // mediahost picks its own work.
   await page.goto('/app/admin')
   await page.getByLabel('Username', { exact: true }).fill('fixture')
   await page.getByLabel('Password', { exact: true }).fill('fixture-password')
   await page.getByRole('button', { name: 'Sign in', exact: true }).click()
-  await page.getByRole('tab', { name: 'Providers', exact: true }).click()
-  const panel = page.getByRole('region', { name: 'Media analysis', exact: true })
-  await expect(panel.getByText('detection disabled', { exact: false }).first()).toBeVisible({
+  await page.getByRole('tab', { name: 'Background work', exact: true }).click()
+  const discovery = page.getByRole('region', { name: 'Mediahost discovery', exact: true })
+  await expect(discovery.getByRole('cell', { name: 'Loudness', exact: true }).first()).toBeVisible({
     timeout: 45000,
   })
-  await expect(
-    panel.getByRole('button', { name: 'Find skip points now', exact: true }),
-  ).toHaveCount(0)
-  await expect(panel).not.toContainText('episodes done since')
+  await expect(discovery.getByRole('cell', { name: 'Skip points', exact: true })).toHaveCount(0)
+  await expect(discovery.getByRole('button', { name: 'Rerun' })).toHaveCount(0)
   expect(
-    (await new AxeBuilder({ page }).include('[aria-labelledby="skip-points"]').analyze())
+    (await new AxeBuilder({ page }).include('[aria-labelledby="work-discovery"]').analyze())
       .violations,
   ).toEqual([])
-  await panel.screenshot({ path: '/tmp/kahawai-segment-admin.png' })
+  await discovery.screenshot({ path: '/tmp/kahawai-segment-admin.png' })
 })

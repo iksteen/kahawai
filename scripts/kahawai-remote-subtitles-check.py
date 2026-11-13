@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Check revision-bound embedded subtitles through an actual remote mediahost.
 Usage: KAHAWAI_BIN=target/release/kahawai python3 scripts/kahawai-remote-subtitles-check.py HOST [SSH_KEY]
-Requires ffmpeg locally and ~/kahawai-mediahost with staged GStreamer remotely.
+Requires ffmpeg locally, and remotely ~/kahawai-mediahost and the kahawai-gstreamer
+package in /opt (as scripts/kahawai-silence.sh deploys them).
 Creates its own temporary hub, mediahost and generated media; never opens the
 installation's databases or changes its media. Tests both revisions at one path.
 """
@@ -133,7 +134,10 @@ try:
     (work/'mediahost.toml').write_text(f'[mediahost]\nhub="localhost:{remote_port}"\nname="remote-subtitle-fixture"\nstate_dir="{remote}/state"\ndetect_segments=false\nrescan_minutes=0\n[[mediahost.collections]]\nname="movies"\nmedia_type="movies"\nroots=["{remote}/media"]\n')
     run(scp + [str(work/'mediahost.toml'), f'{host}:{remote}/mediahost.toml'])
     run(scp + [str(films[0]), f'{host}:{remote}/media/Fixture.mkv'])
-    remote_run(f'GST_PLUGIN_PATH="$HOME/.local/lib/kahawai-gst/plugins" LD_LIBRARY_PATH="$HOME/.local/lib/kahawai-gst/lib" nohup "$HOME/kahawai-mediahost" --config {remote}/mediahost.toml >{remote}/mediahost.log 2>&1 </dev/null & echo $! >{remote}/pid')
+    # The patched stack is a package in /opt with no plugins to stage, and the
+    # binary carries no rpath: its library path is all it needs, exactly as
+    # kahawai-silence.sh starts the installation's own mediahost.
+    remote_run(f'LD_LIBRARY_PATH=/opt/kahawai-gstreamer/lib nohup "$HOME/kahawai-mediahost" --config {remote}/mediahost.toml >{remote}/mediahost.log 2>&1 </dev/null & echo $! >{remote}/pid')
     code = until(lambda: re.search(r'Enrollment code:\s*([^\n]+)', remote_run(f'cat {remote}/mediahost.log')), 'enrollment').group(1).strip()
     api('POST', '/admin/v1/enrollments/approve', {'code':code})
     def collection():

@@ -116,7 +116,9 @@ const where = (q: WorkQueue) =>
               <th class="pr-3 pb-1 font-[500]">Remaining</th>
               <th v-if="group.area.id !== 'discovery'" class="pr-3 pb-1 font-[500]">Done</th>
               <th class="pr-3 pb-1 font-[500]">Next</th>
-              <th class="pb-1"></th>
+              <!-- Named for a screen reader: an empty header cell announces an
+                   unnamed column over the Rerun buttons. -->
+              <th class="pb-1"><span class="sr-only">Actions</span></th>
             </tr>
           </thead>
           <tbody>
