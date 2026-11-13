@@ -133,14 +133,32 @@ describe('leaving', () => {
     expect(s.open.value).toBe(false)
   })
 
-  test('opening a result takes the text with it', () => {
-    // You asked for this one thing and got it; the box that found it is not a
-    // filter you meant to leave standing on the item page.
+  test('an address’s filter is taken as settled, not a debounce later', () => {
+    // A page arriving with `?q=` must ask for the filtered list first; a
+    // debounced adopt asked for everything, then for the filter.
     const s = useSearch()
     s.typed('heat', true)
-    s.taken()
-    expect(s.text.value).toBe('')
+    s.adopt('bjo', false)
+    expect(s.text.value).toBe('bjo')
+    expect(s.query.value).toBe('bjo')
     expect(s.open.value).toBe(false)
+  })
+
+  test('and opens the panel where there is one, with something to show', () => {
+    const s = useSearch()
+    s.adopt('heat', true)
+    expect(s.open.value).toBe(true)
+    s.adopt('', true)
+    expect(s.open.value).toBe(false)
+  })
+
+  test('leaving drops a keystroke that has not settled', async () => {
+    const s = useSearch()
+    const seen = record(s.query)
+    await type(s, 'heat')
+    s.abandon()
+    vi.advanceTimersByTime(DEBOUNCE_MS)
+    expect(seen).not.toContain('heat')
   })
 
   test('an abandoned keystroke never reaches the query at all', async () => {

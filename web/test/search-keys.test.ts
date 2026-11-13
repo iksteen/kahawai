@@ -216,11 +216,40 @@ describe('pressing one', () => {
   })
 
   test('a library keeps the text, where it becomes that library’s filter', async () => {
-    const { wrapper } = await shell()
+    const { router, wrapper } = await shell()
     await search(wrapper, 'heat')
     await key(wrapper, 'Enter')
     await flushPromises()
+    // In the address, so Back from whatever is opened next comes back to it.
+    expect(router.currentRoute.value.fullPath).toBe('/library/films?q=heat')
     expect((wrapper.find('input').element as HTMLInputElement).value).toBe('heat')
+  })
+
+  test('Back from a hit comes back to its results, panel open', async () => {
+    const { router, wrapper } = await shell()
+    await search(wrapper, 'heat')
+    expect(router.currentRoute.value.fullPath).toBe('/?q=heat')
+    await key(wrapper, 'ArrowDown')
+    await key(wrapper, 'ArrowDown')
+    await key(wrapper, 'Enter')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/library/films/item/heat')
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/?q=heat')
+    expect((wrapper.find('input').element as HTMLInputElement).value).toBe('heat')
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(true)
+    expect(wrapper.text()).toContain('the insider')
+  })
+
+  test('typing on keeps the panel open as each word reaches the address', async () => {
+    // Every settled word changes the address; a shell that dismissed on any
+    // address change closed the panel under somebody still typing.
+    const { router, wrapper } = await shell()
+    await search(wrapper, 'hea')
+    await search(wrapper, 'heat')
+    expect(router.currentRoute.value.fullPath).toBe('/?q=heat')
+    expect(wrapper.find('[role="listbox"]').exists()).toBe(true)
   })
 
   test('an item takes the text with it, because you asked for that one thing', async () => {

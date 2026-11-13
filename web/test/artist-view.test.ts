@@ -9,7 +9,7 @@ vi.mock('../src/api/catalogue.ts', () => ({
 import { QueryClient, VueQueryPlugin } from '@tanstack/vue-query'
 import { flushPromises, mount } from '@vue/test-utils'
 import { beforeEach, describe, expect, test, vi } from 'vitest'
-import { createMemoryHistory, createRouter } from 'vue-router'
+import { createMemoryHistory, createRouter, createWebHistory } from 'vue-router'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   libraries: vi.fn(),
@@ -34,10 +34,12 @@ const album = (id: string, title: string, year: number) =>
     sources: 1,
   }) as never
 
-function routerFor() {
+/// Memory history keeps no `back` in its state, so anything that decides
+/// between Back and a push needs the browser's (jsdom's) own.
+function routerFor(history = createMemoryHistory()) {
   const Blank = { template: '<div />' }
   return createRouter({
-    history: createMemoryHistory(),
+    history,
     routes: [
       { path: '/library/:library', name: 'library', component: Blank },
       { path: '/library/:library/artist/:artist', name: 'artist', component: Artist },
@@ -121,6 +123,25 @@ describe('an Album Artist', () => {
     })
     const { wrapper } = await page()
     expect(wrapper.text()).not.toContain('More albums')
+  })
+
+  test('Up returns to the library it came from, still filtered', async () => {
+    // The library left filtered is `/library/music?q=bjo` in history; Up
+    // pushing a bare `/library/music` started it over, unfiltered, at the top.
+    const router = routerFor(createWebHistory())
+    await router.push('/library/music?q=bjo')
+    await router.push('/library/music/artist/various%20artists')
+    await router.isReady()
+    const queryClient = new QueryClient({ defaultOptions: { queries: { retry: false } } })
+    const wrapper = mount(Artist, {
+      global: { plugins: [router, [VueQueryPlugin, { queryClient }]] },
+    })
+    await flushPromises()
+    await wrapper.findAll('button')[0]!.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/music?q=bjo')
+    // Back, not a new entry on top of it.
+    expect(router.options.history.state.forward).toBe('/library/music/artist/various%20artists')
   })
 
   test('returns to the containing music library', async () => {

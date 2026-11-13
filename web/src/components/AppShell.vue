@@ -19,7 +19,7 @@ import { boundaryKey, hasSearchBox, hasSearchPanel, type RouteName } from '../do
 import { targetOf } from '../domain/label.ts'
 import { notice } from '../composables/notices.ts'
 import { moveHighlight, SEARCH_LIST_ID, searchOptionId } from '../domain/search-nav.ts'
-import { useSearch } from '../composables/search.ts'
+import { useSearch, useSearchAddress } from '../composables/search.ts'
 import { useQueue } from '../composables/queue.ts'
 import { useSearchPanel } from '../composables/search-panel.ts'
 
@@ -40,7 +40,9 @@ const router = useRouter()
 // Destructured, because a template only auto-unwraps refs that are top-level
 // setup bindings — `search.text` inside an object is not one, and reaching for
 // `.value` in a template is the mistake that spelling invites.
-const { text, query, open, typed, reopen, dismiss, clear, taken } = useSearch()
+const search = useSearch()
+const { text, query, open, typed, reopen, dismiss, clear } = search
+useSearchAddress(search)
 
 const name = computed(() => (route.name ?? 'libraries') as RouteName)
 
@@ -117,29 +119,16 @@ function take() {
   else openItemFromPanel(targetOf(row.item), row.library.id)
 }
 
-/// A library keeps the text, where it becomes that library's filter. An item
-/// does not: you asked for this one thing and got it.
+/// A library takes the text along in its address, where it becomes that
+/// library's filter. An item does not: you asked for this one thing and got
+/// it, and its address carries no filter, so the box empties on arrival.
 function openFromPanel(library: string) {
   dismiss()
-  void router.push({ name: 'library', params: { library } })
+  void router.push({ name: 'library', params: { library }, query: { q: text.value } })
 }
 function openItemFromPanel(id: string, library: string) {
-  taken()
   void router.push({ name: 'detail', params: { library, id } })
 }
-
-/// Any navigation puts the panel away.
-///
-/// Belt and braces: today every way out is explicit — Escape, the sheet, a
-/// library row, a hit — and only the home screen has a panel at all, so no
-/// test can tell this line from the four that already do the job. It stays
-/// because the flag outliving the route is how the home screen once mounted
-/// with a results panel already open over a page nobody had searched, and the
-/// second screen to grow a panel will not come with that memory attached.
-watch(
-  () => route.fullPath,
-  () => dismiss(),
-)
 
 const navOpen = ref(false)
 const profileOpen = ref(false)
@@ -164,20 +153,17 @@ function openProfile() {
   profileOpen.value = !profileOpen.value
 }
 
+/// Neither clears the box: the destination's address decides what it holds
+/// (`useSearchAddress`), so Home and a library from the menu start empty
+/// while Back still finds the filtered page you left.
 function home() {
   navOpen.value = false
   profileOpen.value = false
-  clear()
 }
 
-/// Only the destinations that SHOW what was filtered clear it. Going to
-/// Settings and back to a library keeps the filter you were using — the old
-/// header cleared on Home and on a library and nowhere else, and a detour is
-/// not the same as a fresh start.
-function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
+function go(to: Parameters<typeof router.push>[0]) {
   navOpen.value = false
   profileOpen.value = false
-  if (fresh) clear()
   void router.push(to)
 }
 </script>
@@ -240,11 +226,7 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
             </span>
           </button>
           <MenuPopover :open="navOpen" align="left" @close="navOpen = false">
-            <MenuItem
-              glyph="home"
-              :here="name === 'libraries'"
-              @click="go({ name: 'libraries' }, true)"
-            >
+            <MenuItem glyph="home" :here="name === 'libraries'" @click="go({ name: 'libraries' })">
               Home
             </MenuItem>
             <span
@@ -257,7 +239,7 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
               :key="library.id"
               :glyph="libGlyph(library.media_type)"
               :here="name === 'library' && route.params.library === library.id"
-              @click="go({ name: 'library', params: { library: library.id } }, true)"
+              @click="go({ name: 'library', params: { library: library.id } })"
             >
               {{ library.name }}
             </MenuItem>
@@ -335,11 +317,7 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
           </span>
         </button>
         <MenuPopover :open="profileOpen" align="right" @close="profileOpen = false">
-          <MenuItem
-            glyph="gear"
-            :here="name === 'settings'"
-            @click="go({ name: 'settings' }, false)"
-          >
+          <MenuItem glyph="gear" :here="name === 'settings'" @click="go({ name: 'settings' })">
             Settings
           </MenuItem>
           <!-- Gated here as well as on the hub, which refuses every admin route
@@ -350,7 +328,7 @@ function go(to: Parameters<typeof router.push>[0], fresh: boolean) {
             v-if="props.admin"
             glyph="shield"
             :here="name === 'admin'"
-            @click="go({ name: 'admin' }, false)"
+            @click="go({ name: 'admin' })"
           >
             Admin
           </MenuItem>

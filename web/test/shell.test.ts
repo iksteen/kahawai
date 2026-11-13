@@ -12,6 +12,7 @@ import { createMemoryHistory, createRouter } from 'vue-router'
 import AppShell from '../src/components/AppShell.vue'
 import MenuPopover from '../src/components/MenuPopover.vue'
 import SearchBox from '../src/components/SearchBox.vue'
+import { DEBOUNCE_MS } from '../src/composables/search.ts'
 
 vi.mock('../src/api/generated/kahawai.ts', () => ({
   getCatalogueArtworkUrl: (library: string, id: string) =>
@@ -40,6 +41,7 @@ function testRouter(start = '/') {
       { path: '/admin', name: 'admin', component: Blank },
       { path: '/settings', name: 'settings', component: Blank },
       { path: '/library/:library', name: 'library', component: Blank },
+      { path: '/library/:library/artist/:artist', name: 'artist', component: Blank },
       { path: '/library/:library/item/:id', name: 'detail', component: Blank },
       {
         path: '/library/:library/item/:id/season/:season',
@@ -47,6 +49,14 @@ function testRouter(start = '/') {
         component: Blank,
       },
       { path: '/library/:library/item/:id/play', name: 'player', component: Blank },
+      // A screen whose chunk takes a while, as a lazily loaded route's does
+      // over a real network: the navigation to it is still pending for that
+      // long.
+      {
+        path: '/slow',
+        name: 'slow',
+        component: () => new Promise((resolve) => setTimeout(() => resolve(Blank), 400)),
+      },
     ],
   })
   void router.push(start)
@@ -396,7 +406,129 @@ describe('leaving a screen', () => {
     await wrapper.findAll('button')[0]!.trigger('click')
     const home = wrapper.findAll('[role="menuitem"]').find((i) => i.text() === 'Home')!
     await home.trigger('click')
-    await wrapper.vm.$nextTick()
+    // On ARRIVAL: home's address carries no filter.
+    await flushPromises()
     expect(wrapper.findComponent(SearchBox).props('modelValue')).toBe('')
+  })
+})
+
+/// The box filters a library page from its address, so Back, a reload and a
+/// shared link come back to the filtered page they left.
+describe('the filter in the address', () => {
+  const settle = async () => {
+    await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_MS + 10))
+    await flushPromises()
+  }
+  const boxText = (wrapper: Awaited<ReturnType<typeof shell>>['wrapper']) =>
+    wrapper.findComponent(SearchBox).props('modelValue')
+
+  test('typing writes it, replacing the entry rather than adding one', async () => {
+    const { wrapper, router } = await shell('/')
+    await router.push('/library/L1')
+    await wrapper.find('input').setValue('heat')
+    await settle()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1?q=heat')
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/')
+  })
+
+  test('arriving with one fills the box', async () => {
+    const { wrapper } = await shell('/library/L1?q=heat')
+    expect(boxText(wrapper)).toBe('heat')
+  })
+
+  test('opening a result starts it empty, and Back finds the filter again', async () => {
+    // The artist page filters on the same box: a filter carried in showed only
+    // the albums whose titles matched the half-typed artist name.
+    const { wrapper, router } = await shell('/library/L1?q=bjo')
+    await router.push('/library/L1/artist/bjork')
+    await flushPromises()
+    expect(boxText(wrapper)).toBe('')
+    expect(router.currentRoute.value.query.q).toBeUndefined()
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1?q=bjo')
+    expect(boxText(wrapper)).toBe('bjo')
+  })
+
+  test('the menu’s library starts unfiltered without rewriting the entry it left', async () => {
+    const { wrapper, router } = await shell('/library/L1?q=heat')
+    await wrapper.find('button[title="Jump to…"]').trigger('click')
+    const films = wrapper.findAll('[role="menuitem"]').find((i) => i.text() === 'Films')!
+    await films.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1')
+    expect(boxText(wrapper)).toBe('')
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1?q=heat')
+    expect(boxText(wrapper)).toBe('heat')
+  })
+
+  test('going home leaves the library’s entry filtered for Back', async () => {
+    const { wrapper, router } = await shell('/library/L1?q=heat')
+    await wrapper.find('a[aria-label="Home"]').trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.name).toBe('libraries')
+    expect(boxText(wrapper)).toBe('')
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1?q=heat')
+  })
+
+  test('the ✕ drops it from the address too', async () => {
+    const { wrapper, router } = await shell('/library/L1?q=heat')
+    await wrapper.find('button[aria-label="Clear the search"]').trigger('click')
+    await settle()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1')
+  })
+
+  test('a keystroke still settling does not replace the navigation leaving it', async () => {
+    // It settles while the destination's chunk is loading. Written to the
+    // address then, its `replace` superseded the push and you stayed put.
+    const { wrapper, router } = await shell('/library/L1?q=heat')
+    await wrapper.find('input').setValue('heatx')
+    await router.push('/slow')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/slow')
+    // And the abandoned letter never reached the entry it was typed on.
+    router.back()
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/L1?q=heat')
+    expect(boxText(wrapper)).toBe('heat')
+  })
+
+  test('typing on past a write in flight keeps what was typed', async () => {
+    const { wrapper, router } = await shell('/library/L1')
+    // Every navigation takes a moment, so the write for "bj" is still in
+    // flight when the next letter goes in.
+    router.beforeEach(() => new Promise((resolve) => setTimeout(resolve, 50)))
+    await wrapper.find('input').setValue('bj')
+    await new Promise((resolve) => setTimeout(resolve, DEBOUNCE_MS + 10))
+    await wrapper.find('input').setValue('bjo')
+    await new Promise((resolve) => setTimeout(resolve, 60))
+    await flushPromises()
+    // "bj" landed, and taking it back would have eaten the "o".
+    expect(router.currentRoute.value.query.q).toBe('bj')
+    expect(boxText(wrapper)).toBe('bjo')
+    await settle()
+    expect(router.currentRoute.value.query.q).toBe('bjo')
+  })
+
+  test('the home screen carries its search too', async () => {
+    const { wrapper, router } = await shell('/')
+    await wrapper.find('input').setValue('heat')
+    await settle()
+    expect(router.currentRoute.value.fullPath).toBe('/?q=heat')
+    // Escape-style dismissal keeps the search where it is.
+    expect(boxText(wrapper)).toBe('heat')
+  })
+
+  test('screens without a box ignore one', async () => {
+    const { router, wrapper } = await shell('/settings?q=heat')
+    await router.push('/library/L1')
+    await flushPromises()
+    expect(boxText(wrapper)).toBe('')
   })
 })

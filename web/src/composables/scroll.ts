@@ -4,9 +4,15 @@ import { useRoute, useRouter, type RouteLocationRaw, type Router } from 'vue-rou
 /// An Up button remains hierarchical on a shared link. When its destination
 /// is also the previous entry, use Back so the entry's scroll and browse sort
 /// survive rather than replacing them with a fresh visit.
+///
+/// The same PAGE, whatever its query: a library left filtered is
+/// `/library/music?q=bjo` in history, and Up from the artist opened out of it
+/// should come back to that filtered list, not start the library over.
 export function backTo(router: Router, target: RouteLocationRaw) {
-  if (router.options.history.state.back === router.resolve(target).fullPath) router.back()
-  else void router.push(target)
+  const back = router.options.history.state.back
+  if (typeof back === 'string' && router.resolve(back).path === router.resolve(target).path) {
+    router.back()
+  } else void router.push(target)
 }
 
 /// Sort belongs to the browse history entry: restoring a pixel offset under

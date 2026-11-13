@@ -75,6 +75,13 @@ export function hasSearchBox(name: RouteName): boolean {
   return name === 'libraries' || name === 'library' || name === 'artist'
 }
 
+/// The search an address carries: its `q`, on a screen with a box, and nothing
+/// anywhere else — every other screen starts with an empty box. The home
+/// screen carries it too, so Back from a hit comes back to its results.
+export function searchOf(name: RouteName, query: Record<string, unknown>): string {
+  return hasSearchBox(name) && typeof query.q === 'string' ? query.q : ''
+}
+
 /// A season segment. `all` rather than an empty one: a null season is ABSOLUTE
 /// numbering, a real answer about an anime, and it needs a spelling of its own.
 export function seasonSegment(season: number | null): string {
