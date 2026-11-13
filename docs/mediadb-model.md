@@ -280,10 +280,16 @@ are available through the API companion. Authenticated catalogue endpoints are:
 - `PUT /admin/v1/catalogue/libraries/{id}/collections`: ordered `{collection_ids}`.
 - `DELETE /admin/v1/catalogue/libraries/{id}`.
 - `GET /api/v1/catalogue/libraries`: accessible libraries.
-- `GET /api/v1/catalogue/libraries/{id}/items`: pages with `offset`, `limit`, exact `total`, title filter `q`,
-  `sort` (`title`, `year`, `added`, optionally descending with `-`) and optional
-  artist filter (default limit 200, cap 1,000; zero is rejected).
-- `GET /api/v1/catalogue/libraries/{id}/artists`: paged album artist groups.
+- `GET /api/v1/catalogue/search`: every catalogue listing and search, browse
+  included (an empty `q`). `libraries` (comma-separated; default every library
+  the viewer may see) and `kinds` (`items`, `artists`, `tracks`; default every
+  kind each library holds — artists and songs exist in music only) choose the
+  pages; each library-and-kind is answered with `offset`, `limit` (1–200,
+  default 20) and an exact `total`, asked concurrently. `sort` needs exactly
+  one kind (items `title`, `year`, `added`, optionally descending with `-`;
+  artists `name`/`-name`; tracks `title`), and `artist` needs `kinds=items`.
+  All or nothing: a library the viewer may not see, or one that cannot be
+  answered, fails the request.
 - `GET /api/v1/catalogue/libraries/{id}/items/{item_id}/artwork` and
   `/api/v1/catalogue/libraries/{id}/artists/{key}/artwork`: scoped viewer artwork.
 - `GET /api/v1/catalogue/libraries/{id}/items/{item_id}`: the scoped identity,

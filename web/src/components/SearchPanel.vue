@@ -9,7 +9,7 @@
 import Attribution from './Attribution.vue'
 import { itemProviders } from '../domain/attribution.ts'
 import Icon from './Icon.vue'
-import { artworkUrl } from '../api/artwork.ts'
+import { artistArtworkUrl, artworkUrl } from '../api/artwork.ts'
 import { countLabel, SEARCH_LIST_ID, searchOptionId, type SearchRow } from '../domain/search-nav.ts'
 import { metaLine, targetOf } from '../domain/label.ts'
 
@@ -19,12 +19,9 @@ const props = defineProps<{
   /// has to stay honest while they do.
   query: string
   rows: SearchRow[]
-  /// The libraries that could not be asked, by name. Only reporting the
-  /// all-failed case still stated a fact it did not have: two libraries
-  /// erroring beside one with no matches printed "nothing matches" over a
-  /// count of one.
-  failed: string[]
-  allFailed: boolean
+  /// Why the search could not be answered; '' when it was. All or nothing: no
+  /// rows are drawn under it.
+  failure: string
   searching: boolean
   highlight: number
 }>()
@@ -33,6 +30,7 @@ const emit = defineEmits<{
   close: []
   retry: []
   openLibrary: [id: string]
+  openArtist: [key: string, library: string]
   openItem: [target: string, library: string]
 }>()
 </script>
@@ -64,19 +62,15 @@ const emit = defineEmits<{
          accessibility tree altogether, which would silently hide the only two
          things in here worth reading out. -->
     <p
-      v-if="props.rows.length === 0 && props.failed.length === 0"
+      v-if="props.rows.length === 0 && props.failure === ''"
       class="m-0 p-2.5 text-[13px] text-dim"
       role="status"
     >
       No matches for “{{ props.query }}”.
     </p>
 
-    <p v-if="props.failed.length > 0" class="m-0 p-2.5 text-[13px] text-warn" role="status">
-      {{
-        props.allFailed
-          ? 'Could not search — the hub did not answer.'
-          : `Could not search ${props.failed.join(', ')}, so these results are incomplete.`
-      }}
+    <p v-if="props.failure !== ''" class="m-0 p-2.5 text-[13px] text-warn" role="status">
+      Could not search — {{ props.failure }}
       <!-- The caller puts focus back in the box before this runs: pressing it
            clears the failure, which unmounts this button, and focus would land
            on the document body with the panel still open and its keys dead. -->
@@ -116,6 +110,30 @@ const emit = defineEmits<{
           </span>
           <span class="font-mono text-[12px] text-dim">{{ countLabel(row.shown, row.total) }}</span>
           <span class="ml-auto flex text-teal"><Icon name="next" :size="13" /></span>
+        </button>
+        <button
+          v-else-if="row.kind === 'artist'"
+          :id="searchOptionId(at)"
+          class="row w-full gap-2.5 px-2.5 py-1.5"
+          :class="at === props.highlight && 'row-on'"
+          role="option"
+          :aria-selected="at === props.highlight"
+          tabindex="-1"
+          type="button"
+          @click="emit('openArtist', row.artist.key, row.library.id)"
+        >
+          <img
+            class="thumb rounded-full!"
+            :src="artistArtworkUrl(row.artist.key, row.library.id, 'thumb')"
+            alt=""
+          />
+          <span class="flex min-w-0 flex-col">
+            <span class="truncate text-[15px]">{{ row.artist.name }}</span>
+            <span class="truncate font-mono text-[12px] text-dim">
+              Artist · {{ row.artist.album_count }}
+              {{ row.artist.album_count === 1 ? 'album' : 'albums' }}
+            </span>
+          </span>
         </button>
         <button
           v-else
@@ -160,7 +178,9 @@ const emit = defineEmits<{
 /// and rebuilds every thumbnail below it, which is the opposite of what keys
 /// are for.
 function rowKey(row: SearchRow): string {
-  return row.kind === 'library' ? `lib:${row.library.id}` : `${row.library.id}:${row.item.id}`
+  if (row.kind === 'library') return `lib:${row.library.id}`
+  if (row.kind === 'artist') return `${row.library.id}:artist:${row.artist.key}`
+  return `${row.library.id}:${row.item.id}`
 }
 export default { name: 'SearchPanel' }
 </script>

@@ -3,6 +3,8 @@ export * from '../src/api/generated/kahawai.ts'
 export {
   listItems,
   listArtists,
+  listTracks,
+  searchEverywhere,
   artistAlbums,
   upNext,
   catalogueDetail,

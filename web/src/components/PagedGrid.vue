@@ -68,6 +68,12 @@ onMounted(() => {
     if (typeof ResizeObserver === 'undefined' || !grid.value) return
     watching = new ResizeObserver(remeasure)
     watching.observe(grid.value)
+    // And the page it sits in: which rows are on screen depends on where the
+    // grid STARTS, which moves whenever something above it changes height —
+    // with no scroll and no change to this grid. A filtered music library's
+    // songs sit below its albums, whose grid grows as the results land.
+    const page = wrap.value?.closest('main')
+    if (page) watching.observe(page)
   })
 })
 onBeforeUnmount(() => {

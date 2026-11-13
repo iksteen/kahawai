@@ -1,6 +1,8 @@
 vi.mock('../src/api/catalogue.ts', () => ({
   listItems: vi.fn(),
   listArtists: vi.fn(),
+  listTracks: vi.fn(),
+  searchEverywhere: vi.fn(),
   artistAlbums: vi.fn(),
   upNext: vi.fn(),
   catalogueDetail: vi.fn(),
@@ -24,99 +26,149 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
 }))
 
-const { listItems } = await import('./api-fixture.ts')
+const { searchEverywhere } = await import('./api-fixture.ts')
 const { useSearchPanel } = await import('../src/composables/search-panel.ts')
 const { notice, clearNotices } = await import('../src/composables/notices.ts')
 
 const films = { id: 'films', name: 'Films', media_type: 'movies' }
 const music = { id: 'music', name: 'Music', media_type: 'music' }
 const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemSummary
-const page = (items: ItemSummary[], total = items.length) => ({ items, total, limit: 5, offset: 0 })
+type Hits = Awaited<ReturnType<typeof searchEverywhere>>[number]
+/// One library's answer: its items, and nothing of the other kinds unless a
+/// test says so.
+const hits = (library: typeof films, items: ItemSummary[], more: Partial<Hits> = {}): Hits => ({
+  library,
+  items,
+  total: items.length,
+  artists: [],
+  artistTotal: 0,
+  songs: [],
+  songTotal: 0,
+  ...more,
+})
 
 /// The composable in a component, because it uses queries and a scope.
-function panel(query = ref('heat'), libraries = ref([films, music])) {
+function panel(query = ref('heat')) {
   const client = new QueryClient({ defaultOptions: { queries: { retry: false } } })
   let api!: ReturnType<typeof useSearchPanel>
   mount(
     defineComponent({
       setup() {
-        api = useSearchPanel(libraries, query)
+        api = useSearchPanel(query)
         return () => h('div')
       },
     }),
     { global: { plugins: [[VueQueryPlugin, { queryClient: client }]] } },
   )
-  return { api: () => api, query, libraries }
+  return { api: () => api, query }
 }
 
-/// Each library answers with what it is given, or refuses.
-function answers(by: Record<string, ItemSummary[] | 'fails'>) {
-  vi.mocked(listItems).mockImplementation(async (params) => {
-    const answer = by[params?.library ?? '']
-    if (answer === 'fails' || answer === undefined) throw new ApiError(503, 'the hub is restarting')
-    return page(answer)
+/// The hub answers Films then Music with what they are given — or, with
+/// 'fails', refuses the whole search.
+function answers(by: { films?: ItemSummary[]; music?: ItemSummary[] } | 'fails') {
+  vi.mocked(searchEverywhere).mockImplementation(async () => {
+    if (by === 'fails') throw new ApiError(503, 'the hub is restarting')
+    return [hits(films, by.films ?? []), hits(music, by.music ?? [])]
   })
 }
 
-beforeEach(() => clearNotices())
+beforeEach(() => {
+  clearNotices()
+})
 afterEach(() => vi.resetAllMocks())
 
 describe('asking', () => {
-  test('every library at once, five each', async () => {
+  test('every library at once, in one request, five each', async () => {
     answers({ films: [item('a')], music: [item('b')] })
     const { api } = panel()
     await flushPromises()
-    expect(listItems).toHaveBeenCalledTimes(2)
-    expect(listItems).toHaveBeenCalledWith({ library: 'films', q: 'heat', limit: 5 })
+    expect(searchEverywhere).toHaveBeenCalledTimes(1)
+    expect(searchEverywhere).toHaveBeenCalledWith({ q: 'heat', limit: 5 })
     // A heading and a hit, twice.
     expect(api().rows.value.map((r) => r.kind)).toEqual(['library', 'item', 'library', 'item'])
+  })
+
+  test('a music library answers with its album artists and songs as well', async () => {
+    const song = { ...item('child1:x:t:u:1'), kind: 'song', title: 'Heat of the Moment' }
+    vi.mocked(searchEverywhere).mockResolvedValue([
+      hits(films, [item('heat')]),
+      hits(music, [item('Heat Album')], {
+        artists: [{ key: 'heatwave', name: 'Heatwave', album_count: 3 }],
+        artistTotal: 2,
+        songs: [song],
+        songTotal: 7,
+      }),
+    ])
+    const { api } = panel()
+    await flushPromises()
+    const rows = api().rows.value
+    expect(rows.map((r) => r.kind)).toEqual([
+      'library',
+      'item',
+      'library',
+      'artist',
+      'item',
+      'item',
+    ])
+    // Artists, then albums, then songs — and the heading counts all three.
+    expect(rows[4]).toMatchObject({ kind: 'item', item: { title: 'Heat Album' } })
+    expect(rows[5]).toMatchObject({ kind: 'item', item: { kind: 'song' } })
+    expect(rows[2]).toMatchObject({ kind: 'library', shown: 3, total: 2 + 1 + 7 })
+  })
+
+  test('a music library with only song hits still gets its heading', async () => {
+    const song = { ...item('child1:x:t:u:1'), kind: 'song' }
+    vi.mocked(searchEverywhere).mockResolvedValue([
+      hits(films, []),
+      hits(music, [], { songs: [song], songTotal: 1 }),
+    ])
+    const { api } = panel()
+    await flushPromises()
+    expect(api().rows.value.map((r) => r.kind)).toEqual(['library', 'item'])
   })
 
   test('nothing at all with an empty box', async () => {
     answers({ films: [item('a')], music: [item('b')] })
     const { api } = panel(ref(''))
     await flushPromises()
-    expect(listItems).not.toHaveBeenCalled()
-    expect(api().drawn.value).toBe(false)
-  })
-
-  test('and nothing while the library list is still coming', async () => {
-    // An empty list searched nothing and answered immediately, and the panel
-    // stated "No matches" as a fact about the catalogue — from a search that
-    // never ran, with no Try again, because nothing failed from its point of
-    // view.
-    answers({})
-    const { api } = panel(ref('heat'), ref([]))
-    await flushPromises()
-    expect(listItems).not.toHaveBeenCalled()
+    expect(searchEverywhere).not.toHaveBeenCalled()
     expect(api().drawn.value).toBe(false)
   })
 })
 
-describe('a library that could not be asked', () => {
-  test('is named, and does not read as no matches', async () => {
-    answers({ films: [item('a')], music: 'fails' })
+describe('a search that could not be answered', () => {
+  test('says so, and shows no rows at all', async () => {
+    // All or nothing: results with a library quietly missing read as fewer
+    // matches.
+    answers('fails')
     const { api } = panel()
     await flushPromises()
-    expect(api().failed.value).toEqual(['Music'])
-    // Films still shows what it found.
-    expect(api().rows.value.some((r) => r.kind === 'item')).toBe(true)
+    expect(api().failure.value).toBe('the hub is restarting')
+    expect(api().rows.value).toEqual([])
+    // Still a panel on screen — the failure and its Try again are in it.
+    expect(api().drawn.value).toBe(true)
   })
 
-  test('and one notice covers the whole search rather than one per library', async () => {
-    // Notices are latest-wins: one each would name whichever failed last and
-    // imply the rest were fine.
-    answers({ films: 'fails', music: 'fails' })
-    panel()
+  test('not even the rows of the search before it', async () => {
+    answers({ films: [item('a')] })
+    const query = ref('heat')
+    const { api } = panel(query)
     await flushPromises()
-    expect(notice.value).toContain('the hub is restarting')
+    expect(api().rows.value).toHaveLength(2)
+
+    answers('fails')
+    query.value = 'other'
+    await flushPromises()
+    expect(api().failure.value).not.toBe('')
+    expect(api().rows.value).toEqual([])
+    expect(api().shownQuery.value).toBe('other')
   })
 
-  test('the notice names the libraries when only some failed', async () => {
-    answers({ films: [item('a')], music: 'fails' })
+  test('and one notice says so', async () => {
+    answers('fails')
     panel()
     await flushPromises()
-    expect(notice.value).toBe('Could not search Music.')
+    expect(notice.value).toBe('Could not search — the hub is restarting')
   })
 
   test('and a failure that repeats is reported every time', async () => {
@@ -124,7 +176,7 @@ describe('a library that could not be asked', () => {
     // Notices clear after five seconds, so there was nothing on screen to
     // duplicate: pressing Try again against a hub that was still down said
     // nothing at all.
-    answers({ films: 'fails', music: 'fails' })
+    answers('fails')
     const { api } = panel()
     await flushPromises()
     expect(notice.value).not.toBe('')
@@ -135,46 +187,32 @@ describe('a library that could not be asked', () => {
     expect(notice.value).not.toBe('')
   })
 
-  test('and a banner from the last query does not sit over the next one', async () => {
-    // The sentence named a library the current search had not asked yet.
-    answers({ films: [item('a')], music: 'fails' })
+  test('and its banner does not sit over the next search while that is asked', async () => {
+    answers('fails')
     const query = ref('heat')
     const { api } = panel(query)
     await flushPromises()
-    expect(api().failed.value).toEqual(['Music'])
+    expect(api().failure.value).not.toBe('')
 
     let answer = () => {}
-    vi.mocked(listItems).mockReturnValue(
-      new Promise((resolve) => (answer = () => resolve(page([])))),
+    vi.mocked(searchEverywhere).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve([]))),
     )
     query.value = 'other'
     await flushPromises()
     expect(api().searching.value).toBe(true)
-    expect(api().failed.value).toEqual([])
+    expect(api().failure.value).toBe('')
 
     answer()
     await flushPromises()
-  })
-
-  test('one library being away is not the hub being away', async () => {
-    // The two sentences say different things, and only one of them is true.
-    answers({ films: [item('a')], music: 'fails' })
-    const { api } = panel()
-    await flushPromises()
-    expect(api().allFailed.value).toBe(false)
-
-    answers({ films: 'fails', music: 'fails' })
-    api().retry()
-    await flushPromises()
-    expect(api().allFailed.value).toBe(true)
   })
 
   test('emptying the box stops the search, even mid-flight', async () => {
     // Otherwise the panel is "still searching" for a query nobody typed, and
     // the failure banner it is holding back never comes back.
     let answer = () => {}
-    vi.mocked(listItems).mockReturnValue(
-      new Promise((resolve) => (answer = () => resolve(page([])))),
+    vi.mocked(searchEverywhere).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve([]))),
     )
     const query = ref('heat')
     const { api } = panel(query)
@@ -191,15 +229,16 @@ describe('a library that could not be asked', () => {
   })
 
   test('and asking again is offered', async () => {
-    answers({ films: 'fails', music: 'fails' })
+    answers('fails')
     const { api } = panel()
     await flushPromises()
-    expect(api().failed.value).toHaveLength(2)
+    expect(api().failure.value).not.toBe('')
 
     answers({ films: [item('a')], music: [item('b')] })
     api().retry()
     await flushPromises()
-    expect(api().failed.value).toEqual([])
+    expect(api().failure.value).toBe('')
+    expect(api().rows.value).toHaveLength(4)
   })
 })
 
@@ -215,8 +254,8 @@ describe('while the next answer is on its way', () => {
     expect(api().rows.value).toHaveLength(2)
 
     let release = () => {}
-    vi.mocked(listItems).mockReturnValue(
-      new Promise((resolve) => (release = () => resolve(page([item('z')])))),
+    vi.mocked(searchEverywhere).mockReturnValue(
+      new Promise((resolve) => (release = () => resolve([hits(films, [item('z')])]))),
     )
     query.value = 'heat 2'
     await flushPromises()

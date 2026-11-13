@@ -49,6 +49,16 @@ artists.add_argument("library")
 artists.add_argument("--offset", type=int, default=0)
 artists.add_argument("--limit", type=int, default=200)
 artists.add_argument("--query", default="")
+search = sub.add_parser("search", help="search every library you can see (or --libraries), one request")
+search.add_argument("query", nargs="?", default="")
+search.add_argument("--libraries", help="comma-separated library ids, in the order to answer them")
+search.add_argument("--kinds", help="comma-separated: items,artists,tracks")
+search.add_argument("--limit", type=int, default=5)
+tracks = sub.add_parser("tracks", help="songs whose title matches, one per album position")
+tracks.add_argument("library")
+tracks.add_argument("--query", default="")
+tracks.add_argument("--offset", type=int, default=0)
+tracks.add_argument("--limit", type=int, default=100)
 sub.add_parser("segments", help="show pending skip-point and loudness analysis per video collection")
 sub.add_parser("item-log").add_argument("item")
 login = sub.add_parser("login")
@@ -124,6 +134,12 @@ args = parser.parse_args()
 quote = lambda value: urllib.parse.quote(value, safe="")
 base = "/api/v1/catalogue/libraries"
 admin = "/admin/v1/catalogue/libraries"
+
+def one_kind(library, kind, page):
+    """One library's page of one kind: every listing is /search, so this is
+    what the library grid, the artist grid and the songs grid ask for."""
+    params = {"libraries": library, "kinds": kind, **{k: v for k, v in page.items() if v is not None}}
+    return request("GET", "/api/v1/catalogue/search?" + urllib.parse.urlencode(params))["libraries"][0][kind]
 match args.command:
     case "artwork":
         from pathlib import Path
@@ -147,7 +163,11 @@ match args.command:
             sys.exit("match requires revision and action; use enrichment detail to read the current revision")
         answer = request("POST", f"/admin/v1/enrich/items/{quote(args.copy)}/match", body)
     case "artists":
-        answer = request("GET", f"{base}/{quote(args.library)}/artists?" + urllib.parse.urlencode({"offset":args.offset,"limit":args.limit,"q":args.query}))
+        answer = one_kind(args.library, "artists", {"offset":args.offset,"limit":args.limit,"q":args.query})
+    case "tracks":
+        answer = one_kind(args.library, "tracks", {"offset":args.offset,"limit":args.limit,"q":args.query})
+    case "search":
+        answer = request("GET", "/api/v1/catalogue/search?" + urllib.parse.urlencode({k:v for k,v in {"q":args.query,"libraries":args.libraries,"kinds":args.kinds,"limit":args.limit}.items() if v is not None}))
     case "segments":
         answer = request("GET", "/admin/v1/segments")
     case "subtitle-search" | "subtitle-download" | "subtitle-delete":
@@ -200,7 +220,7 @@ match args.command:
     case "delete-library":
         answer = request("DELETE", f"{admin}/{quote(args.library)}")
     case "items":
-        answer = request("GET", f"{base}/{quote(args.library)}/items?" + urllib.parse.urlencode({k:v for k,v in {"offset":args.offset,"limit":args.limit,"q":args.query,"sort":args.sort,"artist":args.artist}.items() if v is not None}))
+        answer = one_kind(args.library, "items", {"offset":args.offset,"limit":args.limit,"q":args.query,"sort":args.sort,"artist":args.artist})
     case "children":
         if args.season is not None and args.disc is not None:
             parser.error("--season and --disc cannot be combined")

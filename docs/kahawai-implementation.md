@@ -262,9 +262,12 @@ Feature gating: cargo feature `ocr` on `kahawai-hub` (forwarded by the `kahawai`
 
 ### 4.4 Client API
 
-The complete contract is [web/openapi.json](../web/openapi.json). Catalogue
-browsing uses `/api/v1/catalogue/libraries/{id}/items`, with item detail,
-children, artwork and watched state under that library. POST on an item detail
+The complete contract is [web/openapi.json](../web/openapi.json). Every
+catalogue listing — a library's items, album artists and songs, browsed or
+filtered, and the search across libraries — is `/api/v1/catalogue/search`,
+which answers any set of libraries and kinds in one request; item detail,
+children, artwork and watched state live under
+`/api/v1/catalogue/libraries/{id}/items/{item_id}`. POST on an item detail
 URL previews negotiation without creating a session. Continue watching and
 Up next use `/api/v1/catalogue/continue-watching` and `/api/v1/catalogue/up-next`.
 
@@ -325,16 +328,16 @@ API stability begins with the first formal release (NFR-7, clarified by the main
 
 **The general item browse is a deferred join.** An inner query chooses WHICH ≤200 ids make the page using only indexed scalar columns — the membership covering index for a library browse, the sort index for search and unscoped — and the resolved-metadata view, watch state and source counts join onto those ids afterwards. Joining first and paging second resolves the view for every candidate the sort visits, which is the recurring 900 ms failure mode whenever an ORDER BY stops matching an index. A search page streams the sort index and stops early; when it underfills, the scan saw everything, so the total is known without a counting pass — only a full page pays one. The narrower artist-album exception and its cost boundary are below.
 
-**Browse and search are one endpoint** (HUB-12). Omitting `library` searches every library, which is what makes cross-library search a parameter rather than a second route; `q` matches the folded filename and the resolved title, so an item is found by what it is called now as well as by what it is called on disk. `sort` is a name (`title`, `-title`, `year`, `-year`, `added`, `-added`) mapped to a fixed ORDER BY — never interpolated from the request — and each name resolves to `items.sort_title`/`items.year` only, both carried by one index, so a page is a range scan. `added` needs no column: item ids are ULIDs and sort by mint time. The response carries `total`, `limit` and `offset` so a client can size the whole result set before fetching it.
+**Browse and search are one endpoint** (HUB-12), `/api/v1/catalogue/search`. Omitting `libraries` searches every library, which is what makes cross-library search a parameter rather than a second route; `q` matches the folded filename and the resolved title, so an item is found by what it is called now as well as by what it is called on disk. `sort` is a name (`title`, `-title`, `year`, `-year`, `added`, `-added`) mapped to a fixed ORDER BY — never interpolated from the request — and each name resolves to `items.sort_title`/`items.year` only, both carried by one index, so a page is a range scan. `added` needs no column: item ids are ULIDs and sort by mint time. The response carries `total`, `limit` and `offset` so a client can size the whole result set before fetching it.
 
-Music adds two library-scoped views over those same item rows. `GET
-/api/v1/artists` groups albums by a strict `artist_key` before paging and
+Music adds two library-scoped views over those same item rows. `kinds=artists`
+groups albums by a strict `artist_key` before paging and
 returns that opaque URL-safe, stable-within-the-current-name key, display name
 and album count. The separate `norm_artist` stays the fuzzy search value: using it
 as identity would merge real names such as “One” and “1”, and punctuation-only
 names would have no route key.
-`GET /api/v1/artists/{key}/albums` returns that group's albums, oldest first by
-default, and a search also matches their child tracks. Chronology resolves an
+`kinds=items&artist={key}` returns that group's albums, oldest first with
+`sort=year`, and a search also matches their child tracks. Chronology resolves an
 album's embedded year against its provider premiere date before paging, so the
 order is the same one the card displays. This is deliberately paid across one
 artist's candidate albums rather than every album in the library; persisting a

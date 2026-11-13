@@ -2,7 +2,6 @@ import type { Description } from './generated/model/description.ts'
 // View models used by the catalogue presentation adapter. Wire types remain generated.
 import type { ClientReplayGain } from './generated/model/clientReplayGain.ts'
 import type { CatalogueDetail } from './generated/model/catalogueDetail.ts'
-import type { ItemsParams } from './generated/model/itemsParams.ts'
 
 export type ItemSummary = {
   attribution?: readonly string[]
@@ -50,4 +49,13 @@ export type ItemDetail = Omit<ItemSummary, 'sources'> &
     show_title: string | null
     metadata?: Description | null
   }
-export type BrowseParams = ItemsParams & { library?: string; in_progress?: boolean }
+/// A page of a library's items (`/search`, one library and kind), or of what
+/// is in progress (`/continue-watching`) when `in_progress` is set.
+export type BrowseParams = {
+  library?: string
+  in_progress?: boolean
+  q?: string
+  sort?: string
+  offset?: number
+  limit?: number
+}

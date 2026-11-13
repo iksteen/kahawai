@@ -473,3 +473,135 @@ async fn child_catalogue_precedence_is_separate_from_description_resolution() {
         first.description
     );
 }
+
+#[tokio::test]
+async fn track_search_names_album_children_and_stays_in_its_library() {
+    let (_dir, s) = store().await;
+    let a = collection(
+        &s,
+        "a",
+        MediaType::Music,
+        &[
+            "Artist/Album (2000)/01 - First Light.flac",
+            "Artist/Album (2000)/02 - Second Light.flac",
+            "Artist/Other (2001)/03 - Daylight.flac",
+            "Artist/Other (2001)/04 - Half_Time.flac",
+        ],
+    )
+    .await;
+    let elsewhere = collection(
+        &s,
+        "b",
+        MediaType::Music,
+        &["Band/Hidden (2002)/01 - Moonlight.flac"],
+    )
+    .await;
+    let lib = s
+        .create_library("Music", MediaType::Music, std::slice::from_ref(&a))
+        .await
+        .unwrap();
+    s.create_library("Elsewhere", MediaType::Music, &[elsewhere])
+        .await
+        .unwrap();
+
+    let hits = s.search_tracks(&lib, "LIGHT", 0, 200).await.unwrap();
+    assert_eq!(hits.total, 3, "case-insensitive, and Moonlight is not here");
+    assert_eq!(
+        hits.tracks
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Daylight", "First Light", "Second Light"],
+        "ordered by title"
+    );
+    // Each hit is the very child the album's track list names.
+    for hit in &hits.tracks {
+        let listed = s
+            .library_children(&lib, &hit.parent_id, 0, 200, &ChildFilter::default())
+            .await
+            .unwrap();
+        assert!(
+            listed
+                .children
+                .iter()
+                .any(|c| c.id == hit.id && c.position == hit.position)
+        );
+        assert!(!hit.album.is_empty());
+        assert_eq!(hit.artist.as_deref(), Some("Artist"));
+    }
+
+    // Every page is its slice of the whole list, the far half (read from the
+    // other end and turned round) included.
+    for limit in 1..=3u32 {
+        for offset in 0..=3u64 {
+            let page = s.search_tracks(&lib, "light", offset, limit).await.unwrap();
+            assert_eq!(page.total, 3, "offset {offset} limit {limit}");
+            let want: Vec<_> = hits
+                .tracks
+                .iter()
+                .skip(offset as usize)
+                .take(limit as usize)
+                .map(|t| &t.id)
+                .collect();
+            let got: Vec<_> = page.tracks.iter().map(|t| &t.id).collect();
+            assert_eq!(got, want, "offset {offset} limit {limit}");
+        }
+    }
+    assert_eq!(s.search_tracks(&lib, "zzz", 0, 5).await.unwrap().total, 0);
+    // The query is text, not a LIKE pattern: `%` and `_` match themselves.
+    assert_eq!(s.search_tracks(&lib, "f%t", 0, 5).await.unwrap().total, 0);
+    assert_eq!(s.search_tracks(&lib, "lf_t", 0, 5).await.unwrap().total, 1);
+    assert_eq!(s.search_tracks(&lib, "l_t", 0, 5).await.unwrap().total, 0);
+    assert!(s.search_tracks(&lib, "", 0, 0).await.is_err());
+}
+
+#[tokio::test]
+async fn track_search_counts_a_shared_position_once() {
+    // Two files claiming track 1 of one album are one child with two
+    // renditions on the album page, so they are one hit here too — carrying
+    // the lesser title, as the album's grouped view does.
+    let (_dir, s) = store().await;
+    let a = collection(
+        &s,
+        "a",
+        MediaType::Music,
+        &[
+            "Artist/Album (2000)/01 - Light (Remaster).flac",
+            "Artist/Album (2000)/01 - Light.flac",
+            "Artist/Album (2000)/02 - Lighter.flac",
+        ],
+    )
+    .await;
+    let lib = s
+        .create_library("Music", MediaType::Music, std::slice::from_ref(&a))
+        .await
+        .unwrap();
+    let hits = s.search_tracks(&lib, "light", 0, 200).await.unwrap();
+    let parent = hits.tracks[0].parent_id.clone();
+    let listed = s
+        .library_children(&lib, &parent, 0, 200, &ChildFilter::default())
+        .await
+        .unwrap();
+    assert_eq!(
+        hits.total, listed.total,
+        "one hit per child the album lists"
+    );
+    assert_eq!(
+        hits.tracks
+            .iter()
+            .map(|t| t.title.as_str())
+            .collect::<Vec<_>>(),
+        ["Light", "Lighter"]
+    );
+    let mut ids: Vec<_> = hits.tracks.iter().map(|t| t.id.clone()).collect();
+    ids.sort();
+    ids.dedup();
+    assert_eq!(ids.len(), hits.tracks.len());
+    // A full page pays the count, which must agree.
+    let page = s.search_tracks(&lib, "light", 0, 1).await.unwrap();
+    assert_eq!((page.total, page.tracks[0].title.as_str()), (2, "Light"));
+    // A position whose other entry does not match is still found once.
+    let remaster = s.search_tracks(&lib, "remaster", 0, 5).await.unwrap();
+    assert_eq!(remaster.total, 1);
+    assert_eq!(remaster.tracks[0].id, hits.tracks[0].id);
+}

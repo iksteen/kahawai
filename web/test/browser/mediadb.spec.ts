@@ -1,5 +1,18 @@
-import { expect, test } from '@playwright/test'
+import { type APIRequestContext, expect, test } from '@playwright/test'
 import AxeBuilder from '@axe-core/playwright'
+
+/// A library's items page: one library and one kind of the catalogue's single
+/// listing, `/catalogue/search`.
+async function libraryItems(
+  request: APIRequestContext,
+  library: string,
+  headers: Record<string, string>,
+) {
+  const response = await request.get(`/api/v1/catalogue/search?libraries=${library}&kinds=items`, {
+    headers,
+  })
+  return (await response.json()).libraries[0].items
+}
 
 test('compose libraries from a real mediahost, persist edits and revoke grants on deletion', async ({
   page,
@@ -104,10 +117,7 @@ test('compose libraries from a real mediahost, persist edits and revoke grants o
   await expect
     .poll(
       async () => {
-        const response = await request.get(`/api/v1/catalogue/libraries/${created.id}/items`, {
-          headers,
-        })
-        const rows = (await response.json()).items as {
+        const rows = (await libraryItems(request, created.id, headers)).items as {
           metadata: { description: { overview?: string } }
         }[]
         return rows[0]?.metadata.description.overview
@@ -120,10 +130,9 @@ test('compose libraries from a real mediahost, persist edits and revoke grants o
   await expect
     .poll(
       async () => {
-        const response = await request.get(`/api/v1/catalogue/libraries/${created.id}/items`, {
-          headers,
-        })
-        const rows = (await response.json()).items as { copy_ids: string[] }[]
+        const rows = (await libraryItems(request, created.id, headers)).items as {
+          copy_ids: string[]
+        }[]
         const snapshots = await Promise.all(
           rows
             .flatMap((row) => row.copy_ids)
@@ -294,9 +303,7 @@ test('home uses saved progress and advances up next through stable episode links
   const headers = { Authorization: `Bearer ${process.env.KAHAWAI_MEDIADB_UI_TOKEN}` }
   const libraries = await (await request.get('/api/v1/catalogue/libraries', { headers })).json()
   const library = libraries.find((l: { name: string }) => l.name === 'Fixture series').id
-  const parent = (
-    await (await request.get(`/api/v1/catalogue/libraries/${library}/items`, { headers })).json()
-  ).items[0].id
+  const parent = (await libraryItems(request, library, headers)).items[0].id
   const children = (
     await (
       await request.get(`/api/v1/catalogue/libraries/${library}/items/${parent}/children`, {
@@ -349,9 +356,11 @@ test('physical episodes and tracks keep stable links and source details', async 
   const shows = libraries.find((l) => l.name === 'Fixture series')!
   const music = libraries.find((l) => l.name === 'Fixture music')!
   const parent = async (library: string) => {
-    const result = await request.get(`/api/v1/catalogue/libraries/${library}/items`, { headers })
+    const result = await request.get(`/api/v1/catalogue/search?libraries=${library}&kinds=items`, {
+      headers,
+    })
     expect(result.ok()).toBe(true)
-    return (await result.json()).items[0].id as string
+    return (await result.json()).libraries[0].items.items[0].id as string
   }
   const series = await parent(shows.id)
   const album = await parent(music.id)
@@ -444,9 +453,7 @@ test('play a catalogue rendition in the existing player and save its progress', 
       data: { name: 'Playback fixture', media_type: 'movies', collection_ids: [collection.id] },
     })
   ).json()
-  const item = (
-    await (await request.get(`/api/v1/catalogue/libraries/${library.id}/items`, { headers })).json()
-  ).items[0]
+  const item = (await libraryItems(request, library.id, headers)).items[0]
   const retired: string[] = []
   page.on('request', (request) => {
     if (/\/api\/v1\/items(?:[/?]|$)/.test(request.url())) retired.push(request.url())
@@ -498,8 +505,7 @@ test('anime movies retain Play while anime series expose episodes', async ({ pag
   const headers = { Authorization: `Bearer ${process.env.KAHAWAI_MEDIADB_UI_TOKEN}` }
   const libraries = await (await request.get('/api/v1/catalogue/libraries', { headers })).json()
   const library = libraries.find((l: { name: string }) => l.name === 'Fixture anime')
-  const path = `/api/v1/catalogue/libraries/${library.id}/items`
-  const { items } = await (await request.get(path, { headers })).json()
+  const { items } = await libraryItems(request, library.id, headers)
   const movie = items.find((i: { kind: string }) => i.kind === 'movie')
   const series = items.find((i: { kind: string }) => i.kind === 'series')
   await page.goto(`/app/library/${library.id}/item/${movie.id}`)
@@ -518,9 +524,7 @@ test('community skip lookup runs in the browser with catalogue provider IDs', as
   const headers = { Authorization: `Bearer ${process.env.KAHAWAI_MEDIADB_UI_TOKEN}` }
   const libraries = await (await request.get('/api/v1/catalogue/libraries', { headers })).json()
   const library = libraries.find((l: { name: string }) => l.name === 'Fixture anime')
-  const { items } = await (
-    await request.get(`/api/v1/catalogue/libraries/${library.id}/items`, { headers })
-  ).json()
+  const { items } = await libraryItems(request, library.id, headers)
   const movie = items.find((i: { kind: string }) => i.kind === 'movie')
   expect(
     (
@@ -590,9 +594,7 @@ test('rendered ASS overlays use the selected catalogue source and session URL', 
       data: { name: 'Raster fixture', media_type: 'movies', collection_ids: [collection.id] },
     })
   ).json()
-  const item = (
-    await (await request.get(`/api/v1/catalogue/libraries/${library.id}/items`, { headers })).json()
-  ).items[0]
+  const item = (await libraryItems(request, library.id, headers)).items[0]
   const path = `/api/v1/catalogue/libraries/${library.id}/items/${item.id}`
   const preview = await (await request.fetch(path, { method: 'QUERY', headers, data: {} })).json()
   const source = preview.sources.find((s: { streams?: { subtitles: { format: string }[] } }) =>

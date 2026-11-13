@@ -29,6 +29,7 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
 vi.mock('../src/api/catalogue.ts', () => ({
   listItems: vi.fn(),
   listArtists: vi.fn(),
+  listTracks: vi.fn(),
   artistAlbums: vi.fn(),
   upNext: vi.fn(),
   catalogueDetail: vi.fn(),

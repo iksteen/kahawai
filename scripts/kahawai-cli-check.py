@@ -42,10 +42,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
         elif url.path == '/admin/v1/users':
             self.reply({'users':[{'id':'viewer', 'username':'viewer', 'is_admin':False,
                                   'all_libraries':False, 'libraries':[], 'grants_version':7}]})
-        elif url.path == '/api/v1/catalogue/libraries/library/items':
+        elif url.path == '/api/v1/catalogue/search' and query.get('libraries') == ['library'] \
+                and query.get('kinds') == ['items']:
             offset = int(query['offset'][0])
-            self.reply({'items':[{'id':f'item-{i}', 'title':f'Film {i}', 'copy_ids':['copy'], 'year':2000}
-                                 for i in range(offset, min(offset+200, 201))], 'total':201})
+            self.reply({'libraries':[{
+                'library':{'id':'library', 'name':'Library', 'media_type':'movies'},
+                'items':{'items':[{'id':f'item-{i}', 'title':f'Film {i}', 'copy_ids':['copy'], 'year':2000}
+                                  for i in range(offset, min(offset+200, 201))],
+                         'total':201, 'offset':offset, 'limit':200},
+            }]})
         else:
             self.reply({'message':'unknown library'}, 404)
 

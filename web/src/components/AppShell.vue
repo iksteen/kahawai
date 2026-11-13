@@ -76,10 +76,9 @@ const box = ref<{ focus: () => void } | null>(null)
 /// The panel searches whatever the header holds, on the screens that have one.
 /// It is asked for even while closed, so dismissing keeps the results it
 /// already has — unmounting threw them away, and focusing the box again re-ran
-/// every library's search and showed nothing for a round trip.
-const libraryList = computed(() => props.libraries)
+/// the search and showed nothing for a round trip.
 const panelQuery = computed(() => (panel.value ? query.value : ''))
-const results = useSearchPanel(libraryList, panelQuery)
+const results = useSearchPanel(panelQuery)
 
 /// On screen: the panel has drawn something AND the box has not been
 /// dismissed. Both, because they are different questions — one is "is there
@@ -116,6 +115,7 @@ function take() {
   const row = results.rows.value[results.highlight.value] ?? results.rows.value[0]
   if (!row) return
   if (row.kind === 'library') openFromPanel(row.library.id)
+  else if (row.kind === 'artist') openArtistFromPanel(row.artist.key, row.library.id)
   else openItemFromPanel(targetOf(row.item), row.library.id)
 }
 
@@ -128,6 +128,9 @@ function openFromPanel(library: string) {
 }
 function openItemFromPanel(id: string, library: string) {
   void router.push({ name: 'detail', params: { library, id } })
+}
+function openArtistFromPanel(artist: string, library: string) {
+  void router.push({ name: 'artist', params: { library, artist } })
 }
 
 const navOpen = ref(false)
@@ -276,13 +279,13 @@ function go(to: Parameters<typeof router.push>[0]) {
           v-if="showing"
           :query="results.shownQuery.value"
           :rows="results.rows.value"
-          :failed="results.failed.value"
-          :all-failed="results.allFailed.value"
+          :failure="results.failure.value"
           :searching="results.searching.value"
           :highlight="results.highlight.value"
           @close="dismiss()"
           @retry="askAgain"
           @open-library="openFromPanel"
+          @open-artist="openArtistFromPanel"
           @open-item="openItemFromPanel"
         />
       </SearchBox>

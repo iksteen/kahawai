@@ -1,6 +1,6 @@
 import { onScopeDispose, type Ref, ref, shallowRef, watch } from 'vue'
 
-import { artistAlbums, listArtists } from '../api/catalogue.ts'
+import { artistAlbums, listArtists, listTracks } from '../api/catalogue.ts'
 import type { ArtistSummary } from '../api/generated/model/artistSummary.ts'
 import type { ItemSummary } from '../api/catalogue-model.ts'
 import { CHUNK } from '../domain/virtual.ts'
@@ -83,6 +83,24 @@ function sparsePages<T>(
       for (const chunk of failed) void load(chunk)
     },
   }
+}
+
+/// Songs matching `query` in a music library, paged like the artists.
+export function useTracks(library: Ref<string>, query: Ref<string>, enabled?: Ref<boolean>) {
+  const pages = sparsePages<ItemSummary>(
+    async (offset) => {
+      const answer = await listTracks({
+        library: library.value,
+        q: query.value,
+        limit: CHUNK,
+        offset,
+      })
+      return { rows: answer.items, total: answer.total }
+    },
+    [library, query],
+    enabled,
+  )
+  return pages
 }
 
 export function useArtists(

@@ -233,15 +233,20 @@ async fn direct_play_ranges_end_to_end() {
             let resp = api
                 .clone()
                 .oneshot(
-                    Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
-                        .header("authorization", bearer.clone())
-                        .body(Body::empty())
-                        .unwrap(),
+                    Request::get(format!(
+                        "/api/v1/catalogue/search?libraries={library_id}&kinds=items"
+                    ))
+                    .header("authorization", bearer.clone())
+                    .body(Body::empty())
+                    .unwrap(),
                 )
                 .await
                 .unwrap();
             let v: serde_json::Value = serde_json::from_slice(&body_bytes(resp).await).unwrap();
-            if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
+            if let Some(id) = v["libraries"][0]["items"]["items"]
+                .get(0)
+                .and_then(|i| i["id"].as_str())
+            {
                 return id.to_string();
             }
             tokio::time::sleep(Duration::from_millis(50)).await;

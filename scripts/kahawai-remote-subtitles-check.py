@@ -140,7 +140,7 @@ try:
         return next((c for c in api('GET','/admin/v1/catalogue/collections') if c['file_count']==1 and not c['snapshot']), None)
     col = until(collection, 'remote catalogue import')
     library = api('POST','/admin/v1/catalogue/libraries',{'name':'Remote fixture','media_type':'movies','collection_ids':[col['id']]})['id']
-    item = until(lambda: api('GET',f'/api/v1/catalogue/libraries/{library}/items')['items'], 'library item')[0]['id']
+    item = until(lambda: api('GET',f'/api/v1/catalogue/search?libraries={library}&kinds=items')['libraries'][0]['items']['items'], 'library item')[0]['id']
     item_path = f'/api/v1/catalogue/libraries/{library}/items/{item}'
     with sqlite3.connect(work/'hub'/'hub.db') as db:
         db.execute("INSERT INTO user_prefs(user_id,scope,key,value) SELECT id,'','ass_order','overlay,flatten,burn' FROM users")

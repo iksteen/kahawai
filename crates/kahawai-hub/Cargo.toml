@@ -23,6 +23,7 @@ kahawai-sqlite = { workspace = true }
 kahawai-transport = { workspace = true }
 tonic = { workspace = true }
 tokio = { workspace = true }
+futures-util = { workspace = true }
 tokio-stream = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }

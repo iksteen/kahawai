@@ -758,3 +758,186 @@ impl Store {
         })
     }
 }
+
+/// A song that matched a title search, named the way the album lists it: its
+/// [`ChildId`], so opening or marking it addresses the same child the album's
+/// track list does, and every copy of that position is one hit.
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TrackHit {
+    pub id: String,
+    pub parent_id: String,
+    pub album: String,
+    pub position: ChildPosition,
+    /// The detected title, which is what the search matched. A provider's
+    /// track title can differ; the album page shows that one.
+    pub title: String,
+    pub artist: Option<String>,
+}
+#[derive(Debug, Clone, Serialize, Deserialize, utoipa::ToSchema)]
+pub struct TrackHits {
+    pub tracks: Vec<TrackHit>,
+    pub total: u64,
+}
+
+impl Store {
+    /// Songs in `library` whose title contains `query`, case-insensitively —
+    /// SQLite folds ASCII only, in `LIKE` exactly as in the artist search's
+    /// `lower()`. One hit per child position, ordered by title.
+    ///
+    /// A substring match cannot use an index, so every search scans the
+    /// library's tracks; the work per scanned row is what is kept small.
+    /// - Positions are per COPY (`media_entries.item_id`): a music copy is
+    ///   always its own library item (`identity` gives music a per-copy
+    ///   singleton), so no two copies can hold one child.
+    /// - A position holds more than one entry only rarely — renditions of one
+    ///   track side by side. Those positions are found from the
+    ///   `track_positions` index, which streams; grouping every match instead
+    ///   cost a temporary B-tree over all of them, the bulk of the time at
+    ///   250k tracks. Each such position keeps the entry with the least title
+    ///   (`MIN(title)`, as a grouped query would) and the least artist of its
+    ///   matches; the others are left out of the scan by rowid, so the page
+    ///   and the count are both per position.
+    /// - Pages walk `track_titles`, which covers the filter and is in the
+    ///   sort's order (NOCASE being the same ASCII folding as `lower()`), so a
+    ///   page stops once it has its rows and an offset skips index entries
+    ///   rather than sorting every match ahead of it.
+    /// - Album titles and the artist fallback are joined onto the page's rows,
+    ///   not onto every match.
+    /// - A page that comes back short has seen every match, so its total is
+    ///   known without the counting pass; only a full page pays one.
+    pub async fn search_tracks(
+        &self,
+        library: &str,
+        query: &str,
+        offset: u64,
+        limit: u32,
+    ) -> Result<TrackHits> {
+        use sqlx::Row;
+        ensure!((1..=200).contains(&limit), "invalid track page size");
+        let pattern = format!(
+            "%{}%",
+            query
+                .replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        );
+        let matching = "e.kind='track' AND e.title LIKE ? ESCAPE '\\'
+            AND e.collection_id IN (SELECT collection_id FROM library_collections WHERE library_id=?)";
+        let mut c = self.db.read_pool().acquire().await?;
+        let mut tx = c.begin().await?;
+
+        // The matching entries of positions that hold more than one.
+        let shared = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "WITH d AS (SELECT item_id,disc,track FROM media_entries INDEXED BY track_positions
+                        WHERE kind='track' AND track IS NOT NULL
+                        GROUP BY item_id,disc,track HAVING COUNT(*)>1)
+             SELECT e.rowid AS rid,e.item_id,e.disc,e.track,e.id,e.title,e.artist
+             FROM media_entries e JOIN d ON d.item_id=e.item_id AND d.disc IS e.disc AND d.track=e.track
+             WHERE {matching}"
+        )))
+        .bind(&pattern)
+        .bind(library)
+        .fetch_all(&mut *tx)
+        .await?;
+        type Position = (String, Option<i64>, i64);
+        /// rowid, title, entry id, artist.
+        type Entry = (i64, String, String, Option<String>);
+        let mut groups: BTreeMap<Position, Vec<Entry>> = BTreeMap::new();
+        for r in &shared {
+            groups
+                .entry((r.get("item_id"), r.get("disc"), r.get("track")))
+                .or_default()
+                .push((r.get("rid"), r.get("title"), r.get("id"), r.get("artist")));
+        }
+        let mut excluded = Vec::new();
+        let mut artists: BTreeMap<i64, Option<String>> = BTreeMap::new();
+        for entries in groups.values_mut() {
+            entries.sort_by(|a, b| (&a.1, &a.2).cmp(&(&b.1, &b.2)));
+            let keep = entries[0].0;
+            artists.insert(keep, entries.iter().filter_map(|e| e.3.clone()).min());
+            excluded.extend(entries[1..].iter().map(|e| e.0));
+        }
+        let excluded_json = serde_json::to_string(&excluded)?;
+        let kept = format!("{matching} AND e.rowid NOT IN (SELECT value FROM json_each(?))");
+
+        let mut rows = sqlx::query(sqlx::AssertSqlSafe(format!(
+            "SELECT h.*,i.library_item_id AS parent,i.artist AS album_artist,w.title AS album
+             FROM (SELECT e.rowid AS rid,e.item_id,e.disc,e.track,e.id,e.title,e.artist
+                   FROM media_entries e INDEXED BY track_titles WHERE {kept}
+                   ORDER BY e.title COLLATE NOCASE,e.item_id,e.disc,e.track,e.id
+                   LIMIT ? OFFSET ?) h
+             JOIN collection_items i ON i.id=h.item_id JOIN library_items w ON w.id=i.library_item_id"
+        )))
+        .bind(&pattern)
+        .bind(library)
+        .bind(&excluded_json)
+        .bind(i64::from(limit))
+        .bind(i64::try_from(offset)?)
+        .fetch_all(&mut *tx)
+        .await?;
+        let seen_all = rows.len() < limit as usize && (offset == 0 || !rows.is_empty());
+        let total = if seen_all {
+            offset + rows.len() as u64
+        } else {
+            let n: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
+                "SELECT COUNT(*) FROM media_entries e INDEXED BY track_titles WHERE {kept}"
+            )))
+            .bind(&pattern)
+            .bind(library)
+            .bind(&excluded_json)
+            .fetch_one(&mut *tx)
+            .await?;
+            u64::try_from(n)?
+        };
+        // The page's own order, restored here rather than by an outer ORDER BY
+        // on the joined rows: the same keys, NOCASE being ASCII folding and
+        // NULL (None) sorting first, as in SQLite.
+        rows.sort_by_cached_key(|r| {
+            (
+                r.get::<String, _>("title").to_ascii_lowercase(),
+                r.get::<String, _>("item_id"),
+                r.get::<Option<i64>, _>("disc"),
+                r.get::<Option<i64>, _>("track"),
+                r.get::<String, _>("id"),
+            )
+        });
+        tx.commit().await?;
+        let tracks = rows
+            .into_iter()
+            .map(|r| -> Result<TrackHit> {
+                let parent: String = r.get("parent");
+                let disc = r
+                    .get::<Option<i64>, _>("disc")
+                    .map(u32::try_from)
+                    .transpose()?;
+                let position = match r.get::<Option<i64>, _>("track") {
+                    Some(track) => ChildPosition::Track {
+                        disc,
+                        track: u32::try_from(track)?,
+                    },
+                    None => ChildPosition::UnnumberedTrack {
+                        disc,
+                        entry_id: r.get("id"),
+                    },
+                };
+                let artist = match artists.get(&r.get::<i64, _>("rid")) {
+                    Some(group) => group.clone(),
+                    None => r.get("artist"),
+                };
+                Ok(TrackHit {
+                    id: ChildId {
+                        parent: parent.clone(),
+                        position: position.clone(),
+                    }
+                    .encode(),
+                    parent_id: parent,
+                    album: r.get("album"),
+                    position,
+                    title: r.get("title"),
+                    artist: artist.or_else(|| r.get("album_artist")),
+                })
+            })
+            .collect::<Result<_>>()?;
+        Ok(TrackHits { tracks, total })
+    }
+}

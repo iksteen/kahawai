@@ -353,5 +353,79 @@ async fn scale(path: &Path) -> Result<()> {
         );
     }
     s.close().await;
+    track_search(path).await
+}
+
+/// Song search against the same 200 ms target (NFR-1), at NFR-1's 50k and at
+/// 250k tracks — ten per album, the shape of a real collection. Two
+/// collections (5k and 20k albums) back two libraries: one over the first, one
+/// over both. A substring match cannot use an index, so every needle scans the
+/// library's tracks: "song" is the adversarial one (it matches every track, so
+/// the grouping and the count see everything), a full title the rare one, and
+/// "zzz" matches nothing. Titles are scrambled against insertion order (7919 is
+/// coprime to both collection sizes, so each is a permutation): stored in title
+/// order, the sorter got presorted input and flattered every ascending page.
+/// Every case is printed before any is judged.
+async fn track_search(path: &Path) -> Result<()> {
+    let mut c = sqlx::SqliteConnection::connect_with(
+        &sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(path)
+            .foreign_keys(true),
+    )
+    .await?;
+    let mut tx = c.begin().await?;
+    sqlx::raw_sql("INSERT INTO collections(id,mediahost_id,remote_id,media_type,epoch,version) VALUES
+            ('songs-a','scale','songs-a','music','scale',1),('songs-b','scale','songs-b','music','scale',1);
+        INSERT INTO collection_roots VALUES('root-a','songs-a','songs-a','/a',1),('root-b','songs-b','songs-b','/b',1);
+        INSERT INTO libraries VALUES('music50k','Music 50k','music'),('music250k','Music 250k','music');
+        INSERT INTO library_collections VALUES('music50k','songs-a','music',0),('music250k','songs-a','music',0),('music250k','songs-b','music',1);
+        WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<25000)
+        INSERT INTO library_items(id,media_type,title,title_key,year,singleton)
+        SELECT 'a'||x,'music',printf('Album %05d',x),printf('album %05d',x),2000,'a'||x FROM n;
+        INSERT INTO collection_items(id,collection_id,root_id,occurrence,title,year,library_item_id,artist,description_json)
+        SELECT 'c'||substr(id,2),
+            CASE WHEN CAST(substr(id,2) AS INTEGER)<=5000 THEN 'songs-a' ELSE 'songs-b' END,
+            CASE WHEN CAST(substr(id,2) AS INTEGER)<=5000 THEN 'root-a' ELSE 'root-b' END,
+            'occ'||id,title,year,id,printf('Artist %04d',CAST(substr(id,2) AS INTEGER)%2000),'{}'
+        FROM library_items WHERE media_type='music';
+        WITH RECURSIVE n(x) AS(VALUES(1) UNION ALL SELECT x+1 FROM n WHERE x<250000)
+        INSERT INTO media_entries(id,collection_id,item_id,occurrence,kind,title,disc,track)
+        SELECT 'e'||x,CASE WHEN x<=50000 THEN 'songs-a' ELSE 'songs-b' END,'c'||(((x-1)/10)+1),'t'||x,'track',
+            printf('Song %06d',CASE WHEN x<=50000 THEN (x*7919)%50000 ELSE 50000+((x*7919)%200000) END),
+            1,((x-1)%10)+1 FROM n;").execute(&mut *tx).await?;
+    tx.commit().await?;
+    c.close().await?;
+    let s = Store::open(path).await?;
+    let mut misses = Vec::new();
+    for (library, size) in [("music50k", 50_000), ("music250k", 250_000)] {
+        for (needle, expected) in [("song", size), ("Song 012345", 1), ("zzz", 0)] {
+            for (offset, limit) in [(0, 5), (0, 100), (size / 2, 100), (size * 4 / 5, 100)] {
+                let started = std::time::Instant::now();
+                let hits = s.search_tracks(library, needle, offset, limit).await?;
+                let elapsed = started.elapsed();
+                ensure!(
+                    hits.total == expected,
+                    "wrong track total for {needle:?} in {library}: {}",
+                    hits.total
+                );
+                println!(
+                    "{size} tracks: {needle:?} offset {offset} limit {limit}, {} of {} hits, {} ms",
+                    hits.tracks.len(),
+                    hits.total,
+                    elapsed.as_millis()
+                );
+                if elapsed > std::time::Duration::from_millis(200) {
+                    misses.push(format!(
+                        "{size} tracks {needle:?} offset {offset}: {elapsed:?}"
+                    ));
+                }
+            }
+        }
+    }
+    s.close().await;
+    ensure!(
+        misses.is_empty(),
+        "track search exceeded the 200 ms target: {misses:?}"
+    );
     Ok(())
 }

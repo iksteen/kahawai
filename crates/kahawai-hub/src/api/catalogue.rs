@@ -92,15 +92,6 @@ pub struct CreateCatalogueLibrary {
 pub struct CatalogueMembership {
     collection_ids: Vec<String>,
 }
-#[derive(Deserialize, utoipa::IntoParams)]
-#[into_params(parameter_in = Query)]
-pub struct CataloguePage {
-    q: Option<String>,
-    sort: Option<String>,
-    artist: Option<String>,
-    offset: Option<u32>,
-    limit: Option<u32>,
-}
 #[derive(Serialize, ToSchema)]
 pub struct CatalogueItems {
     total: i64,
@@ -135,7 +126,6 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
         )
         .route("/api/v1/catalogue/up-next", get(feeds::catalogue_up_next))
         .route("/api/v1/catalogue/libraries", get(libraries))
-        .route("/api/v1/catalogue/libraries/{id}/items", get(items))
         .route(
             "/api/v1/catalogue/libraries/{id}/items/{item_id}/watched",
             axum::routing::put(catalogue_set_watched),
@@ -152,10 +142,7 @@ pub(super) fn routes(state: &AppState) -> Router<AppState> {
             "/api/v1/catalogue/libraries/{id}/items/{item_id}/seasons/{season}/items",
             get(catalogue_season_items),
         )
-        .route(
-            "/api/v1/catalogue/libraries/{id}/artists",
-            get(catalogue_artists),
-        )
+        .route("/api/v1/catalogue/search", get(catalogue_search))
         .route(
             "/api/v1/catalogue/libraries/{id}/items/{item_id}",
             get(item).fallback(playback::catalogue_method),
@@ -401,40 +388,34 @@ pub(super) async fn delete_library(
     retire_removed_sources(&s, &id).await?;
     Ok(StatusCode::NO_CONTENT)
 }
-#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/items",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),CataloguePage),responses((status=200,body=CatalogueItems)))]
-pub(super) async fn items(
-    State(s): State<AppState>,
-    ApiPath(id): ApiPath<String>,
-    ApiQuery(q): ApiQuery<CataloguePage>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<CatalogueItems>, ApiError> {
-    visible(&s, &claims, &id).await?;
-    let limit = q.limit.unwrap_or(200).min(1000);
-    let offset = q.offset.unwrap_or(0);
-    if limit == 0 {
-        return Err(ApiError::new(
-            ErrorCode::BadRequest,
-            "limit must be positive",
-        ));
-    }
-    let sort = q.sort.as_deref().unwrap_or("title");
-    if !["title", "-title", "year", "-year", "-added", "added"].contains(&sort) {
-        return Err(ApiError::new(
-            ErrorCode::BadRequest,
-            "invalid catalogue sort",
-        ));
-    }
+/// What every library and kind of one search shares: who asks, for what text,
+/// and which page.
+struct Ask<'a> {
+    s: &'a AppState,
+    claims: &'a crate::auth::Claims,
+    text: &'a str,
+    offset: u32,
+    limit: u32,
+}
+/// One page of a library's items with the viewer's watch state, for a sort
+/// and limit the caller has validated.
+async fn item_page(
+    ask: &Ask<'_>,
+    id: &str,
+    sort: &str,
+    artist: Option<&str>,
+) -> Result<CatalogueItems, ApiError> {
+    let Ask {
+        s,
+        claims,
+        text,
+        offset,
+        limit,
+    } = *ask;
     let (rows, total) = s
         .registry
         .catalogue()
-        .browse_page(
-            &id,
-            offset,
-            limit,
-            q.q.as_deref().unwrap_or(""),
-            sort,
-            q.artist.as_deref(),
-        )
+        .browse_page(id, offset, limit, text, sort, artist)
         .await
         .map_err(store_error)?;
     let mut marks = watch::read(
@@ -452,12 +433,12 @@ pub(super) async fn items(
             item
         })
         .collect();
-    Ok(Json(CatalogueItems {
+    Ok(CatalogueItems {
         total,
         items,
         offset,
         limit,
-    }))
+    })
 }
 #[derive(Deserialize, utoipa::IntoParams)]
 #[into_params(parameter_in = Query)]
@@ -1101,33 +1082,25 @@ pub struct CatalogueArtists {
     offset: u32,
     limit: u32,
 }
-#[utoipa::path(get,path="/api/v1/catalogue/libraries/{id}/artists",tag="Catalogue",security(("bearer_auth"=[])),params(("id"=String,Path),CataloguePage),responses((status=200,body=CatalogueArtists)))]
-pub(super) async fn catalogue_artists(
-    State(s): State<AppState>,
-    ApiPath(id): ApiPath<String>,
-    ApiQuery(q): ApiQuery<CataloguePage>,
-    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
-) -> Result<Json<CatalogueArtists>, ApiError> {
-    visible(&s, &claims, &id).await?;
-    let limit = q.limit.unwrap_or(200).min(1000);
-    let sort = q.sort.as_deref().unwrap_or("name");
-    if limit == 0 || !["name", "-name"].contains(&sort) {
-        return Err(ApiError::new(ErrorCode::BadRequest, "invalid artist page"));
-    }
-    let offset = q.offset.unwrap_or(0);
+async fn artist_page(
+    ask: &Ask<'_>,
+    id: &str,
+    descending: bool,
+) -> Result<CatalogueArtists, ApiError> {
+    let Ask {
+        s,
+        text,
+        offset,
+        limit,
+        ..
+    } = *ask;
     let (rows, total) = s
         .registry
         .catalogue()
-        .browse_artists(
-            &id,
-            offset,
-            limit,
-            q.q.as_deref().unwrap_or(""),
-            sort == "-name",
-        )
+        .browse_artists(id, offset, limit, text, descending)
         .await
         .map_err(store_error)?;
-    Ok(Json(CatalogueArtists {
+    Ok(CatalogueArtists {
         artists: rows
             .into_iter()
             .map(|(name, album_count)| ArtistSummary {
@@ -1139,7 +1112,226 @@ pub(super) async fn catalogue_artists(
         total,
         offset,
         limit,
+    })
+}
+
+#[derive(Serialize, ToSchema)]
+pub struct CatalogueTracks {
+    tracks: Vec<m::TrackHit>,
+    total: u64,
+    offset: u64,
+    limit: u32,
+}
+async fn track_page(ask: &Ask<'_>, id: &str) -> Result<CatalogueTracks, ApiError> {
+    let Ask {
+        s,
+        text,
+        offset,
+        limit,
+        ..
+    } = *ask;
+    let offset = u64::from(offset);
+    let hits = s
+        .registry
+        .catalogue()
+        .search_tracks(id, text, offset, limit)
+        .await
+        .map_err(store_error)?;
+    Ok(CatalogueTracks {
+        tracks: hits.tracks,
+        total: hits.total,
+        offset,
+        limit,
+    })
+}
+
+#[derive(Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct SearchQuery {
+    /// Matched case-insensitively against titles (items, songs) and names
+    /// (album artists). Empty matches everything, which makes this a browse.
+    q: Option<String>,
+    /// Comma-separated library IDs, answered in that order. Every library the
+    /// viewer may see, in the libraries endpoint's order, when absent.
+    libraries: Option<String>,
+    /// Comma-separated: `items`, `artists`, `tracks`. Every kind each library
+    /// holds when absent; `artists` and `tracks` exist in music libraries only.
+    kinds: Option<String>,
+    /// With exactly one kind: items `title` (default), `-title`, `year`,
+    /// `-year`, `added`, `-added`; artists `name` (default), `-name`; tracks
+    /// `title`.
+    sort: Option<String>,
+    /// With `kinds=items` only: an album artist's key, for that artist's albums.
+    artist: Option<String>,
+    offset: Option<u32>,
+    /// Hits per library and kind, 1 to 200; 20 when absent.
+    limit: Option<u32>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct SearchLibrary {
+    id: String,
+    name: String,
+    media_type: String,
+}
+/// One library's answer. Each kind is exactly the page its own listing would
+/// be, total included; absent when not asked for, or not held by the library.
+#[derive(Serialize, ToSchema)]
+pub struct LibraryHits {
+    library: SearchLibrary,
+    items: Option<CatalogueItems>,
+    /// Album artists; music libraries only.
+    artists: Option<CatalogueArtists>,
+    /// Songs, one hit per album position, keyed by the album's child id;
+    /// music libraries only.
+    tracks: Option<CatalogueTracks>,
+}
+#[derive(Serialize, ToSchema)]
+pub struct CatalogueSearch {
+    libraries: Vec<LibraryHits>,
+}
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SearchKind {
+    Items,
+    Artists,
+    Tracks,
+}
+async fn maybe<T>(
+    page: Option<impl std::future::Future<Output = Result<T, ApiError>>>,
+) -> Result<Option<T>, ApiError> {
+    match page {
+        Some(page) => page.await.map(Some),
+        None => Ok(None),
+    }
+}
+/// Every catalogue search and filtered listing: the home screen's search
+/// across libraries, and a library's (or an artist's) items, album artists
+/// and songs, paged.
+///
+/// One request for any number of libraries and kinds, multiplexed here
+/// rather than by the client: on a slow link every request costs a round
+/// trip of its own. Each library-and-kind is the same bounded query its
+/// listing runs, and they are asked concurrently, so this costs the slowest
+/// of them rather than their sum — on the same reader pool a client's
+/// concurrent requests would share. Not one grouped query across libraries:
+/// that was measured and withdrawn (`docs/web-next-plan.md`, B3).
+///
+/// All or nothing: a library that cannot be answered fails the request,
+/// since a partial answer would read as fewer matches.
+#[utoipa::path(get,path="/api/v1/catalogue/search",tag="Catalogue",security(("bearer_auth"=[])),params(SearchQuery),responses((status=200,body=CatalogueSearch),(status=400,body=ApiErrorBody),(status=404,body=ApiErrorBody)))]
+pub(super) async fn catalogue_search(
+    State(s): State<AppState>,
+    ApiQuery(q): ApiQuery<SearchQuery>,
+    axum::Extension(claims): axum::Extension<crate::auth::Claims>,
+) -> Result<Json<CatalogueSearch>, ApiError> {
+    let bad = |message: &'static str| ApiError::new(ErrorCode::BadRequest, message);
+    let limit = q.limit.unwrap_or(20);
+    if !(1..=200).contains(&limit) {
+        return Err(bad("invalid search limit"));
+    }
+    let offset = q.offset.unwrap_or(0);
+    let kinds: Vec<SearchKind> = match q.kinds.as_deref() {
+        None => vec![SearchKind::Items, SearchKind::Artists, SearchKind::Tracks],
+        Some(list) => {
+            let mut kinds = Vec::new();
+            for kind in list.split(',') {
+                let kind = match kind {
+                    "items" => SearchKind::Items,
+                    "artists" => SearchKind::Artists,
+                    "tracks" => SearchKind::Tracks,
+                    _ => return Err(bad("invalid search kind")),
+                };
+                if !kinds.contains(&kind) {
+                    kinds.push(kind);
+                }
+            }
+            kinds
+        }
+    };
+    let single = (q.kinds.is_some() && kinds.len() == 1).then(|| kinds[0]);
+    let (item_sort, artist_desc) = match (q.sort.as_deref(), single) {
+        (None, _) => ("title", false),
+        (Some(sort), Some(SearchKind::Items))
+            if ["title", "-title", "year", "-year", "-added", "added"].contains(&sort) =>
+        {
+            (sort, false)
+        }
+        (Some(sort), Some(SearchKind::Artists)) if sort == "name" || sort == "-name" => {
+            ("title", sort == "-name")
+        }
+        (Some("title"), Some(SearchKind::Tracks)) => ("title", false),
+        _ => return Err(bad("invalid search sort")),
+    };
+    if q.artist.is_some() && single != Some(SearchKind::Items) {
+        return Err(bad("artist needs kinds=items"));
+    }
+
+    let all = s.registry.catalogue().libraries().await.map_err(internal)?;
+    let mut libraries = Vec::new();
+    match q.libraries.as_deref() {
+        None => {
+            for library in all {
+                if crate::grants::can_see_library(s.registry.db(), &claims, &library.id)
+                    .await
+                    .map_err(internal)?
+                {
+                    libraries.push(library);
+                }
+            }
+        }
+        Some(list) => {
+            for id in list.split(',') {
+                if libraries.iter().any(|l: &m::Library| l.id == id) {
+                    continue;
+                }
+                let library = all
+                    .iter()
+                    .find(|l| l.id == id)
+                    .ok_or_else(|| hidden("library"))?;
+                if !crate::grants::can_see_library(s.registry.db(), &claims, id)
+                    .await
+                    .map_err(internal)?
+                {
+                    return Err(hidden("library"));
+                }
+                libraries.push(library.clone());
+            }
+        }
+    }
+
+    let ask = Ask {
+        s: &s,
+        claims: &claims,
+        text: q.q.as_deref().unwrap_or(""),
+        offset,
+        limit,
+    };
+    let (ask, artist) = (&ask, q.artist.as_deref());
+    let answers = futures_util::future::try_join_all(libraries.into_iter().map(|library| {
+        let music = library.media_type == m::MediaType::Music;
+        let wants_items = kinds.contains(&SearchKind::Items);
+        let wants_artists = music && kinds.contains(&SearchKind::Artists);
+        let wants_tracks = music && kinds.contains(&SearchKind::Tracks);
+        async move {
+            let id = library.id.as_str();
+            let (items, artists, tracks) = tokio::try_join!(
+                maybe(wants_items.then(|| item_page(ask, id, item_sort, artist))),
+                maybe(wants_artists.then(|| artist_page(ask, id, artist_desc))),
+                maybe(wants_tracks.then(|| track_page(ask, id))),
+            )?;
+            Ok::<_, ApiError>(LibraryHits {
+                library: SearchLibrary {
+                    id: library.id.clone(),
+                    name: library.name.clone(),
+                    media_type: library.media_type.as_str().into(),
+                },
+                items,
+                artists,
+                tracks,
+            })
+        }
     }))
+    .await?;
+    Ok(Json(CatalogueSearch { libraries: answers }))
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize, ToSchema)]

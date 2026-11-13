@@ -675,7 +675,7 @@ async fn a_query_parameter_that_will_not_parse_refuses_in_the_same_shape() {
 async fn a_path_that_is_not_utf8_refuses_in_the_same_shape() {
     let (_dir, router) = api_harness().await;
     let token = bearer(&router).await;
-    let request = Request::get("/api/v1/catalogue/libraries/%FF/items")
+    let request = Request::get("/api/v1/catalogue/libraries/%FF/items/i1")
         .header("authorization", format!("Bearer {token}"))
         .body(Body::empty())
         .unwrap();

@@ -339,20 +339,29 @@ test('the match selector renders hub-served candidate box art under CSP', async 
                   collection_ids: ['collection'],
                 },
               ]
-            : path === '/api/v1/catalogue/libraries/movies/items'
+            : path === '/api/v1/catalogue/search'
               ? {
-                  items: [
+                  libraries: [
                     {
-                      ...item,
-                      media_type: 'movies',
-                      copy_ids: ['copy'],
-                      representative_id: 'copy',
-                      metadata: {},
+                      library: { id: 'movies', name: 'Movies', media_type: 'movies' },
+                      items: {
+                        items: [
+                          {
+                            ...item,
+                            media_type: 'movies',
+                            copy_ids: ['copy'],
+                            representative_id: 'copy',
+                            metadata: {},
+                          },
+                        ],
+                        total: 1,
+                        offset: 0,
+                        limit: 100,
+                      },
+                      artists: null,
+                      tracks: null,
                     },
                   ],
-                  total: 1,
-                  offset: 0,
-                  limit: 100,
                 }
               : path === '/api/v1/catalogue/libraries/movies/items/copy'
                 ? { copies: [{ id: 'copy', title: 'X-Men', year: 2000, paths: ['X-Men.mkv'] }] }

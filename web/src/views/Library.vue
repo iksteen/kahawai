@@ -34,7 +34,7 @@ import { notify } from '../composables/notices.ts'
 import { sentence } from '../domain/refusal.ts'
 import { targetOf } from '../domain/label.ts'
 import { useLibraryItems } from '../composables/library.ts'
-import { useArtists } from '../composables/music.ts'
+import { useArtists, useTracks } from '../composables/music.ts'
 import { useScreenName } from '../composables/title.ts'
 import { useSearchBox, useSearchQuery } from '../composables/search.ts'
 import { whoAmI } from '../api/session.ts'
@@ -75,6 +75,12 @@ const { loaded, total, libraryTotal, failure, need, refresh, retry } = useLibrar
   itemsEnabled,
 )
 const artists = useArtists(library, query, artistSort, music)
+/// A filtered music library lists matching songs too, below its albums.
+const songs = useTracks(
+  library,
+  query,
+  computed(() => music.value && query.value !== ''),
+)
 
 /// HUB-8 hand-matching, from the grid: an operator finds a wrong cover by
 /// LOOKING at the covers, so the affordance belongs where they are looking.
@@ -101,14 +107,18 @@ const page = ref<HTMLElement | null>(null)
 const wrap = ref<HTMLElement | null>(null)
 const grid = ref<HTMLElement | null>(null)
 const artistsReady = ref(false)
+const songsReady = ref(false)
 const scrollReady = computed(() => {
   if (!details.data.value && !details.isError.value) return false
   const itemsReady =
     !!failure.value || (total.value !== null && (total.value === 0 || metric.value !== null))
   if (!music.value) return itemsReady
+  const songsSettled =
+    !!songs.failure.value ||
+    (songs.total.value !== null && (songs.total.value === 0 || songsReady.value))
   return (
     (artists.total.value === 0 || artistsReady.value || !!artists.failure.value) &&
-    (!query.value || itemsReady)
+    (!query.value || (itemsReady && songsSettled))
   )
 })
 
@@ -258,9 +268,11 @@ const count = computed(() => {
   const artistCount = artists.total.value
   if (!query.value) return artistCount === null ? '' : `${artistCount} artists`
   const itemCount = total.value
+  const songCount = songs.total.value
   return [
     artistCount === null ? '' : `${artistCount} artists`,
-    itemCount === null ? '' : `${itemCount} albums and songs`,
+    itemCount === null ? '' : `${itemCount} albums`,
+    songCount === null ? '' : `${songCount} songs`,
   ]
     .filter(Boolean)
     .join(' · ')
@@ -268,13 +280,16 @@ const count = computed(() => {
 
 const pageFailure = computed(() => {
   if (!music.value) return failure.value
-  return [artists.failure.value, query.value ? failure.value : ''].filter(Boolean).join(' ')
+  return [artists.failure.value, query.value ? failure.value : '', songs.failure.value]
+    .filter(Boolean)
+    .join(' ')
 })
 
 function retryPage() {
   if (music.value) {
     if (artists.failure.value) artists.retry()
     if (query.value && failure.value) retry()
+    if (songs.failure.value) songs.retry()
   } else {
     retry()
   }
@@ -351,7 +366,12 @@ function retryPage() {
     <p v-if="music && !query && artists.total.value === 0" class="text-dim">
       Nothing here yet. Attach a collection to this library and its scan will fill this page.
     </p>
-    <p v-else-if="music && query && artists.total.value === 0 && total === 0" class="text-dim">
+    <p
+      v-else-if="
+        music && query && artists.total.value === 0 && total === 0 && songs.total.value === 0
+      "
+      class="text-dim"
+    >
       Nothing matches “{{ query }}”.
     </p>
     <p v-else-if="!music && total === 0" class="text-dim">
@@ -390,16 +410,16 @@ function retryPage() {
       </p>
     </section>
 
-    <h2 v-if="music && query && total !== 0" class="mt-7 mb-3 text-[17px] font-[650]">
-      Albums and songs
-    </h2>
+    <h2 v-if="music && query && total !== 0" class="mt-7 mb-3 text-[17px] font-[650]">Albums</h2>
 
     <!-- The whole library's height, reserved before a single card past the
          fold has been fetched. That is the difference from infinite scroll,
          where the page grows as you go and the scrollbar jumps under the thumb
          every time it does. -->
+    <!-- Not for a filter no album matched: the reserved height floors at one
+         row, which stood as an empty band above the songs. -->
     <div
-      v-if="!music || query"
+      v-if="!music || (query && total !== 0)"
       ref="wrap"
       class="relative"
       :style="height !== undefined ? { height: `${height}px` } : {}"
@@ -432,6 +452,21 @@ function retryPage() {
       </ul>
     </div>
 
+    <section v-if="music && query && (songs.total.value ?? 0) > 0" class="song-grid">
+      <h2 class="mt-7 mb-3 text-[17px] font-[650]">Songs</h2>
+      <PagedGrid
+        :total="songs.total.value"
+        min-width="150px"
+        @need="songs.need"
+        @ready="songsReady = $event"
+      >
+        <!-- A song opens its album (`targetOf`), where it is listed. -->
+        <template #default="{ at }">
+          <Card :item="songs.loaded.value.get(at)" @open="open" />
+        </template>
+      </PagedGrid>
+    </section>
+
     <MatchDialog v-if="matching" :item="matching" @close="matching = null" @applied="refresh()" />
     <Attribution :providers="itemProviders(loaded.values())" />
   </main>
@@ -443,7 +478,8 @@ function retryPage() {
   grid-template-columns: repeat(auto-fill, minmax(var(--card-min, 140px), 1fr));
 }
 
-.artist-grid {
+.artist-grid,
+.song-grid {
   --card-ratio: 1;
 }
 </style>

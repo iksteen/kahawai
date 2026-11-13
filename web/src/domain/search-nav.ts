@@ -4,6 +4,7 @@
 /// heading is a row you can land on and press.
 
 import type { ItemSummary } from '../api/catalogue-model.ts'
+import type { ArtistSummary } from '../api/generated/model/artistSummary.ts'
 import type { LibrarySummary } from './shelves.ts'
 
 /// Shared because a mismatch is silent: the input points
@@ -13,35 +14,46 @@ import type { LibrarySummary } from './shelves.ts'
 export const SEARCH_LIST_ID = 'search-results-list'
 export const searchOptionId = (i: number) => `search-opt-${i}`
 
-/// Hits from one library, as the search returns them.
+/// Hits from one library, as the search returns them. A music library answers
+/// three ways — album artists, albums (`items`) and songs — and the others
+/// only with items, their artists and songs empty.
 export type LibraryHits = {
   library: LibrarySummary
   items: ItemSummary[]
   total: number
-  /// Empty when it answered. A library that could not be asked is a different
-  /// answer from one with no matches, and an empty list gives the first when
-  /// it means the second.
-  failure: string
+  artists: ArtistSummary[]
+  artistTotal: number
+  songs: ItemSummary[]
+  songTotal: number
 }
 
 /// A row the panel renders and the keyboard can land on.
 export type SearchRow =
   | { kind: 'library'; library: LibrarySummary; total: number; shown: number }
+  | { kind: 'artist'; artist: ArtistSummary; library: LibrarySummary }
   | { kind: 'item'; item: ItemSummary; library: LibrarySummary }
 
-/// Heading, then that library's items. An empty library contributes no
-/// heading: one over nothing reads as "we looked and found some".
+/// Heading, then that library's hits: album artists, then its items (albums,
+/// for music), then songs — the order the library page lists them in. An
+/// empty library contributes no heading: one over nothing reads as "we
+/// looked and found some". The heading counts every kind, since pressing it
+/// shows them all.
 export function searchRows(hits: LibraryHits[]): SearchRow[] {
   const rows: SearchRow[] = []
   for (const hit of hits) {
-    if (hit.items.length === 0) continue
+    const { artists, songs } = hit
+    const shown = artists.length + hit.items.length + songs.length
+    if (shown === 0) continue
     rows.push({
       kind: 'library',
       library: hit.library,
-      total: hit.total,
-      shown: hit.items.length,
+      total: hit.artistTotal + hit.total + hit.songTotal,
+      shown,
     })
-    for (const item of hit.items) rows.push({ kind: 'item', item, library: hit.library })
+    for (const artist of artists) rows.push({ kind: 'artist', artist, library: hit.library })
+    for (const item of [...hit.items, ...songs]) {
+      rows.push({ kind: 'item', item, library: hit.library })
+    }
   }
   return rows
 }
@@ -63,17 +75,4 @@ export function moveHighlight(count: number, from: number, delta: number): numbe
   if (next < 0) return 0
   if (next >= count) return count - 1
   return next
-}
-
-/// What one notice says about a set of libraries that would not answer.
-///
-/// One notice for the whole search, once every library has answered, so it can
-/// say whether this was a bad connection or one bad library. Per-library
-/// notices are latest-wins: one would name whichever failed last and imply the
-/// rest were fine.
-export function searchTrouble(hits: LibraryHits[]): string {
-  const broke = hits.filter((h) => h.failure !== '')
-  if (broke.length === 0) return ''
-  if (broke.length === hits.length) return `Could not search — ${broke[0]!.failure}`
-  return `Could not search ${broke.map((h) => h.library.name).join(', ')}.`
 }

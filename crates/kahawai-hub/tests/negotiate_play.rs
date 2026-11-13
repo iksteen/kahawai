@@ -303,15 +303,17 @@ async fn negotiation_picks_cheapest_source_and_honors_caps() {
             let resp = api
                 .clone()
                 .oneshot(
-                    Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
-                        .header("authorization", bearer.clone())
-                        .body(Body::empty())
-                        .unwrap(),
+                    Request::get(format!(
+                        "/api/v1/catalogue/search?libraries={library_id}&kinds=items"
+                    ))
+                    .header("authorization", bearer.clone())
+                    .body(Body::empty())
+                    .unwrap(),
                 )
                 .await
                 .unwrap();
             let v: serde_json::Value = json(body_bytes(resp).await);
-            if let Some(item) = v["items"].get(0)
+            if let Some(item) = v["libraries"][0]["items"]["items"].get(0)
                 && item["copy_ids"]
                     .as_array()
                     .is_some_and(|ids| ids.len() == 2)

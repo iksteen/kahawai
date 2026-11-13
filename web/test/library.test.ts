@@ -1,6 +1,7 @@
 vi.mock('../src/api/catalogue.ts', () => ({
   listItems: vi.fn(),
   listArtists: vi.fn(),
+  listTracks: vi.fn(),
   artistAlbums: vi.fn(),
   upNext: vi.fn(),
   catalogueDetail: vi.fn(),
@@ -56,6 +57,7 @@ const {
   enrichmentSearch,
   listArtists,
   listItems,
+  listTracks,
   libraries,
 } = await import('./api-fixture.ts')
 const { clearNotices, notice } = await import('../src/composables/notices.ts')
@@ -195,6 +197,7 @@ beforeEach(() => {
     limit: 100,
     offset: 0,
   })
+  vi.mocked(listTracks).mockResolvedValue({ items: [], total: 0 })
   clearNotices()
 })
 afterEach(() => {
@@ -248,6 +251,38 @@ describe('opening a library', () => {
     expect(wrapper.text()).not.toContain('More artists')
   })
 
+  test('a filtered music library lists matching songs, and a song opens its album', async () => {
+    const song = row({
+      id: 'child1:a1:t:u:3',
+      kind: 'song',
+      title: 'Heat of the Moment',
+      artist: 'Asia',
+      parent_id: 'a1',
+      parent_title: 'Asia',
+    })
+    vi.mocked(listTracks).mockResolvedValue({ items: [song], total: 1 })
+    const { wrapper, router } = await filtered('heat', '/library/music')
+    expect(listTracks).toHaveBeenCalledWith(
+      expect.objectContaining({ library: 'music', q: 'heat', offset: 0 }),
+    )
+    expect(wrapper.findAll('h2').map((heading) => heading.text())).toEqual([
+      'Artists',
+      'Albums',
+      'Songs',
+    ])
+    expect(wrapper.find('[role="status"]').text()).toContain('1 songs')
+    const card = wrapper.find('.song-grid button')
+    expect(card.text()).toContain('Heat of the Moment')
+    await card.trigger('click')
+    await flushPromises()
+    expect(router.currentRoute.value.path).toBe('/library/music/item/a1')
+  })
+
+  test('an unfiltered music library asks for no songs', async () => {
+    await grid('/library/music')
+    expect(listTracks).not.toHaveBeenCalled()
+  })
+
   test('does not render an empty Artists section for item-only search results', async () => {
     vi.mocked(listArtists).mockResolvedValue({
       artists: [],
@@ -256,7 +291,7 @@ describe('opening a library', () => {
       offset: 0,
     })
     const { wrapper } = await filtered('heat', '/library/music')
-    expect(wrapper.findAll('h2').map((heading) => heading.text())).toEqual(['Albums and songs'])
+    expect(wrapper.findAll('h2').map((heading) => heading.text())).toEqual(['Albums'])
   })
 })
 

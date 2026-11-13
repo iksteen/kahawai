@@ -1,70 +1,58 @@
 /// Searching every library at once.
 ///
-/// One request per library rather than one for everything, because the items
-/// endpoint does not say which library a row came from, and "at most five
-/// each" is not something a single LIMIT can express. They run concurrently
-/// and each is a bounded query, so it costs one round trip.
+/// ONE request: the hub's `/search` answers every library this viewer may see,
+/// each with the kinds it holds (for music, album artists and songs beside the
+/// albums), asking them concurrently on its side. A request per library — or
+/// per kind — cost each a round trip of its own, which on a slow link is the
+/// waiting. The hub does not group them in one query either: that was measured
+/// and is slower at every catalogue size tried (`docs/web-next-plan.md`, B3).
 ///
-/// The hub could group them in SQL — it was measured, and it is slower than
-/// this fan-out at every catalogue size tried (`docs/web-next-plan.md`, B3).
+/// All or nothing. The libraries share one catalogue, so they fail together
+/// anyway, and results with a library quietly missing read as fewer matches.
 ///
-/// ONE query holding all of them, rather than one query per library. The
-/// difference is what happens on the next keystroke: `useQueries` rebuilds its
-/// observers when the keys change, so a per-library query has no previous data
-/// to keep and the panel blanks between every two letters. A single observer
-/// keyed on the query text keeps the rows that are on screen until their
-/// replacements arrive, which is the behaviour the old panel spent forty lines
-/// on.
+/// ONE query holding all of them. The difference is what happens on the next
+/// keystroke: a query whose key changes keeps the rows that are on screen
+/// until their replacements arrive (`keepPreviousData`), which is the
+/// behaviour the old panel spent forty lines on.
 
 import { computed, type Ref, ref, watch } from 'vue'
 import { keepPreviousData, useQuery } from '@tanstack/vue-query'
 
-import type { LibrarySummary } from '../domain/shelves.ts'
-import { listItems } from '../api/catalogue.ts'
-import { type LibraryHits, searchRows, searchTrouble } from '../domain/search-nav.ts'
+import { searchEverywhere } from '../api/catalogue.ts'
+import { type LibraryHits, searchRows } from '../domain/search-nav.ts'
 import { notify } from './notices.ts'
 import { sentence } from '../domain/refusal.ts'
 
-/// How many hits each library contributes to the panel.
+/// How many hits of each kind each library contributes to the panel.
 export const PER_LIBRARY = 5
 
-export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<string>) {
-  /// Nothing is asked while there is nothing to ask for, and nothing while the
-  /// library list is still coming.
-  ///
-  /// The guard is on the LENGTH, not on the value. An empty list searched
-  /// nothing and answered immediately, and the panel stated "No matches" as a
-  /// fact about the catalogue — from a search that never ran, with no Try
-  /// again, because nothing failed from its point of view.
-  const asking = computed(() => query.value !== '' && libraries.value.length > 0)
+export function useSearchPanel(query: Ref<string>) {
+  /// Nothing is asked while there is nothing to ask for.
+  const asking = computed(() => query.value !== '')
 
   const search = useQuery({
-    queryKey: computed(() => ['search', query.value, libraries.value.map((l) => l.id).join(',')]),
+    queryKey: computed(() => ['search', query.value]),
     enabled: asking,
     // The rows already on screen stay visible and actionable while their
     // replacements load. Blanking the panel makes every debounced keystroke
     // flash the whole surface away instead.
     placeholderData: keepPreviousData,
-    queryFn: async (): Promise<LibraryHits[]> =>
-      Promise.all(
-        libraries.value.map(async (library) => {
-          try {
-            const answer = await listItems({
-              library: library.id,
-              q: query.value,
-              limit: PER_LIBRARY,
-            })
-            return { library, items: answer.items, total: answer.total, failure: '' }
-          } catch (cause) {
-            // "No matches here" and "we could not ask" are different answers,
-            // and an empty list gives the first when it means the second. The
-            // query itself does not fail: one library being away must not take
-            // the other three's results off the screen.
-            return { library, items: [], total: 0, failure: sentence(cause) }
-          }
-        }),
-      ),
+    queryFn: (): Promise<LibraryHits[]> => searchEverywhere({ q: query.value, limit: PER_LIBRARY }),
   })
+
+  /// Asking, with the previous query's rows still on screen.
+  ///
+  /// No `asking &&` guard: a query that has been disabled mid-flight stops
+  /// reporting itself as fetching, so the guard was a second answer to a
+  /// question that already had one, and no test could tell it apart.
+  const searching = computed(() => search.isFetching.value)
+
+  /// Why the search could not be answered, '' while it can or while it is
+  /// being asked again — so a failure does not paint over the next keystroke's
+  /// results for a round trip.
+  const failure = computed(() =>
+    !searching.value && asking.value && search.isError.value ? sentence(search.error.value) : '',
+  )
 
   /// The query the rows on screen belong to, and '' when there are none.
   ///
@@ -76,41 +64,27 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
   /// "heat", and two arrow presses and Enter opened a film out of them.
   const shownQuery = ref('')
   watch(
-    [asking, () => search.isPlaceholderData.value, () => search.data.value],
+    [asking, () => search.isPlaceholderData.value, () => search.data.value, failure],
     () => {
       if (!asking.value) shownQuery.value = ''
+      else if (failure.value !== '') shownQuery.value = query.value
       else if (!search.isPlaceholderData.value && search.data.value) shownQuery.value = query.value
     },
     { immediate: true },
   )
 
+  /// Nothing under a failure: rows left over from the last answer would read
+  /// as this query's.
   const hits = computed<LibraryHits[]>(() =>
-    shownQuery.value === '' ? [] : (search.data.value ?? []),
+    shownQuery.value === '' || failure.value !== '' ? [] : (search.data.value ?? []),
   )
   const rows = computed(() => searchRows(hits.value))
-
-  /// Asking, with the previous query's rows still on screen.
-  ///
-  /// No `asking &&` guard: a query that has been disabled mid-flight stops
-  /// reporting itself as fetching, so the guard was a second answer to a
-  /// question that already had one, and no test could tell it apart.
-  const searching = computed(() => search.isFetching.value)
-
-  /// Cleared before asking, so a failure does not paint over the next
-  /// keystroke's results for a round trip — the banner named a library the
-  /// current search had not asked yet.
-  const failed = computed(() =>
-    searching.value ? [] : hits.value.filter((h) => h.failure !== '').map((h) => h.library.name),
-  )
-  const allFailed = computed(
-    () => failed.value.length > 0 && failed.value.length === hits.value.length,
-  )
 
   /// Whether there is a panel ON SCREEN — which is what the input's
   /// `aria-expanded` has to mean.
   ///
-  /// Not `rows.length > 0`: a query that matches nothing, or a hub that failed
-  /// every library, puts a visible panel up with no rows in it. Deriving this
+  /// Not `rows.length > 0`: a query that matches nothing, or a search that
+  /// failed, puts a visible panel up with no rows in it. Deriving this
   /// from the row count told a screen reader the combobox was collapsed while
   /// "No matches" or the retry button was showing — the exact two states
   /// somebody would most need read out.
@@ -123,9 +97,7 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
   watch(rows, () => (highlight.value = -1))
 
   /// One notice per SETTLED ATTEMPT — the moment a search stops being in
-  /// flight, and every time. Reported here rather than per library because
-  /// notices are latest-wins: one each would name whichever failed last and
-  /// imply the rest were fine.
+  /// flight, and every time.
   ///
   /// An earlier version remembered the sentence it had said and refused to
   /// repeat it. Notices clear after five seconds, so there was nothing on
@@ -133,15 +105,13 @@ export function useSearchPanel(libraries: Ref<LibrarySummary[]>, query: Ref<stri
   /// then said nothing at all — on the one channel the panel deliberately does
   /// not leave to a live region.
   watch(searching, (now, before) => {
-    if (now || !before || !asking.value) return
-    const trouble = searchTrouble(search.data.value ?? [])
-    if (trouble !== '') notify(trouble)
+    if (now || !before || failure.value === '') return
+    notify(`Could not search — ${failure.value}`)
   })
 
   return {
     rows,
-    failed,
-    allFailed,
+    failure,
     searching,
     drawn,
     highlight,

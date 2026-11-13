@@ -273,15 +273,20 @@ pub async fn harness(file_name: &str, render: fn(&Path)) -> Harness {
                 let resp = api
                     .clone()
                     .oneshot(
-                        Request::get(format!("/api/v1/catalogue/libraries/{library_id}/items"))
-                            .header("authorization", &bearer)
-                            .body(Body::empty())
-                            .unwrap(),
+                        Request::get(format!(
+                            "/api/v1/catalogue/search?libraries={library_id}&kinds=items"
+                        ))
+                        .header("authorization", &bearer)
+                        .body(Body::empty())
+                        .unwrap(),
                     )
                     .await
                     .unwrap();
                 let v = json_body(resp).await;
-                if let Some(id) = v["items"].get(0).and_then(|i| i["id"].as_str()) {
+                if let Some(id) = v["libraries"][0]["items"]["items"]
+                    .get(0)
+                    .and_then(|i| i["id"].as_str())
+                {
                     return id.to_string();
                 }
                 tokio::time::sleep(Duration::from_millis(50)).await;

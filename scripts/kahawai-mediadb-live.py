@@ -46,6 +46,12 @@ def api(method, path, body=None, base=url):
         return json.loads(raw) if raw else None
 
 
+def library_items(library):
+    """A library's items: one library and one kind of the catalogue's single
+    listing, `/catalogue/search`."""
+    return api("GET", f"/api/v1/catalogue/search?libraries={library}&kinds=items")["libraries"][0]["items"]
+
+
 def until(check, description, seconds=60):
     deadline = time.monotonic() + seconds
     last = None
@@ -158,9 +164,9 @@ def check_cli(library, item, child_checks):
     temporary = json.loads(cli("kahawai-mediadb.sh", "api", "create-library", "CLI fixture", "movies").stdout)
     members = next(row['collection_ids'] for row in api("GET", "/api/v1/catalogue/libraries") if row['id'] == library)
     cli("kahawai-mediadb.sh", "api", "set-collections", temporary['id'], *members)
-    assert api("GET", f"/api/v1/catalogue/libraries/{temporary['id']}/items")['items'][0]['id'] == item
+    assert library_items(temporary['id'])['items'][0]['id'] == item
     cli("kahawai-mediadb.sh", "api", "set-collections", temporary['id'])
-    assert api("GET", f"/api/v1/catalogue/libraries/{temporary['id']}/items")['total'] == 0
+    assert library_items(temporary['id'])['total'] == 0
     cli("kahawai-mediadb.sh", "api", "delete-library", temporary['id'])
     cli("kahawai-mediadb.sh", "api", "rescan", library)
     cli("kahawai-mediadb.sh", "api", "rescan", library, "--deep")
@@ -239,12 +245,12 @@ def check_subtitle_and_nfo_revisions(library, item, copies, roots):
         selected = api("GET", f"/admin/v1/enrich/items/{copy}")["input"]["selected"]
         return selected[1]['title'] if selected else None
     until(lambda: all(selected_title(copy) == "Corrected Film" for copy in copies), "corrected NFO identities assigned")
-    page = api("GET", f"/api/v1/catalogue/libraries/{library}/items")
+    page = library_items(library)
     assert len(page['items']) == 1 and page['items'][0]['id'] != item, page
     for path, text in nfos.items():
         path.write_text(text)
     until(lambda: all(selected_title(copy) == "Dark City" for copy in copies), "original NFO identities restored")
-    assert api("GET", f"/api/v1/catalogue/libraries/{library}/items")['items'][0]['id'] == item
+    assert library_items(library)['items'][0]['id'] == item
     print("PASS: cached sidecar edits and NFO identity corrections through real processes")
 
 
@@ -368,7 +374,7 @@ roots = {json.dumps([str(r) for r in roots])}
     anime_source = next(c for c in collections() if c["remote_id"] == "anime")
     anime_library = api("POST", "/admin/v1/catalogue/libraries", {"name": "Fixture anime", "media_type": "anime", "collection_ids": [anime_source["id"]]})
     anime_path = f"/api/v1/catalogue/libraries/{anime_library['id']}/items"
-    anime_items = api("GET", anime_path)["items"]
+    anime_items = library_items(anime_library['id'])["items"]
     assert sorted(i["kind"] for i in anime_items) == ["movie", "series"], anime_items
     movie = next(i for i in anime_items if i["kind"] == "movie")
     # A fixed provider answer in this disposable fixture avoids depending on
@@ -383,7 +389,7 @@ roots = {json.dumps([str(r) for r in roots])}
         source = next(c for c in collections() if c["remote_id"] == kind)
         lib = api("POST", "/admin/v1/catalogue/libraries", {"name": f"Fixture {kind}", "media_type": kind, "collection_ids": [source["id"]]})
         path = f"/api/v1/catalogue/libraries/{lib['id']}/items"
-        parent = api("GET", path)["items"][0]["id"]
+        parent = library_items(lib['id'])["items"][0]["id"]
         child_path = f"{path}/{parent}/children"
         result = api("GET", child_path)
         assert result["total"] == (3 if kind == "series" else 2), result
@@ -414,7 +420,7 @@ roots = {json.dumps([str(r) for r in roots])}
     library = api("POST", "/admin/v1/catalogue/libraries", {"name": "Fixture movies", "media_type": "movies", "collection_ids": [col["id"]]})
     check_rescans(library["id"])
     items_path = f"/api/v1/catalogue/libraries/{library['id']}/items"
-    page = api("GET", items_path)
+    page = library_items(library['id'])
     assert len(page["items"]) == 1 and len(page["items"][0]["copy_ids"]) == 2, page
     item = page["items"][0]["id"]
     copies = page["items"][0]["copy_ids"]
@@ -467,7 +473,7 @@ roots = {json.dumps([str(r) for r in roots])}
     with urllib.request.urlopen(request, timeout=10) as response:
         assert response.status == 200 and b"Source-bound live subtitle" in response.read()
     api("DELETE", f"/api/v1/playback/sessions/{playback['session_id']}")
-    restored = api("GET", items_path)["items"]
+    restored = library_items(library["id"])["items"]
     assert restored[0]["id"] == item and restored[0]["copy_ids"] == copies, restored
     before = mediahost.pid
     stop(mediahost)
@@ -475,15 +481,15 @@ roots = {json.dumps([str(r) for r in roots])}
     assert mediahost.pid != before
     until(lambda: ready_collection(col["mediahost_id"]), "mediahost replay")
     until(lambda: "filesystem watches installed" in replay_log.read_text(), "mediahost watches ready")
-    assert api("GET", items_path)["items"][0]["id"] == item
+    assert library_items(library["id"])["items"][0]["id"] == item
     check_watcher_scans(other, replay_log)
     # Only generated test fixtures are modified.
     other.unlink()
     until(lambda: ready_collection(col["mediahost_id"], count=1), "file tombstone")
-    assert len(api("GET", items_path)["items"][0]["copy_ids"]) == 1
+    assert len(library_items(library["id"])["items"][0]["copy_ids"]) == 1
     api("DELETE", f"/admin/v1/satellites/{col['mediahost_id']}")
     assert collections() == []
-    assert api("GET", items_path)["items"] == []
+    assert library_items(library["id"])["items"] == []
     assert query("mediadb.db", f"SELECT COUNT(*) FROM library_items WHERE id='{item}'") == [(1,)]
     assert query("mediadb.db", "SELECT COUNT(*) FROM collection_items") == [(0,)]
     assert query("hub.db", "SELECT COUNT(*) FROM catalogue_watch_state WHERE played=1") == [(3,)]
@@ -502,7 +508,7 @@ roots = {json.dumps([str(r) for r in roots])}
     assert diagnostic_session in item_log(episode_ids[1])
     assert local["remote_id"] == "movies"
     local_library = api("POST", "/admin/v1/catalogue/libraries", {"name": "Local fixture", "media_type": "movies", "collection_ids": [local["id"]]})
-    local_items = api("GET", f"/api/v1/catalogue/libraries/{local_library['id']}/items")["items"]
+    local_items = library_items(local_library['id'])["items"]
     assert len(local_items) == 1 and local_items[0]["id"] == item, local_items
     assert local_items[0]["played"] is True, "watch state must survive replacement of the entire mediahost"
     assert query("hub.db", "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='files'") == [(0,)]

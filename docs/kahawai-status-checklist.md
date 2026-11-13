@@ -470,8 +470,17 @@ audio/video byte separation for manual playback testing; see
       pages and fetch visible chunks without a load-more control. Grouping
       happens before paging, and chronology uses the same embedded-or-enriched
       release year the album card displays;
-      search returns matching artists alongside albums and songs and matches
-      track titles within an artist's albums. A strict synthetic `artist_key`
+      search returns matching artists alongside albums and songs. Every
+      catalogue listing is one endpoint, `/catalogue/search`, answering any set
+      of libraries and kinds (items, album artists, songs) in one request, the
+      hub asking them concurrently; the home panel makes one request for every
+      library, and a filtered music library page has Artists, Albums and Songs.
+      Songs are one hit per album position, keyed by the album's child id, in
+      title order.
+      and matches track titles within an artist's albums. Song search holds
+      NFR-1's 200 ms at 250k tracks for a needle matching every song, deep
+      pages included (`catalogue_check scale`), on the `track_titles` and
+      `track_positions` indexes. A strict synthetic `artist_key`
       keeps fuzzy-search equivalents such as “One” and “1” distinct; a rename
       changes the route key. A durable artwork projection requires exactly one
       credited-artist MusicBrainz identity, tries Fanart.tv before TheAudioDB,

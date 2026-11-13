@@ -179,6 +179,7 @@ done
 [ -n "$body" ] || { echo 'fixture collections did not finish ingestion' >&2; exit 1; }
 LIBRARY_ID=$(curl -sf -X POST "http://$API/admin/v1/catalogue/libraries" -H "Authorization: Bearer $TOKEN" -H content-type:application/json -d "$body" | json_field id)
 start=$(date +%s%N)
-items=$(curl -sf "http://$API/api/v1/catalogue/libraries/$LIBRARY_ID/items?limit=1" -H "Authorization: Bearer $TOKEN" | json_field total)
+items=$(curl -sf "http://$API/api/v1/catalogue/search?libraries=$LIBRARY_ID&kinds=items&limit=1" -H "Authorization: Bearer $TOKEN" \
+    | python3 -c 'import json,sys; print(json.load(sys.stdin)["libraries"][0]["items"]["total"])')
 end=$(date +%s%N)
 echo "   browse with $HOSTS hosts up  : $(( (end - start) / 1000000 )) ms (items visible: ${items:-?})"

@@ -1,6 +1,8 @@
 vi.mock('../src/api/catalogue.ts', () => ({
   listItems: vi.fn(),
   listArtists: vi.fn(),
+  listTracks: vi.fn(),
+  searchEverywhere: vi.fn(),
   artistAlbums: vi.fn(),
   upNext: vi.fn(),
   catalogueDetail: vi.fn(),
@@ -22,9 +24,11 @@ vi.mock('../src/api/generated/kahawai.ts', () => ({
   libraries: vi.fn(),
   getCatalogueArtworkUrl: (library: string, id: string) =>
     `/api/v1/catalogue/libraries/${library}/items/${id}/artwork`,
+  getCatalogueArtistArtworkUrl: (library: string, key: string) =>
+    `/api/v1/catalogue/libraries/${library}/artists/${key}/artwork`,
 }))
 
-const { listItems } = await import('./api-fixture.ts')
+const { searchEverywhere } = await import('./api-fixture.ts')
 const AppShell = (await import('../src/components/AppShell.vue')).default
 const { DEBOUNCE_MS } = await import('../src/composables/search.ts')
 
@@ -34,13 +38,29 @@ const LIBS = [
 ]
 const item = (id: string) => ({ id, title: id, kind: 'movie' }) as ItemSummary
 
+type Hits = Awaited<ReturnType<typeof searchEverywhere>>[number]
+/// One library's answer: its items, and nothing of the other kinds unless a
+/// test says so.
+const hits = (
+  library: (typeof LIBS)[number],
+  items: ItemSummary[],
+  more: Partial<Hits> = {},
+): Hits => ({
+  library,
+  items,
+  total: items.length,
+  artists: [],
+  artistTotal: 0,
+  songs: [],
+  songTotal: 0,
+  ...more,
+})
+
+/// Every library answers with what it is given, in one search.
 function answers(by: Record<string, ItemSummary[]>) {
-  vi.mocked(listItems).mockImplementation(async (params) => ({
-    items: by[params?.library ?? ''] ?? [],
-    total: (by[params?.library ?? ''] ?? []).length,
-    limit: 5,
-    offset: 0,
-  }))
+  vi.mocked(searchEverywhere).mockImplementation(async () =>
+    LIBS.map((library) => hits(library, by[library.id] ?? [])),
+  )
 }
 
 const Blank = { template: '<div />' }
@@ -51,6 +71,7 @@ async function shell() {
     routes: [
       { path: '/', name: 'libraries', component: Blank },
       { path: '/library/:library', name: 'library', component: Blank },
+      { path: '/library/:library/artist/:artist', name: 'artist', component: Blank },
       { path: '/library/:library/item/:id', name: 'detail', component: Blank },
     ],
   })
@@ -252,6 +273,25 @@ describe('pressing one', () => {
     expect(wrapper.find('[role="listbox"]').exists()).toBe(true)
   })
 
+  test('an artist opens that artist, in its library', async () => {
+    vi.mocked(searchEverywhere).mockResolvedValue([
+      hits(LIBS[0]!, [item('heat'), item('the insider')]),
+      hits(LIBS[1]!, [item('heat wave')], {
+        artists: [{ key: 'heatwave', name: 'Heatwave', album_count: 3 }],
+        artistTotal: 1,
+      }),
+    ])
+    const { router, wrapper } = await shell()
+    await search(wrapper, 'heat')
+    // Films heading, two films, Music heading, then the artist.
+    const rows = wrapper.findAll('[role="option"]').map((r) => r.text().replace(/\s+/g, ' ').trim())
+    expect(rows[4]).toBe('Heatwave Artist · 3 albums')
+    for (let n = 0; n < 5; n++) await key(wrapper, 'ArrowDown')
+    await key(wrapper, 'Enter')
+    await flushPromises()
+    expect(router.currentRoute.value.fullPath).toBe('/library/music/artist/heatwave')
+  })
+
   test('an item takes the text with it, because you asked for that one thing', async () => {
     const { router, wrapper } = await shell()
     await search(wrapper, 'heat')
@@ -280,10 +320,8 @@ describe('a query nobody is searching for any more', () => {
 
     await search(wrapper, '')
     let answer = () => {}
-    vi.mocked(listItems).mockReturnValue(
-      new Promise(
-        (resolve) => (answer = () => resolve({ items: [], total: 0, limit: 5, offset: 0 })),
-      ),
+    vi.mocked(searchEverywhere).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve([]))),
     )
     await search(wrapper, 'zzz')
     expect(wrapper.find('[role="listbox"]').exists()).toBe(false)
@@ -298,10 +336,8 @@ describe('a query nobody is searching for any more', () => {
     await search(wrapper, 'heat')
 
     let answer = () => {}
-    vi.mocked(listItems).mockReturnValue(
-      new Promise(
-        (resolve) => (answer = () => resolve({ items: [], total: 0, limit: 5, offset: 0 })),
-      ),
+    vi.mocked(searchEverywhere).mockReturnValue(
+      new Promise((resolve) => (answer = () => resolve([]))),
     )
     await wrapper.find('input').setValue('heat 2')
     vi.advanceTimersByTime(DEBOUNCE_MS)
@@ -402,12 +438,12 @@ describe('leaving it', () => {
     const { wrapper } = await shell()
     await search(wrapper, 'heat')
     await key(wrapper, 'Escape')
-    vi.mocked(listItems).mockClear()
+    vi.mocked(searchEverywhere).mockClear()
 
     await wrapper.find('input').trigger('focus')
     await flushPromises()
     expect(wrapper.find('[role="listbox"]').exists()).toBe(true)
-    expect(listItems).not.toHaveBeenCalled()
+    expect(searchEverywhere).not.toHaveBeenCalled()
   })
 
   test('Escape belongs to the panel, not to every search box', async () => {

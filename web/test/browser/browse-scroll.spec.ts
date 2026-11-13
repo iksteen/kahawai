@@ -56,8 +56,11 @@ async function catalogue(page: Page) {
         watch: { played: 0, total: 0 },
       })
     }
-    const music = path.includes('fixture-music')
-    if (path.endsWith('/items') || path.endsWith('/artists')) {
+    if (path.endsWith('/search')) {
+      // Every listing is one library and one kind of `/search`.
+      const library = url.searchParams.get('libraries') ?? ''
+      const kind = url.searchParams.get('kinds') ?? 'items'
+      const music = library.includes('fixture-music')
       const offset = Number(url.searchParams.get('offset') ?? 0)
       const limit = Number(url.searchParams.get('limit') ?? 100)
       requests.push(offset)
@@ -68,7 +71,7 @@ async function catalogue(page: Page) {
           requested()
         })
       }
-      const artists = path.endsWith('/artists')
+      const artists = kind === 'artists'
       const reversed = url.searchParams.get('sort')?.startsWith('-')
       const rows = Array.from({ length: Math.min(limit, total - offset) }, (_, n) => {
         const at = reversed ? total - offset - n - 1 : offset + n
@@ -80,8 +83,19 @@ async function catalogue(page: Page) {
             }
           : row(at, music)
       })
-      return json(route, { [artists ? 'artists' : 'items']: rows, total, offset, limit })
+      return json(route, {
+        libraries: [
+          {
+            library: libraries.find((l) => l.id === library),
+            items: null,
+            artists: null,
+            tracks: null,
+            [kind]: { [artists ? 'artists' : 'items']: rows, total, offset, limit },
+          },
+        ],
+      })
     }
+    const music = path.includes('fixture-music')
     const at = Number(/(?:film|album)-(\d+)/.exec(path)?.[1] ?? 0)
     return json(route, {
       ...row(at, music),

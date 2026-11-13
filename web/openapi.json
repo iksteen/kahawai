@@ -9,7 +9,7 @@
     },
     "version": "0.0.0-dev"
   },
-  "x-kahawai-source-sha256": "f5d245e6d0bbf662727c609435e8f829f39405e5581eb98e66167c93f785e49c",
+  "x-kahawai-source-sha256": "de97ef198d8440c8d0b8c92fe4db4f837a6cb97083effcb83a0b36011f28ea76",
   "paths": {
     "/admin/v1/catalogue/collections": {
       "get": {
@@ -5670,92 +5670,6 @@
         ]
       }
     },
-    "/api/v1/catalogue/libraries/{id}/artists": {
-      "get": {
-        "tags": [
-          "Catalogue"
-        ],
-        "operationId": "catalogue_artists",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "q",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "sort",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "artist",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CatalogueArtists"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ]
-      }
-    },
     "/api/v1/catalogue/libraries/{id}/artists/{key}/artwork": {
       "get": {
         "tags": [
@@ -5811,92 +5725,6 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/ApiErrorBody"
-                }
-              }
-            }
-          }
-        },
-        "security": [
-          {
-            "bearer_auth": []
-          }
-        ]
-      }
-    },
-    "/api/v1/catalogue/libraries/{id}/items": {
-      "get": {
-        "tags": [
-          "Catalogue"
-        ],
-        "operationId": "items",
-        "parameters": [
-          {
-            "name": "id",
-            "in": "path",
-            "required": true,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "q",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "sort",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "artist",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "string"
-            }
-          },
-          {
-            "name": "offset",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
-          },
-          {
-            "name": "limit",
-            "in": "query",
-            "required": false,
-            "schema": {
-              "type": "integer",
-              "format": "int32",
-              "minimum": 0
-            }
-          }
-        ],
-        "responses": {
-          "200": {
-            "headers": {
-              "X-Request-Id": {
-                "schema": {
-                  "type": "string"
-                },
-                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
-              }
-            },
-            "content": {
-              "application/json": {
-                "schema": {
-                  "$ref": "#/components/schemas/CatalogueItems"
                 }
               }
             }
@@ -6923,6 +6751,142 @@
             }
           },
           "409": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "bearer_auth": []
+          }
+        ]
+      }
+    },
+    "/api/v1/catalogue/search": {
+      "get": {
+        "tags": [
+          "Catalogue"
+        ],
+        "summary": "Every catalogue search and filtered listing: the home screen's search\nacross libraries, and a library's (or an artist's) items, album artists\nand songs, paged.",
+        "description": "One request for any number of libraries and kinds, multiplexed here\nrather than by the client: on a slow link every request costs a round\ntrip of its own. Each library-and-kind is the same bounded query its\nlisting runs, and they are asked concurrently, so this costs the slowest\nof them rather than their sum — on the same reader pool a client's\nconcurrent requests would share. Not one grouped query across libraries:\nthat was measured and withdrawn (`docs/web-next-plan.md`, B3).\n\nAll or nothing: a library that cannot be answered fails the request,\nsince a partial answer would read as fewer matches.",
+        "operationId": "catalogue_search",
+        "parameters": [
+          {
+            "name": "q",
+            "in": "query",
+            "description": "Matched case-insensitively against titles (items, songs) and names\n(album artists). Empty matches everything, which makes this a browse.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "libraries",
+            "in": "query",
+            "description": "Comma-separated library IDs, answered in that order. Every library the\nviewer may see, in the libraries endpoint's order, when absent.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "kinds",
+            "in": "query",
+            "description": "Comma-separated: `items`, `artists`, `tracks`. Every kind each library\nholds when absent; `artists` and `tracks` exist in music libraries only.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "sort",
+            "in": "query",
+            "description": "With exactly one kind: items `title` (default), `-title`, `year`,\n`-year`, `added`, `-added`; artists `name` (default), `-name`; tracks\n`title`.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "artist",
+            "in": "query",
+            "description": "With `kinds=items` only: an album artist's key, for that artist's albums.",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "offset",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "description": "Hits per library and kind, 1 to 200; 20 when absent.",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int32",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/CatalogueSearch"
+                }
+              }
+            }
+          },
+          "400": {
+            "headers": {
+              "X-Request-Id": {
+                "schema": {
+                  "type": "string"
+                },
+                "description": "Server-generated ULID for correlating this response with hub logs; an inbound value is never reused"
+              }
+            },
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorBody"
+                }
+              }
+            }
+          },
+          "404": {
             "headers": {
               "X-Request-Id": {
                 "schema": {
@@ -9647,6 +9611,20 @@
           }
         }
       },
+      "CatalogueSearch": {
+        "type": "object",
+        "required": [
+          "libraries"
+        ],
+        "properties": {
+          "libraries": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/LibraryHits"
+            }
+          }
+        }
+      },
       "CatalogueSeasons": {
         "type": "object",
         "required": [
@@ -9657,6 +9635,38 @@
             "type": "array",
             "items": {
               "$ref": "#/components/schemas/CatalogueChildGroup"
+            }
+          }
+        }
+      },
+      "CatalogueTracks": {
+        "type": "object",
+        "required": [
+          "tracks",
+          "total",
+          "offset",
+          "limit"
+        ],
+        "properties": {
+          "limit": {
+            "type": "integer",
+            "format": "int32",
+            "minimum": 0
+          },
+          "offset": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "total": {
+            "type": "integer",
+            "format": "int64",
+            "minimum": 0
+          },
+          "tracks": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/TrackHit"
             }
           }
         }
@@ -11444,6 +11454,50 @@
           }
         }
       },
+      "LibraryHits": {
+        "type": "object",
+        "description": "One library's answer. Each kind is exactly the page its own listing would\nbe, total included; absent when not asked for, or not held by the library.",
+        "required": [
+          "library"
+        ],
+        "properties": {
+          "artists": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CatalogueArtists",
+                "description": "Album artists; music libraries only."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "items": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CatalogueItems"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "library": {
+            "$ref": "#/components/schemas/SearchLibrary"
+          },
+          "tracks": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CatalogueTracks",
+                "description": "Songs, one hit per album position, keyed by the album's child id;\nmusic libraries only."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        }
+      },
       "LibraryItemKind": {
         "type": "string",
         "description": "Playable shape, distinct from a collection's category (anime contains both).\nDerived from visible physical entries, not provider descriptions or a stored flag.",
@@ -12459,6 +12513,25 @@
           }
         }
       },
+      "SearchLibrary": {
+        "type": "object",
+        "required": [
+          "id",
+          "name",
+          "media_type"
+        ],
+        "properties": {
+          "id": {
+            "type": "string"
+          },
+          "media_type": {
+            "type": "string"
+          },
+          "name": {
+            "type": "string"
+          }
+        }
+      },
       "SearchRequest": {
         "type": "object",
         "required": [
@@ -13345,6 +13418,41 @@
             }
           }
         ]
+      },
+      "TrackHit": {
+        "type": "object",
+        "description": "A song that matched a title search, named the way the album lists it: its\n[`ChildId`], so opening or marking it addresses the same child the album's\ntrack list does, and every copy of that position is one hit.",
+        "required": [
+          "id",
+          "parent_id",
+          "album",
+          "position",
+          "title"
+        ],
+        "properties": {
+          "album": {
+            "type": "string"
+          },
+          "artist": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "id": {
+            "type": "string"
+          },
+          "parent_id": {
+            "type": "string"
+          },
+          "position": {
+            "$ref": "#/components/schemas/ChildPosition"
+          },
+          "title": {
+            "type": "string",
+            "description": "The detected title, which is what the search matched. A provider's\ntrack title can differ; the album page shows that one."
+          }
+        }
       },
       "TrackListing": {
         "allOf": [

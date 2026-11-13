@@ -287,6 +287,12 @@ Reopening this wants a different shape, not a faster version of this one — a
 per-library UNION of indexed top-N stops early on a dense needle but pays N
 full scans on a rare one, which is the trade to measure next time.
 
+The round trips went later, without the grouped query: `/catalogue/search`
+answers every library in one request by running each library's own bounded
+query concurrently in the hub, then joining the answers. The database work
+is the client's fan-out exactly — the same queries, on the same reader pool —
+less a round trip per library, which on a slow link was the waiting.
+
 ### B4. Part numbers on source rows — DONE
 
 UI-27 / finding 11. Seven part files of one film were published as a flat

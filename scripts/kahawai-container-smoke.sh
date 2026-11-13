@@ -268,8 +268,8 @@ done
 library=$(python3 -c 'import json,sys;print(json.dumps(dict(name="Smoke",media_type="movies",collection_ids=[sys.argv[1]])))' "$collection" |
     curl -sf -X POST "http://$api/admin/v1/catalogue/libraries" -H "Authorization: Bearer $auth" -H content-type:application/json -d @- |
     py 'print(d["id"])')
-body=$(curl -sf -H "Authorization: Bearer $auth" "http://$api/api/v1/catalogue/libraries/$library/items")
-item=$(printf '%s' "$body" | py 'print(d["items"][0]["id"])')
+body=$(curl -sf -H "Authorization: Bearer $auth" "http://$api/api/v1/catalogue/search?libraries=$library&kinds=items")
+item=$(printf '%s' "$body" | py 'print(d["libraries"][0]["items"]["items"][0]["id"])')
 
 echo "==> starting a session" >&2
 session=$(curl -sf -X POST "http://$api/api/v1/playback/sessions" \

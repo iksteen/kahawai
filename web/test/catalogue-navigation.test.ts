@@ -1,9 +1,8 @@
 import { beforeEach, expect, test, vi } from 'vitest'
 import {
-  items,
   item,
   cataloguePlayback,
-  catalogueArtists,
+  catalogueSearch,
   catalogueContinue,
   catalogueUpNext,
   catalogueChildren as children,
@@ -16,13 +15,15 @@ import {
   catalogueRow,
   upNext,
   catalogueChildren,
+  searchEverywhere,
+  listTracks,
+  artistAlbums,
 } from '../src/api/catalogue.ts'
 vi.mock('../src/api/generated/kahawai.ts', () => ({
-  items: vi.fn(),
   item: vi.fn(),
   cataloguePlayback: vi.fn(),
   libraries: vi.fn(),
-  catalogueArtists: vi.fn(),
+  catalogueSearch: vi.fn(),
   catalogueContinue: vi.fn(),
   catalogueUpNext: vi.fn(),
   catalogueChildren: vi.fn(),
@@ -50,8 +51,14 @@ test.each(['auto', 'manual', 'weak', null])('grid preserves match confidence %s'
     confidence,
   )
 })
+/// `/search` answering one library with the parts given.
+const answer = (library: string, parts: Record<string, unknown>) =>
+  vi.mocked(catalogueSearch).mockResolvedValue({
+    libraries: [{ library: { id: library, name: library, media_type: 'music' }, ...parts }],
+  } as never)
+
 test('the existing grids receive exact totals and scoped, filtered pages', async () => {
-  vi.mocked(items).mockResolvedValue({ items: [entry], total: 101, limit: 50, offset: 50 })
+  answer('films', { items: { items: [entry], total: 101, limit: 50, offset: 50 } })
   const page = await listItems({
     library: 'films',
     offset: 50,
@@ -59,7 +66,15 @@ test('the existing grids receive exact totals and scoped, filtered pages', async
     q: 'City',
     sort: '-year',
   })
-  expect(items).toHaveBeenCalledWith('films', { offset: 50, limit: 50, q: 'City', sort: '-year' })
+  // One library, one kind: the page that grid asks for.
+  expect(catalogueSearch).toHaveBeenCalledWith({
+    libraries: 'films',
+    kinds: 'items',
+    offset: 50,
+    limit: 50,
+    q: 'City',
+    sort: '-year',
+  })
   expect(page.total).toBe(101)
   expect(page.items[0]).toMatchObject({
     id: 'film',
@@ -78,9 +93,65 @@ test('the existing detail head receives metadata without claiming playable sourc
   expect(result.unavailable).toBeUndefined()
 })
 test('artist grids page through the catalogue API', async () => {
-  vi.mocked(catalogueArtists).mockResolvedValue({ artists: [], total: 0, offset: 100, limit: 50 })
+  answer('music', { artists: { artists: [], total: 0, offset: 100, limit: 50 } })
   await listArtists({ library: 'music', offset: 100, limit: 50, sort: '-name' })
-  expect(catalogueArtists).toHaveBeenCalledWith('music', { offset: 100, limit: 50, sort: '-name' })
+  expect(catalogueSearch).toHaveBeenCalledWith({
+    libraries: 'music',
+    kinds: 'artists',
+    offset: 100,
+    limit: 50,
+    sort: '-name',
+  })
+})
+
+test('an artist page asks for that artist’s items, and nothing undefined', async () => {
+  answer('music', { items: { items: [entry], total: 1, offset: 0, limit: 100 } })
+  const page = await artistAlbums('Asia', { library: 'music', limit: 100 })
+  expect(catalogueSearch).toHaveBeenCalledWith({
+    libraries: 'music',
+    kinds: 'items',
+    limit: 100,
+    artist: 'Asia',
+  })
+  expect(page.albums[0]).toMatchObject({ id: 'film', library_id: 'music' })
+})
+
+test('songs page as rows that open their album', async () => {
+  answer('music', {
+    tracks: {
+      tracks: [
+        {
+          id: 'child1:album:t:u:3',
+          parent_id: 'album',
+          album: 'Asia',
+          position: { kind: 'track', disc: null, track: 3 },
+          title: 'Heat of the Moment',
+          artist: 'Asia',
+        },
+      ],
+      total: 1,
+      offset: 0,
+      limit: 100,
+    },
+  })
+  const page = await listTracks({ library: 'music', q: 'heat', limit: 100 })
+  expect(catalogueSearch).toHaveBeenCalledWith({
+    libraries: 'music',
+    kinds: 'tracks',
+    q: 'heat',
+    limit: 100,
+  })
+  expect(page.items[0]).toMatchObject({
+    kind: 'song',
+    parent_id: 'album',
+    episode: 3,
+    season: null,
+  })
+})
+
+test('a library answered without the kind asked for is a contract break, not no matches', async () => {
+  answer('music', { artists: null })
+  await expect(listArtists({ library: 'music' })).rejects.toThrow('without artists')
 })
 
 test('stable physical children are supplied by the catalogue, not metadata list positions', async () => {
@@ -312,4 +383,58 @@ test('season and disc filters cannot be combined', async () => {
   )
   expect(seasonItems).not.toHaveBeenCalled()
   expect(children).not.toHaveBeenCalled()
+})
+
+test('one search answers every library, each with the kinds it holds', async () => {
+  vi.mocked(catalogueSearch).mockResolvedValue({
+    libraries: [
+      {
+        library: { id: 'films', name: 'Films', media_type: 'movies' },
+        items: { items: [entry], total: 3, limit: 5, offset: 0 },
+        artists: null,
+        tracks: null,
+      },
+      {
+        library: { id: 'music', name: 'Music', media_type: 'music' },
+        items: { items: [], total: 0, limit: 5, offset: 0 },
+        artists: {
+          artists: [{ key: 'asia', name: 'Asia', album_count: 2 }],
+          total: 1,
+          limit: 5,
+          offset: 0,
+        },
+        tracks: {
+          tracks: [
+            {
+              id: 'child1:album:t:1:3',
+              parent_id: 'album',
+              album: 'Asia',
+              position: { kind: 'track', disc: 1, track: 3 },
+              title: 'Heat of the Moment',
+              artist: 'Asia',
+            },
+          ],
+          total: 9,
+          limit: 5,
+          offset: 0,
+        },
+      },
+    ],
+  })
+  const [films, music] = await searchEverywhere({ q: 'heat', limit: 5 })
+  if (!films || !music) throw new Error('expected both libraries')
+  expect(catalogueSearch).toHaveBeenCalledWith({ q: 'heat', limit: 5 })
+  expect(films).toMatchObject({ total: 3, artists: [], artistTotal: 0, songs: [], songTotal: 0 })
+  expect(films.items[0]).toMatchObject({ id: 'film', library_id: 'films' })
+  expect(music).toMatchObject({ library: { id: 'music' }, artistTotal: 1, songTotal: 9 })
+  expect(music.artists[0]?.name).toBe('Asia')
+  expect(music.songs[0]).toMatchObject({
+    kind: 'song',
+    id: 'child1:album:t:1:3',
+    library_id: 'music',
+    parent_id: 'album',
+    parent_title: 'Asia',
+    season: 1,
+    episode: 3,
+  })
 })

@@ -31,8 +31,7 @@ function panel(props: Partial<InstanceType<typeof SearchPanel>['$props']> = {}) 
     props: {
       query: 'heat',
       rows,
-      failed: [],
-      allFailed: false,
+      failure: '',
       searching: false,
       highlight: -1,
       ...props,
@@ -112,32 +111,26 @@ describe('what it says when there are no rows', () => {
   })
 })
 
-describe('when a library could not be asked', () => {
-  test('it is named, and the results are called incomplete', () => {
-    const wrapper = panel({ failed: ['Music'] })
-    expect(wrapper.text()).toContain('Could not search Music')
-    expect(wrapper.text()).toContain('incomplete')
-    // Not "nothing matches": the rows that did arrive are still there.
+describe('when the search could not be answered', () => {
+  test('it says why, and draws no rows under it', () => {
+    // All or nothing: the caller hands no rows with a failure, and the panel
+    // does not claim there were no matches either.
+    const wrapper = panel({ rows: [], failure: 'Could not reach the hub.' })
+    expect(wrapper.text()).toContain('Could not search — Could not reach the hub.')
     expect(wrapper.text()).not.toContain('No matches')
   })
 
-  test('all of them failing says the hub did not answer', () => {
-    const wrapper = panel({ rows: [], failed: ['Films', 'Music'], allFailed: true })
-    expect(wrapper.text()).toContain('the hub did not answer')
-    expect(wrapper.text()).not.toContain('incomplete')
-  })
-
-  test('and either way it is announced, not just drawn', () => {
+  test('and it is announced, not just drawn', () => {
     // Outside the listbox, because a listbox may contain nothing but options:
     // a paragraph inside one can be dropped from the accessibility tree.
-    const wrapper = panel({ failed: ['Music'] })
+    const wrapper = panel({ rows: [], failure: 'nope' })
     const statuses = wrapper.findAll('[role="status"]')
     expect(statuses.some((s) => s.text().includes('Could not search'))).toBe(true)
     expect(wrapper.find('[role="listbox"]').text()).not.toContain('Could not search')
   })
 
   test('Try again asks the caller to ask again', async () => {
-    const wrapper = panel({ failed: ['Music'] })
+    const wrapper = panel({ rows: [], failure: 'nope' })
     await wrapper
       .findAll('button')
       .find((b) => b.text() === 'Try again')!

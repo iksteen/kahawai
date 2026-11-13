@@ -1,10 +1,9 @@
 /// Translate catalogue descriptions into the existing presentation models.
 /// User state comes from the hub alongside the descriptions; playback is separate.
 import {
-  items,
   item,
   cataloguePlayback,
-  catalogueArtists,
+  catalogueSearch,
   catalogueContinue,
   catalogueUpNext,
   catalogueChildren as getCatalogueChildren,
@@ -14,6 +13,9 @@ import { descriptionProviders } from '../domain/attribution.ts'
 import type { ItemQuery } from './generated/model/itemQuery.ts'
 import type { FeedItem } from './generated/model/feedItem.ts'
 import type { LibraryChild } from './generated/model/libraryChild.ts'
+import type { TrackHit } from './generated/model/trackHit.ts'
+import type { CatalogueSearchParams } from './generated/model/catalogueSearchParams.ts'
+import type { LibraryHits } from '../domain/search-nav.ts'
 import type { CatalogueChildrenParams } from './generated/model/catalogueChildrenParams.ts'
 import type { CatalogueItem } from './generated/model/catalogueItem.ts'
 import type { ItemSummary } from './catalogue-model.ts'
@@ -60,9 +62,28 @@ export async function listItems(params: BrowseParams = {}) {
     return { ...result, items: result.items.map(feedRow) }
   }
   if (!params.library) throw new Error('Catalogue browsing requires a library.')
-  const { library, ...page } = params
-  const result = await items(library, page)
+  const { library, in_progress: _, ...page } = params
+  const result = await kindOf(library, 'items', page)
   return { ...result, items: result.items.map((entry) => catalogueRow(entry, library)) }
+}
+
+type Page = { q?: string; sort?: string; artist?: string; offset?: number; limit?: number }
+type Kind = 'items' | 'artists' | 'tracks'
+
+/// One library's page of one kind. Every catalogue listing is this one
+/// endpoint (`/search`), so a page is the same rows whichever screen asks.
+async function kindOf<K extends Kind>(library: string, kind: K, page: Page) {
+  // Absent rather than undefined: with `exactOptionalPropertyTypes` the two
+  // differ, and the generated params say a key may be absent.
+  const params: CatalogueSearchParams = { libraries: library, kinds: kind }
+  for (const [key, value] of Object.entries(page)) {
+    if (value !== undefined) Object.assign(params, { [key]: value })
+  }
+  const answer = (await catalogueSearch(params)).libraries[0]?.[kind]
+  // The hub answers every library it was asked for, and the kind for any
+  // library that holds it; a hole here is a contract break, not "no matches".
+  if (!answer) throw new Error(`The hub answered without ${kind} for this library.`)
+  return answer as NonNullable<NonNullable<typeof answer>>
 }
 
 export async function listArtists(params: {
@@ -73,7 +94,69 @@ export async function listArtists(params: {
   limit?: number
 }) {
   const { library, ...page } = params
-  return catalogueArtists(library, page)
+  return kindOf(library, 'artists', page)
+}
+
+/// Every library's first hits of every kind it holds, in one request — the
+/// hub asks them concurrently. All or nothing: a refusal is the whole search's.
+export async function searchEverywhere(params: {
+  q: string
+  limit: number
+}): Promise<LibraryHits[]> {
+  const result = await catalogueSearch(params)
+  return result.libraries.map(({ library, items, artists, tracks }) => ({
+    library,
+    items: items?.items.map((entry) => catalogueRow(entry, library.id)) ?? [],
+    total: items?.total ?? 0,
+    artists: artists?.artists ?? [],
+    artistTotal: artists?.total ?? 0,
+    songs: tracks?.tracks.map((hit) => trackRow(hit, library.id)) ?? [],
+    songTotal: tracks?.total ?? 0,
+  }))
+}
+
+/// Songs whose title matches, as song rows: `id` is the album's child id,
+/// `parent_id`/`parent_title` the album, so the row opens and labels the way a
+/// track does everywhere else (`targetOf`, `metaLine`).
+export async function listTracks(params: {
+  library: string
+  q?: string
+  offset?: number
+  limit?: number
+}) {
+  const { library, ...page } = params
+  const result = await kindOf(library, 'tracks', page)
+  return { total: result.total, items: result.tracks.map((hit) => trackRow(hit, library)) }
+}
+
+function trackRow(hit: TrackHit, library: string): ItemSummary {
+  const position = hit.position
+  return {
+    id: hit.id,
+    title: hit.title,
+    year: null,
+    kind: 'song',
+    library_id: library,
+    artist: hit.artist ?? null,
+    sources: 1,
+    art_version: null,
+    file_title: null,
+    file_year: null,
+    matched_title: null,
+    match_confidence: null,
+    parent_id: hit.parent_id,
+    parent_title: hit.album,
+    season: position.kind === 'episode' ? null : (position.disc ?? null),
+    episode: position.kind === 'track' ? position.track : null,
+    episode_end: null,
+    proj_episode: null,
+    proj_season: null,
+    played: false,
+    duration_ms: null,
+    resume_duration_ms: null,
+    resume_position_ms: null,
+    replay_gain: null,
+  }
 }
 
 export async function artistAlbums(
@@ -81,7 +164,7 @@ export async function artistAlbums(
   params: { library: string; q?: string; sort?: string; offset?: number; limit?: number },
 ) {
   const { library, ...page } = params
-  const { items: albums, ...result } = await items(library, { ...page, artist: key })
+  const { items: albums, ...result } = await kindOf(library, 'items', { ...page, artist: key })
   return {
     ...result,
     albums: albums.map((entry) => catalogueRow(entry, library)),

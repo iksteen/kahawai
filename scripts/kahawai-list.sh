@@ -60,18 +60,23 @@ for lib in ([{'id':library}] if feeds else libraries):
     lid = lib['id']
     path = f'{root}/{quote(lid)}'
     params = {}
+    key = 'artists' if mode == 'artists' else 'children' if mode == 'children' else 'items'
+    # Items, album artists and an artist's albums are one library and one kind
+    # of the catalogue's single listing; its page sits under that library.
+    searched = not feeds and mode != 'children'
     if feeds:
         path = '/api/v1/catalogue/' + mode
         if library: params['library'] = library
     elif mode == 'children': path += f'/items/{quote(parent)}/children'
     else:
-        path += '/artists' if mode == 'artists' else '/items'
+        path = '/api/v1/catalogue/search'
+        params.update(libraries=lid, kinds=key)
         if needle: params['q'] = needle
         if mode == 'albums': params.update(artist=artist, sort='year')
-    key = 'artists' if mode == 'artists' else 'children' if mode == 'children' else 'items'
     offset = 0
     while True:
         answer = request(path + '?' + urllib.parse.urlencode(dict(params, offset=offset, limit=200)))
+        if searched: answer = answer['libraries'][0][key]
         rows = answer[key]
         for row in rows:
             if mode == 'artists':

@@ -227,12 +227,11 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
         )
         .await;
     assert_eq!(status, StatusCode::CREATED, "{lib}");
-    let path = format!(
-        "/api/v1/catalogue/libraries/{}/items",
-        lib["id"].as_str().unwrap()
-    );
-    let (status, page) = f.request("GET", &path, Value::Null, Some(&f.token)).await;
-    assert_eq!(status, StatusCode::OK, "{page}");
+    let library = lib["id"].as_str().unwrap();
+    let path = format!("/api/v1/catalogue/search?libraries={library}&kinds=items");
+    let (status, found) = f.request("GET", &path, Value::Null, Some(&f.token)).await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let page = &found["libraries"][0]["items"];
     assert_eq!(page["items"].as_array().unwrap().len(), 2);
     let (status, review) = f
         .request("GET", "/admin/v1/enrich/items", Value::Null, Some(&f.token))
@@ -280,9 +279,14 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
 
     let id = page["items"][0]["id"].as_str().unwrap().to_owned();
     assert_eq!(
-        f.request("GET", &format!("{path}/{id}"), Value::Null, Some(&f.token))
-            .await
-            .0,
+        f.request(
+            "GET",
+            &format!("/api/v1/catalogue/libraries/{library}/items/{id}"),
+            Value::Null,
+            Some(&f.token)
+        )
+        .await
+        .0,
         StatusCode::OK
     );
     assert_eq!(
@@ -302,7 +306,7 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
     assert_eq!(
         f.request(
             "GET",
-            &format!("{path}?limit=0"),
+            &format!("{path}&limit=0"),
             Value::Null,
             Some(&f.token)
         )
@@ -313,12 +317,12 @@ async fn ingestion_ack_browse_restart_archive_and_history_preservation() {
     assert_eq!(
         f.request(
             "GET",
-            &format!("{path}?limit=1&offset=1"),
+            &format!("{path}&limit=1&offset=1"),
             Value::Null,
             Some(&f.token)
         )
         .await
-        .1["items"]
+        .1["libraries"][0]["items"]["items"]
             .as_array()
             .unwrap()
             .len(),
@@ -417,7 +421,7 @@ async fn external_grants_fail_closed_and_do_not_require_old_library_rows() {
     assert_eq!(
         f.request(
             "GET",
-            &format!("/api/v1/catalogue/libraries/{two}/items"),
+            &format!("/api/v1/catalogue/search?libraries={two}"),
             Value::Null,
             Some(&token)
         )
@@ -3125,4 +3129,231 @@ async fn nested_season_items_preserve_pagination_watch_and_library_scope() {
         .0,
         StatusCode::NOT_FOUND
     );
+}
+
+/// A music library ("Music", one song) and a film library ("Films"), both with
+/// something matching "light".
+async fn search_fixture(f: &Fixture) -> (String, String) {
+    let s = f.registry.catalogue();
+    s.put_mediahost("host", "Fixture").await.unwrap();
+    let mut o = offer("music", 1);
+    o.media_type = "music".into();
+    let (music_col, _) = s.offer_collection("host", &o).await.unwrap();
+    s.apply_catalogue(
+        "host",
+        &delta(
+            "music",
+            1,
+            "Lightning/Light Years (2000)/01 - First Light.flac",
+            true,
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let music = s
+        .create_library("Music", MediaType::Music, std::slice::from_ref(&music_col))
+        .await
+        .unwrap();
+    let (film_col, _) = s
+        .offer_collection("host", &offer("films", 1))
+        .await
+        .unwrap();
+    s.apply_catalogue(
+        "host",
+        &delta(
+            "films",
+            1,
+            "Light Sleeper (1992)/Light Sleeper (1992).mkv",
+            true,
+            true,
+        ),
+    )
+    .await
+    .unwrap();
+    let films = s
+        .create_library("Films", MediaType::Movies, std::slice::from_ref(&film_col))
+        .await
+        .unwrap();
+    (music, films)
+}
+
+#[tokio::test]
+async fn search_answers_every_library_and_kind_in_one_request() {
+    let f = Fixture::new().await;
+    let (music, films) = search_fixture(&f).await;
+    let get = |path: String| {
+        let f = &f;
+        async move { f.request("GET", &path, Value::Null, Some(&f.token)).await }
+    };
+
+    // Every library the viewer may see, in the libraries endpoint's order.
+    let (status, all) = get("/api/v1/catalogue/search?q=light&limit=3".into()).await;
+    assert_eq!(status, StatusCode::OK, "{all}");
+    let (_, listed) = get("/api/v1/catalogue/libraries".into()).await;
+    let order: Vec<_> = listed
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["id"].clone())
+        .collect();
+    let answered: Vec<_> = all["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["library"]["id"].clone())
+        .collect();
+    assert_eq!(answered, order);
+    let part = |answer: &Value, library: &str, kind: &str| -> Value {
+        answer["libraries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|l| l["library"]["id"] == library)
+            .unwrap()[kind]
+            .clone()
+    };
+
+    // Each part is the page that library and kind answer when asked alone.
+    let base = format!("/api/v1/catalogue/libraries/{music}");
+    for kind in ["items", "artists", "tracks"] {
+        let (_, alone) = get(format!(
+            "/api/v1/catalogue/search?q=light&libraries={music}&kinds={kind}&limit=3"
+        ))
+        .await;
+        assert_eq!(
+            part(&all, &music, kind),
+            part(&alone, &music, kind),
+            "{kind}"
+        );
+    }
+    assert_eq!(part(&all, &music, "items")["total"], 1);
+    assert_eq!(
+        part(&all, &music, "artists")["artists"][0]["name"],
+        "Lightning"
+    );
+    let tracks = part(&all, &music, "tracks");
+    assert_eq!(
+        (tracks["total"].clone(), tracks["limit"].clone()),
+        (json!(1), json!(3))
+    );
+    assert_eq!(tracks["tracks"][0]["title"], "First Light");
+    // A song is the very child the album lists.
+    let parent = tracks["tracks"][0]["parent_id"].as_str().unwrap();
+    let (_, children) = get(format!("{base}/items/{parent}/children")).await;
+    assert_eq!(tracks["tracks"][0]["id"], children["children"][0]["id"]);
+    // A film library holds no artists or songs.
+    assert_eq!(part(&all, &films, "items")["total"], 1);
+    assert_eq!(part(&all, &films, "artists"), Value::Null);
+    assert_eq!(part(&all, &films, "tracks"), Value::Null);
+
+    // Asked-for libraries come back in the order asked, and only asked kinds.
+    let (_, some) = get(format!(
+        "/api/v1/catalogue/search?q=light&libraries={films},{music}&kinds=items"
+    ))
+    .await;
+    let ids: Vec<_> = some["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["library"]["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(films), json!(music)]);
+    assert_eq!(part(&some, &music, "tracks"), Value::Null);
+    assert_eq!(part(&some, &music, "items")["limit"], 20);
+
+    // One kind takes that kind's sort and paging; an artist narrows items.
+    let (_, sorted) = get(format!(
+        "/api/v1/catalogue/search?libraries={music}&kinds=artists&sort=-name&offset=0&limit=2"
+    ))
+    .await;
+    let artists = part(&sorted, &music, "artists");
+    assert_eq!(
+        (artists["limit"].clone(), artists["total"].clone()),
+        (json!(2), json!(1))
+    );
+    let (_, by_artist) = get(format!(
+        "/api/v1/catalogue/search?libraries={music}&kinds=items&artist=Lightning"
+    ))
+    .await;
+    assert_eq!(part(&by_artist, &music, "items")["total"], 1);
+    let (_, by_other) = get(format!(
+        "/api/v1/catalogue/search?libraries={music}&kinds=items&artist=Somebody"
+    ))
+    .await;
+    assert_eq!(part(&by_other, &music, "items")["total"], 0);
+
+    for (query, expected) in [
+        ("limit=0", StatusCode::BAD_REQUEST),
+        ("limit=201", StatusCode::BAD_REQUEST),
+        ("offset=bad", StatusCode::BAD_REQUEST),
+        ("kinds=albums", StatusCode::BAD_REQUEST),
+        ("kinds=items,artists&sort=title", StatusCode::BAD_REQUEST),
+        ("sort=title", StatusCode::BAD_REQUEST),
+        ("kinds=tracks&sort=-name", StatusCode::BAD_REQUEST),
+        ("kinds=artists&artist=Lightning", StatusCode::BAD_REQUEST),
+        ("libraries=nope", StatusCode::NOT_FOUND),
+    ] {
+        let (status, body) = get(format!("/api/v1/catalogue/search?q=a&{query}")).await;
+        assert_eq!(status, expected, "{query}: {body}");
+    }
+    let (status, _) = f
+        .request("GET", "/api/v1/catalogue/search?q=light", Value::Null, None)
+        .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn search_covers_only_the_libraries_a_viewer_may_see() {
+    let f = Fixture::new().await;
+    let (music, films) = search_fixture(&f).await;
+    let hash = kahawai_hub::auth::hash_password("test-password").unwrap();
+    sqlx::query("INSERT INTO users(id,username,password_hash,is_admin,all_libraries) VALUES('film-only','film-only',?,0,0)").bind(hash).execute(f.registry.db()).await.unwrap();
+    let granted = f
+        .request(
+            "PUT",
+            "/admin/v1/users/film-only/libraries",
+            json!({"grants_version":0,"all_libraries":false,"libraries":[films]}),
+            Some(&f.token),
+        )
+        .await;
+    assert_eq!(granted.0, StatusCode::OK, "{:?}", granted.1);
+    let auth = Auth::new(f.registry.db().clone(), f.dir.path())
+        .await
+        .unwrap();
+    let token = auth
+        .login("film-only", "test-password")
+        .await
+        .unwrap()
+        .access_token;
+
+    let (status, found) = f
+        .request(
+            "GET",
+            "/api/v1/catalogue/search?q=light",
+            Value::Null,
+            Some(&token),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "{found}");
+    let ids: Vec<_> = found["libraries"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|l| l["library"]["id"].clone())
+        .collect();
+    assert_eq!(ids, [json!(films)]);
+    // Naming a library it may not see is the same answer as one that is not
+    // there, and fails the whole request rather than leaving it out.
+    for libraries in [music.clone(), format!("{films},{music}")] {
+        let (status, _) = f
+            .request(
+                "GET",
+                &format!("/api/v1/catalogue/search?q=light&libraries={libraries}"),
+                Value::Null,
+                Some(&token),
+            )
+            .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{libraries}");
+    }
 }
