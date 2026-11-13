@@ -579,6 +579,70 @@ describe('scrolling it', () => {
   })
 })
 
+describe('the content above it moving', () => {
+  /// jsdom has no ResizeObserver; this one is fired by hand.
+  class FakeResizeObserver {
+    static all: FakeResizeObserver[] = []
+    observed = new Set<Element>()
+    constructor(readonly callback: ResizeObserverCallback) {
+      FakeResizeObserver.all.push(this)
+    }
+    observe(el: Element) {
+      this.observed.add(el)
+    }
+    unobserve(el: Element) {
+      this.observed.delete(el)
+    }
+    disconnect() {
+      this.observed.clear()
+    }
+  }
+  const resized = (el: Element) =>
+    FakeResizeObserver.all
+      .filter((o) => o.observed.has(el))
+      .forEach((o) => o.callback([], o as unknown as ResizeObserver))
+
+  test('a filtered music grid lifted into view draws its rows without a scroll', async () => {
+    // Typing in a music library, the Artists section still holds every artist
+    // when the filtered items land: the grid is measured far below the fold,
+    // and draws nothing. Then the section shrinks to the artists that match.
+    FakeResizeObserver.all = []
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver)
+    let gridTop = 20_000
+    vi.stubGlobal('getComputedStyle', () => ({
+      gridTemplateColumns: Array<string>(10).fill('120px').join(' '),
+    }))
+    vi.stubGlobal('innerHeight', 900)
+    Element.prototype.getBoundingClientRect = function rect(this: Element) {
+      return {
+        top: this.tagName === 'LI' ? 0 : gridTop - window.scrollY,
+        height: this.tagName === 'LI' ? 186 : 0,
+      } as DOMRect
+    }
+    hub(300)
+    const { wrapper } = await filtered('bjo', '/library/music')
+    await flushPromises()
+    // The item grid, not the Artists section's own grid above it.
+    const items = () => wrapper.find('main > div.relative > ul')
+    expect(items().exists()).toBe(true)
+    expect(items().findAll('li')).toHaveLength(0)
+
+    gridTop = 300
+    resized(wrapper.find('main').element)
+    await flushPromises()
+    expect(items().findAll('li').length).toBeGreaterThan(0)
+  })
+
+  test('and the grid a filter brings in is watched for its own width', async () => {
+    // A music library opens on its artists, with no item grid to observe.
+    FakeResizeObserver.all = []
+    vi.stubGlobal('ResizeObserver', FakeResizeObserver)
+    const { wrapper } = await filtered('bjo', '/library/music')
+    const list = wrapper.find('main > div.relative > ul').element
+    expect(FakeResizeObserver.all.some((o) => o.observed.has(list))).toBe(true)
+  })
+})
+
 describe('hand-matching from the grid (HUB-8)', () => {
   beforeEach(() => {
     admin.value = true

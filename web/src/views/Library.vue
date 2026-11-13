@@ -97,6 +97,7 @@ function clearFilter() {
 /// grid column, so a row's height is a function of the window width.
 const metric = ref<Metric | null>(null)
 const rows = ref({ start: 0, end: 0 })
+const page = ref<HTMLElement | null>(null)
 const wrap = ref<HTMLElement | null>(null)
 const grid = ref<HTMLElement | null>(null)
 const artistsReady = ref(false)
@@ -144,6 +145,14 @@ function recompute() {
 /// flow, so the page does not scroll — and it appears the instant the reserved
 /// height lands, narrowing every column after the only measurement that would
 /// otherwise ever be taken.
+///
+/// And on the PAGE, because which rows are on screen is a function of where
+/// the grid starts, and that moves whenever something above it changes height
+/// — with no scroll, and no change to the grid. Filtering a music library is
+/// the case that found it: the Artists section still holds every artist when
+/// the filtered items land, so the grid is measured thousands of pixels down
+/// and draws no rows at all; the section then shrinks to the few that match,
+/// lifting an empty grid into view, and it stayed empty until a scroll.
 let watching: ResizeObserver | undefined
 function remeasure() {
   measure()
@@ -157,10 +166,18 @@ onMounted(() => {
     // measurement twice — which costs a `getComputedStyle` and is why the
     // guard below decides whether anything changed.
     remeasure()
-    if (typeof ResizeObserver === 'undefined' || !grid.value) return
+    if (typeof ResizeObserver === 'undefined') return
     watching = new ResizeObserver(remeasure)
-    watching.observe(grid.value)
+    if (page.value) watching.observe(page.value)
+    if (grid.value) watching.observe(grid.value)
   })
+})
+/// The grid comes and goes with the filter on a music library, which opens
+/// on its artists with no grid at all — observed only at mount, the grid a
+/// filter brought in never was.
+watch(grid, (now, before) => {
+  if (before) watching?.unobserve(before)
+  if (now) watching?.observe(now)
 })
 onBeforeUnmount(() => {
   window.removeEventListener('scroll', recompute)
@@ -265,7 +282,7 @@ function retryPage() {
 </script>
 
 <template>
-  <main :data-scroll-page="route.fullPath" :data-scroll-ready="scrollReady">
+  <main ref="page" :data-scroll-page="route.fullPath" :data-scroll-ready="scrollReady">
     <!-- The wordmark opens the jump menu now, so home needs saying
          somewhere. -->
     <Btn ghost small class="mb-[18px]" @click="router.push({ name: 'libraries' })">← Home</Btn>
